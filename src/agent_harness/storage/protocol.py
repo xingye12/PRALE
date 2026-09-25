@@ -1,3 +1,4 @@
+from asyncio import Lock
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -55,6 +56,8 @@ class CommitResult:
 
 
 class Storage(Protocol):
+    def operation_lock(self, key: str) -> Lock: ...
+
     async def commit(self, writes: list[Write]) -> CommitResult: ...
 
     async def get_entries(self, ids: list[str]) -> dict[str, Entry]: ...

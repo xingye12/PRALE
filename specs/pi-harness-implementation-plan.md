@@ -14,7 +14,7 @@
 - 小而稳定的 Python 库 API、事件和 hook；
 - 存储一致性与崩溃恢复测试。
 
-第一版明确不包含：跨会话语义记忆/向量检索、多主写入、分布式一致性、外部副作用的 exactly-once 保证，以及 pi 的实验性 `pico3/` 运行时。
+第一版明确不包含：多主写入、分布式一致性、外部副作用的 exactly-once 保证，以及 pi 的实验性 `pico3/` 运行时。跨会话长期记忆和 Skill 自进化作为阶段 10 的可选扩展实现，其范围和不变量分别见 [长期记忆实现规范](long-term-memory-implementation-spec.md) 与 [Skill 自进化功能接入](skill-self-evolution-integration.md)。
 
 ## 2. 规范来源与优先级
 
@@ -107,6 +107,7 @@ await lane.queue_follow_up(...)
 await lane.compact(...)
 await lane.navigate(...)
 await lane.resume(...)
+await lane.recover(provider=None)
 await lane.request_abort(...)
 snapshot = await lane.snapshot(...)
 subscription = lane.watch(...)
@@ -132,6 +133,7 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 | 7. SQLite 与恢复 | schema、migration、SQLite backend、crash injection suite | 在每个事务边界中断后可恢复到定义状态 |
 | 8. 观察与扩展 | hooks、watch、telemetry、文档与示例 | handler/listener 失败隔离；hook 结果遵守持久化边界 |
 | 9. 服务层（后置） | HTTP/RPC、认证、远程订阅、TUI 适配 | 仅复用库 API；不得把传输状态混入 domain/runtime |
+| 10. 长期资产（可选） | Session→L0 trace archive、L1--L3、Skill buffer/review、资产检索与 SQLite | 跨 Session 资产经 scope 隔离；后台失败不阻塞 Drive；冻结 source snapshot、召回/Skill 版本进入 effect intent |
 
 每阶段顺序固定为：先写规格化/崩溃测试，再实现 memory backend 或 runtime，再接入 SQLite 或外部适配器。阶段完成前不得提前把服务框架或 UI 作为运行时依赖。
 
@@ -168,6 +170,70 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 ### ADR-004：外部副作用采用 at-least-once 风险可见化
 
 在外部系统不支持幂等时，无法保证 exactly-once。系统以 durable intent 表示不确定副作用，以 replay policy 选择重试或显式中断收束。
+
+### ADR-005：跨会话资产与 Session 状态分库存储、通过 outbox 衔接
+
+长期记忆和 Skill 的生命周期、身份范围和异步处理方式均不同于单 Session 的执行状态，因此由独立的资产存储拥有。Session terminal settlement 原子写入 capture outbox，后台以幂等方式投递资产库；召回和 Skill loadout 冻结进 provider effect intent。这样既不把 LLM/索引 I/O 放进 Session transaction，也能在崩溃后补投并维持 operation 的可复现性。
+
+### ADR-006：流式输出以内容 checkpoint 恢复，而非连接续接
+
+**背景：** provider 的 HTTP/SSE 连接不能在进程重启后可靠续接，但 UI 仍需要看到已生成的内容，恢复也必须避免把未知远端结果当作未发生。
+
+**决策：** `assistant.effect_pending` intent 保存 `model`、`stream_options` 与 `content_checkpoint`。支持流式能力的 provider 每收到一个内容帧就原子替换该 state 并发出 `message_update`；流结束后仍通过正常 settlement 写入 assistant entry 和 usage。`recover()` 默认只收束未知 provider outcome；若已知 pending tool 为 `safe`，调用方必须以 `recover(provider)` 提供继续运行所需的 provider。
+
+**后果：** checkpoint 增加写放大，但不会保存或重连 provider transport 状态。崩溃恢复写入明确的 aborted assistant entry，内容为最后一个已 durable checkpoint；不会将其误报为完整回答。
+
+### ADR-007：SQLite 文件一库一 Session，并显式绑定逻辑 ID
+
+**背景：** 第一版的 SQLite repository 为每个 Session 分配独立数据库文件；若只依赖文件名，会让复制、移动或错误打开文件时的 Session 所有权变得不明确。
+
+**决策：** 每个数据库在 `sessions` 表中保存唯一逻辑 ID 和创建时间。`Harness.open()` 绑定或验证该 ID；repository fork 在暴露克隆之前将绑定替换为目标 Session。schema migration ledger 目前为 v1 基表与 v2 查询索引，均可重复执行。
+
+**后果：** 同一 SQLite 文件不能被不同 session ID 打开，消除了跨 Session value/lane 地址碰撞；跨 Session fork 是数据库快照而非共享可写存储。
+
+### ADR-008：Drive 领取使用 durable lease
+
+**背景：** 同一 SQLite Session 可以被多个进程内 Harness 或多个数据库连接重新挂载。仅靠对象内 `asyncio.Lock` 无法阻止两个 Drive 对同一 effect intent 同时调用 provider/tool。
+
+**决策：** `lane.drive()` 在执行前原子写入 `operation/<id>/drive_lease`，未取得 lease 的调用方仅观察 terminal result。terminal settlement 与 lane 空闲状态在同一事务删除 lease；本地异常退出在 finally 中按 token 条件释放。`recover()` 显式接管旧 lease，代表调用方已判定原执行进程不可用。
+
+**后果：** 同一 operation 在正常运行中只有一个 Drive。进程崩溃留下的 lease 不会自动猜测远端 effect 是否完成，而由显式恢复走既有 intent/settlement 规则；运维方不应对仍在运行的实例调用 `recover()`。
+
+### ADR-009：operation 取消中止本地 Drive，但不伪造远端 outcome
+
+**背景：** 调用方取消等待与业务层 `request_abort()` 不是同一件事。后者需要停止本地资源占用，但 provider/tool 已开始时无法证明远端是否完成。
+
+**决策：** `request_abort()` 先 durable 写入 `cancel_requested`，然后仅中止同一 Lane 已登记的本地 Drive task。Drive 捕获该取消时，若 state 仍为 `assistant.effect_pending`，按 interrupted/unknown settlement 收束；尚未开始 effect 的状态按 cancelled settlement 收束。单纯取消调用 `drive()` 的 await task 不会设置 durable cancel flag，仍向调用方传播 `CancelledError`。
+
+**后果：** API 可以立即停止本地生成，同时不会错误声称外部请求未执行。跨进程运行实例不共享 task，仍需通过自己的 watcher/abort transport 触发本地中止，durable state 保持一致。
+
+### ADR-010：服务层仅提供认证后的 JSON-RPC 与事件流适配
+
+**背景：** 阶段 9 需要 HTTP/RPC、认证和远程订阅，但核心 harness 不应依赖 Web 框架或连接状态。
+
+**决策：** `api/service.py` 提供 `AuthenticatedHarnessService`、可替换的 `Authenticator` 协议和 `RemoteSubscription`。HTTP、WebSocket、SSE 或 TUI 外壳只负责认证、调用 `dispatch()`、以及将 `next()` 事件编码给客户端；service 本身只依赖公开 `HarnessRpc` / `Lane.watch()`。telemetry 以独立的 event listener adapter 提供。
+
+**后果：** 传输连接、认证凭据和订阅队列不会进入 domain/runtime 或 durable Session。应用可以采用任意 Web 框架，而无需重写 Agent loop。
+
+### ADR-011：compaction entry 持久化摘要覆盖范围与保留 tail
+
+**背景：** 仅追加 summary entry 不会自动缩短 provider context；如果后续投影仍读取全部祖先消息，compaction 没有实际作用。
+
+**决策：** compaction payload 除 `summary` 外保存 `retained_message_ids`。上下文投影遇到最近的 compaction/branch summary 后，发送 system summary、声明保留的原始 message tail，以及摘要之后的新消息；被摘要覆盖的祖先消息不再发送，但仍保留在 entry tree。
+
+**后果：** compaction 格式是可演进的 JSON payload；旧格式没有 tail 元数据时安全退化为仅发送 summary 和其后消息。摘要不重写历史，也不改变 branch 的不可变 parent 链。
+
+### ADR-012：内置本地工具是 integration adapter，写入类效果默认不可重放
+
+**背景：** `read`、`write`、`edit` 和 `bash` 需要本地文件系统或进程访问，且后三者可能已产生无法从 durable state 推断的外部效果。
+
+**决策：** 本地工具实现置于 `integrations.local_tools`，仅以 runtime 的 `AgentTool` 协议注册。`read` 标记为 `safe`；`write`、`edit` 与 `bash` 标记为 `never`。文件修改按 resolved file path 通过共享队列串行化。工具结果可携带 JSON `details`（read 分页/图片、edit diff/patch、bash 截断日志路径），并随 tool-result entry 原子结算。
+
+**后果：** 在 tool effect intent 之后发生崩溃时，恢复会重放 read，但绝不自动重放写、编辑或 shell 命令；它们会按既有规则留下 outcome-unknown 工具结果。文件队列只定义进程内顺序，不能把普通文件写入升级为原子替换或 exactly-once。
+
+### ADR-013：L0 是冻结的 Session trace archive，而非当前上下文的副本
+
+Session entry tree 是已结算对话的权威来源，但 compaction、navigation、fork、删除和替换式 operation state 使其不能被后台 worker 延迟地当作“当前轨迹”读取。terminal settlement 因而冻结 branch entry IDs/hash，并以 outbox 异步 materialize 不可变 L0 archive；需要 effect/retry 级审计时，额外以 append-only TraceRecord 保存。此选择避免丢失原始历史，也避免将瞬态 event 或可变 checkpoint 错当完整事实。
 
 ## 10. 首个可执行里程碑
 

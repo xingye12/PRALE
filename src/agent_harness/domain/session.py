@@ -76,3 +76,6 @@ class Session:
 
     async def get_value(self, address: ValueAddress[object]) -> object | None:
         return await self._storage.get_value(address)
+
+    def operation_lock(self, lane: str) -> asyncio.Lock:
+        return self._storage.operation_lock(f"session/{self.id}/lane/{lane}")

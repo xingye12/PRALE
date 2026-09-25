@@ -1,8 +1,8 @@
 from dataclasses import dataclass
 from typing import Literal
 
-from agent_harness.api.models import OperationKind, OperationResult
 from agent_harness.domain.entries import JsonValue
+from agent_harness.domain.types import OperationKind
 
 ControlStatus = Literal["running", "cancel_requested"]
 
@@ -30,6 +30,3 @@ class OperationState:
 class ActiveOperation:
     meta: OperationMeta
     state: OperationState
-
-
-OperationTerminal = OperationResult

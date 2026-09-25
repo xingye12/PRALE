@@ -15,3 +15,19 @@ class InvalidLane(HarnessError):
 
 class OperationMismatch(HarnessError):
     pass
+
+
+class ProviderNotConfigured(HarnessError):
+    pass
+
+
+class OperationAlreadyExists(HarnessError):
+    pass
+
+
+class NothingToCompact(HarnessError):
+    """The selected branch has no prior history eligible for compaction."""
+
+
+class UnknownTarget(HarnessError):
+    """A navigation request refers to an entry outside the session tree."""

@@ -19,6 +19,10 @@ def lane_tip(lane: str) -> ValueAddress[str | None]:
     return ValueAddress(f"lane/{lane}/tip")
 
 
+def lane_inbox(lane: str) -> ListAddress[dict[str, object]]:
+    return ListAddress(f"lane/{lane}/inbox")
+
+
 def operation_meta(operation_id: str) -> ValueAddress[object]:
     return ValueAddress(f"operation/{operation_id}/meta")
 
@@ -29,3 +33,7 @@ def operation_state(operation_id: str) -> ValueAddress[object]:
 
 def operation_result(operation_id: str) -> ValueAddress[object]:
     return ValueAddress(f"operation/{operation_id}/result")
+
+
+def operation_lease(operation_id: str) -> ValueAddress[dict[str, str]]:
+    return ValueAddress(f"operation/{operation_id}/drive_lease")

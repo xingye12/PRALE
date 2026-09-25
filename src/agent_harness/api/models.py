@@ -1,8 +1,6 @@
 from dataclasses import dataclass
-from typing import Literal
 
-OperationKind = Literal["run", "compaction", "navigation"]
-OperationStatus = Literal["completed", "declined", "aborted", "failed"]
+from agent_harness.domain.types import OperationKind, OperationStatus
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,3 +29,9 @@ class LaneSnapshot:
     tip_id: str | None
     operation_id: str | None
     last_operation_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class AbortResult:
+    operation_id: str
+    newly_requested: bool

@@ -1,5 +1,6 @@
 import copy
 import time
+from asyncio import Lock
 from collections.abc import Callable
 
 from agent_harness.domain.entries import Entry
@@ -32,6 +33,19 @@ class MemoryStorage(Storage):
         self._values: dict[str, object] = {}
         self._lists: dict[str, list[object]] = {}
         self._usage: list[tuple[int, UsageRow]] = []
+        self._operation_locks: dict[str, Lock] = {}
+
+    def operation_lock(self, key: str) -> Lock:
+        return self._operation_locks.setdefault(key, Lock())
+
+    def clone(self) -> "MemoryStorage":
+        clone = MemoryStorage(self._now_ms)
+        clone._next_seq = self._next_seq
+        clone._entries = copy.deepcopy(self._entries)
+        clone._values = copy.deepcopy(self._values)
+        clone._lists = copy.deepcopy(self._lists)
+        clone._usage = copy.deepcopy(self._usage)
+        return clone
 
     async def commit(self, writes: list[Write]) -> CommitResult:
         self._validate(writes)
