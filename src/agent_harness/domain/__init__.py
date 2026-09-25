@@ -1,0 +1,1 @@
+"""Pure, durable domain model."""
