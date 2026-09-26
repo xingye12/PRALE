@@ -30,8 +30,10 @@ from agent_harness.storage.protocol import AppendList, DeleteValue, InsertEntry,
 
 if TYPE_CHECKING:
     from agent_harness.domain.memory import MemoryScope
+    from agent_harness.domain.skill import SkillScope
     from agent_harness.memory.runtime import MemoryRuntime
     from agent_harness.runtime.generation import ChatProvider
+    from agent_harness.skill.runtime import SkillEvolutionRuntime
 
 
 def _now_ms() -> int:
@@ -48,6 +50,7 @@ def _redact_trace(value: object) -> object:
     if isinstance(value, list):
         return [_redact_trace(item) for item in value]
     if isinstance(value, str):
+
         def redact_match(match: re.Match[str]) -> str:
             secret = match.group(2)
             marker = hashlib.sha256(secret.encode()).hexdigest()[:12]
@@ -73,6 +76,8 @@ class Lane:
         hooks: HookRegistry | None = None,
         memory_scope: "MemoryScope | None" = None,
         memory_runtime: "MemoryRuntime | None" = None,
+        skill_scope: "SkillScope | None" = None,
+        skill_runtime: "SkillEvolutionRuntime | None" = None,
         trace_recorder: bool = False,
     ) -> None:
         self.name = name
@@ -86,6 +91,8 @@ class Lane:
         self._drive_task: asyncio.Task[object] | None = None
         self._memory_scope = memory_scope
         self._memory_runtime = memory_runtime
+        self._skill_scope = skill_scope
+        self._skill_runtime = skill_runtime
         self._trace_recorder = trace_recorder
 
     async def attach(self, at: str | None = None) -> None:
@@ -157,7 +164,7 @@ class Lane:
                     SetValue(
                         operation_state(operation_id),
                         OperationState(current.at, "cancel_requested", current.data),
-                    )
+                    ),
                 ]
             )
             return AbortResult(operation_id, newly_requested=True)
@@ -253,7 +260,7 @@ class Lane:
             result.operation_id, "terminal_settlement", {"status": result.status, "tip_id": result.tip_id}
         )
         trace_ids.extend(terminal_trace_ids)
-        return [
+        writes: list[Write] = [
             *terminal_trace,
             AppendList(
                 outbox,
@@ -261,10 +268,7 @@ class Lane:
                     "event": "memory_capture_requested",
                     "key": key,
                     "scope": {
-                        "team_id": scope.team_id,
-                        "agent_id": scope.agent_id,
-                        "user_id": scope.user_id,
-                        "task_id": scope.task_id,
+                        "repository_id": scope.repository_id,
                     },
                     "lane": self.name,
                     "kind": result.kind,
@@ -276,8 +280,32 @@ class Lane:
                     "trace_format_version": "execution-v1" if self._trace_recorder else "conversation-v1",
                     "trace_entry_ids": trace_ids,
                 },
-            )
+            ),
         ]
+        if self._skill_runtime is not None and self._skill_scope is not None:
+            skill_outbox = ListAddress[dict[str, object]]("skill/capture_outbox")
+            skill_existing = await mutator.read_list(skill_outbox)
+            if not any(isinstance(item, dict) and item.get("key") == key for item in skill_existing):
+                writes.append(
+                    AppendList(
+                        skill_outbox,
+                        {
+                            "event": "skill_capture_requested",
+                            "key": key,
+                            "scope": {"repository_id": self._skill_scope.repository_id},
+                            "lane": self.name,
+                            "kind": result.kind,
+                            "operation_id": result.operation_id,
+                            "base_tip_id": result.from_tip_id,
+                            "tip_id": result.tip_id,
+                            "source_entry_ids": list(source_ids),
+                            "source_entry_hash": digest,
+                            "trace_format_version": "execution-v1" if self._trace_recorder else "conversation-v1",
+                            "trace_entry_ids": trace_ids,
+                        },
+                    )
+                )
+        return writes
 
     def trace_writes_with_ids(
         self, operation_id: str, event: str, data: dict[str, object] | None = None
@@ -301,9 +329,26 @@ class Lane:
 
         return await self._memory_runtime.recall(
             self._memory_scope,
-            RecallQuery(prompt, context_summary, self._memory_scope.task_id),
+            RecallQuery(prompt, context_summary),
             RecallBudget(),
         )
+
+    async def available_skills(self, prompt: str):
+        """Best-effort metadata-only Skill discovery; admission never depends on it."""
+        if self._skill_runtime is None or self._skill_scope is None:
+            return ()
+        try:
+            return await self._skill_runtime.listing(self._skill_scope, prompt)
+        except Exception:
+            return ()
+
+    async def load_skill(self, skill_id: str, version: int | None = None):
+        if self._skill_runtime is None or self._skill_scope is None:
+            return None
+        try:
+            return await self._skill_runtime.load(self._skill_scope, skill_id, version)
+        except Exception:
+            return None
 
     @property
     def tools(self) -> ToolRegistry:

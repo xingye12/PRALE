@@ -21,9 +21,19 @@ from agent_harness.domain.memory import (
 class MemoryStore(Protocol):
     async def capture_archive(self, archive: SessionTraceArchive) -> tuple[SessionTraceArchive, bool]: ...
 
+    async def find_archive(
+        self, scope: MemoryScope, session_id: str, operation_id: str, tip_id: str | None, source_hash: str
+    ) -> SessionTraceArchive | None: ...
+
     async def create_or_wake_job(
-        self, scope: MemoryScope, stage: str, watermark: int, not_before: int,
-        prompt_id: str | None = None, prompt_version: int | None = None, prompt_mode: str | None = None,
+        self,
+        scope: MemoryScope,
+        stage: str,
+        watermark: int,
+        not_before: int,
+        prompt_id: str | None = None,
+        prompt_version: int | None = None,
+        prompt_mode: str | None = None,
         input_ids: tuple[str, ...] = (),
     ) -> PromotionJob: ...
 
@@ -55,6 +65,8 @@ class MemoryStore(Protocol):
 
     async def read_l2(self, scope: MemoryScope) -> tuple[WorkSceneMemory, ...]: ...
 
+    async def read_all_l2(self) -> tuple[WorkSceneMemory, ...]: ...
+
     async def read_l3(self, scope: MemoryScope) -> OperatingDoctrine | None: ...
 
     async def audit(self, scope: MemoryScope, event: str, data: dict[str, object]) -> None: ...
@@ -77,9 +89,13 @@ class MemoryStore(Protocol):
 class MemoryExtractor(Protocol):
     async def extract_l1(self, archives: tuple[SessionTraceArchive, ...]) -> tuple[AtomicCandidate, ...]: ...
 
-    async def extract_l2(self, l1: tuple[object, ...], scenes: tuple[WorkSceneMemory, ...]) -> tuple[SceneCandidate, ...]: ...
+    async def extract_l2(
+        self, l1: tuple[object, ...], scenes: tuple[WorkSceneMemory, ...]
+    ) -> tuple[SceneCandidate, ...]: ...
 
-    async def extract_l3(self, scenes: tuple[WorkSceneMemory, ...], current: OperatingDoctrine | None) -> DoctrineCandidate | None: ...
+    async def extract_l3(
+        self, scenes: tuple[WorkSceneMemory, ...], current: OperatingDoctrine | None
+    ) -> DoctrineCandidate | None: ...
 
 
 class EmbeddingProvider(Protocol):

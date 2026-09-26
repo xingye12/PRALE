@@ -1,6 +1,7 @@
 """Provider-neutral adapters for structured long-term-memory extraction."""
 
 import json
+import re
 from collections.abc import Awaitable, Callable
 
 from agent_harness.api.errors import UnsupportedPromptMode
@@ -46,7 +47,10 @@ class JsonMemoryExtractor:
         value = _load_list(raw)
         candidates = tuple(
             AtomicCandidate(
-                item["type"], item["content"], item.get("background", ""), item.get("scene_key", ""),
+                item["type"],
+                item["content"],
+                item.get("background", ""),
+                item.get("scene_key", ""),
                 item.get("priority", 0),
                 item.get("confidence", 0.0),
                 item["metadata"],
@@ -54,7 +58,8 @@ class JsonMemoryExtractor:
                 item.get("decision", "create"),
                 tuple(item.get("supersedes_ids", [])),
                 item.get("decision_reason", ""),
-            ) for item in value
+            )
+            for item in value
         )
         for candidate in candidates:
             validate_atomic_candidate(candidate)
@@ -75,14 +80,17 @@ class JsonMemoryExtractor:
             raise ValueError("l2_merge response lacks merged scene IDs")
         return (*created, *updated, *merged)
 
-    async def _extract_l2_operation(
-        self, operation: str, payload: dict[str, object]
-    ) -> tuple[SceneCandidate, ...]:
+    async def _extract_l2_operation(self, operation: str, payload: dict[str, object]) -> tuple[SceneCandidate, ...]:
         value = _load_list(await self._complete(operation, payload))
         candidates = tuple(
             SceneCandidate(
-                item["scenario_key"], item["content"], item.get("summary", ""), tuple(item["l1_ids"]),
-                item["l1_high_watermark"], item.get("expected_version"), tuple(item.get("merge_scene_ids", [])),
+                item["scenario_key"],
+                item["content"],
+                item.get("summary", ""),
+                tuple(item["l1_ids"]),
+                item["l1_high_watermark"],
+                item.get("expected_version"),
+                tuple(item.get("merge_scene_ids", [])),
                 bool(item.get("persona_update_request", False)),
             )
             for item in value
@@ -119,10 +127,60 @@ def _load_list(raw: str) -> list[dict[str, object]]:
 def _archive_payload(archive: SessionTraceArchive) -> dict[str, object]:
     return {
         "archive_id": archive.archive_id,
+        "repository_id": archive.scope.repository_id,
         "operation_kind": archive.operation_kind,
         "trace_format_version": archive.trace_format_version,
         "items": [_jsonable(item) for item in archive.items],
         "ancestor_items": [_jsonable(item) for item in archive.ancestor_items],
+        "coding_evidence": _coding_evidence(archive),
+        "coding_memory_policy": {
+            "retain": [
+                "verified repository architecture, interfaces, invariants, and dependency boundaries",
+                "accepted decisions with their rationale and constraints",
+                "tool-verified test, build, migration, and failure outcomes",
+                "reusable debugging methods, anti-patterns, and repository-relative artifacts",
+            ],
+            "reject": [
+                "unverified assistant plans or speculative diagnoses",
+                "raw source dumps, transient command chatter, and credentials",
+                "a file path or symbol without its role, constraint, or outcome",
+            ],
+            "rules": [
+                "Use tool outcomes as evidence, but record an outcome as fact only when it is explicit.",
+                "Keep code references repository-relative and include the module, symbol, or test meaning.",
+                "Do not convert a one-off patch recipe into work_method; executable workflows belong to SkillStore.",
+            ],
+        },
+    }
+
+
+_REPOSITORY_PATH = re.compile(r"(?<!\w)(?:[\w.-]+/)+[\w.-]+")
+
+
+def _coding_evidence(archive: SessionTraceArchive) -> dict[str, object]:
+    """Project a compact, source-addressable coding view from frozen L0.
+
+    The raw trace remains authoritative. This projection prevents an extractor
+    from treating a long tool transcript as a fact while preserving the files
+    and verified outcomes that make coding memory useful.
+    """
+    files: set[str] = set()
+    tool_outcomes: list[dict[str, object]] = []
+    for item in archive.items:
+        text = "\n".join(part for part in (item.content, json.dumps(item.payload, default=str)) if part)
+        files.update(_REPOSITORY_PATH.findall(text))
+        if item.role == "tool":
+            tool_outcomes.append(
+                {
+                    "source_entry_id": item.source_entry_id,
+                    "is_error": bool(item.payload.get("is_error", False)),
+                    "excerpt": (item.content or "")[:800],
+                }
+            )
+    return {
+        "repository_id": archive.scope.repository_id,
+        "files": sorted(files)[:30],
+        "tool_outcomes": tool_outcomes[:20],
     }
 
 

@@ -374,3 +374,68 @@ def test_scope_deletion_does_not_affect_other_scope(tmp_path) -> None:
         assert await store.current_l1_watermark(first) == 0
 
     asyncio.run(scenario())
+
+
+def test_repository_scope_isolates_l0_to_l2_but_shares_l3(tmp_path) -> None:
+    async def scenario() -> None:
+        store = SQLiteMemoryStore(tmp_path / "memory.db")
+        first, second = MemoryScope("git@example/first"), MemoryScope("git@example/second")
+        metadata = {"work_object": "first", "status": "active", "activity_start_time": "1", "activity_end_time": "2"}
+        await store.apply_candidates(
+            first, (AtomicCandidate("work_fact", "only first repository", "", "first", 1, 1.0, metadata, ("l0",)),), 1
+        )
+        scene = "\n".join(
+            f"{heading}: value"
+            for heading in (
+                "工作场景",
+                "适用条件",
+                "核心 SOP",
+                "判断逻辑",
+                "禁忌与反模式",
+                "关键事实依据",
+                "相关任务与资产",
+                "演化记录",
+                "待确认问题",
+            )
+        )
+        await store.write_scene(first, SceneCandidate("first", scene, "", (), 1))
+        doctrine = "\n".join(
+            f"{heading}: value"
+            for heading in (
+                "Operating Thesis",
+                "Core Principles",
+                "Reusable SOPs",
+                "Decision Logic",
+                "Boundaries & Anti-patterns",
+                "Agent Rules",
+            )
+        )
+        await store.write_doctrine(first, DoctrineCandidate(doctrine, (), 1))
+        repository_only = RecallBudget(min_score=0, include_l3=False)
+        assert (await store.search(first, RecallQuery("only first"), repository_only)).items
+        assert not (await store.search(second, RecallQuery("only first"), repository_only)).items
+        assert await store.read_l2(second) == ()
+        assert (await store.read_l3(first)) == (await store.read_l3(second))
+
+    asyncio.run(scenario())
+
+
+def test_code_artifact_reference_is_searchable_without_polluting_display_content(tmp_path) -> None:
+    async def scenario() -> None:
+        store = SQLiteMemoryStore(tmp_path / "memory.db")
+        scope = MemoryScope("git@example/repo")
+        candidate = AtomicCandidate(
+            "work_artifact",
+            "The migration contract is documented.",
+            "",
+            "database",
+            80,
+            1.0,
+            {"artifact_type": "doc", "artifact_ref": "specs/schema-migration.md"},
+            ("trace",),
+        )
+        await store.apply_candidates(scope, (candidate,), 1)
+        bundle = await store.search(scope, RecallQuery("schema-migration.md"), RecallBudget(min_score=0))
+        assert [item.content for item in bundle.items if item.level == "l1"] == [candidate.content]
+
+    asyncio.run(scenario())

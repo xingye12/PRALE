@@ -6,6 +6,7 @@ already frozen by the session outbox before it reaches this component.
 # ruff: noqa
 
 import json
+import re
 import sqlite3
 import time
 import uuid
@@ -17,6 +18,7 @@ from agent_harness.domain.memory import (
     AtomicCandidate,
     AtomicMemory,
     DoctrineCandidate,
+    GLOBAL_L3_SCOPE,
     MemoryScope,
     PromotionJob,
     PromotionConflict,
@@ -27,6 +29,7 @@ from agent_harness.domain.memory import (
     SessionTraceArchive,
     SceneCandidate,
     TraceItem,
+    WorkSceneMemory,
     content_hash,
     validate_atomic_candidate,
     validate_doctrine_content,
@@ -38,16 +41,45 @@ if TYPE_CHECKING:
 
 
 def _scope(scope: MemoryScope) -> tuple[str, str, str]:
-    return (scope.team_id, scope.agent_id, "" if scope.user_id is None else scope.user_id)
+    # The physical columns predate repository ownership.  v4 stores the
+    # repository key in their first component and fixes the deprecated identity
+    # components to empty strings; all predicates remain database-side.
+    return scope.storage_key
 
 
 def _now() -> int:
     return time.time_ns() // 1_000_000
 
 
+_CODE_TOKEN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_REPOSITORY_PATH = re.compile(r"(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+")
+
+
+def _search_terms(query: RecallQuery) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """Keep code identifiers searchable even when punctuation splits FTS tokens."""
+    text = f"{query.text}\n{query.context_summary}".lower()
+    terms = tuple(dict.fromkeys(token for token in _CODE_TOKEN.findall(text) if len(token) > 1))
+    paths = tuple(dict.fromkeys(_REPOSITORY_PATH.findall(text)))
+    return terms, paths
+
+
+def _indexable_memory_text(content: str, metadata: dict[str, object]) -> str:
+    """Index stable code references without changing the displayed memory text."""
+    references = [
+        str(metadata[key])
+        for key in ("artifact_ref", "work_object", "scope", "symbol", "path", "test_ref")
+        if isinstance(metadata.get(key), str)
+    ]
+    return "\n".join((content, *references))
+
+
 class SQLiteMemoryStore:
     def __init__(
-        self, path: str | Path, *, id_factory: Callable[[], str] | None = None, now_ms: Callable[[], int] | None = None,
+        self,
+        path: str | Path,
+        *,
+        id_factory: Callable[[], str] | None = None,
+        now_ms: Callable[[], int] | None = None,
         embedding_provider: "EmbeddingProvider | None" = None,
     ) -> None:
         self._conn = sqlite3.connect(str(path), isolation_level=None)
@@ -124,6 +156,19 @@ class SQLiteMemoryStore:
         if "input_hash" not in job_columns:
             self._conn.execute("ALTER TABLE memory_jobs ADD COLUMN input_hash TEXT")
         self._conn.execute("INSERT OR IGNORE INTO schema_migrations VALUES(3)")
+        # v4 changes the meaning of the historical three-part storage key to
+        # (repository_id, '', '').  Existing rows cannot be automatically
+        # remapped because they contain no repository identity.
+        self._conn.execute("INSERT OR IGNORE INTO schema_migrations VALUES(4)")
+        # v5 makes code references stored in L1 metadata searchable. FTS is a
+        # derived index, so rebuilding it is safe and keeps old databases equal
+        # to newly written memories.
+        if self._conn.execute("SELECT 1 FROM schema_migrations WHERE version=5").fetchone() is None:
+            self._conn.execute("DELETE FROM memory_fts")
+            self._conn.execute(
+                "INSERT INTO memory_fts SELECT memory_id,team_id,agent_id,user_id,content || ' ' || metadata FROM atomic_memories WHERE status='active'"
+            )
+            self._conn.execute("INSERT INTO schema_migrations VALUES(5)")
 
     async def capture_archive(self, archive: SessionTraceArchive) -> tuple[SessionTraceArchive, bool]:
         sk = _scope(archive.scope)
@@ -249,6 +294,16 @@ class SQLiteMemoryStore:
             conn.execute("ROLLBACK")
             raise
 
+    async def find_archive(
+        self, scope: MemoryScope, session_id: str, operation_id: str, tip_id: str | None, source_hash: str
+    ) -> SessionTraceArchive | None:
+        row = self._conn.execute(
+            """SELECT archive_id FROM trace_archives WHERE team_id=? AND agent_id=? AND user_id=?
+            AND session_id=? AND operation_id=? AND tip_id IS ? AND source_entry_hash=?""",
+            (*_scope(scope), session_id, operation_id, tip_id, source_hash),
+        ).fetchone()
+        return await self._read_archive(str(row[0])) if row else None
+
     async def _refresh_embeddings(self, scope: MemoryScope) -> None:
         """Refresh only the derived side index; failures intentionally leave it stale."""
         provider = self._embeddings
@@ -334,14 +389,21 @@ class SQLiteMemoryStore:
             return ()
         rows = self._conn.execute(
             f"""SELECT i.* FROM trace_items i JOIN trace_archives a ON a.archive_id=i.archive_id
-            WHERE i.source_entry_id IN ({','.join('?' for _ in ids)})
+            WHERE i.source_entry_id IN ({",".join("?" for _ in ids)})
               AND a.team_id=? AND a.agent_id=? AND a.user_id=?""",
             (*ids, *_scope(scope)),
         ).fetchall()
         by_id = {
             str(item["source_entry_id"]): TraceItem(
-                item["source_entry_id"], item["source_seq"], item["timestamp"], item["type"], item["role"],
-                item["content"], json.loads(item["payload"]), tuple(json.loads(item["redacted_paths"])), item["store_seq"],
+                item["source_entry_id"],
+                item["source_seq"],
+                item["timestamp"],
+                item["type"],
+                item["role"],
+                item["content"],
+                json.loads(item["payload"]),
+                tuple(json.loads(item["redacted_paths"])),
+                item["store_seq"],
             )
             for item in rows
         }
@@ -581,7 +643,10 @@ class SQLiteMemoryStore:
                     conn.execute(
                         "UPDATE atomic_memories SET status='superseded',updated_at=? WHERE memory_id=?", (now, old)
                     )
-                conn.execute("INSERT INTO memory_fts VALUES(?,?,?,?,?)", (memory_id, *sk, candidate.content))
+                conn.execute(
+                    "INSERT INTO memory_fts VALUES(?,?,?,?,?)",
+                    (memory_id, *sk, _indexable_memory_text(candidate.content, candidate.metadata)),
+                )
                 conn.execute(
                     "INSERT INTO memory_audit(team_id,agent_id,user_id,created_at,event,data) VALUES(?,?,?,?,?,?)",
                     (
@@ -610,7 +675,7 @@ class SQLiteMemoryStore:
         await self._refresh_embeddings(scope)
 
     async def search(self, scope: MemoryScope, query: RecallQuery, budget: RecallBudget) -> RecallBundle:
-        words = [word for word in query.text.lower().split() if word]
+        words, paths = _search_terms(query)
         rows = []
         fts_scores: dict[str, float] = {}
         fts_ranks: dict[str, int] = {}
@@ -647,6 +712,7 @@ class SQLiteMemoryStore:
                 ).fetchall()
                 for row in candidates:
                     all_rows[str(row["memory_id"])] = row
+
                 def cosine(row: sqlite3.Row) -> float:
                     vector = tuple(float(value) for value in json.loads(row["vector"]))
                     if len(vector) != len(query_vector):
@@ -655,6 +721,7 @@ class SQLiteMemoryStore:
                     left_norm = sum(left * left for left in query_vector) ** 0.5
                     right_norm = sum(right * right for right in vector) ** 0.5
                     return numerator / (left_norm * right_norm) if left_norm and right_norm else -1.0
+
                 vector_ranks = {
                     str(row["memory_id"]): index
                     for index, row in enumerate(sorted(candidates, key=cosine, reverse=True), start=1)
@@ -664,10 +731,12 @@ class SQLiteMemoryStore:
                 await self.audit(scope, "recall_embedding_degraded", {"reason": type(error).__name__})
         scored = []
         for memory_id, row in all_rows.items():
-            keyword_score = sum(word in row["content"].lower() for word in words) / max(len(words), 1)
+            haystack = f"{row['content']} {row['metadata']}".lower()
+            keyword_score = sum(word in haystack for word in words) / max(len(words), 1)
+            path_score = sum(path in haystack for path in paths) / max(len(paths), 1)
             # RRF keeps keyword and semantic rankings comparable without trusting either score scale.
             rrf = sum(60 / (60 + rank) for rank in (fts_ranks.get(memory_id), vector_ranks.get(memory_id)) if rank)
-            score = max(keyword_score, fts_scores.get(memory_id, 0.0), rrf)
+            score = max(keyword_score, path_score, fts_scores.get(memory_id, 0.0), rrf)
             if score >= budget.min_score:
                 scored.append((score, row))
         scored.sort(key=lambda item: (item[0], item[1]["priority"], item[1]["last_confirmed_at"]), reverse=True)
@@ -767,10 +836,35 @@ class SQLiteMemoryStore:
             for row in rows
         )
 
+    async def read_all_l2(self):
+        """Current L2 scenes from every repository, for global L3 synthesis."""
+        rows = self._conn.execute(
+            "SELECT * FROM work_scene_memories WHERE status='current' ORDER BY updated_at DESC"
+        ).fetchall()
+        return tuple(
+            WorkSceneMemory(
+                row["scene_id"],
+                MemoryScope(row["team_id"], row["agent_id"], row["user_id"] or None),
+                row["scenario_key"],
+                row["version"],
+                row["status"],
+                row["content"],
+                row["summary"],
+                row["heat"],
+                tuple(json.loads(row["l1_ids"])),
+                row["l1_high_watermark"],
+                row["created_at"],
+                row["updated_at"],
+                row["content_hash"],
+                bool(row["persona_update_request"]),
+            )
+            for row in rows
+        )
+
     async def read_l3(self, scope: MemoryScope):
         row = self._conn.execute(
             "SELECT * FROM operating_doctrines WHERE team_id=? AND agent_id=? AND user_id=? ORDER BY version DESC LIMIT 1",
-            _scope(scope),
+            _scope(GLOBAL_L3_SCOPE),
         ).fetchone()
         if row is None:
             return None
@@ -778,7 +872,7 @@ class SQLiteMemoryStore:
 
         return OperatingDoctrine(
             row["doctrine_id"],
-            scope,
+            GLOBAL_L3_SCOPE,
             row["version"],
             row["content"],
             tuple(json.loads(row["l2_ids"])),
@@ -841,8 +935,14 @@ class SQLiteMemoryStore:
             ).fetchone()[0]
             if count + 1 >= (max_scenes * 4 + 4) // 5:
                 self._audit_in_transaction(
-                    scope, "l2_capacity_warning", {"count": count + 1, "max_scenes": max_scenes,
-                    "level": "full" if count + 1 >= max_scenes else "80_percent"}, now
+                    scope,
+                    "l2_capacity_warning",
+                    {
+                        "count": count + 1,
+                        "max_scenes": max_scenes,
+                        "level": "full" if count + 1 >= max_scenes else "80_percent",
+                    },
+                    now,
                 )
             if count >= max_scenes:
                 evict = self._conn.execute(
@@ -852,7 +952,9 @@ class SQLiteMemoryStore:
                 self._conn.execute(
                     "UPDATE work_scene_memories SET status='dormant',updated_at=? WHERE scene_id=?", (now, evict[0])
                 )
-                self._audit_in_transaction(scope, "l2_capacity_evicted", {"scene_id": evict[0], "max_scenes": max_scenes}, now)
+                self._audit_in_transaction(
+                    scope, "l2_capacity_evicted", {"scene_id": evict[0], "max_scenes": max_scenes}, now
+                )
             scene_id = self._ids()
             self._conn.execute(
                 "INSERT INTO work_scene_memories VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -881,26 +983,42 @@ class SQLiteMemoryStore:
             ).rowcount
             if not changed:
                 raise PromotionConflict("merged scene is unavailable in this scope")
-        self._audit_in_transaction(scope, event, {"scenario_key": candidate.scenario_key, "merged": candidate.merge_scene_ids}, now)
+        self._audit_in_transaction(
+            scope, event, {"scenario_key": candidate.scenario_key, "merged": candidate.merge_scene_ids}, now
+        )
 
     async def write_doctrine(self, scope: MemoryScope, candidate: DoctrineCandidate) -> None:
         validate_doctrine_content(candidate.content)
-        now, sk = self._now(), _scope(scope)
+        now, sk = self._now(), _scope(GLOBAL_L3_SCOPE)
         conn = self._conn
         conn.execute("BEGIN IMMEDIATE")
         try:
             current = conn.execute(
-                "SELECT version FROM operating_doctrines WHERE team_id=? AND agent_id=? AND user_id=? ORDER BY version DESC LIMIT 1", sk
+                "SELECT version FROM operating_doctrines WHERE team_id=? AND agent_id=? AND user_id=? ORDER BY version DESC LIMIT 1",
+                sk,
             ).fetchone()
-            if current is not None and (candidate.expected_version is None or current["version"] != candidate.expected_version):
+            if current is not None and (
+                candidate.expected_version is None or current["version"] != candidate.expected_version
+            ):
                 raise PromotionConflict("doctrine version changed")
             version = 1 if current is None else int(current["version"]) + 1
             conn.execute(
                 "INSERT INTO operating_doctrines VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (self._ids(), *sk, version, candidate.content, json.dumps(candidate.l2_ids), candidate.l2_high_watermark,
-                 now, now, content_hash(candidate.content)),
+                (
+                    self._ids(),
+                    *sk,
+                    version,
+                    candidate.content,
+                    json.dumps(candidate.l2_ids),
+                    candidate.l2_high_watermark,
+                    now,
+                    now,
+                    content_hash(candidate.content),
+                ),
             )
-            self._audit_in_transaction(scope, "l3_update", {"version": version, "l2_ids": candidate.l2_ids}, now)
+            self._audit_in_transaction(
+                GLOBAL_L3_SCOPE, "l3_update", {"version": version, "l2_ids": candidate.l2_ids}, now
+            )
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -953,9 +1071,7 @@ class SQLiteMemoryStore:
             ):
                 conn.execute(f"DELETE FROM {table} WHERE team_id=? AND agent_id=? AND user_id=?", sk)
             conn.execute("DELETE FROM memory_fts WHERE team_id=? AND agent_id=? AND user_id=?", sk)
-            conn.execute(
-                "DELETE FROM memory_embeddings WHERE memory_id NOT IN (SELECT memory_id FROM atomic_memories)"
-            )
+            conn.execute("DELETE FROM memory_embeddings WHERE memory_id NOT IN (SELECT memory_id FROM atomic_memories)")
             conn.execute("COMMIT")
         except Exception:
             conn.execute("ROLLBACK")
@@ -968,12 +1084,18 @@ class SQLiteMemoryStore:
         try:
             conn.execute("DELETE FROM memory_fts WHERE team_id=? AND agent_id=? AND user_id=?", sk)
             rows = conn.execute(
-                "SELECT memory_id,content FROM atomic_memories WHERE team_id=? AND agent_id=? AND user_id=? AND status='active'",
+                "SELECT memory_id,content,metadata FROM atomic_memories WHERE team_id=? AND agent_id=? AND user_id=? AND status='active'",
                 sk,
             ).fetchall()
             for row in rows:
-                conn.execute("INSERT INTO memory_fts VALUES(?,?,?,?,?)", (row["memory_id"], *sk, row["content"]))
-            conn.execute("DELETE FROM memory_embeddings WHERE memory_id IN (SELECT memory_id FROM atomic_memories WHERE team_id=? AND agent_id=? AND user_id=?)", sk)
+                conn.execute(
+                    "INSERT INTO memory_fts VALUES(?,?,?,?,?)",
+                    (row["memory_id"], *sk, _indexable_memory_text(row["content"], json.loads(row["metadata"]))),
+                )
+            conn.execute(
+                "DELETE FROM memory_embeddings WHERE memory_id IN (SELECT memory_id FROM atomic_memories WHERE team_id=? AND agent_id=? AND user_id=?)",
+                sk,
+            )
             self._audit_in_transaction(scope, "indexes_rebuilt", {"l1_count": len(rows)}, self._now())
             conn.execute("COMMIT")
         except Exception:
@@ -1028,8 +1150,7 @@ class SQLiteMemoryStore:
                 for row in conn.execute(
                     """SELECT scene_id FROM work_scene_memories AS s WHERE team_id=? AND agent_id=? AND user_id=?
                     AND status='dormant' AND updated_at<? AND NOT EXISTS (
-                      SELECT 1 FROM operating_doctrines d WHERE d.team_id=s.team_id AND d.agent_id=s.agent_id
-                      AND d.user_id=s.user_id AND instr(d.l2_ids, s.scene_id)>0)""",
+                      SELECT 1 FROM operating_doctrines d WHERE instr(d.l2_ids, s.scene_id)>0)""",
                     (*sk, l2_before),
                 )
             ]
@@ -1065,9 +1186,7 @@ class SQLiteMemoryStore:
     async def audit(self, scope: MemoryScope, event: str, data: dict[str, object]) -> None:
         self._audit_in_transaction(scope, event, data, self._now())
 
-    def _audit_in_transaction(
-        self, scope: MemoryScope, event: str, data: dict[str, object], created_at: int
-    ) -> None:
+    def _audit_in_transaction(self, scope: MemoryScope, event: str, data: dict[str, object], created_at: int) -> None:
         """Record an audit row without committing a transaction owned by the caller."""
         self._conn.execute(
             "INSERT INTO memory_audit(team_id,agent_id,user_id,created_at,event,data) VALUES(?,?,?,?,?,?)",

@@ -132,7 +132,7 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 | 6. 结构操作 | compaction、branch summary、navigation、fork | 历史不可变；摘要/导航可恢复且 tip 原子更新 |
 | 7. SQLite 与恢复 | schema、migration、SQLite backend、crash injection suite | 在每个事务边界中断后可恢复到定义状态 |
 | 8. 观察与扩展 | hooks、watch、telemetry、文档与示例 | handler/listener 失败隔离；hook 结果遵守持久化边界 |
-| 9. 服务层（后置） | HTTP/RPC、认证、远程订阅、TUI 适配 | 仅复用库 API；不得把传输状态混入 domain/runtime |
+| 9. 服务层（后置） | HTTP/RPC、认证、远程订阅、TUI 适配 | 仅复用库 API；不得把传输状态混入 domain/runtime。Web UI 的 catalog、durable trace 查询、指标与适配实施见 [Web UI 实施计划](web-ui-implementation-plan.md) |
 | 10. 长期资产（可选） | 持久化调度器与 runtime 生命周期、Session→L0 trace archive、L1--L3、Skill buffer/review、资产检索、保留/GC 与 SQLite | 跨 Session 资产经 scope 隔离；后台失败不阻塞 Drive；冻结 source snapshot、召回/Skill 版本进入 effect intent；进程重启后延迟任务不丢失且只执行一次 |
 
 每阶段顺序固定为：先写规格化/崩溃测试，再实现 memory backend 或 runtime，再接入 SQLite 或外部适配器。阶段完成前不得提前把服务框架或 UI 作为运行时依赖。
@@ -173,7 +173,7 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 
 ### ADR-005：跨会话资产与 Session 状态分库存储、通过 outbox 衔接
 
-长期记忆和 Skill 的生命周期、身份范围和异步处理方式均不同于单 Session 的执行状态，因此由独立的资产存储拥有。Session terminal settlement 原子写入 capture outbox，后台以幂等方式投递资产库；召回和 Skill loadout 冻结进 provider effect intent。这样既不把 LLM/索引 I/O 放进 Session transaction，也能在崩溃后补投并维持 operation 的可复现性。
+长期记忆和 Skill 的生命周期、scope 范围和异步处理方式均不同于单 Session 的执行状态，因此由独立的资产存储拥有。Session terminal settlement 原子写入 capture outbox，后台以幂等方式投递资产库；召回和 Skill loadout 冻结进 provider effect intent。这样既不把 LLM/索引 I/O 放进 Session transaction，也能在崩溃后补投并维持 operation 的可复现性。
 
 ### ADR-006：流式输出以内容 checkpoint 恢复，而非连接续接
 
@@ -258,6 +258,38 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 **决策：** `delete` 不再立即 unlink。它先写入 durable 删除标记，把该 Session 的未送达 outbox 提升为高优先级投递，仅在所有 outbox 已 delivered（或人工判定为不可投递）后才执行 unlink。dispatcher 遇到 entry 缺失时**必须**进入可观测 dead letter，绝不能回读 Session 或用当前 branch 补齐。fork 或复制不受此约束：L0 archive 一经 materialize 即独立于 Session 生命周期。
 
 **后果：** 删除成为异步且可观测的操作，语义从“文件立即消失”变为“标记删除并排空投递”。若投递持续失败，删除会停留在 pending 状态并需要人工介入——这是有意的选择：宁可暴露一个未完成的删除，也不要静默丢弃无法重建的历史。
+
+### ADR-017：Web 观察通过应用层读模型，effect 耗时必须持久化
+
+**背景：** 阶段 9 的既有 RPC 与远程订阅可以驱动实时界面，但 event 是 best-effort 投影，不能在断线或重启后重建完整轨迹。现有 usage ledger 也没有稳定的 operation/call 查询关系，无法可靠回答逐 turn token 和 LLM/工具耗时。
+
+**决策：** Web UI 位于核心外的应用适配层，以受权 session catalog 定位一库一 Session；新增只读 trace/memory facade 而不将 SQL 或 storage 私有对象暴露给 HTTP。每个 LLM/tool effect attempt 追加 durable span，其开始与 intent 对齐，结束与 outcome、operation state、usage 一起原子结算。L1--L3 观察按认证主体映射的 `MemoryScope` 查询。完整接口、迁移和验收见 [Web UI 实施计划](web-ui-implementation-plan.md)。
+
+**后果：** UI 能在刷新、重启和崩溃恢复后显示可审计的历史；未记录 span 的旧 Session 显式显示未知数据。系统新增 catalog、查询 DTO 和 append-only 观测数据，但保持 Web 框架、连接状态和项目路径配置不进入 domain/runtime。
+
+### ADR-018：L0--L2 按 repository 隔离，L3 为本地全局 doctrine
+
+**背景：** 本 harness 的目标部署是一个人以同一 agent 在多个仓库工作。旧的 `(team_id, agent_id, user_id)` scope 既没有本地身份提供者支撑，也不能阻止仓库专属事实、路径和任务跨仓库召回；反过来，稳定的工作原则与偏好应能跨仓库复用。
+
+**决策：** `MemoryScope` 的公开归属字段改为稳定 `repository_id`。L0 archive、L1 atomic memory、L2 work scene、其索引、水位线、job 与 audit 均只按 repository ID 过滤。L3 采用一个保留的全局 scope：任何仓库召回同一 doctrine，L3 job 汇集全部仓库的 current L2 场景再决定是否更新。旧 SQLite 的三元组物理列暂作为兼容存储键承载 repository ID（其余两列固定为空）；由于旧数据不含 repository 身份，迁移不得臆测归属，旧调用可通过兼容构造器排空/导出后再显式重归档。
+
+**后果：** 仓库知识不会在 L0--L2 之间泄漏，L3 仍能形成跨仓库一致的个人工作准则。该模型不提供多用户或团队 ACL；若未来需要，必须引入独立 owner/ACL 维度，而不能复用 repository ID。
+
+### ADR-019：Code memory 以冻结工具证据和代码词元提升可用性
+
+**背景：** coding Agent 的关键经验经常附着在文件路径、符号、测试/构建 outcome 与工具调用上。只把原始对话交给抽取模型会把长工具输出当作噪声，也容易将 assistant 的计划误写成已验证事实；按空白切词还会漏掉 `src/module.py`、`foo_bar` 等代码查询。
+
+**决策：** L1 extractor 从已经脱敏的冻结 L0 生成有限 CodingEvidence：repository ID、路径和带 source entry ID 的工具 outcome，并带固定的 code-memory 提取契约。L1 FTS 索引额外纳入稳定 artifact/path/symbol 元数据；召回把 query 与 context summary 中的路径、标识符拆词，并保留原始 content 作为展示内容。ContextAssembler 分层投影 global doctrine、repository context、code memory 与 trace evidence，并强制声明它们不是当前 checkout 的真相。
+
+**后果：** 代码相关的事实、资产与验证结果更容易被正确沉淀和命中，且 Agent 被提醒重新验证。CodeGraph、工作区扫描或自动执行命令不进入 memory runtime；它们如需加入，必须作为独立、受权限约束的 tool/integration。
+
+### ADR-020：Skill worker 等待同一 L0 archive
+
+**背景：** terminal settlement 同时写入 memory 和 Skill capture outbox，但二者的 dispatcher 没有顺序保证。若 Skill worker 回读 Session entries，就会绕过 L0 的冻结与去重语义。
+
+**决策：** Skill outbox 保持 pending，直到 `MemoryRuntime` 已按同一冻结 key materialize `SessionTraceArchive`。Skill buffer 仅追加该 L0 archive；SQLite 在一个 transaction 内更新 `(scope, session)` 计数，并在工具调用、字节或 oversize 阈值触发时写入 immutable archive 与 extraction job。
+
+**后果：** Skill 不会从可变 Session 回读，memory 暂未投递时只会延迟 Skill Review，不影响用户 operation。
 
 ## 10. 首个可执行里程碑
 

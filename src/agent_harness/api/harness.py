@@ -1,12 +1,14 @@
 from agent_harness.api.errors import InvalidLane
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.session import Session
+from agent_harness.domain.skill import SkillScope
 from agent_harness.memory.runtime import MemoryRuntime
 from agent_harness.runtime.events import EventBus, EventListener
 from agent_harness.runtime.hooks import HookHandler, HookRegistry
 from agent_harness.runtime.lane import Lane
 from agent_harness.runtime.retry import RetryPolicy
 from agent_harness.runtime.tools import AgentTool
+from agent_harness.skill.runtime import SkillEvolutionRuntime
 from agent_harness.storage.protocol import Storage
 
 
@@ -21,6 +23,8 @@ class Harness:
         *,
         memory_scope: MemoryScope | None = None,
         memory_runtime: MemoryRuntime | None = None,
+        skill_scope: SkillScope | None = None,
+        skill_runtime: SkillEvolutionRuntime | None = None,
         trace_recorder: bool = False,
     ) -> None:
         self._session = session
@@ -31,11 +35,21 @@ class Harness:
         self._lanes: dict[str, Lane] = {}
         self._memory_scope = memory_scope
         self._memory_runtime = memory_runtime
+        self._skill_scope = skill_scope
+        self._skill_runtime = skill_runtime
         self._trace_recorder = trace_recorder
         if (memory_scope is None) != (memory_runtime is None):
             raise ValueError("memory_scope and memory_runtime must be configured together")
+        if skill_runtime is not None and memory_runtime is None:
+            raise ValueError("skill_runtime requires memory_runtime for L0 archive materialization")
+        if (skill_scope is None) != (skill_runtime is None):
+            raise ValueError("skill_scope and skill_runtime must be configured together")
         if memory_runtime is not None and memory_scope is not None:
             memory_runtime.bind_session(session, memory_scope)
+        if skill_runtime is not None and memory_runtime is not None and memory_scope is not None:
+            if skill_scope != SkillScope.from_memory_scope(memory_scope):
+                raise ValueError("skill_scope must match memory_scope owner")
+            skill_runtime.bind_session(session, memory_scope, memory_runtime)
 
     @classmethod
     async def open(
@@ -47,14 +61,22 @@ class Harness:
         *,
         memory_scope: MemoryScope | None = None,
         memory_runtime: MemoryRuntime | None = None,
+        skill_scope: SkillScope | None = None,
+        skill_runtime: SkillEvolutionRuntime | None = None,
         trace_recorder: bool = False,
     ) -> "Harness":
         bind_session = getattr(storage, "bind_session", None)
         if callable(bind_session):
             bind_session(session_id)
         return cls(
-            Session(session_id, storage), tools, retry,
-            memory_scope=memory_scope, memory_runtime=memory_runtime, trace_recorder=trace_recorder,
+            Session(session_id, storage),
+            tools,
+            retry,
+            memory_scope=memory_scope,
+            memory_runtime=memory_runtime,
+            skill_scope=skill_scope,
+            skill_runtime=skill_runtime,
+            trace_recorder=trace_recorder,
         )
 
     async def acquire_lane(self, name: str) -> Lane:
@@ -71,6 +93,8 @@ class Harness:
                 hooks=self._hooks,
                 memory_scope=self._memory_scope,
                 memory_runtime=self._memory_runtime,
+                skill_scope=self._skill_scope,
+                skill_runtime=self._skill_runtime,
                 trace_recorder=self._trace_recorder,
             )
             await lane.attach()
@@ -96,6 +120,8 @@ class Harness:
             hooks=self._hooks,
             memory_scope=self._memory_scope,
             memory_runtime=self._memory_runtime,
+            skill_scope=self._skill_scope,
+            skill_runtime=self._skill_runtime,
             trace_recorder=self._trace_recorder,
         )
         await target.attach(tip_id)
@@ -109,5 +135,9 @@ class Harness:
         return self._hooks.on(name, handler)
 
     async def close(self) -> None:
+        if self._skill_runtime is not None and self._skill_scope is not None:
+            await self._skill_runtime.archive_session_closed(self._skill_scope, self._session.id)
         if self._memory_runtime is not None:
             await self._memory_runtime.aclose()
+        if self._skill_runtime is not None:
+            await self._skill_runtime.aclose()

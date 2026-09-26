@@ -99,8 +99,55 @@ def test_l1_prompt_receives_l0_ancestor_background() -> None:
         item = TraceItem("new", 2, 2, "message", "user", "new", {})
         ancestor = TraceItem("old", 1, 1, "message", "assistant", "earlier context", {})
         archive = SessionTraceArchive(
-            "archive", MemoryScope("team", "agent", "user"), "session", "lane", "op", "run", None, "new",
-            ("new",), "hash", "conversation-v1", 1, "content", (item,), None, ("old",), False, (ancestor,),
+            "archive",
+            MemoryScope("team", "agent", "user"),
+            "session",
+            "lane",
+            "op",
+            "run",
+            None,
+            "new",
+            ("new",),
+            "hash",
+            "conversation-v1",
+            1,
+            "content",
+            (item,),
+            None,
+            ("old",),
+            False,
+            (ancestor,),
+        )
+        assert await JsonMemoryExtractor(completion).extract_l1((archive,)) == ()
+
+    asyncio.run(scenario())
+
+
+def test_l1_prompt_receives_compact_coding_evidence() -> None:
+    async def completion(stage: str, payload: dict[str, object]) -> str:
+        archive = payload["archives"][0]
+        assert archive["repository_id"] == "git@example/repo"
+        assert archive["coding_evidence"]["files"] == ["src/app.py"]
+        assert archive["coding_evidence"]["tool_outcomes"][0]["is_error"] is True
+        assert any("unverified assistant plans" in rule for rule in archive["coding_memory_policy"]["reject"])
+        return "[]"
+
+    async def scenario() -> None:
+        archive = SessionTraceArchive(
+            "archive",
+            MemoryScope("git@example/repo"),
+            "session",
+            "lane",
+            "op",
+            "run",
+            None,
+            "tip",
+            ("tool",),
+            "hash",
+            "conversation-v1",
+            1,
+            "content",
+            (TraceItem("tool", 1, 1, "message", "tool", "pytest src/app.py failed", {"is_error": True}),),
         )
         assert await JsonMemoryExtractor(completion).extract_l1((archive,)) == ()
 

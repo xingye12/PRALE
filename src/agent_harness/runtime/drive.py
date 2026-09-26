@@ -356,6 +356,7 @@ class Drive:
             raise RuntimeError("transform_context must return a request object with messages")
         prompt = operation.meta.request.get("prompt", "") if isinstance(operation.meta.request, dict) else ""
         bundle = await self._lane.recall_memory(prompt if isinstance(prompt, str) else "")
+        skills = await self._lane.available_skills(prompt if isinstance(prompt, str) else "")
         if bundle is not None and bundle.items:
             from agent_harness.memory.context import ContextAssembler
 
@@ -367,6 +368,19 @@ class Drive:
             }
             assert self._lane._memory_runtime is not None and self._lane._memory_scope is not None  # noqa: SLF001
             await self._lane._memory_runtime.record_injection(self._lane._memory_scope, bundle)  # noqa: SLF001
+        if skills:
+            listing = "\n".join(
+                f"- {item.skill_id}@{item.version}: {item.name} — {item.description}; "
+                f"triggers: {', '.join(item.triggers)}"
+                for item in skills
+            )
+            transformed = {
+                **transformed,
+                "messages": [
+                    *transformed["messages"],
+                    {"role": "system", "content": f"<available_skills>\n{listing}\n</available_skills>"},
+                ],
+            }
         request = await self._lane.hooks.run(
             "before_request",
             transformed,
@@ -379,6 +393,34 @@ class Drive:
         )
         if not isinstance(payload, dict) or not isinstance(payload.get("messages"), list):
             raise RuntimeError("before_payload must return a payload object with messages")
+        selected = payload.get("selected_skills", [])
+        if not isinstance(selected, list):
+            selected = []
+        loadouts = []
+        for selected_item in selected:
+            if not isinstance(selected_item, dict) or not isinstance(selected_item.get("skill_id"), str):
+                continue
+            requested_version = selected_item.get("version")
+            if not isinstance(requested_version, int):
+                requested_version = None
+            loadout = await self._lane.load_skill(selected_item["skill_id"], requested_version)
+            if loadout is not None:
+                loadouts.append(loadout)
+        if loadouts:
+            payload = {
+                **payload,
+                "messages": [
+                    *payload["messages"],
+                    *(
+                        {
+                            "role": "system",
+                            "content": f'<skill id="{loadout.skill_id}" version="{loadout.version}">\n'
+                            f"{loadout.markdown}\n</skill>",
+                        }
+                        for loadout in loadouts
+                    ),
+                ],
+            }
         assistant_entry_id = self._lane.new_id()
         usage_id = self._lane.new_id()
         intent = {
@@ -396,6 +438,21 @@ class Drive:
             ]
             if bundle is not None
             else [],
+            "skill_listing": [
+                {"skill_id": item.skill_id, "version": item.version, "name": item.name} for item in skills
+            ],
+            "skill_loadout": [
+                {
+                    "skill_id": loadout.skill_id,
+                    "version": loadout.version,
+                    "content_hash": loadout.content_hash,
+                    "resource_hashes": list(loadout.resource_hashes),
+                    "budget": sum(
+                        len(loadout.markdown) + sum(len(item.content) for item in loadout.files) for loadout in loadouts
+                    ),
+                }
+                for loadout in loadouts
+            ],
         }
         await self._transition(operation, OperationState(at="assistant.effect_pending", control="running", data=intent))
 

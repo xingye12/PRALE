@@ -18,17 +18,47 @@ class PromotionConflict(Exception):
     """An optimistic L2/L3 replacement observed a different current version."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class MemoryScope:
-    team_id: str
-    agent_id: str
-    user_id: str | None
-    task_id: str | None = None
+    """Repository ownership for L0--L2 memory assets.
+
+    A process represents one person's agent, so identity is deliberately not a
+    memory authorization dimension.  ``repository_id`` must be a stable,
+    caller-supplied identifier (for example a canonical Git remote), not an
+    ephemeral checkout path.  The optional legacy arguments only keep old
+    serialized callers readable; new callers must pass one repository ID.
+    """
+
+    repository_id: str
+
+    def __init__(
+        self,
+        repository_id: str,
+        legacy_agent_id: str | None = None,
+        legacy_user_id: str | None = None,
+        legacy_task_id: str | None = None,
+    ) -> None:
+        if legacy_agent_id is not None or legacy_user_id is not None or legacy_task_id is not None:
+            # Compatibility only: old (team, agent, user, task) callers become
+            # one repository namespace and no longer grant identity sharing.
+            repository_id = "/".join(
+                part for part in (repository_id, legacy_agent_id or "", legacy_user_id or "") if part
+            )
+        if not repository_id or "\x00" in repository_id:
+            raise ValueError("repository_id must be non-empty and contain no NUL")
+        object.__setattr__(self, "repository_id", repository_id)
 
     @property
-    def visibility_key(self) -> tuple[str, str, str | None]:
-        """The v1 access boundary; task is retrieval context, not authority."""
-        return (self.team_id, self.agent_id, self.user_id)
+    def visibility_key(self) -> str:
+        return self.repository_id
+
+    @property
+    def storage_key(self) -> tuple[str, str, str]:
+        """Compatibility mapping for the pre-v4 SQLite physical columns."""
+        return (self.repository_id, "", "")
+
+
+GLOBAL_L3_SCOPE = MemoryScope("__global_l3__")
 
 
 @dataclass(frozen=True, slots=True)

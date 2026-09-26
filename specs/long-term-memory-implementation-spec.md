@@ -6,7 +6,7 @@
 
 记忆回答“知道什么”，不保存可执行操作流程；后者属于 [Skill 自进化功能接入](skill-self-evolution-integration.md)。`Session` 仍是单次对话和执行的唯一写拥有者。长期记忆由独立的 `MemoryStore` 持有，不能作为 `Session` 的 value/list 或 entry tree 的替代品。
 
-本阶段包括：跨 Session 的 L0--L3 数据模型、异步晋升、受预算的召回、身份隔离、SQLite 实现、保留/GC 策略及恢复/审计。它不包括跨进程多主写入、记忆资产的团队审批 UI、模型权重训练，或把全部历史自动塞入 prompt。
+本阶段包括：跨 Session 的 L0--L3 数据模型、异步晋升、受预算的召回、repository 隔离、SQLite 实现、保留/GC 策略及恢复/审计。它不包括跨进程多主写入、记忆资产的审批 UI、模型权重训练，或把全部历史自动塞入 prompt。
 
 术语以根目录 [CONTEXT.md](../CONTEXT.md) 为准。本文中的 **必须** 是验收条件；**建议** 可替换，但不能削弱权限、可追溯性或主运行时的恢复性。
 
@@ -77,20 +77,17 @@ L0 仍须作为 `MemoryStore` 的独立、不可变 archive 保存。这不是�
 
 capture outbox 至少冻结 `session_id`、`lane`、`operation_id`、`base_tip_id`、`tip_id`、`source_entry_ids`（按 branch 顺序）、`source_entry_hash`、`trace_format_version` 和 scope。dispatcher 按这些 ID 读取 immutable entries 后写入 L0 archive；它不得改用 dispatch 时的 lane tip。唯一 capture key 为 `(session_id, operation_id, tip_id, source_entry_hash)`，因而 fork 后相同的 entry IDs 也不会混淆来源。
 
-### 2.2 身份与可见性
+### 2.2 scope 与可见性
 
-每次 `Harness.open` **必须**可选接收不可变 `MemoryScope` 和 `MemoryRuntime`。未配置二者时，现有 harness 行为不变，且不进行 capture、召回或后台任务。`MemoryScope` 至少包含：
+每次 `Harness.open` **必须**可选接收不可变 `MemoryScope` 和 `MemoryRuntime`。未配置二者时，现有 harness 行为不变，且不进行 capture、召回或后台任务。当前本地单用户部署的 `MemoryScope` 只包含稳定仓库标识：
 
 ```python
 @dataclass(frozen=True, slots=True)
 class MemoryScope:
-    team_id: str
-    agent_id: str
-    user_id: str | None
-    task_id: str | None = None
+    repository_id: str
 ```
 
-`session_id` 仅作为 L0 来源和任务去重维度，不能单独授予跨 Session 访问权。查询必须先按 scope/资产可见性过滤，再进行关键词或向量排序；不得先全库搜索再在应用层过滤。初版默认仅允许同一 `(team_id, agent_id, user_id)` 读取与写入；团队共享必须以后续显式绑定/ACL 功能实现。
+`repository_id` 必须是稳定仓库标识（建议 canonical Git remote），不能使用易变 checkout 路径。`session_id` 仅作为 L0 来源和任务去重维度，不能单独授予跨 Session 访问权。L0--L2 查询必须先按 repository 过滤，再进行关键词或向量排序；不得先全库搜索再在应用层过滤。L3 是唯一例外：每个本地 MemoryStore 仅保留一个全局 doctrine，所有 repository scope 都可读取它；L3 的更新输入是全部仓库的 current L2 场景。
 
 ## 3. 数据模型与持久化
 
@@ -194,7 +191,7 @@ L3 **必须**以增量更新为主：读取自上次生成后发生变化的 L2 
 | L3 | 永久 | 不可自动回收 |
 | audit | 400 天 | 不可在对应资产仍存在时回收 |
 
-GC **必须**是可中断的离线批处理，且**必须**遵守一条硬约束：**被 supersedes 链或 watermark 引用的记录不得回收**，否则审计链会断。GC 每轮**必须**写入 audit（回收对象、数量、依据），使保留策略的执行本身可追溯。删除 `MemoryScope` 时**必须**级联回收其全部层级，且不得影响其他 scope。
+GC **必须**是可中断的离线批处理，且**必须**遵守一条硬约束：**被 supersedes 链或 watermark 引用的记录不得回收**，否则审计链会断。GC 每轮**必须**写入 audit（回收对象、数量、依据），使保留策略的执行本身可追溯。删除 repository `MemoryScope` 时只级联回收其 L0--L2、job 与 audit，且不得影响其他 repository 或全局 L3。
 
 ### 3.6 索引
 
@@ -231,13 +228,13 @@ dispatcher **必须**只依赖 outbox 中冻结的 ID 与 hash 读取 entries，
 | --- | --- |
 | L1 | 同一 scope 新增 5 个 turn，或显式 flush |
 | L2 | L1 成功后延迟 90 秒入队；同一 scope 最小间隔 15 分钟 |
-| L3 | 首次 L2 成功后；此后每新增 50 条 L1，或管理员 flush |
+| L3 | 首次 L2 成功后；此后任一仓库产生 L2 变更，或管理员 flush |
 
 L1 **不设**空闲/超时触发：轮次阈值与显式 flush 是唯一触发源。理由是空闲触发在本 harness 中没有正确的信号来源——Session 的可写状态由 Drive 拥有，后台按时间推断“对话已结束”会与 compaction、navigation 和 fork 竞争判断，而轮次阈值已经覆盖了同一场景且完全可重现。
 
 阈值与延迟均为配置项，不是 API 兼容承诺。L2 的 90 秒延迟**必须**允许配置为 0，此时 job 直接以 `queued` 入队——这使一个不引入任何时钟依赖的 v1 成为可能，也让测试不必等待真实时间。
 
-L1 worker 必须：读取未消费 L0 item 与受限祖先链背景、执行质量/敏感信息门控、产出协议化候选、在当前 L1 中检索相似项（类型内与类型间）、作出 `create | supersede | merge | no_op` 决定，并原子写入 L1、来源关系、索引更新任务和审计。L2/L3 只消费成功的下层 watermark；L2 失败不可触发 L3。LLM 输出必须先经 JSON/Markdown schema 验证和长度/类型校验，再写入；校验失败**必须**记为不可重试错误，不得重试同一非法输出。
+L1 worker 必须：读取未消费 L0 item 与受限祖先链背景、执行质量/敏感信息门控、产出协议化候选、在当前 L1 中检索相似项（类型内与类型间）、作出 `create | supersede | merge | no_op` 决定，并原子写入 L1、来源关系、索引更新任务和审计。对 code 模式，extractor 还必须接收由冻结 L0 派生的 CodingEvidence（仓库 ID、有限路径集合、带 entry ID 的工具 outcome）；工具成功/失败可作为事实证据，但 assistant 的计划或诊断未经结果验证不得沉淀为事实。路径、symbol、测试或命令的引用必须说明其作用、约束或 outcome，不能仅保存裸字符串。L2/L3 只消费成功的下层 watermark；L2 失败不可触发 L3。LLM 输出必须先经 JSON/Markdown schema 验证和长度/类型校验，再写入；校验失败**必须**记为不可重试错误，不得重试同一非法输出。
 
 失败分为可重试（provider 超时、暂时存储不可用）、不可重试（schema 不合法、权限拒绝、内容安全拒绝）和未知。有限指数退避后进入 `dead_letter`，保留输入引用而非静默丢弃。管理员可显式重放 dead letter；重放必须生成 audit event。
 
@@ -256,12 +253,12 @@ async def recall(scope: MemoryScope, query: RecallQuery, budget: RecallBudget) -
 1. 在预算内加入 L3 doctrine（若存在）；
 2. 以 scene key/关键词选择相关 L2 场景块；
 3. 对 L1 和必要 L0 做 `keyword | embedding | hybrid` 检索；hybrid 使用 RRF 融合；
-4. 去重、过滤 superseded/rejected/无权限项，按相关性、priority、recency 和来源多样性截断；
+4. 去重、过滤 superseded/rejected/无权限项，按相关性、priority、recency 和来源多样性截断；code 模式还须把 query/context 中的路径和 identifier 拆为检索词，并索引 `work_artifact` 的稳定引用字段；
 5. 生成结构化 `RecallBundle`，其中每项包含 ID、version、层级、内容、score 和 source IDs。
 
 `work_task` 类记录在任务上下文匹配时**建议**优先保留其 `status` 与 `owner`，使“谁在等什么”不被相关性打分挤掉。
 
-`ContextAssembler` 必须以明确 `<long_term_memory>` 边界、只读提示和来源 ID 投影 bundle；记忆内容不得覆盖 system 指令，也不得被当作当前用户的授权。注入点在现有 hook 链的 `transform_context` 之后、`before_request` 之前：`transform_context` 仍可调整对话上下文，而记忆注入作为其下游的独立区块加入，且**必须**可被 `before_request` 观察到以便审计。最终 provider 请求（含 memory bundle hash、每个记忆 ID/version 与预算）必须写入现有 LLM effect intent；恢复时重用该 frozen bundle，绝不能重新召回后改变已持久化 intent。
+`ContextAssembler` 必须以明确 `<long_term_memory>` 边界、只读提示和来源 ID 投影 bundle；code 模式须分组标明 global doctrine、repository context、relevant code memory 和 trace evidence，并提醒 Agent 将路径、symbol、命令与测试结果视为历史证据、在当前 checkout 验证后再编辑或断言。记忆内容不得覆盖 system 指令，也不得被当作当前用户的授权。注入点在现有 hook 链的 `transform_context` 之后、`before_request` 之前：`transform_context` 仍可调整对话上下文，而记忆注入作为其下游的独立区块加入，且**必须**可被 `before_request` 观察到以便审计。最终 provider 请求（含 memory bundle hash、每个记忆 ID/version 与预算）必须写入现有 LLM effect intent；恢复时重用该 frozen bundle，绝不能重新召回后改变已持久化 intent。
 
 召回超时、embedding 失败、索引尚未建立或 `MemoryRuntime` 不可用时，必须降级为 FTS；FTS 也不可用时记录 telemetry 并以空 bundle 继续 Drive。任何召回故障不得阻塞 prompt admission 或终止正常 operation。
 

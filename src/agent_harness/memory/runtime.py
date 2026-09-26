@@ -11,6 +11,7 @@ from collections.abc import Callable
 
 from agent_harness.domain.entries import Entry
 from agent_harness.domain.memory import (
+    GLOBAL_L3_SCOPE,
     MemoryScope,
     MemoryRetentionPolicy,
     RecallBudget,
@@ -110,6 +111,9 @@ class MemoryRuntime:
         """Explicitly enqueue one promotion stage without depending on an idle timer."""
         if stage not in {"l1", "l2", "l3"}:
             raise ValueError(f"unsupported promotion stage {stage!r}")
+        if stage == "l3":
+            await self._store.create_or_wake_job(GLOBAL_L3_SCOPE, "l3", self._now(), self._now())
+            return
         watermark = (
             await self._store.current_l1_watermark(scope)
             if stage == "l1"
@@ -195,7 +199,7 @@ class MemoryRuntime:
         delivered: list[object] = []
         dead_letters: list[object] = []
         for raw in pending:
-            if not isinstance(raw, dict) or raw.get("scope") != _scope_json(scope):
+            if not _scope_matches(raw, scope):
                 continue
             try:
                 if raw.get("event", "memory_capture_requested") != "memory_capture_requested":
@@ -209,7 +213,11 @@ class MemoryRuntime:
                     turns = sum(item.role == "user" for candidate in pending_archives for item in candidate.items)
                     if turns >= self._threshold:
                         await self._store.create_or_wake_job(
-                            scope, "l1", max_seq, self._now(), input_ids=tuple(item.archive_id for item in pending_archives)
+                            scope,
+                            "l1",
+                            max_seq,
+                            self._now(),
+                            input_ids=tuple(item.archive_id for item in pending_archives),
                         )
                 delivered.append(raw)
             except Exception as error:
@@ -265,6 +273,30 @@ class MemoryRuntime:
             items,
         )
 
+    async def materialize_capture(
+        self, session: Session, scope: MemoryScope, raw: dict[str, object]
+    ) -> SessionTraceArchive:
+        """Public, shared L0 materializer used by dependent asset dispatchers.
+
+        It intentionally does not capture again: callers consume the same frozen
+        identifiers and validation logic while MemoryRuntime remains the sole L0
+        authority.
+        """
+        return await self._materialize(session, scope, raw)
+
+    async def materialized_capture(
+        self, scope: MemoryScope, session_id: str, raw: dict[str, object]
+    ) -> SessionTraceArchive | None:
+        """Read the L0 authority archive referenced by a frozen capture outbox record."""
+        tip_id = _optional_str(raw, "tip_id")
+        return await self._store.find_archive(
+            scope,
+            session_id,
+            _required_str(raw, "operation_id"),
+            tip_id,
+            _required_str(raw, "source_entry_hash"),
+        )
+
     async def _run_job(self, job) -> None:
         try:
             if self._extractor is None:
@@ -276,8 +308,14 @@ class MemoryRuntime:
             await self._safe_audit(
                 job.scope,
                 "job_started",
-                {"job_id": job.job_id, "stage": job.stage, "attempt": job.attempt, "input_ids": job.input_ids,
-                 "prompt_id": job.prompt_id, "prompt_version": job.prompt_version},
+                {
+                    "job_id": job.job_id,
+                    "stage": job.stage,
+                    "attempt": job.attempt,
+                    "input_ids": job.input_ids,
+                    "prompt_id": job.prompt_id,
+                    "prompt_version": job.prompt_version,
+                },
             )
             if job.stage == "l1":
                 after = await self._store.current_l1_watermark(job.scope)
@@ -286,7 +324,9 @@ class MemoryRuntime:
                 watermark = max((item.store_seq for archive in archives for item in archive.items), default=after)
                 await self._store.apply_candidates(job.scope, l1_candidates, watermark)
                 await self._store.complete_job(job.job_id, job.lease_id or "", content_hash(str(l1_candidates)))
-                await self._safe_audit(job.scope, "job_completed", {"job_id": job.job_id, "candidates": len(l1_candidates)})
+                await self._safe_audit(
+                    job.scope, "job_completed", {"job_id": job.job_id, "candidates": len(l1_candidates)}
+                )
                 delay = self._l2_delay_ms
                 last_l2 = await self._store.last_completed_at(job.scope, "l2")
                 if last_l2 is not None:
@@ -302,8 +342,8 @@ class MemoryRuntime:
                     tuple(memory.memory_id for memory in await self._store.read_l1_since(job.scope, after)),
                 )
                 return
-            scenes = await self._store.read_l2(job.scope)
             if job.stage == "l2":
+                scenes = await self._store.read_l2(job.scope)
                 after = await self._store.stage_watermark(job.scope, "l2")
                 l1 = await self._store.read_l1_since(job.scope, after)
                 l2_candidates = await self._extractor.extract_l2(l1, scenes)
@@ -314,28 +354,36 @@ class MemoryRuntime:
                 )
                 await self._store.advance_watermark(job.scope, "l2", watermark)
                 await self._store.complete_job(job.job_id, job.lease_id or "", content_hash(str(l2_candidates)))
-                await self._safe_audit(job.scope, "job_completed", {"job_id": job.job_id, "candidates": len(l2_candidates)})
-                l3_watermark = await self._store.stage_watermark(job.scope, "l3")
-                current_doctrine = await self._store.read_l3(job.scope)
+                await self._safe_audit(
+                    job.scope, "job_completed", {"job_id": job.job_id, "candidates": len(l2_candidates)}
+                )
+                current_doctrine = await self._store.read_l3(GLOBAL_L3_SCOPE)
                 persona_requested = any(candidate.persona_update_request for candidate in l2_candidates)
-                if (
-                    current_doctrine is None
-                    or watermark - l3_watermark >= self._l3_l1_threshold
-                    or persona_requested
-                ):
+                # L1 watermarks are repository-local and cannot safely be
+                # compared with the global L3 watermark. Every material L2
+                # change therefore wakes one deduplicated global synthesis.
+                if current_doctrine is None or l2_candidates or persona_requested:
                     await self._store.create_or_wake_job(
-                        job.scope, "l3", watermark, self._now(),
-                        getattr(self._extractor, "prompt_id", None), getattr(self._extractor, "prompt_version", None),
-                        getattr(self._extractor, "mode", "code"), tuple(scene.scene_id for scene in scenes),
+                        GLOBAL_L3_SCOPE,
+                        "l3",
+                        max(watermark, self._now()),
+                        self._now(),
+                        getattr(self._extractor, "prompt_id", None),
+                        getattr(self._extractor, "prompt_version", None),
+                        getattr(self._extractor, "mode", "code"),
+                        tuple(scene.scene_id for scene in scenes),
                     )
                 return
             if job.stage == "l3":
-                l3_candidate = await self._extractor.extract_l3(scenes, await self._store.read_l3(job.scope))
+                scenes = await self._store.read_all_l2()
+                l3_candidate = await self._extractor.extract_l3(scenes, await self._store.read_l3(GLOBAL_L3_SCOPE))
                 if l3_candidate is not None:
-                    await self._store.write_doctrine(job.scope, l3_candidate)
-                await self._store.advance_watermark(job.scope, "l3", job.input_high_watermark)
+                    await self._store.write_doctrine(GLOBAL_L3_SCOPE, l3_candidate)
+                await self._store.advance_watermark(GLOBAL_L3_SCOPE, "l3", job.input_high_watermark)
                 await self._store.complete_job(job.job_id, job.lease_id or "", content_hash(str(l3_candidate)))
-                await self._safe_audit(job.scope, "job_completed", {"job_id": job.job_id, "candidates": int(l3_candidate is not None)})
+                await self._safe_audit(
+                    job.scope, "job_completed", {"job_id": job.job_id, "candidates": int(l3_candidate is not None)}
+                )
                 return
             raise ValueError(f"unsupported promotion stage {job.stage}")
         except AttributeError:
@@ -349,16 +397,38 @@ class MemoryRuntime:
             await self._safe_audit(job.scope, "job_dead_letter", {"job_id": job.job_id, "error": str(error)})
         except Exception as error:
             try:
-                retry_at = None if job.attempt >= self._max_job_attempts else self._now() + 1_000 * 2 ** (job.attempt - 1)
+                retry_at = (
+                    None if job.attempt >= self._max_job_attempts else self._now() + 1_000 * 2 ** (job.attempt - 1)
+                )
                 await self._store.fail_job(job.job_id, job.lease_id or "", type(error).__name__, retry_at)
                 if retry_at is None:
-                    await self._safe_audit(job.scope, "job_dead_letter", {"job_id": job.job_id, "error": type(error).__name__})
+                    await self._safe_audit(
+                        job.scope, "job_dead_letter", {"job_id": job.job_id, "error": type(error).__name__}
+                    )
             except Exception:
                 await self._safe_audit(job.scope, "job_settlement_error", {"job_id": job.job_id})
 
 
 def _scope_json(scope: MemoryScope) -> dict[str, str | None]:
-    return {"team_id": scope.team_id, "agent_id": scope.agent_id, "user_id": scope.user_id, "task_id": scope.task_id}
+    return {"repository_id": scope.repository_id}
+
+
+def _scope_matches(raw: object, scope: MemoryScope) -> bool:
+    """Accept pre-repository outbox records during the API migration."""
+    if not isinstance(raw, dict):
+        return False
+    encoded = raw.get("scope")
+    if not isinstance(encoded, dict):
+        return False
+    repository_id = encoded.get("repository_id")
+    if isinstance(repository_id, str):
+        return repository_id == scope.repository_id
+    # Old records used (team, agent, user, task).  Their deterministic legacy
+    # constructor mapping is the only safe way to drain them after upgrade.
+    team, agent, user = encoded.get("team_id"), encoded.get("agent_id"), encoded.get("user_id")
+    if not isinstance(team, str) or not isinstance(agent, str) or (user is not None and not isinstance(user, str)):
+        return False
+    return MemoryScope(team, agent, user).repository_id == scope.repository_id
 
 
 def _trace_item(entry: Entry) -> TraceItem:

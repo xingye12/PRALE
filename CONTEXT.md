@@ -5,7 +5,7 @@
 ## Runtime
 
 **Session**:
-一次对话及其可恢复运行状态的唯一写拥有者。它不等同于用户、团队或跨会话知识库。
+一次对话及其可恢复运行状态的唯一写拥有者。它不等同于用户、仓库或跨会话知识库。
 _Avoid_: Memory, workspace
 
 **Drive**:
@@ -19,8 +19,16 @@ _Avoid_: Task, job
 ## Long-lived assets
 
 **Memory scope**:
-限定长期记忆可见性和写入归属的身份范围，由 `team_id`、`agent_id`、`user_id` 及可选 `task_id` 构成。它不由 `session_id` 单独定义。
-_Avoid_: Global memory, session memory
+限定 L0--L2 长期记忆可见性和写入归属的仓库范围，由稳定的 `repository_id` 构成。L3 不属于某一仓库，而是该本地 agent 的单一全局 doctrine。
+_Avoid_: Team memory, user memory, session memory
+
+**Repository memory / global doctrine**:
+L0、L1 与 L2 只可在其 `repository_id` 内被读取、晋升、合并或回收；L3 从全部仓库的 current L2 场景提炼，并可被每个仓库召回。
+_Avoid_: Cross-repository L1, repository-specific L3
+
+**Coding evidence**:
+从冻结 L0 的消息与工具结果派生出的、带 source entry ID 的紧凑视图，包含仓库相对路径和工具 outcome。它辅助 L1 抽取判断已验证结果，但不替代 L0，也不使 Agent 跳过对当前 checkout 的验证。
+_Avoid_: Source dump, executable instruction, current workspace truth
 
 **Atomic memory**:
 可独立判断、可追溯到 L0 来源且可被单独召回的长期记忆单元。
