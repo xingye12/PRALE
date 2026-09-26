@@ -133,7 +133,7 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 | 7. SQLite 与恢复 | schema、migration、SQLite backend、crash injection suite | 在每个事务边界中断后可恢复到定义状态 |
 | 8. 观察与扩展 | hooks、watch、telemetry、文档与示例 | handler/listener 失败隔离；hook 结果遵守持久化边界 |
 | 9. 服务层（后置） | HTTP/RPC、认证、远程订阅、TUI 适配 | 仅复用库 API；不得把传输状态混入 domain/runtime |
-| 10. 长期资产（可选） | Session→L0 trace archive、L1--L3、Skill buffer/review、资产检索与 SQLite | 跨 Session 资产经 scope 隔离；后台失败不阻塞 Drive；冻结 source snapshot、召回/Skill 版本进入 effect intent |
+| 10. 长期资产（可选） | 持久化调度器与 runtime 生命周期、Session→L0 trace archive、L1--L3、Skill buffer/review、资产检索、保留/GC 与 SQLite | 跨 Session 资产经 scope 隔离；后台失败不阻塞 Drive；冻结 source snapshot、召回/Skill 版本进入 effect intent；进程重启后延迟任务不丢失且只执行一次 |
 
 每阶段顺序固定为：先写规格化/崩溃测试，再实现 memory backend 或 runtime，再接入 SQLite 或外部适配器。阶段完成前不得提前把服务框架或 UI 作为运行时依赖。
 
@@ -234,6 +234,30 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 ### ADR-013：L0 是冻结的 Session trace archive，而非当前上下文的副本
 
 Session entry tree 是已结算对话的权威来源，但 compaction、navigation、fork、删除和替换式 operation state 使其不能被后台 worker 延迟地当作“当前轨迹”读取。terminal settlement 因而冻结 branch entry IDs/hash，并以 outbox 异步 materialize 不可变 L0 archive；需要 effect/retry 级审计时，额外以 append-only TraceRecord 保存。此选择避免丢失原始历史，也避免将瞬态 event 或可变 checkpoint 错当完整事实。
+
+### ADR-014：后台资产 worker 的调度与生命周期由持久状态驱动
+
+**背景：** 阶段 10 需要延迟执行（L1 成功后延迟触发 L2）、失败退避重试和 outbox 重扫，但现有运行时只有进程内 `asyncio` 原语。当前 `RetryPolicy.not_before` 只被写入、从没有任何组件在到期后唤醒它。同时 `MemoryRuntime`/`SkillEvolutionRuntime` 没有明确的启动/关闭语义，未被 `close` 的后台任务会在事件循环结束或被丢弃时静默消失，留下 `running` 状态的 job 和已过期的 lease。
+
+**决策：** 所有延迟与重试状态（`not_before`、job 状态、attempt）必须与 job 在**同一事务**持久化；进程内 timer 只是唤醒优化，不是事实来源。`PromotionScheduler` 是唯一的时间驱动者，接受可注入 clock 与等待原语，使测试可用假时钟瞬时推进而不依赖真实时间。`start()` 重新武装未完成 job：`not_before` 已过则立即领取，未到则挂起 timer；`aclose()` 停止接纳新 job，等待在途 job 收敛到 durable 状态后返回，不得在取消路径上留下半个写入。`Harness.close()` 必须级联关闭两个 runtime。scheduler 不提供互斥保证——跨进程并发仍由既有的 lease compare-and-set 裁决。
+
+**后果：** 延迟语义在进程重启后不丢失，且延迟可配置为 0 以获得一个无时钟依赖的最小实现。代价是每次调度需要一次存储读取；允许用内存索引加速，但该索引必须能从 durable 状态完整重建，不得成为唯一事实来源。
+
+### ADR-015：L0 archive 存增量、以 item watermark 消费
+
+**背景：** ADR-013 规定了 terminal settlement 冻结 branch entry IDs 并 materialize 不可变 L0 archive，但没有定义 archive 的边界。若每个 operation 都保存它可见的完整 branch，共同前缀会被每个 operation 重复存储，总存储量随会话长度退化为 O(n²)，且单次 capture 的写入量随时间线性增长。反之若只保存“最后几条消息”，extractor 既没有背景，也无法正确表达 fork 前的历史。
+
+**决策：** archive 是**投递单位**，`TraceItem` 是**消费单位**。archive 只保存 base tip 之后的增量 entries（base tip 取自 `OperationMeta.source_tip_id`，并同时出现在 terminal result 的 `from_tip_id`），另以 `parent_archive_id` 与最多 K 个 `ancestor_item_ids` 携带受限背景。`MemoryStore` 为每个 item 分配 scope 内单调递增的 `store_seq`，L1 的 watermark 是 `store_seq` 而不是 archive 边界，因此一个 archive 可以被部分消费而不丢失位置。重复 materialize 由 capture key 与 `(archive_id, source_entry_id)` 双重去重。
+
+**后果：** 存储与写入量回到 O(n)，archive 可被部分消费，且 fork 或 navigation 之后 archive 仍精确对应该 operation 新增的 entries。背景必须由 L0 自身沿 archive 链解析，不能回读 Session。代价是 archive 之间存在引用关系：GC 必须保证被 watermark 或 supersedes 链引用的记录不被回收，且父 archive 缺失时要显式记录缺口而不是重建。
+
+### ADR-016：资产投递必须先于 Session 物理删除
+
+**背景：** 现有 `SQLiteSessionRepo.delete` 直接 unlink 数据库文件，会连同该 Session 的 entries、values 和 lists 一并销毁。而 capture outbox 本身是 Session 内的 entry，投递是异步的。“operation 结算 → 调用方删除 Session → dispatcher 尚未投递”因此会永久丢失这段轨迹：dispatcher 随后会因 source entry 缺失进入 dead letter，但原始数据已不存在，重放也无从进行。
+
+**决策：** `delete` 不再立即 unlink。它先写入 durable 删除标记，把该 Session 的未送达 outbox 提升为高优先级投递，仅在所有 outbox 已 delivered（或人工判定为不可投递）后才执行 unlink。dispatcher 遇到 entry 缺失时**必须**进入可观测 dead letter，绝不能回读 Session 或用当前 branch 补齐。fork 或复制不受此约束：L0 archive 一经 materialize 即独立于 Session 生命周期。
+
+**后果：** 删除成为异步且可观测的操作，语义从“文件立即消失”变为“标记删除并排空投递”。若投递持续失败，删除会停留在 pending 状态并需要人工介入——这是有意的选择：宁可暴露一个未完成的删除，也不要静默丢弃无法重建的历史。
 
 ## 10. 首个可执行里程碑
 

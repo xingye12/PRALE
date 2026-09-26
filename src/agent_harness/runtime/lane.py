@@ -1,4 +1,6 @@
 import asyncio
+import hashlib
+import re
 import time
 import uuid
 from collections.abc import Callable
@@ -11,6 +13,7 @@ from agent_harness.domain.operations import ActiveOperation, OperationMeta, Oper
 from agent_harness.domain.session import Session, SessionMutator
 from agent_harness.domain.types import OperationKind
 from agent_harness.domain.values import (
+    ListAddress,
     lane_inbox,
     lane_state,
     lane_tip,
@@ -23,14 +26,36 @@ from agent_harness.runtime.events import EventBus, EventListener, HarnessEvent
 from agent_harness.runtime.hooks import HookRegistry
 from agent_harness.runtime.retry import RetryPolicy
 from agent_harness.runtime.tools import AgentTool, ToolRegistry
-from agent_harness.storage.protocol import AppendList, DeleteValue, InsertEntry, SetValue
+from agent_harness.storage.protocol import AppendList, DeleteValue, InsertEntry, SetValue, Write
 
 if TYPE_CHECKING:
+    from agent_harness.domain.memory import MemoryScope
+    from agent_harness.memory.runtime import MemoryRuntime
     from agent_harness.runtime.generation import ChatProvider
 
 
 def _now_ms() -> int:
     return time.time_ns() // 1_000_000
+
+
+_UNSET = object()
+
+
+def _redact_trace(value: object) -> object:
+    sensitive = {"authorization", "cookie", "password", "secret", "token", "api_key", "private_key"}
+    if isinstance(value, dict):
+        return {key: "[REDACTED]" if key.lower() in sensitive else _redact_trace(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [_redact_trace(item) for item in value]
+    if isinstance(value, str):
+        def redact_match(match: re.Match[str]) -> str:
+            secret = match.group(2)
+            marker = hashlib.sha256(secret.encode()).hexdigest()[:12]
+            return f"{match.group(1)}[REDACTED:{marker}]"
+
+        value = re.sub(r"(?i)(bearer\s+)([^\s]+)", redact_match, value)
+        value = re.sub(r"(?i)((?:api[_-]?key|token|password|secret)\s*[:=]\s*)([^\s,;]+)", redact_match, value)
+    return value
 
 
 class Lane:
@@ -46,6 +71,9 @@ class Lane:
         retry: RetryPolicy = RetryPolicy(),
         events: EventBus | None = None,
         hooks: HookRegistry | None = None,
+        memory_scope: "MemoryScope | None" = None,
+        memory_runtime: "MemoryRuntime | None" = None,
+        trace_recorder: bool = False,
     ) -> None:
         self.name = name
         self._session = session
@@ -56,6 +84,9 @@ class Lane:
         self._events = events or EventBus()
         self._hooks = hooks or HookRegistry()
         self._drive_task: asyncio.Task[object] | None = None
+        self._memory_scope = memory_scope
+        self._memory_runtime = memory_runtime
+        self._trace_recorder = trace_recorder
 
     async def attach(self, at: str | None = None) -> None:
         """Durably create the lane's idle projection if this is its first attachment."""
@@ -122,6 +153,7 @@ class Lane:
                 return AbortResult(operation_id, newly_requested=False)
             await mutator.commit(
                 [
+                    *self.trace_writes(operation_id, "cancel_requested", {"state": current.at}),
                     SetValue(
                         operation_state(operation_id),
                         OperationState(current.at, "cancel_requested", current.data),
@@ -189,6 +221,89 @@ class Lane:
 
     def new_id(self) -> str:
         return self._id_factory()
+
+    async def memory_capture_writes(
+        self,
+        mutator: SessionMutator,
+        result: OperationResult,
+        terminal_entry_ids: tuple[str, ...] = (),
+        branch_tip_id: object = _UNSET,
+    ) -> list[Write]:
+        """Build the frozen capture outbox record in the terminal Session mutation."""
+        if self._memory_runtime is None or self._memory_scope is None:
+            return []
+        import hashlib
+
+        base = await mutator.scan_branch(result.from_tip_id)
+        tip = await mutator.get_value(lane_tip(self.name)) if branch_tip_id is _UNSET else branch_tip_id
+        if tip is not None and not isinstance(tip, str):
+            raise RuntimeError("invalid frozen terminal tip")
+        terminal = await mutator.scan_branch(tip)
+        base_seq = base[-1].seq if base else 0
+        source_ids = tuple(entry.id for entry in terminal if entry.seq > base_seq) + terminal_entry_ids
+        digest = hashlib.sha256("\0".join(source_ids).encode()).hexdigest()
+        outbox = ListAddress[dict[str, object]]("memory/capture_outbox")
+        existing = await mutator.read_list(outbox)
+        key = [self._session.id, result.operation_id, result.tip_id, digest]
+        if any(isinstance(item, dict) and item.get("key") == key for item in existing):
+            return []
+        scope = self._memory_scope
+        trace_ids = list(await mutator.read_list(ListAddress[str](f"operation/{result.operation_id}/trace")))
+        terminal_trace, terminal_trace_ids = self.trace_writes_with_ids(
+            result.operation_id, "terminal_settlement", {"status": result.status, "tip_id": result.tip_id}
+        )
+        trace_ids.extend(terminal_trace_ids)
+        return [
+            *terminal_trace,
+            AppendList(
+                outbox,
+                {
+                    "event": "memory_capture_requested",
+                    "key": key,
+                    "scope": {
+                        "team_id": scope.team_id,
+                        "agent_id": scope.agent_id,
+                        "user_id": scope.user_id,
+                        "task_id": scope.task_id,
+                    },
+                    "lane": self.name,
+                    "kind": result.kind,
+                    "operation_id": result.operation_id,
+                    "base_tip_id": result.from_tip_id,
+                    "tip_id": result.tip_id,
+                    "source_entry_ids": list(source_ids),
+                    "source_entry_hash": digest,
+                    "trace_format_version": "execution-v1" if self._trace_recorder else "conversation-v1",
+                    "trace_entry_ids": trace_ids,
+                },
+            )
+        ]
+
+    def trace_writes_with_ids(
+        self, operation_id: str, event: str, data: dict[str, object] | None = None
+    ) -> tuple[list[Write], tuple[str, ...]]:
+        if not self._trace_recorder:
+            return [], ()
+        trace_id = self._id_factory()
+        payload = {"event": event, "data": _redact_trace(data or {})}
+        return [
+            InsertEntry(NewEntry(trace_id, None, "custom", payload, custom_type="trace_record")),
+            AppendList(ListAddress[str](f"operation/{operation_id}/trace"), trace_id),
+        ], (trace_id,)
+
+    def trace_writes(self, operation_id: str, event: str, data: dict[str, object] | None = None) -> list[Write]:
+        return self.trace_writes_with_ids(operation_id, event, data)[0]
+
+    async def recall_memory(self, prompt: str, context_summary: str = ""):
+        if self._memory_runtime is None or self._memory_scope is None:
+            return None
+        from agent_harness.domain.memory import RecallBudget, RecallQuery
+
+        return await self._memory_runtime.recall(
+            self._memory_scope,
+            RecallQuery(prompt, context_summary, self._memory_scope.task_id),
+            RecallBudget(),
+        )
 
     @property
     def tools(self) -> ToolRegistry:

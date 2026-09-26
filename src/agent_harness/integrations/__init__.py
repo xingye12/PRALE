@@ -13,3 +13,6 @@ __all__ = [
     "WriteTool",
     "create_builtin_tools",
 ]
+from agent_harness.integrations.memory_provider import JsonMemoryExtractor
+
+__all__ = ["JsonMemoryExtractor"]

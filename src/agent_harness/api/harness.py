@@ -1,5 +1,7 @@
 from agent_harness.api.errors import InvalidLane
+from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.session import Session
+from agent_harness.memory.runtime import MemoryRuntime
 from agent_harness.runtime.events import EventBus, EventListener
 from agent_harness.runtime.hooks import HookHandler, HookRegistry
 from agent_harness.runtime.lane import Lane
@@ -11,22 +13,49 @@ from agent_harness.storage.protocol import Storage
 class Harness:
     """Transport-neutral facade for a durable single-session harness."""
 
-    def __init__(self, session: Session, tools: tuple[AgentTool, ...] = (), retry: RetryPolicy = RetryPolicy()) -> None:
+    def __init__(
+        self,
+        session: Session,
+        tools: tuple[AgentTool, ...] = (),
+        retry: RetryPolicy = RetryPolicy(),
+        *,
+        memory_scope: MemoryScope | None = None,
+        memory_runtime: MemoryRuntime | None = None,
+        trace_recorder: bool = False,
+    ) -> None:
         self._session = session
         self._tools = tools
         self._retry = retry
         self._events = EventBus()
         self._hooks = HookRegistry()
         self._lanes: dict[str, Lane] = {}
+        self._memory_scope = memory_scope
+        self._memory_runtime = memory_runtime
+        self._trace_recorder = trace_recorder
+        if (memory_scope is None) != (memory_runtime is None):
+            raise ValueError("memory_scope and memory_runtime must be configured together")
+        if memory_runtime is not None and memory_scope is not None:
+            memory_runtime.bind_session(session, memory_scope)
 
     @classmethod
     async def open(
-        cls, session_id: str, storage: Storage, tools: tuple[AgentTool, ...] = (), retry: RetryPolicy = RetryPolicy()
+        cls,
+        session_id: str,
+        storage: Storage,
+        tools: tuple[AgentTool, ...] = (),
+        retry: RetryPolicy = RetryPolicy(),
+        *,
+        memory_scope: MemoryScope | None = None,
+        memory_runtime: MemoryRuntime | None = None,
+        trace_recorder: bool = False,
     ) -> "Harness":
         bind_session = getattr(storage, "bind_session", None)
         if callable(bind_session):
             bind_session(session_id)
-        return cls(Session(session_id, storage), tools, retry)
+        return cls(
+            Session(session_id, storage), tools, retry,
+            memory_scope=memory_scope, memory_runtime=memory_runtime, trace_recorder=trace_recorder,
+        )
 
     async def acquire_lane(self, name: str) -> Lane:
         if not name or "\x00" in name:
@@ -40,6 +69,9 @@ class Harness:
                 retry=self._retry,
                 events=self._events,
                 hooks=self._hooks,
+                memory_scope=self._memory_scope,
+                memory_runtime=self._memory_runtime,
+                trace_recorder=self._trace_recorder,
             )
             await lane.attach()
             self._lanes[name] = lane
@@ -62,6 +94,9 @@ class Harness:
             retry=self._retry,
             events=self._events,
             hooks=self._hooks,
+            memory_scope=self._memory_scope,
+            memory_runtime=self._memory_runtime,
+            trace_recorder=self._trace_recorder,
         )
         await target.attach(tip_id)
         self._lanes[target_name] = target
@@ -72,3 +107,7 @@ class Harness:
 
     def on_hook(self, name: str, handler: HookHandler):
         return self._hooks.on(name, handler)
+
+    async def close(self) -> None:
+        if self._memory_runtime is not None:
+            await self._memory_runtime.aclose()

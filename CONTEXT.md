@@ -26,13 +26,21 @@ _Avoid_: Global memory, session memory
 可独立判断、可追溯到 L0 来源且可被单独召回的长期记忆单元。
 _Avoid_: Note, summary
 
-**Scenario memory**:
-围绕一个稳定工作场景组织的、可人工查看和维护的知识块。
-_Avoid_: Chat summary, project memory
+**Work scene memory**:
+围绕一个稳定工作场景组织的、可人工查看和维护的知识块；承载“某项目当前处于什么阶段、有哪些决策、约束与待办”的组合语境。
+_Avoid_: Chat summary, project memory, scenario memory
 
 **Session trace archive**:
-在 Operation terminal 时由固定 branch tip 与 source IDs 派生的不可变 L0 快照。它不是 dispatch 时读取的当前上下文。
+在 Operation terminal 时派生、只包含该 Operation 新增 entry 的不可变 L0 记录。它以 base tip 与 terminal tip 界定增量，并以受限祖先链携带背景；它不是 dispatch 时读取的当前上下文，也不是完整 branch 的副本。
 _Avoid_: Current transcript, conversation copy
+
+**Terminal tip / base tip**:
+一次 Operation 结算时写入 lane 的 `tip_id`，以及同一 Operation 启动时的 `source_tip_id`。二者都从已持久化的 operation result 读回，无需重新扫描 Session；其差集定义了 L0 增量。
+_Avoid_: Current branch, latest message
+
+**Promotion job**:
+把 L0 增量推进到 L1、L2 或 L3 的可恢复后台工作单元；按 scope 与 stage 去重，以持久化的输入 watermark 和 `not_before` 驱动，因此重启后不会丢失延迟或重复消费。
+_Avoid_: Task, worker, timer
 
 **Trace record**:
 在同一 Session mutation 中追加的、已脱敏执行审计事件，例如 effect intent、retry 或工具 outcome。

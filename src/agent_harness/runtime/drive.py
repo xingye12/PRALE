@@ -157,9 +157,12 @@ class Drive:
                 )
                 next_tip = summary_id
             result = self._terminal_result(operation, next_tip, "completed")
+            writes.extend([SetValue(lane_tip(self._lane.name), next_tip)])
+            terminal_ids = (summary_id,) if summary is not None else ()
             writes.extend(
-                [SetValue(lane_tip(self._lane.name), next_tip), *self._terminal_writes(operation, result, "completed")]
+                await self._lane.memory_capture_writes(mutator, result, terminal_ids, branch_tip_id=target_id)
             )
+            writes.extend(self._terminal_writes(operation, result, "completed"))
             await mutator.commit(writes)
             return result
 
@@ -256,6 +259,7 @@ class Drive:
                     ),
                     InsertUsage(UsageRow(usage_id, usage, entry_id=entry_id)),
                     SetValue(lane_tip(self._lane.name), entry_id),
+                    *await self._lane.memory_capture_writes(mutator, result, (entry_id,)),
                     *self._terminal_writes(operation, result, "completed"),
                 ]
             )
@@ -290,6 +294,7 @@ class Drive:
                     InsertEntry(NewEntry(entry_id, parent, "compaction", {"summary": "[compaction interrupted]"})),
                     InsertUsage(UsageRow(usage_id, {}, entry_id=entry_id)),
                     SetValue(lane_tip(self._lane.name), entry_id),
+                    *await self._lane.memory_capture_writes(mutator, result, (entry_id,)),
                     *self._terminal_writes(operation, result, "aborted"),
                 ]
             )
@@ -325,7 +330,22 @@ class Drive:
             current = await mutator.get_value(operation_state(operation.meta.operation_id))
             if current != operation.state:
                 raise RuntimeError("operation state changed while Drive was running")
-            await mutator.commit([SetValue(operation_state(operation.meta.operation_id), next_state)])
+            await mutator.commit(
+                [
+                    *self._lane.trace_writes(
+                        operation.meta.operation_id,
+                        "state_transition",
+                        {
+                            "from": operation.state.at,
+                            "to": next_state.at,
+                            # Intent, retry and tool-call details are part of the durable execution trace.
+                            # Lane redaction runs before this custom entry is committed.
+                            "state_data": next_state.data,
+                        },
+                    ),
+                    SetValue(operation_state(operation.meta.operation_id), next_state),
+                ]
+            )
 
         await self._lane._session.mutate(transition)  # noqa: SLF001
 
@@ -334,6 +354,19 @@ class Drive:
         transformed = await self._lane.hooks.run("transform_context", {"messages": project_messages(context)})
         if not isinstance(transformed, dict) or not isinstance(transformed.get("messages"), list):
             raise RuntimeError("transform_context must return a request object with messages")
+        prompt = operation.meta.request.get("prompt", "") if isinstance(operation.meta.request, dict) else ""
+        bundle = await self._lane.recall_memory(prompt if isinstance(prompt, str) else "")
+        if bundle is not None and bundle.items:
+            from agent_harness.memory.context import ContextAssembler
+
+            memory_message = ContextAssembler().assemble(bundle)
+            assert memory_message is not None
+            transformed = {
+                **transformed,
+                "messages": [*transformed["messages"], memory_message],
+            }
+            assert self._lane._memory_runtime is not None and self._lane._memory_scope is not None  # noqa: SLF001
+            await self._lane._memory_runtime.record_injection(self._lane._memory_scope, bundle)  # noqa: SLF001
         request = await self._lane.hooks.run(
             "before_request",
             transformed,
@@ -356,6 +389,13 @@ class Drive:
             "model": getattr(self._provider, "model", type(self._provider).__name__) if self._provider else None,
             "stream_options": {"checkpoint": "content"},
             "content_checkpoint": "",
+            "memory_bundle_hash": bundle.content_hash if bundle is not None else None,
+            "memory_items": [
+                {"id": item.id, "version": item.version, "level": item.level, "content": item.content}
+                for item in bundle.items
+            ]
+            if bundle is not None
+            else [],
         }
         await self._transition(operation, OperationState(at="assistant.effect_pending", control="running", data=intent))
 
@@ -560,6 +600,7 @@ class Drive:
                 await mutator.commit(writes)
                 return None
             result = self._terminal_result(operation, assistant_entry_id, "completed")
+            writes.extend(await self._lane.memory_capture_writes(mutator, result, (assistant_entry_id,)))
             writes.extend(self._terminal_writes(operation, result, "completed"))
             await mutator.commit(writes)
             return result
@@ -746,6 +787,11 @@ class Drive:
             ]
             await mutator.commit(
                 [
+                    *self._lane.trace_writes(
+                        operation.meta.operation_id,
+                        "tool_outcome",
+                        {"tool_call_id": active["tool_call_id"], "is_error": result.get("is_error", False)},
+                    ),
                     InsertEntry(
                         NewEntry(
                             active["result_entry_id"],
@@ -784,6 +830,13 @@ class Drive:
             ]
             parent_id = await mutator.get_value(lane_tip(self._lane.name))
             writes = []
+            writes.extend(
+                self._lane.trace_writes(
+                    operation.meta.operation_id,
+                    "tool_batch_outcome",
+                    {"tool_call_ids": [call["tool_call_id"] for call in active]},
+                )
+            )
             for call in active:
                 result = by_id[call["tool_call_id"]]
                 writes.append(
@@ -838,7 +891,8 @@ class Drive:
             if tip_id is not None and not isinstance(tip_id, str):
                 raise RuntimeError("invalid lane tip")
             result = self._terminal_result(operation, tip_id, status)
-            await mutator.commit(self._terminal_writes(operation, result, status))
+            writes = await self._lane.memory_capture_writes(mutator, result)
+            await mutator.commit([*writes, *self._terminal_writes(operation, result, status)])
             return result
 
         return await self._lane._session.mutate(settle)  # noqa: SLF001
@@ -861,7 +915,8 @@ class Drive:
                 error_code="cancelled",
                 error_message="operation cancelled before the next external effect",
             )
-            await mutator.commit(self._terminal_writes(operation, result, "aborted"))
+            writes = await self._lane.memory_capture_writes(mutator, result)
+            await mutator.commit([*writes, *self._terminal_writes(operation, result, "aborted")])
             return result
 
         return await self._lane._session.mutate(settle)  # noqa: SLF001
@@ -907,6 +962,7 @@ class Drive:
                     InsertEntry(NewEntry(assistant_entry_id, parent_id, "message", assistant_payload)),
                     InsertUsage(UsageRow(usage_id, usage, entry_id=assistant_entry_id)),
                     SetValue(lane_tip(self._lane.name), assistant_entry_id),
+                    *await self._lane.memory_capture_writes(mutator, result, (assistant_entry_id,)),
                     SetValue(
                         operation_state(operation.meta.operation_id),
                         OperationState("terminal", "running", {"status": status}),

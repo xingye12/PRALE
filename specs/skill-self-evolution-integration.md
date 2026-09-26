@@ -6,7 +6,18 @@
 
 本设计接入 [长期记忆实现规范](long-term-memory-implementation-spec.md) 所定义的身份范围、outbox、后台任务和审计原则，但 `SkillStore` 是独立资产库：L1 记忆的更新绝不能隐式改写 Skill，Skill Review 的失败也不能影响 L0--L3 晋升。
 
-自动路径只允许新增或非破坏性更新。删除、撤销历史版本、变更可见性、安装外部依赖、发布至团队 loadout，均须经独立的人工/资产管理流程。
+自动路径只允许新增或非破坏性更新。删除、撤销历史版本、变更可见性、发布至团队 loadout、安装外部依赖，均须经独立的人工/资产管理流程。
+
+### 1.1 自动创建的默认状态是 active
+
+自动提炼创建的 Skill 默认状态为 **`active`**，不是 `draft`。这与参考实现一致：参考实现的 `skills` 表已移除 draft 状态并以 `DEFAULT 'active'` 建表，即自动沉淀的经验应当立即可用，而不是等待一个现实中不存在的审核队列。
+
+由此产生的安全边界**必须**由另外两个属性承担，且二者都是自动路径不能修改的：
+
+- `visibility` 初始且始终为 `private`——自动路径**不提供** `set_visibility` 动作；
+- owner **必须**是提炼时的 `(team_id, agent_id, user_id)`，自动路径**不提供**跨 owner 写入。
+
+因此“默认 active”的准确含义是：**该 Skill 对创建它的 owner 立即可用，对其他任何人不可见**。这也意味着不存在“先创建再激活”的两步流程，`activate`/`disable`/`archive` 只作为人工资产管理动作存在。
 
 ## 2. Skill 合约与存储模型
 
@@ -23,7 +34,7 @@ SkillAsset (skill_id: "skl-…")
 
 `SKILL.md` frontmatter 必须含 `name`、`description`、`triggers`、`version`、`status`。正文必须覆盖：适用范围与不适用范围、前置条件、步骤、验证、失败/回滚处理、资源使用说明。`description` 与 `triggers` 用于 listing/search；完整正文只有在实际选中 Skill 后才加载。
 
-`SkillScope` 与 `MemoryScope` 的身份字段一致。初版只允许 owner `(team_id, agent_id, user_id)` 自动创建和修改私有 Skill。`visibility` 初始值为 `private`；`draft | active | disabled | archived` 是 Skill 生命周期状态，自动提炼创建的默认状态为 `draft`。`active` 或共享是显式审核动作，而非 Review LLM 的权限。
+`SkillScope` 与 `MemoryScope` 的身份字段一致。初版只允许 owner `(team_id, agent_id, user_id)` 自动创建和修改私有 Skill。`visibility` 初始值为 `private`；`active | disabled | archived` 是 Skill 生命周期状态，自动提炼创建的默认状态为 `active`（见 §1.1）。`disabled`/`archived` 与共享可见性是显式资产管理动作，而非 Review LLM 的权限。
 
 SQLite 后端至少包含 `skills`、`skill_versions`、`skill_files`、`skill_archives`、`skill_extraction_jobs`、`skill_candidates`、`skill_audit`、Skill FTS 表和 `schema_migrations`。文件正文可存 SQLite blob 或由 content-addressed blob store 持有；不论实现如何，`SkillVersion` 提交必须原子地绑定 Markdown、manifest、文件 hash 和版本号。禁止通过可变工作目录把“当前文件”当作权威版本。
 
@@ -31,25 +42,44 @@ SQLite 后端至少包含 `skills`、`skill_versions`、`skill_files`、`skill_a
 
 ### 3.1 捕获时机
 
-Skill buffer 只能消费已 terminal operation 的已持久化输入和结果。它的来源必须是长期记忆规范定义的 `SessionTraceArchive`，而不是 event bus、当前 provider context 或从可变 `OperationState` 临时读取的数据。默认使用 `conversation-v1` archive 中的 user/assistant/tool entries；启用 `execution-v1` TraceRecorder 后，Review 可额外看到脱敏的 intent、retry 和验证轨迹。绝不从流式未完成片段、`never` replay policy 的未知工具结果或未执行的计划中提炼成功方法。
+Skill buffer 只能消费已 terminal operation 的已持久化输入和结果。它的来源**必须**是长期记忆规范定义的 `SessionTraceArchive`，而不是 event bus、当前 provider context 或从可变 `OperationState` 临时读取的数据。默认使用 `conversation-v1` archive 中的 user/assistant/tool entries；启用 `execution-v1` TraceRecorder 后，Review 可额外看到脱敏的 intent、retry 和验证轨迹。绝不从流式未完成片段、`never` replay policy 的未知工具结果或未执行的计划中提炼成功方法。
 
-在 operation terminal settlement 的同一 Session mutation 中，新增 `skill_capture_requested` outbox entry，引用冻结的 Session source IDs、terminal tip、operation ID 与 trace format；其语义与记忆 capture outbox 相同。Skill dispatcher 必须消费已 materialize 的 `SessionTraceArchive`（可按 archive ID 等待/重试），以 `(scope, archive_id, payload_hash)` 幂等写入 session `SkillBuffer`，再独立标记 outbox delivered。若记忆和 Skill 同时启用，可在同一 Session transaction 追加两条 outbox；两条下游投递互不依赖，但二者必须引用同一个冻结 snapshot。
+在 operation terminal settlement 的同一 Session mutation 中，新增 `skill_capture_requested` outbox entry，引用冻结的 Session source IDs、terminal tip、operation ID 与 trace format；其语义与记忆 capture outbox 相同。Skill dispatcher **必须**消费已 materialize 的 `SessionTraceArchive`（可按 archive ID 等待/重试），以 `(scope, archive_id, payload_hash)` 幂等写入 session `SkillBuffer`，再独立标记 outbox delivered。若记忆和 Skill 同时启用，可在同一 Session transaction 追加两条 outbox；两条下游投递互不依赖，但二者必须引用同一个冻结 snapshot。
 
-### 3.2 归档阈值
+### 3.2 配置组合与依赖解析
 
-Buffer 按 `(scope, session_id)` 维护消息字节数、成功 tool call 数、turn 数和最后活动时间。满足任一条件时原子封存为 immutable `SkillArchive` 并创建 extraction job：
+`SkillStore` 的来源是 L0 `SessionTraceArchive`，而 L0 materializer 由 `MemoryRuntime` 拥有。因此存在一个**必须显式解决**的配置组合问题：`Harness.open` 接受独立的可选 `memory_runtime` 与 `skill_runtime`，但只配置 `skill_runtime` 时不产出任何 archive，Skill 将永久静默为空。
 
-- 成功工具调用数达到配置阈值（建议 3）；
-- 脱敏后的累计字节数达到阈值（建议 32 KiB）；
-- session 空闲达到阈值（建议 10 分钟）；
+v1 的解析规则**必须**是 fail-closed：
+
+| `memory_runtime` | `skill_runtime` | 行为 |
+| --- | --- | --- |
+| 未配置 | 未配置 | 现有 harness 行为不变，无 capture、无后台任务 |
+| 已配置 | 未配置 | 仅记忆功能；capture/L0/晋升按配置运行 |
+| 未配置 | 已配置 | **必须**在 `Harness.open` 阶段抛出配置错误，而不是静默不产出 Skill |
+| 已配置 | 已配置 | 共享同一 L0 materializer 与同一冻结 archive |
+
+只想要 Skill 而不想要记忆晋升的部署，**必须**配置 `memory_runtime` 并把 L1/L2/L3 晋升阶段关闭（capture 与 L0 materializer 保持启用）。这比在 `SkillEvolutionRuntime` 内复制一个 materializer 更好：两个 materializer 会让 L0 的身份、去重 key 和保留策略出现两套实现。
+
+两条 outbox 的投递顺序无关，但**必须**由同一个 dispatcher 语义消费同一冻结 snapshot；`skill_runtime` 已配置但 `memory_runtime` 缺失时不得降级为“从 Session 直接读”。
+
+### 3.3 归档阈值
+
+Buffer 按 `(scope, session_id)` 维护消息字节数、成功 tool call 数和 turn 数。满足任一条件时原子封存为 immutable `SkillArchive` 并创建 extraction job：
+
+- 成功工具调用数达到配置阈值（默认 **5**）；
+- 脱敏后的累计字节数达到阈值（默认 **40 KiB**）；
+- Session 显式关闭或删除；
 - 管理/API 显式 `force_archive`；
 - 单条内容超过限制时以压缩或分块策略封存。
 
-归档必须返回 `tool_calls | bytes | idle | forced | oversize` 原因，并清空的只是当前 buffer 指针/计数，绝不能删除 archive。低质量、失败或无复用价值的内容可以被 Review 判定为 `no_op`，仍必须保留 archive 和结论审计。
+归档**必须**返回 `tool_calls | bytes | session_closed | forced | oversize` 原因，并清空的只是当前 buffer 指针/计数，绝不能删除 archive。低质量、失败或无复用价值的内容可以被 Review 判定为 `no_op`，仍必须保留 archive 和结论审计。
+
+不设空闲/超时触发。理由与 L1 相同：后台按时间推断“对话已结束”会与 Session 的 compaction、navigation 和 fork 竞争判断，而 `session_closed` 已覆盖“会话真的结束了但没到阈值”这一唯一真实缺口，且是完全可重现的显式事件。因此 `last_activity` 只作为 telemetry，不作为归档依据。
 
 ## 4. 异步 Review 与受控写入
 
-每个 owner `SkillScope` 的 extraction jobs 必须串行 claim，避免自动任务并发修改同一资产；不同 owner 可并行。job 状态为 `queued | running | retry_wait | dead_letter | completed`，须保存 archive ID、lease、attempt、prompt/version、候选 Skill IDs、动作输出 hash、错误类别和退避时间。与记忆任务一样，claim/lease takeover/完成/失败都必须 durable、幂等、可审计。
+每个 owner `SkillScope` 的 extraction jobs 必须串行 claim，避免自动任务并发修改同一资产；不同 owner 可并行。job 状态为 `scheduled | queued | running | retry_wait | dead_letter | completed`，须保存 archive ID、`not_before`、lease、attempt、prompt/version、候选 Skill IDs、动作输出 hash、错误类别和退避时间。与记忆任务一样，claim/lease takeover/完成/失败都必须 durable、幂等、可审计，且 `not_before` 与状态在同一事务持久化（见 ADR-014）。
 
 Review 顺序如下：
 
@@ -65,12 +95,14 @@ Review LLM **不得**直接使用数据库、文件系统、shell、网络或删
 | 动作 | 约束 |
 | --- | --- |
 | `skill_list` / `skill_view` | 仅能读取调用 scope 已授权的元数据或版本 |
-| `skill_create` | 默认 `draft`；名称、frontmatter、资源 manifest 校验通过才写入 |
+| `skill_create` | 写入 `active` + `private`；名称、frontmatter、资源 manifest 校验通过才写入 |
 | `skill_update` | 要求 `expected_version`，提交完整新版本 |
 | `skill_patch` | 必须唯一命中指定片段；无法唯一命中时拒绝 |
 | `skill_files_write` | 仅新增/替换相对资源路径；路径遍历、可执行外部下载和超限内容拒绝 |
 
-自动流程不提供 `delete`、`set_visibility`、`activate`、`archive` 或跨 owner 修改动作。脚本资源即使被提炼出来，也只是未执行的版本化文本；后续执行仍必须通过 Harness 工具注册、权限和 effect intent 机制。
+自动流程不提供 `delete`、`set_visibility`、`activate`、`deactivate`、`archive` 或跨 owner 修改动作。脚本资源即使被提炼出来，也只是未执行的版本化文本；后续执行仍必须通过 Harness 工具注册、权限和 effect intent 机制。
+
+`skill_create` 写入的是 `active` 而非 `draft`，因此“新建即生效”**必须**由质量门（§5）而非状态流转来保证。
 
 ## 5. 版本、冲突和质量门
 
@@ -83,11 +115,17 @@ write(expected_version=3) → 成功 version 4 / VersionConflict(current=4)
 
 版本永不重写；可以读取、列举、导出历史 version。资源 manifest 与 `SKILL.md` 同一版本提交，故任何版本始终可完整重建。
 
-创建或更新至少要通过：可复用性（不只是一次性事实）、明确触发边界、至少一个有成功结果的来源、验证步骤、无 secret/PII、无未验证高风险命令、与现有 Skill 的重复/冲突检查。将“这次任务做了什么”直接复制为 Skill、仅凭 assistant 声称成功、或把临时项目状态写入 Skill 均须 `no_op`；前两类知识应进入长期记忆或保留在 session。
+创建或更新至少要通过：可复用性（不只是一次性事实）、明确触发边界、至少一个有成功结果的来源、验证步骤、无 secret/PII、无未验证高风险命令、与现有 Skill 的重复/冲突检查。将“这次任务做了什么”直接复制为 Skill、仅凭 assistant 声称成功、或把临时项目状态写入 Skill 均须 `no_op`。
+
+敏感内容扫描是**净新增工作**，不能依赖已有实现：参考实现的长度与 prompt-injection 过滤在 `sanitize.ts` 中已被注释掉，因此本 harness **必须**自行实现并测试字段级脱敏、prompt-injection 检测与 secret 扫描。**必须**为每条拒绝规则提供阳性与阴性测试用例，否则该门形同虚设。
+
+上述规则中被判为“一次性事实”或“未验证方法”的内容不应被丢弃：它们应进入长期记忆的 `work_method` 或保留在 session，二者与 Skill 的判定规则见长期记忆规范 §1.2。
 
 ## 6. 运行时检索和装配
 
-Skill 可用 `keyword | embedding | hybrid` 搜索，但必须先按 scope、visibility、绑定与 `status=active` 过滤。每次 run 在构造 provider request 前取得预算受限的 `SkillListing`：仅含 `skill_id`、name、description、triggers、version 和简短状态，建议总预算 2,000 字符。listing 应置于独立 `<available_skills>` prompt 区块，不能把所有 `SKILL.md` 注入。
+Skill 可用 `keyword | embedding | hybrid` 搜索，但必须先按 scope、visibility、绑定与 `status=active` 过滤。**SQLite v1 只提供 FTS/BM25**：`embedding` 与 `hybrid` 是接口允许的取值，但未接入向量索引时**必须**降级为 BM25 并记录 telemetry，而不是让 `embedding` 生效却返回空结果。
+
+每次 run 在构造 provider request 前取得预算受限的 `SkillListing`：仅含 `skill_id`、name、description、triggers、version 和简短状态，建议总预算 2,000 字符。listing 应置于独立 `<available_skills>` prompt 区块，不能把所有 `SKILL.md` 注入。
 
 模型/运行时选中某项后，通过稳定 ID + version 请求 `SkillLoadout`，其中包含完整 Markdown 与 manifest 指定的必要资源。完整 loadout 进入该 operation 的 effect intent，至少记录 `skill_id`、version、content hash、resource hashes 和装配预算。崩溃恢复必须重用该冻结 version，不能在重试时偷偷换成最新 Skill。
 
@@ -95,7 +133,7 @@ Skill 可用 `keyword | embedding | hybrid` 搜索，但必须先按 scope、vis
 
 ## 7. API、配置和安全
 
-`Harness.open` 应增加可选 `skill_runtime` 与 `skill_scope` 依赖；未传时保持兼容。稳定 API 可提供：
+`Harness.open` 应增加可选 `skill_runtime` 与 `skill_scope` 依赖；未传时保持兼容，但组合合法性受 §3.2 约束。稳定 API 可提供：
 
 ```python
 await skill_runtime.force_archive(scope, session_id)
@@ -104,7 +142,9 @@ await skill_runtime.load(scope, skill_id, version=None)
 await skill_runtime.review_status(archive_or_job_id)
 ```
 
-人工审核/资产管理 API 另行定义，不能混入自动 Review 权限。配置至少包含：buffer 阈值、archive 最大大小、Review provider/timeout/retry、最大候选数、listing/loadout 字符预算、允许的资源 MIME/大小、是否允许 embedding，以及 `auto_create_draft`/`auto_update_draft` 开关。生产默认应启用 `auto_create_draft`，关闭对 `active` Skills 的自动更新。
+`SkillEvolutionRuntime` **必须**提供与 `MemoryRuntime` 相同的生命周期：`start()` 恢复未完成 job 与 outbox 扫描，`aclose()` 停止调度并等待在途 job 收敛；`Harness.close()` 必须级联关闭二者（见 ADR-014）。
+
+人工审核/资产管理 API 另行定义，不能混入自动 Review 权限。配置至少包含：buffer 阈值（tool call 数与字节数）、archive 最大大小、Review provider/timeout/retry、最大候选数、listing/loadout 字符预算、允许的资源 MIME/大小、是否允许 embedding、以及 `auto_create` / `auto_update_active` 开关。生产默认**必须**启用 `auto_create`，**必须**关闭 `auto_update_active`——即可以自动沉淀新 Skill（`active` + `private`），但不得自动改写一个已存在且可能正被使用的 active Skill；对该类资产的更新只能由人工资产管理流程发起。
 
 必须记录 archive 原因与 hash、job 生命周期、Reviewer prompt/version、候选检索结果、每项 create/update/patch 的前后 version/hash、拒绝原因、冲突和被装配的 Skill versions。日志/审计不得保存原始密钥或受控资源明文。
 
@@ -112,16 +152,21 @@ await skill_runtime.review_status(archive_or_job_id)
 
 1. 实现纯 DTO、`SkillStore`/`SkillReviewer` 协议、in-memory conformance backend 和版本/资源原子性测试。
 2. 实现 terminal outbox、SkillBuffer、归档、worker lease/recovery 和审计；不接入 LLM。
-3. 实现受控 Review schema、候选检索、draft create/update/patch 和 optimistic-lock 冲突处理。
+3. 实现受控 Review schema、候选检索、active create/update/patch、敏感内容扫描和 optimistic-lock 冲突处理。
 4. 实现 listing/loadout 与冻结到 LLM effect intent；最后接入 SQLite、可选 embedding 和人工审核适配器。
 
 验收条件：
 
 - 同一 terminal operation 的重复 dispatcher 投递只增加一次 buffer 输入；archive 后崩溃不丢 archive、不重复创建 extraction job；Skill buffer 与 Memory L0 使用同一冻结 terminal snapshot；
+- 自动创建的 Skill 为 `active` + `private`，且仅为 owner 可见；自动路径无法改变 visibility 或写入跨 owner；
+- 默认配置下自动流程不能修改已存在的 active Skill（`auto_update_active=false`），尝试时必须留下拒绝审计；
+- 只配置 `skill_runtime` 而不配置 `memory_runtime` 时，`Harness.open` 抛出配置错误而不是静默停用；
 - 并发 update 不能静默覆盖，`expected_version` 不匹配必须返回当前版本；
 - 自动 Reviewer 无法删除资源、提升 visibility/status、写出 scope，或调用未授权副作用；
-- 成功但一次性的聊天不会创建 Skill；包含成功工具结果与验证的重复流程可创建 `draft`；
-- 同一 operation 在恢复后使用相同 Skill ID/version/hashes；
+- 成功但一次性的聊天不会创建 Skill；包含成功工具结果与验证的重复流程创建 `active` Skill；
+- 敏感内容、prompt-injection 与 secret 扫描规则各有阳性/阴性测试，且拒绝项进入 audit；
+- `embedding` 在仅 BM25 的 SQLite v1 上降级并记录 telemetry；
 - 未授权、disabled、archived Skill 不会出现在 listing/search/loadout；
+- 未到 `not_before` 的 job 不执行；进程重启后已到期的 job 只执行一次；
 - Review/存储/embedding 故障不会阻塞用户 operation，且有限重试后存在可重放 dead letter；
 - SQLite migration、资源原子提交、buffer/archive/版本语义在所有 Storage backend 的 conformance suite 中一致。

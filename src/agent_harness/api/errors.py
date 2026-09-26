@@ -1,3 +1,8 @@
+from agent_harness.domain.memory import PromotionConflict
+
+__all__ = ["PromotionConflict"]
+
+
 class HarnessError(Exception):
     """Base class for domain-level harness errors."""
 
@@ -31,3 +36,19 @@ class NothingToCompact(HarnessError):
 
 class UnknownTarget(HarnessError):
     """A navigation request refers to an entry outside the session tree."""
+
+
+class MemoryScopeDenied(HarnessError):
+    pass
+
+
+class RecallBudgetExceeded(HarnessError):
+    pass
+
+
+class MemoryNotFound(HarnessError):
+    pass
+
+
+class UnsupportedPromptMode(HarnessError):
+    pass
