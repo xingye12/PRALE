@@ -2,9 +2,11 @@
 import sqlite3
 import time
 from asyncio import Lock
+from collections.abc import Sequence
 from pathlib import Path
 from typing import cast
 
+from agent_harness.domain.effects import EffectSpan, UsageRecord, as_usage, normalize_usage
 from agent_harness.domain.entries import Entry, JsonValue
 from agent_harness.domain.values import ListAddress, ValueAddress
 from agent_harness.storage.codec import dumps, loads
@@ -15,7 +17,9 @@ from agent_harness.storage.protocol import (
     CommitResult,
     DeleteValue,
     InsertEntry,
+    InsertSpan,
     InsertUsage,
+    SettleSpan,
     SetValue,
     Storage,
     Write,
@@ -85,6 +89,43 @@ class SQLiteStorage(Storage):
             INSERT OR IGNORE INTO schema_migrations(version) VALUES(2);
             """
         )
+        self._migrate_effect_spans()
+        self._migrate_usage_attribution()
+
+    def _migrate_effect_spans(self) -> None:
+        """v3 adds per-attempt effect records; older sessions simply have none."""
+
+        self._connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS effect_spans (
+                span_id TEXT PRIMARY KEY,
+                operation_id TEXT NOT NULL,
+                call_id TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                lane TEXT NOT NULL,
+                attempt INTEGER NOT NULL,
+                started_at INTEGER NOT NULL,
+                outcome TEXT NOT NULL,
+                ended_at INTEGER,
+                error_class TEXT,
+                CHECK ((outcome = 'pending') = (ended_at IS NULL))
+            );
+            CREATE INDEX IF NOT EXISTS effect_spans_operation ON effect_spans(operation_id, started_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS effect_spans_call ON effect_spans(operation_id, call_id, attempt);
+            INSERT OR IGNORE INTO schema_migrations(version) VALUES(3);
+            """
+        )
+
+    def _migrate_usage_attribution(self) -> None:
+        """v4 attributes new usage rows to their operation and effect attempt."""
+
+        columns = {row[1] for row in self._connection.execute("PRAGMA table_info(usage_rows)")}
+        if "operation_id" not in columns:
+            self._connection.execute("ALTER TABLE usage_rows ADD COLUMN operation_id TEXT")
+        if "span_id" not in columns:
+            self._connection.execute("ALTER TABLE usage_rows ADD COLUMN span_id TEXT")
+        self._connection.execute("CREATE INDEX IF NOT EXISTS usage_rows_operation ON usage_rows(operation_id, seq)")
+        self._connection.execute("INSERT OR IGNORE INTO schema_migrations(version) VALUES(4)")
 
     async def commit(self, writes: list[Write]) -> CommitResult:
         async with self._lock:
@@ -121,9 +162,38 @@ class SQLiteStorage(Storage):
                     elif isinstance(write, InsertUsage):
                         row = write.row
                         conn.execute(
-                            "INSERT INTO usage_rows VALUES (?, ?, ?, ?)",
-                            (row.id, next_seq, row.entry_id, dumps(row.usage)),
+                            "INSERT INTO usage_rows VALUES (?, ?, ?, ?, ?, ?)",
+                            (row.id, next_seq, row.entry_id, dumps(row.usage), row.operation_id, row.span_id),
                         )
+                    elif isinstance(write, InsertSpan):
+                        span = write.span
+                        if conn.execute("SELECT 1 FROM effect_spans WHERE span_id = ?", (span.span_id,)).fetchone():
+                            raise StorageInvariantError(f"effect span {span.span_id!r} already exists")
+                        conn.execute(
+                            "INSERT INTO effect_spans VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                            (
+                                span.span_id,
+                                span.operation_id,
+                                span.call_id,
+                                span.kind,
+                                span.lane,
+                                span.attempt,
+                                span.started_at,
+                                span.outcome,
+                                span.ended_at,
+                                span.error_class,
+                            ),
+                        )
+                    elif isinstance(write, SettleSpan):
+                        cursor = conn.execute(
+                            """UPDATE effect_spans SET ended_at = ?, outcome = ?, error_class = ?
+                               WHERE span_id = ? AND outcome = 'pending'""",
+                            (write.ended_at, write.outcome, write.error_class, write.span_id),
+                        )
+                        if cursor.rowcount != 1:
+                            raise StorageInvariantError(
+                                f"effect span {write.span_id!r} is unknown or was already settled"
+                            )
                     elif isinstance(write, SetValue):
                         conn.execute(
                             "INSERT INTO values_store(address, payload) VALUES (?, ?) ON CONFLICT(address) DO UPDATE SET payload=excluded.payload",
@@ -176,6 +246,27 @@ class SQLiteStorage(Storage):
         ).fetchall()
         return [loads(row[0]) for row in rows]
 
+    async def list_spans(self, operation_id: str) -> list[EffectSpan]:
+        rows = self._connection.execute(
+            "SELECT * FROM effect_spans WHERE operation_id = ? ORDER BY started_at, rowid", (operation_id,)
+        ).fetchall()
+        return [self._span(row) for row in rows]
+
+    async def list_usage(self, operation_id: str) -> list[UsageRecord]:
+        rows = self._connection.execute(
+            "SELECT * FROM usage_rows WHERE operation_id = ? ORDER BY seq", (operation_id,)
+        ).fetchall()
+        return [self._usage_record(row) for row in rows]
+
+    async def usage_for_entries(self, entry_ids: Sequence[str]) -> list[UsageRecord]:
+        if not entry_ids:
+            return []
+        rows = self._connection.execute(
+            f"SELECT * FROM usage_rows WHERE entry_id IN ({','.join('?' for _ in entry_ids)}) ORDER BY seq",
+            list(entry_ids),
+        ).fetchall()
+        return [self._usage_record(row) for row in rows]
+
     def _entry(self, row: sqlite3.Row) -> Entry:
         return Entry(
             row["id"],
@@ -185,6 +276,34 @@ class SQLiteStorage(Storage):
             row["type"],
             cast(JsonValue, loads(row["payload"])),
             row["custom_type"],
+        )
+
+    def _span(self, row: sqlite3.Row) -> EffectSpan:
+        return EffectSpan(
+            span_id=row["span_id"],
+            operation_id=row["operation_id"],
+            call_id=row["call_id"],
+            kind=row["kind"],
+            lane=row["lane"],
+            attempt=row["attempt"],
+            started_at=row["started_at"],
+            outcome=row["outcome"],
+            ended_at=row["ended_at"],
+            error_class=row["error_class"],
+        )
+
+    def _usage_record(self, row: sqlite3.Row) -> UsageRecord:
+        raw = as_usage(loads(row["usage"]))
+        input_tokens, output_tokens, total_tokens = normalize_usage(raw)
+        return UsageRecord(
+            id=row["id"],
+            operation_id=row["operation_id"],
+            entry_id=row["entry_id"],
+            span_id=row["span_id"],
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            raw=raw,
         )
 
     def close(self) -> None:

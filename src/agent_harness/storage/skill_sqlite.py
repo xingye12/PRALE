@@ -12,7 +12,9 @@ from typing import Any, cast
 
 from agent_harness.domain.skill import (
     SkillArchive,
+    SkillArchiveSummary,
     SkillAsset,
+    SkillAuditRecord,
     SkillExtractionJob,
     SkillFile,
     SkillListing,
@@ -41,6 +43,11 @@ class SQLiteSkillStore:
         self._conn.execute("PRAGMA foreign_keys=ON")
         self._ids, self._now = id_factory or (lambda: str(uuid.uuid4())), now_ms or _now
         self._migrate()
+
+    def close(self) -> None:
+        """Release the connection; a store the deployment opened, it also closes."""
+
+        self._conn.close()
 
     def _migrate(self) -> None:
         self._conn.executescript("""
@@ -495,14 +502,123 @@ class SQLiteSkillStore:
         row = self._conn.execute(
             "SELECT * FROM skill_versions WHERE skill_id=? AND version=?", (skill_id, asset["current_version"])
         ).fetchone()
+        return _asset(asset), self._version(skill_id, row)
+
+    async def get_skill(self, scope: SkillScope, skill_id: str) -> SkillAsset | None:
+        """One asset in any state; a disabled skill must still be readable."""
+        row = self._conn.execute(
+            "SELECT * FROM skills WHERE skill_id=? AND repository_id=?", (skill_id, scope.storage_key)
+        ).fetchone()
+        return _asset(row) if row else None
+
+    async def list_skills(
+        self, scope: SkillScope, state: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[SkillAsset, ...]:
+        """Assets for the browse view, newest first.
+
+        Unlike ``search``/``listing`` this is not the prompt's injection view:
+        it keeps disabled and archived skills, because a UI that can only see
+        what is currently injected cannot explain what happened to the rest.
+        """
+        sql = "SELECT * FROM skills WHERE repository_id=?"
+        params: list[object] = [scope.storage_key]
+        if state is not None:
+            sql += " AND state=?"
+            params.append(state)
+        if after is not None:
+            sql += " AND (updated_at<? OR (updated_at=? AND skill_id<?))"
+            params += [after[0], after[0], after[1]]
+        sql += " ORDER BY updated_at DESC, skill_id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(_asset(row) for row in self._conn.execute(sql, params).fetchall())
+
+    async def list_versions(
+        self, scope: SkillScope, skill_id: str, after: tuple[int] | None, limit: int
+    ) -> tuple[SkillVersion, ...]:
+        """One skill's version history, newest first, files included.
+
+        Pages stay small by construction: every version carries the resource
+        files that were stored with it, and the history of one skill is short.
+        """
+        sql = """SELECT * FROM skill_versions WHERE skill_id=?
+            AND EXISTS(SELECT 1 FROM skills WHERE skill_id=? AND repository_id=?)"""
+        params: list[object] = [skill_id, skill_id, scope.storage_key]
+        if after is not None:
+            sql += " AND version<?"
+            params.append(after[0])
+        sql += " ORDER BY version DESC LIMIT ?"
+        params.append(limit)
+        return tuple(self._version(skill_id, row) for row in self._conn.execute(sql, params).fetchall())
+
+    def _version(self, skill_id: str, row: sqlite3.Row) -> SkillVersion:
         files = tuple(
             SkillFile(f["path"], bytes(f["content"]), f["mime_type"])
             for f in self._conn.execute(
-                "SELECT * FROM skill_files WHERE skill_id=? AND version=?", (skill_id, asset["current_version"])
+                "SELECT * FROM skill_files WHERE skill_id=? AND version=?", (skill_id, row["version"])
             )
         )
-        return _asset(asset), SkillVersion(
+        return SkillVersion(
             skill_id, row["version"], row["markdown"], row["manifest"], files, row["content_hash"], row["created_at"]
+        )
+
+    async def list_archives(
+        self, scope: SkillScope, after: tuple[int, str] | None, limit: int
+    ) -> tuple[SkillArchiveSummary, ...]:
+        """Source archives of this repository, newest first, payload excluded."""
+        sql = """SELECT archive_id, repository_id, session_id, source_archive_id, payload_hash, reason,
+            trace_format_version, bytes_count, successful_tool_calls, turn_count, created_at
+            FROM skill_archives WHERE repository_id=?"""
+        params: list[object] = [scope.storage_key]
+        if after is not None:
+            sql += " AND (created_at<? OR (created_at=? AND archive_id<?))"
+            params += [after[0], after[0], after[1]]
+        sql += " ORDER BY created_at DESC, archive_id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(
+            SkillArchiveSummary(
+                row["archive_id"],
+                SkillScope(row["repository_id"]),
+                row["session_id"],
+                row["source_archive_id"],
+                row["payload_hash"],
+                row["reason"],
+                row["trace_format_version"],
+                row["bytes_count"],
+                row["successful_tool_calls"],
+                row["turn_count"],
+                row["created_at"],
+            )
+            for row in self._conn.execute(sql, params).fetchall()
+        )
+
+    async def list_jobs(
+        self, scope: SkillScope, status: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[SkillExtractionJob, ...]:
+        """Extraction jobs of this repository, newest first, in every state."""
+        sql = "SELECT * FROM skill_extraction_jobs WHERE repository_id=?"
+        params: list[object] = [scope.storage_key]
+        if status is not None:
+            sql += " AND status=?"
+            params.append(status)
+        if after is not None:
+            sql += " AND (created_at<? OR (created_at=? AND job_id<?))"
+            params += [after[0], after[0], after[1]]
+        sql += " ORDER BY created_at DESC, job_id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(_job(row) for row in self._conn.execute(sql, params).fetchall())
+
+    async def list_audit(self, scope: SkillScope, after: tuple[int] | None, limit: int) -> tuple[SkillAuditRecord, ...]:
+        """Audit rows of this repository, newest first, keyed by insertion order."""
+        sql = "SELECT * FROM skill_audit WHERE repository_id=?"
+        params: list[object] = [scope.storage_key]
+        if after is not None:
+            sql += " AND id<?"
+            params.append(after[0])
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(
+            SkillAuditRecord(row["id"], scope, row["created_at"], row["event"], json.loads(row["data"]))
+            for row in self._conn.execute(sql, params).fetchall()
         )
 
     async def create(self, scope: SkillScope, proposal: SkillProposal, now: int) -> SkillAsset:

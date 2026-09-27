@@ -84,7 +84,7 @@ def test_sqlite_reopen_recovers_an_unknown_provider_outcome(tmp_path) -> None:
         result = await recovered.recover()
 
         assert result is not None
-        assert result.status == "aborted"
+        assert result.status == "unknown"
         reopened.close()
 
     asyncio.run(scenario())
@@ -142,7 +142,11 @@ def test_sqlite_forward_migration_from_v1_is_idempotent(tmp_path) -> None:
     second = SQLiteStorage(path)
     versions = [row[0] for row in second._connection.execute("SELECT version FROM schema_migrations ORDER BY version")]  # noqa: SLF001
     indexes = {row[1] for row in second._connection.execute("PRAGMA index_list('list_elements')")}  # noqa: SLF001
+    span_indexes = {row[1] for row in second._connection.execute("PRAGMA index_list('effect_spans')")}  # noqa: SLF001
+    usage_columns = {row[1] for row in second._connection.execute("PRAGMA table_info('usage_rows')")}  # noqa: SLF001
     second.close()
 
-    assert versions == [1, 2]
+    assert versions == [1, 2, 3, 4]
     assert "list_elements_address_seq" in indexes
+    assert "effect_spans_call" in span_indexes
+    assert {"operation_id", "span_id"} <= usage_columns

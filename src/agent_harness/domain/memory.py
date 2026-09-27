@@ -154,6 +154,43 @@ class OperatingDoctrine:
 
 
 @dataclass(frozen=True, slots=True)
+class ArchiveSummary:
+    """A list-view projection of a stored L0 archive.
+
+    The captured trace items stay in storage: browsing hundreds of archives
+    must not load every entry they hold, and the item count is what the list
+    actually shows.  Reading one archive in full remains a separate request.
+    """
+
+    archive_id: str
+    scope: MemoryScope
+    session_id: str
+    lane: str
+    operation_id: str
+    operation_kind: str
+    tip_id: str | None
+    trace_format_version: str
+    created_at: int
+    item_count: int
+    parent_archive_id: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryAuditRecord:
+    """One read-only row of the promotion pipeline's audit log.
+
+    ``audit_id`` is the storage's insertion order, which is the only stable
+    ordering the log has: several events routinely share a millisecond.
+    """
+
+    audit_id: int
+    scope: MemoryScope
+    created_at: int
+    event: str
+    data: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class PromotionJob:
     job_id: str
     scope: MemoryScope

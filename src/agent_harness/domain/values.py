@@ -23,6 +23,18 @@ def lane_inbox(lane: str) -> ListAddress[dict[str, object]]:
     return ListAddress(f"lane/{lane}/inbox")
 
 
+def lane_operations(lane: str) -> ListAddress[dict[str, object]]:
+    """Append-only admission index; a lane's turns in the order they were admitted."""
+
+    return ListAddress(f"lane/{lane}/operations")
+
+
+def session_lanes() -> ListAddress[str]:
+    """Append-only lane index, so a reader can enumerate a session's lanes."""
+
+    return ListAddress("session/lanes")
+
+
 def operation_meta(operation_id: str) -> ValueAddress[object]:
     return ValueAddress(f"operation/{operation_id}/meta")
 

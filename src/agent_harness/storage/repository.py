@@ -12,6 +12,14 @@ class SessionMetadata:
     created_at: int
 
 
+def session_filename(session_id: str) -> str:
+    """The single authority for how a session id maps onto a file name."""
+
+    if not session_id or "/" in session_id or "\\" in session_id:
+        raise ValueError("session ID must be a non-empty filename component")
+    return f"{session_id}.sqlite"
+
+
 class MemorySessionRepo:
     def __init__(self) -> None:
         self._stores: dict[str, tuple[SessionMetadata, MemoryStorage]] = {}
@@ -94,6 +102,4 @@ class SQLiteSessionRepo:
         return metadata, clone
 
     def _path(self, session_id: str) -> Path:
-        if not session_id or "/" in session_id or "\\" in session_id:
-            raise ValueError("session ID must be a non-empty filename component")
-        return self._directory / f"{session_id}.sqlite"
+        return self._directory / session_filename(session_id)

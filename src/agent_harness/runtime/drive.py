@@ -2,11 +2,13 @@
 
 import asyncio
 import time
+from collections.abc import Sequence
 
 from agent_harness.api.errors import ProviderNotConfigured, UnknownTarget
 from agent_harness.api.models import OperationResult
 from agent_harness.domain.compaction import select_compaction_window
 from agent_harness.domain.context import project_messages
+from agent_harness.domain.effects import EffectKind, EffectOutcome, EffectSpan, ErrorClass
 from agent_harness.domain.entries import NewEntry
 from agent_harness.domain.operations import ActiveOperation, OperationState
 from agent_harness.domain.session import SessionMutator
@@ -21,13 +23,67 @@ from agent_harness.domain.values import (
 )
 from agent_harness.runtime.generation import AssistantResult, ChatProvider, GenerationDelta, GenerationRequest
 from agent_harness.runtime.lane import Lane
-from agent_harness.storage.protocol import ClearList, DeleteValue, InsertEntry, InsertUsage, SetValue, UsageRow, Write
+from agent_harness.storage.protocol import (
+    ClearList,
+    DeleteValue,
+    InsertEntry,
+    InsertSpan,
+    InsertUsage,
+    SettleSpan,
+    SetValue,
+    UsageRow,
+    Write,
+)
+
+_TERMINAL_OUTCOME: dict[OperationStatus, EffectOutcome] = {
+    "completed": "completed",
+    "declined": "aborted",
+    "aborted": "aborted",
+    "failed": "failed",
+    "unknown": "unknown",
+}
+
+
+def _tool_outcome(result: dict[str, object]) -> tuple[EffectOutcome, ErrorClass | None]:
+    if result.get("is_error"):
+        return "failed", "tool_error"
+    return "completed", None
 
 
 class Drive:
     def __init__(self, lane: Lane, provider: ChatProvider | None) -> None:
         self._lane = lane
         self._provider = provider
+
+    def _open_span(
+        self, operation: ActiveOperation, call_id: str, kind: EffectKind, attempt: int
+    ) -> tuple[EffectSpan, InsertSpan]:
+        """Reserve the durable record of one effect attempt.
+
+        The caller commits it in the same transaction as the intent that
+        authorizes the effect, so a crash can never leave an effect whose
+        attempt was never recorded.
+        """
+
+        span = EffectSpan(
+            span_id=self._lane.new_id(),
+            operation_id=operation.meta.operation_id,
+            call_id=call_id,
+            kind=kind,
+            lane=self._lane.name,
+            attempt=attempt,
+            started_at=self._lane.now_ms(),
+        )
+        return span, InsertSpan(span)
+
+    def _settle_span(
+        self, span_id: object, outcome: EffectOutcome, error_class: ErrorClass | None = None
+    ) -> list[Write]:
+        """Close one attempt; intents written before spans existed close nothing."""
+
+        if not isinstance(span_id, str):
+            return []
+        return [SettleSpan(span_id, self._lane.now_ms(), outcome, error_class)]
 
     async def run(self) -> OperationResult:
         initial = await self._required_operation()
@@ -105,6 +161,8 @@ class Drive:
                                 "is_error": True,
                                 "terminate": True,
                             },
+                            outcome="unknown",
+                            error_class="interrupted",
                         )
             return await self.run()
         return await self._settle_interrupted(operation)
@@ -190,13 +248,16 @@ class Drive:
                 )
             if not isinstance(hook_context.get("messages"), list):
                 raise RuntimeError("before_compaction must return a messages object")
+            entry_id = self._lane.new_id()
+            span, span_write = self._open_span(operation, entry_id, "llm", attempt=1)
             intent = {
-                "entry_id": self._lane.new_id(),
+                "entry_id": entry_id,
                 "usage_id": self._lane.new_id(),
+                "span_id": span.span_id,
                 "messages": hook_context["messages"],
                 "retained_message_ids": retained_message_ids,
             }
-            await self._transition(operation, OperationState("summary.effect_pending", "running", intent))
+            await self._transition(operation, OperationState("summary.effect_pending", "running", intent), [span_write])
             operation = await self._required_operation()
         if operation.state.at != "summary.effect_pending":
             raise RuntimeError(f"cannot compact from state {operation.state.at!r}")
@@ -227,6 +288,7 @@ class Drive:
         retained_message_ids: list[str] | None = None,
     ) -> OperationResult:
         data = operation.state.data
+        span_id: object = None
         if operation.state.at == "starting":
             entry_id = self._lane.new_id()
             usage_id = self._lane.new_id()
@@ -236,6 +298,7 @@ class Drive:
                 raise RuntimeError("compaction intent is invalid")
             entry_id = data.get("entry_id")
             usage_id = data.get("usage_id")
+            span_id = data.get("span_id")
             if not isinstance(entry_id, str) or not isinstance(usage_id, str):
                 raise RuntimeError("compaction intent is invalid")
             retained_ids = data.get("retained_message_ids", [])
@@ -257,7 +320,16 @@ class Drive:
                             {"summary": summary, "retained_message_ids": retained_ids},
                         )
                     ),
-                    InsertUsage(UsageRow(usage_id, usage, entry_id=entry_id)),
+                    InsertUsage(
+                        UsageRow(
+                            usage_id,
+                            usage,
+                            entry_id=entry_id,
+                            operation_id=operation.meta.operation_id,
+                            span_id=span_id if isinstance(span_id, str) else None,
+                        )
+                    ),
+                    *self._settle_span(span_id, "completed"),
                     SetValue(lane_tip(self._lane.name), entry_id),
                     *await self._lane.memory_capture_writes(mutator, result, (entry_id,)),
                     *self._terminal_writes(operation, result, "completed"),
@@ -277,6 +349,7 @@ class Drive:
             raise RuntimeError("compaction intent is invalid")
         entry_id = data["entry_id"]
         usage_id = data["usage_id"]
+        span_id = data.get("span_id")
 
         async def settle(mutator: SessionMutator) -> OperationResult:
             if await mutator.get_value(operation_state(operation.meta.operation_id)) != operation.state:
@@ -285,17 +358,26 @@ class Drive:
             result = self._terminal_result(
                 operation,
                 entry_id,
-                "aborted",
+                "unknown",
                 error_code="interrupted",
                 error_message="compaction outcome is unknown after process interruption",
             )
             await mutator.commit(
                 [
                     InsertEntry(NewEntry(entry_id, parent, "compaction", {"summary": "[compaction interrupted]"})),
-                    InsertUsage(UsageRow(usage_id, {}, entry_id=entry_id)),
+                    InsertUsage(
+                        UsageRow(
+                            usage_id,
+                            {},
+                            entry_id=entry_id,
+                            operation_id=operation.meta.operation_id,
+                            span_id=span_id if isinstance(span_id, str) else None,
+                        )
+                    ),
+                    *self._settle_span(span_id, "unknown", "interrupted"),
                     SetValue(lane_tip(self._lane.name), entry_id),
                     *await self._lane.memory_capture_writes(mutator, result, (entry_id,)),
-                    *self._terminal_writes(operation, result, "aborted"),
+                    *self._terminal_writes(operation, result, "unknown"),
                 ]
             )
             return result
@@ -325,13 +407,16 @@ class Drive:
 
         await self._lane._session.mutate(consume)  # noqa: SLF001
 
-    async def _transition(self, operation: ActiveOperation, next_state: OperationState) -> None:
+    async def _transition(
+        self, operation: ActiveOperation, next_state: OperationState, extra: Sequence[Write] = ()
+    ) -> None:
         async def transition(mutator: SessionMutator) -> None:
             current = await mutator.get_value(operation_state(operation.meta.operation_id))
             if current != operation.state:
                 raise RuntimeError("operation state changed while Drive was running")
             await mutator.commit(
                 [
+                    *extra,
                     *self._lane.trace_writes(
                         operation.meta.operation_id,
                         "state_transition",
@@ -423,9 +508,11 @@ class Drive:
             }
         assistant_entry_id = self._lane.new_id()
         usage_id = self._lane.new_id()
+        span, span_write = self._open_span(operation, assistant_entry_id, "llm", attempt=1)
         intent = {
             "assistant_entry_id": assistant_entry_id,
             "usage_id": usage_id,
+            "span_id": span.span_id,
             "messages": payload["messages"],
             "attempt": 1,
             "model": getattr(self._provider, "model", type(self._provider).__name__) if self._provider else None,
@@ -454,7 +541,11 @@ class Drive:
                 for loadout in loadouts
             ],
         }
-        await self._transition(operation, OperationState(at="assistant.effect_pending", control="running", data=intent))
+        await self._transition(
+            operation,
+            OperationState(at="assistant.effect_pending", control="running", data=intent),
+            [span_write],
+        )
 
     async def _execute_and_settle(self, operation: ActiveOperation) -> OperationResult | None:
         intent = operation.state.data
@@ -559,14 +650,21 @@ class Drive:
             raise RuntimeError("generation attempt is invalid")
         next_attempt = attempt + 1
         if next_attempt > self._lane.retry.max_attempts:
-            return await self._settle_interrupted(operation)
+            # The provider raised, which cannot prove the remote side never saw
+            # the request; the attempt is recorded as failed, the operation as
+            # an unprovable outcome.
+            return await self._settle_interrupted(operation, span_outcome="failed", span_error_class="provider_error")
         next_data = {
             **data,
             "attempt": next_attempt,
             "not_before": time.time_ns() // 1_000_000 + self._lane.retry.delay_ms(next_attempt),
             "last_error": error,
         }
-        await self._transition(operation, OperationState("assistant.retry_wait", "running", next_data))
+        await self._transition(
+            operation,
+            OperationState("assistant.retry_wait", "running", next_data),
+            self._settle_span(data.get("span_id"), "failed", "provider_error"),
+        )
         return None
 
     async def _wait_for_retry(self, operation: ActiveOperation) -> None:
@@ -576,7 +674,22 @@ class Drive:
         delay = max(0, data["not_before"] - (time.time_ns() // 1_000_000))
         if delay:
             await asyncio.sleep(delay / 1_000)
-        await self._transition(operation, OperationState("assistant.effect_pending", "running", data))
+        # The retry is a new attempt with its own span: its call duration must
+        # not include the backoff the turn spent waiting.
+        latest = await self._required_operation()
+        latest_data = latest.state.data
+        if not isinstance(latest_data, dict):
+            raise RuntimeError("retry state is invalid")
+        attempt = latest_data.get("attempt", 1)
+        call_id = latest_data.get("assistant_entry_id")
+        if not isinstance(attempt, int) or not isinstance(call_id, str):
+            raise RuntimeError("retry state is invalid")
+        span, span_write = self._open_span(latest, call_id, "llm", attempt)
+        await self._transition(
+            latest,
+            OperationState("assistant.effect_pending", latest.state.control, {**latest_data, "span_id": span.span_id}),
+            [span_write],
+        )
 
     async def _settle_assistant(self, operation: ActiveOperation, response: AssistantResult) -> OperationResult | None:
         intent = operation.state.data
@@ -624,7 +737,16 @@ class Drive:
                 ]
             writes = [
                 InsertEntry(NewEntry(assistant_entry_id, parent_id, "message", assistant_payload)),
-                InsertUsage(UsageRow(usage_id, response.usage, entry_id=assistant_entry_id)),
+                InsertUsage(
+                    UsageRow(
+                        usage_id,
+                        response.usage,
+                        entry_id=assistant_entry_id,
+                        operation_id=operation.meta.operation_id,
+                        span_id=intent.get("span_id") if isinstance(intent.get("span_id"), str) else None,
+                    )
+                ),
+                *self._settle_span(intent.get("span_id"), "completed"),
                 SetValue(lane_tip(self._lane.name), assistant_entry_id),
             ]
             if calls:
@@ -680,12 +802,22 @@ class Drive:
         if pending is not None:
             tool = self._lane.tools.get(pending["tool_name"])
             if tool is not None and tool.replay_policy == "safe":
-                await self._transition_tool(operation, pending, "planned")
+                # The replay is a new attempt.  Close the lost one as unknown in
+                # the same transaction that authorizes the retry, so a span is
+                # never left pending for an effect that nothing is waiting on.
+                await self._transition_tool(
+                    operation,
+                    pending,
+                    "planned",
+                    extra=self._settle_span(pending.get("span_id"), "unknown", "interrupted"),
+                )
                 return
             await self._settle_tool(
                 operation,
                 pending,
                 {"content": "tool execution interrupted; outcome is unknown", "is_error": True, "terminate": True},
+                outcome="unknown",
+                error_class="interrupted",
             )
             return
         planned = next((call for call in calls if isinstance(call, dict) and call.get("status") == "planned"), None)
@@ -708,7 +840,11 @@ class Drive:
             raise RuntimeError("before_tool must return a tool request object")
         if "arguments" in tool_event:
             planned = {**planned, "arguments": tool_event["arguments"]}
-        await self._transition_tool(operation, planned, "effect_pending")
+        attempt = planned.get("attempt", 0) + 1 if isinstance(planned.get("attempt"), int) else 1
+        span, span_write = self._open_span(operation, planned["tool_call_id"], "tool", attempt)
+        await self._transition_tool(
+            operation, {**planned, "attempt": attempt, "span_id": span.span_id}, "effect_pending", extra=[span_write]
+        )
         latest = await self._required_operation()
         active = next(call for call in latest.state.data["calls"] if call["tool_call_id"] == planned["tool_call_id"])
         if tool_event.get("block"):
@@ -716,6 +852,8 @@ class Drive:
                 latest,
                 active,
                 {"content": "tool call blocked by hook", "is_error": True, "terminate": True},
+                outcome="aborted",
+                error_class="hook_blocked",
             )
             return
         tool = self._lane.tools.get(active["tool_name"])
@@ -724,6 +862,8 @@ class Drive:
                 latest,
                 active,
                 {"content": f"unknown tool: {active['tool_name']}", "is_error": True},
+                outcome="aborted",
+                error_class="unknown_tool",
             )
             return
         try:
@@ -746,7 +886,7 @@ class Drive:
         if not isinstance(result_event, dict):
             raise RuntimeError("after_tool must return a tool result object")
         result = result_event
-        await self._settle_tool(latest, active, result)
+        await self._settle_tool(latest, active, result, *_tool_outcome(result))
         await self._lane.emit(
             "tool_end",
             operation.meta.operation_id,
@@ -775,7 +915,14 @@ class Drive:
             if not isinstance(event, dict):
                 raise RuntimeError("before_tool must return a tool request object")
             prepared.append(({**call, "arguments": event.get("arguments", call["arguments"])}, event))
-        await self._transition_tools(operation, [call for call, _ in prepared], "effect_pending")
+        targets: list[dict] = []
+        span_writes: list[Write] = []
+        for call, _ in prepared:
+            attempt = call.get("attempt", 0) + 1 if isinstance(call.get("attempt"), int) else 1
+            span, span_write = self._open_span(operation, call["tool_call_id"], "tool", attempt)
+            targets.append({**call, "attempt": attempt, "span_id": span.span_id})
+            span_writes.append(span_write)
+        await self._transition_tools(operation, targets, "effect_pending", extra=span_writes)
         latest = await self._required_operation()
         latest_calls = latest.state.data["calls"]  # validated by _transition_tools
         active = [
@@ -783,12 +930,16 @@ class Drive:
             for prepared_call, _ in prepared
         ]
 
-        async def execute(call: dict, event: dict) -> dict:
+        async def execute(call: dict, event: dict) -> tuple[dict, EffectOutcome, ErrorClass | None]:
             if event.get("block"):
-                return {"content": "tool call blocked by hook", "is_error": True, "terminate": True}
+                return (
+                    {"content": "tool call blocked by hook", "is_error": True, "terminate": True},
+                    "aborted",
+                    ("hook_blocked"),
+                )
             tool = self._lane.tools.get(call["tool_name"])
             if tool is None:
-                return {"content": f"unknown tool: {call['tool_name']}", "is_error": True}
+                return {"content": f"unknown tool: {call['tool_name']}", "is_error": True}, "aborted", "unknown_tool"
             try:
                 await self._lane.emit(
                     "tool_start",
@@ -804,11 +955,14 @@ class Drive:
             after = await self._lane.hooks.run("after_tool", result)
             if not isinstance(after, dict):
                 raise RuntimeError("after_tool must return a tool result object")
-            return after
+            outcome, error_class = _tool_outcome(after)
+            return after, outcome, error_class
 
         hook_events = (item[1] for item in prepared)
-        results = await asyncio.gather(*(execute(call, event) for call, event in zip(active, hook_events)))
-        await self._settle_tool_batch(latest, active, list(results))
+        executed = await asyncio.gather(*(execute(call, event) for call, event in zip(active, hook_events)))
+        results = [result for result, _, _ in executed]
+        outcomes = [(outcome, error_class) for _, outcome, error_class in executed]
+        await self._settle_tool_batch(latest, active, results, outcomes)
         for call, result in zip(active, results):
             await self._lane.emit(
                 "tool_end",
@@ -816,10 +970,18 @@ class Drive:
                 {"tool_call_id": call["tool_call_id"], "is_error": result.get("is_error", False)},
             )
 
-    async def _transition_tool(self, operation: ActiveOperation, target: dict, status: str) -> None:
-        await self._transition_tools(operation, [target], status)
+    async def _transition_tool(
+        self, operation: ActiveOperation, target: dict, status: str, extra: Sequence[Write] = ()
+    ) -> None:
+        await self._transition_tools(operation, [target], status, extra)
 
-    async def _transition_tools(self, operation: ActiveOperation, targets: list[dict], status: str) -> None:
+    async def _transition_tools(
+        self,
+        operation: ActiveOperation,
+        targets: list[dict],
+        status: str,
+        extra: Sequence[Write] = (),
+    ) -> None:
         data = operation.state.data
         assert isinstance(data, dict) and isinstance(data.get("calls"), list)
         ids = {target.get("tool_call_id") for target in targets}
@@ -828,9 +990,16 @@ class Drive:
             {**call, **by_id[call.get("tool_call_id")], "status": status} if call.get("tool_call_id") in ids else call
             for call in data["calls"]
         ]
-        await self._transition(operation, OperationState("tools", "running", {"calls": calls}))
+        await self._transition(operation, OperationState("tools", "running", {"calls": calls}), extra)
 
-    async def _settle_tool(self, operation: ActiveOperation, active: dict, result: dict) -> None:
+    async def _settle_tool(
+        self,
+        operation: ActiveOperation,
+        active: dict,
+        result: dict,
+        outcome: EffectOutcome = "completed",
+        error_class: ErrorClass | None = None,
+    ) -> None:
         async def settle(mutator: SessionMutator) -> None:
             current = await mutator.get_value(operation_state(operation.meta.operation_id))
             if current != operation.state:
@@ -849,6 +1018,7 @@ class Drive:
                         "tool_outcome",
                         {"tool_call_id": active["tool_call_id"], "is_error": result.get("is_error", False)},
                     ),
+                    *self._settle_span(active.get("span_id"), outcome, error_class),
                     InsertEntry(
                         NewEntry(
                             active["result_entry_id"],
@@ -867,8 +1037,14 @@ class Drive:
 
         await self._lane._session.mutate(settle)  # noqa: SLF001
 
-    async def _settle_tool_batch(self, operation: ActiveOperation, active: list[dict], results: list[dict]) -> None:
-        if len(active) != len(results):
+    async def _settle_tool_batch(
+        self,
+        operation: ActiveOperation,
+        active: list[dict],
+        results: list[dict],
+        outcomes: list[tuple[EffectOutcome, ErrorClass | None]],
+    ) -> None:
+        if len(active) != len(results) or len(active) != len(outcomes):
             raise RuntimeError("tool batch results do not match durable calls")
 
         async def settle(mutator: SessionMutator) -> None:
@@ -894,8 +1070,9 @@ class Drive:
                     {"tool_call_ids": [call["tool_call_id"] for call in active]},
                 )
             )
-            for call in active:
+            for call, (outcome, error_class) in zip(active, outcomes):
                 result = by_id[call["tool_call_id"]]
+                writes.extend(self._settle_span(call.get("span_id"), outcome, error_class))
                 writes.append(
                     InsertEntry(
                         NewEntry(
@@ -920,7 +1097,12 @@ class Drive:
 
         await self._lane._session.mutate(settle)  # noqa: SLF001
 
-    async def _settle_interrupted(self, operation: ActiveOperation) -> OperationResult:
+    async def _settle_interrupted(
+        self,
+        operation: ActiveOperation,
+        span_outcome: EffectOutcome = "unknown",
+        span_error_class: ErrorClass | None = "interrupted",
+    ) -> OperationResult:
         data = operation.state.data
         checkpoint = data.get("content_checkpoint", "") if isinstance(data, dict) else ""
         if not isinstance(checkpoint, str):
@@ -934,9 +1116,13 @@ class Drive:
                 "error": "generation interrupted before its outcome could be persisted",
             },
             usage={},
-            status="aborted",
+            # The effect was issued and its result is gone: neither success nor
+            # failure can be claimed, and the turn must not look replayable.
+            status="unknown",
             error_code="interrupted",
             error_message="generation outcome is unknown after process interruption",
+            span_outcome=span_outcome,
+            span_error_class=span_error_class,
         )
 
     async def _settle_terminal_at_tip(self, operation: ActiveOperation, status: OperationStatus) -> OperationResult:
@@ -987,6 +1173,8 @@ class Drive:
         status: OperationStatus,
         error_code: str | None = None,
         error_message: str | None = None,
+        span_outcome: EffectOutcome | None = None,
+        span_error_class: ErrorClass | None = None,
     ) -> OperationResult:
         intent = operation.state.data
         if not isinstance(intent, dict):
@@ -1014,15 +1202,29 @@ class Drive:
                 error_code=error_code,
                 error_message=error_message,
             )
+            span_id = intent.get("span_id")
             await mutator.commit(
                 [
                     InsertEntry(NewEntry(assistant_entry_id, parent_id, "message", assistant_payload)),
-                    InsertUsage(UsageRow(usage_id, usage, entry_id=assistant_entry_id)),
+                    InsertUsage(
+                        UsageRow(
+                            usage_id,
+                            usage,
+                            entry_id=assistant_entry_id,
+                            operation_id=operation.meta.operation_id,
+                            span_id=span_id if isinstance(span_id, str) else None,
+                        )
+                    ),
+                    *self._settle_span(
+                        span_id,
+                        span_outcome or _TERMINAL_OUTCOME[status],
+                        span_error_class,
+                    ),
                     SetValue(lane_tip(self._lane.name), assistant_entry_id),
                     *await self._lane.memory_capture_writes(mutator, result, (assistant_entry_id,)),
                     SetValue(
                         operation_state(operation.meta.operation_id),
-                        OperationState("terminal", "running", {"status": status}),
+                        OperationState("terminal", "settled", {"status": status}),
                     ),
                     SetValue(operation_result(operation.meta.operation_id), result),
                     SetValue(
@@ -1061,7 +1263,7 @@ class Drive:
         return [
             SetValue(
                 operation_state(operation.meta.operation_id),
-                OperationState("terminal", "running", {"status": status}),
+                OperationState("terminal", "settled", {"status": status}),
             ),
             SetValue(operation_result(operation.meta.operation_id), result),
             SetValue(

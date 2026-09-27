@@ -1,11 +1,17 @@
+from agent_harness.api.catalog import SessionCatalog, SessionSummary
 from agent_harness.api.errors import (
+    InvalidCursor,
     MemoryNotFound,
     MemoryScopeDenied,
     NothingToCompact,
+    ProjectConfigError,
     PromotionConflict,
+    SessionNotFound,
     UnknownTarget,
 )
 from agent_harness.api.harness import Harness
+from agent_harness.api.pagination import Page, decode_cursor, encode_cursor
+from agent_harness.api.project import ProjectInfo, ProjectRuntimeConfig
 from agent_harness.api.rpc import HarnessRpc
 from agent_harness.api.service import AuthenticatedHarnessService, AuthenticationError, StaticTokenAuthenticator
 from agent_harness.api.tui import TuiController
@@ -16,12 +22,22 @@ __all__ = [
     "AuthenticationError",
     "Harness",
     "HarnessRpc",
+    "InvalidCursor",
     "MemoryNotFound",
     "MemoryScope",
     "MemoryScopeDenied",
     "NothingToCompact",
+    "Page",
+    "ProjectConfigError",
+    "ProjectInfo",
+    "ProjectRuntimeConfig",
     "PromotionConflict",
+    "SessionCatalog",
+    "SessionNotFound",
+    "SessionSummary",
     "StaticTokenAuthenticator",
     "TuiController",
     "UnknownTarget",
+    "decode_cursor",
+    "encode_cursor",
 ]

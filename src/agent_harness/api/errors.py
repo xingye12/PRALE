@@ -52,3 +52,15 @@ class MemoryNotFound(HarnessError):
 
 class UnsupportedPromptMode(HarnessError):
     pass
+
+
+class SessionNotFound(HarnessError):
+    """A session was requested that the catalog does not authorize."""
+
+
+class InvalidCursor(HarnessError):
+    """A pagination cursor was malformed or belonged to another query."""
+
+
+class ProjectConfigError(HarnessError):
+    """The application configuration cannot identify a usable project root."""

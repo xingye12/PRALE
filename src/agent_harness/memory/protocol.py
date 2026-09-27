@@ -2,9 +2,11 @@
 from typing import Protocol
 
 from agent_harness.domain.memory import (
+    ArchiveSummary,
     AtomicCandidate,
     AtomicMemory,
     DoctrineCandidate,
+    MemoryAuditRecord,
     MemoryScope,
     OperatingDoctrine,
     PromotionJob,
@@ -84,6 +86,32 @@ class MemoryStore(Protocol):
     ) -> dict[str, object]: ...
 
     async def rebuild_indexes(self, scope: MemoryScope) -> None: ...
+
+    # Read-only browse paths.  Each takes the decoded sort key it continues
+    # from and returns one more row than asked for, so the caller can tell
+    # whether a further page exists without a second query.
+
+    async def list_l0(
+        self, scope: MemoryScope, after: tuple[int, str] | None, limit: int
+    ) -> tuple[ArchiveSummary, ...]: ...
+
+    async def read_archive(self, archive_id: str) -> SessionTraceArchive | None: ...
+
+    async def list_l1(
+        self, scope: MemoryScope, status: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[AtomicMemory, ...]: ...
+
+    async def list_l2(
+        self, scope: MemoryScope, status: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[WorkSceneMemory, ...]: ...
+
+    async def list_jobs(
+        self, scope: MemoryScope, status: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[PromotionJob, ...]: ...
+
+    async def list_audit(
+        self, scope: MemoryScope, after: tuple[int] | None, limit: int
+    ) -> tuple[MemoryAuditRecord, ...]: ...
 
 
 class MemoryExtractor(Protocol):

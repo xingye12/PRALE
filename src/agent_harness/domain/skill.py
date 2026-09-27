@@ -112,6 +112,39 @@ class SkillArchive:
 
 
 @dataclass(frozen=True, slots=True)
+class SkillArchiveSummary:
+    """A list-view projection of one source archive.
+
+    The archived trace payload is deliberately absent: browsing archives must
+    not deserialize every captured session, and the counts below are what the
+    list shows.  ``get_archive`` remains the way to read one in full.
+    """
+
+    archive_id: str
+    scope: SkillScope
+    session_id: str
+    source_archive_id: str
+    payload_hash: str
+    reason: ArchiveReason
+    trace_format_version: str
+    bytes_count: int
+    successful_tool_calls: int
+    turn_count: int
+    created_at: int
+
+
+@dataclass(frozen=True, slots=True)
+class SkillAuditRecord:
+    """One read-only row of the skill audit log, newest last in storage order."""
+
+    audit_id: int
+    scope: SkillScope
+    created_at: int
+    event: str
+    data: dict[str, object]
+
+
+@dataclass(frozen=True, slots=True)
 class SkillExtractionJob:
     job_id: str
     scope: SkillScope
@@ -169,10 +202,16 @@ class SkillConfig:
 
 
 _FRONTMATTER = re.compile(r"\A---\n(?P<meta>.*?)\n---\n(?P<body>.*)\Z", re.DOTALL)
-_SECRET = re.compile(r"(?i)(?:api[_-]?key|secret|password|token)\s*[:=]\s*[^\s,;]+|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk|ghp)_[A-Za-z0-9_-]{16,}\b")
-_INJECTION = re.compile(r"(?i)(ignore (?:all |previous )?instructions|system prompt|you are chatgpt|<\s*/?available_skills)")
+_SECRET = re.compile(
+    r"(?i)(?:api[_-]?key|secret|password|token)\s*[:=]\s*[^\s,;]+|-----BEGIN [A-Z ]*PRIVATE KEY-----|\b(?:sk|ghp)_[A-Za-z0-9_-]{16,}\b"
+)
+_INJECTION = re.compile(
+    r"(?i)(ignore (?:all |previous )?instructions|system prompt|you are chatgpt|<\s*/?available_skills)"
+)
 _PII = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b|(?<!\d)(?:\+?\d[ -]?){9,14}\d(?!\d)", re.I)
-_HIGH_RISK_COMMAND = re.compile(r"(?im)^\s*(?:sudo\s+)?(?:rm\s+-[a-z]*r[a-z]*f|mkfs\b|dd\s+if=|curl\b[^\n|]*\|\s*(?:ba)?sh\b)")
+_HIGH_RISK_COMMAND = re.compile(
+    r"(?im)^\s*(?:sudo\s+)?(?:rm\s+-[a-z]*r[a-z]*f|mkfs\b|dd\s+if=|curl\b[^\n|]*\|\s*(?:ba)?sh\b)"
+)
 
 
 def skill_content_hash(markdown: str, files: tuple[SkillFile, ...]) -> str:
@@ -221,7 +260,11 @@ def validate_skill_proposal(proposal: SkillProposal, *, config: SkillConfig) -> 
     for file in proposal.files:
         if not file.path or file.path.startswith("/") or ".." in file.path.split("/"):
             raise ValueError("invalid resource path")
-        if file.path in paths or len(file.content) > config.max_file_bytes or file.mime_type not in config.allowed_mime_types:
+        if (
+            file.path in paths
+            or len(file.content) > config.max_file_bytes
+            or file.mime_type not in config.allowed_mime_types
+        ):
             raise ValueError("invalid skill resource")
         paths.add(file.path)
     triggers = tuple(item.strip() for item in fields["triggers"].split(",") if item.strip())

@@ -15,12 +15,14 @@ from agent_harness.domain.types import OperationKind
 from agent_harness.domain.values import (
     ListAddress,
     lane_inbox,
+    lane_operations,
     lane_state,
     lane_tip,
     operation_lease,
     operation_meta,
     operation_result,
     operation_state,
+    session_lanes,
 )
 from agent_harness.runtime.events import EventBus, EventListener, HarnessEvent
 from agent_harness.runtime.hooks import HookRegistry
@@ -99,14 +101,19 @@ class Lane:
         """Durably create the lane's idle projection if this is its first attachment."""
 
         async def create_if_absent(mutator: SessionMutator) -> None:
-            if await mutator.get_value(lane_state(self.name)) is not None:
-                return
-            await mutator.commit(
-                [
-                    SetValue(lane_tip(self.name), at),
-                    SetValue(lane_state(self.name), {"current_operation_id": None, "last_operation_id": None}),
-                ]
-            )
+            writes: list[Write] = []
+            if await mutator.get_value(lane_state(self.name)) is None:
+                writes.extend(
+                    [
+                        SetValue(lane_tip(self.name), at),
+                        SetValue(lane_state(self.name), {"current_operation_id": None, "last_operation_id": None}),
+                    ]
+                )
+            # Also index lanes that predate the index, so a reader can enumerate them.
+            if self.name not in await mutator.read_list(session_lanes()):
+                writes.append(AppendList(session_lanes(), self.name))
+            if writes:
+                await mutator.commit(writes)
 
         await self._session.mutate(create_if_absent)
 
@@ -228,6 +235,11 @@ class Lane:
 
     def new_id(self) -> str:
         return self._id_factory()
+
+    def now_ms(self) -> int:
+        """The lane clock, so effects and operations share one timeline."""
+
+        return self._now_ms()
 
     async def memory_capture_writes(
         self,
@@ -408,31 +420,38 @@ class Lane:
             operation_request = request | ({"prompt_entry_id": prompt_entry_id} if prompt_entry_id is not None else {})
             meta = OperationMeta(operation_id, self.name, tip, started_at, kind, operation_request)
             durable_state = OperationState(at="starting", control="running", data={})
-            writes = [
-                SetValue(operation_meta(operation_id), meta),
-                SetValue(operation_state(operation_id), durable_state),
-                SetValue(
-                    lane_state(self.name),
-                    {"current_operation_id": operation_id, "last_operation_id": state.get("last_operation_id")},
-                ),
-            ]
+            writes: list[Write] = []
             if prompt_entry_id is not None:
-                writes.insert(
-                    0,
+                writes.append(
                     InsertEntry(
                         NewEntry(prompt_entry_id, tip, "message", {"role": "user", "content": request["prompt"]})
-                    ),
+                    )
                 )
-                writes.insert(1, SetValue(lane_tip(self.name), prompt_entry_id))
+                writes.append(SetValue(lane_tip(self.name), prompt_entry_id))
                 parent_id = prompt_entry_id
                 for message in request.get("before_run_messages", []):
                     entry_id = self._id_factory()
-                    writes.insert(
-                        -3,
-                        InsertEntry(NewEntry(entry_id, parent_id, "message", {"role": "user", "content": message})),
+                    writes.append(
+                        InsertEntry(NewEntry(entry_id, parent_id, "message", {"role": "user", "content": message}))
                     )
-                    writes.insert(-3, SetValue(lane_tip(self.name), entry_id))
+                    writes.append(SetValue(lane_tip(self.name), entry_id))
                     parent_id = entry_id
+            writes.extend(
+                [
+                    SetValue(operation_meta(operation_id), meta),
+                    SetValue(operation_state(operation_id), durable_state),
+                    SetValue(
+                        lane_state(self.name),
+                        {"current_operation_id": operation_id, "last_operation_id": state.get("last_operation_id")},
+                    ),
+                    # The turn index is written with the admission, in the same
+                    # transaction: a reader must never miss an admitted operation.
+                    AppendList(
+                        lane_operations(self.name),
+                        {"operation_id": operation_id, "kind": kind, "started_at": started_at},
+                    ),
+                ]
+            )
             await mutator.commit(writes)
             return OperationAdmission(operation_id=operation_id, kind=kind, started_at=started_at)
 

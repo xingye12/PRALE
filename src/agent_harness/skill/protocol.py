@@ -3,7 +3,9 @@ from typing import Protocol
 
 from agent_harness.domain.skill import (
     SkillArchive,
+    SkillArchiveSummary,
     SkillAsset,
+    SkillAuditRecord,
     SkillExtractionJob,
     SkillListing,
     SkillLoadout,
@@ -35,6 +37,31 @@ class SkillStore(Protocol):
     async def create(self, scope: SkillScope, proposal: SkillProposal, now: int) -> SkillAsset: ...
     async def update(self, scope: SkillScope, proposal: SkillProposal, now: int) -> SkillAsset: ...
     async def audit(self, scope: SkillScope, event: str, data: dict[str, object]) -> None: ...
+
+    # Read-only browse paths, each taking the decoded sort key it continues
+    # from and returning one row more than asked for.
+
+    async def get_skill(self, scope: SkillScope, skill_id: str) -> SkillAsset | None: ...
+
+    async def list_skills(
+        self, scope: SkillScope, state: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[SkillAsset, ...]: ...
+
+    async def list_versions(
+        self, scope: SkillScope, skill_id: str, after: tuple[int] | None, limit: int
+    ) -> tuple[SkillVersion, ...]: ...
+
+    async def list_archives(
+        self, scope: SkillScope, after: tuple[int, str] | None, limit: int
+    ) -> tuple[SkillArchiveSummary, ...]: ...
+
+    async def list_jobs(
+        self, scope: SkillScope, status: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[SkillExtractionJob, ...]: ...
+
+    async def list_audit(
+        self, scope: SkillScope, after: tuple[int] | None, limit: int
+    ) -> tuple[SkillAuditRecord, ...]: ...
 
 
 class SkillReviewer(Protocol):

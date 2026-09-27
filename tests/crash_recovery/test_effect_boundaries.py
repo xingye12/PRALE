@@ -67,7 +67,7 @@ def test_provider_effect_after_intent_before_settlement_recovers_as_unknown_with
         # Re-attaching has no access to the original Drive/provider task.
         recovered = await (await Harness.open("session-1", storage)).acquire_lane("main")
         result = await recovered.recover()
-        assert result is not None and result.status == "aborted"
+        assert result is not None and result.status == "unknown"
         assert provider.calls == 1
         assert (await storage.scan_branch(result.tip_id))[-1].payload["stop_reason"] == "aborted"
 

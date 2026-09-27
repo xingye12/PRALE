@@ -52,6 +52,7 @@ Harness
        ├─ entry tree（只追加）
        ├─ values/lists（可替换运行状态与短期 checkpoint）
        ├─ usage ledger（只追加）
+       ├─ effect ledger（只追加，每次 LLM/工具 attempt 一行）
        └─ Lane × N（每条 lane 至多一个 operation）
 ```
 
@@ -62,37 +63,69 @@ Harness
 | Branch | entry tree 中可移动的逻辑路径 | 保存 tip；历史不重写 |
 | Lane | 绑定 branch tip 的串行执行通道 | 每条 lane 仅一个活动 operation |
 | Operation | `run`、`compaction`、`navigation` 工作单元 | metadata 不变；state 整体替换；terminal result 独立保存 |
+| EffectSpan | 一次 LLM/工具 effect attempt 的可查询记录 | 只追加；与 intent 同事务开始、与 outcome 同事务结算；每次 attempt 独立一行 |
+| 派生索引 | 让读者枚举权威记录的只追加 list（`lane/{lane}/operations`、`session/lanes`） | 与所索引的权威写入同事务；只用于定位，缺失或对不上时必须显式报告不完整 |
 | Drive | operation 的进程内执行器 | 不持久化；重启后由 operation state 重建 |
 
-所有持久内容必须归类为 entries、values/lists 或 usage ledger。单次提交分配单调递增的 `sequence`，且 entry 插入、usage 插入、tip 更新、operation state 更新和队列更新必须原子可见。禁止把这些逻辑拆成多个独立事务。
+所有持久内容必须归类为 entries、values/lists、usage ledger 或 effect ledger。单次提交分配单调递增的 `sequence`，且 entry 插入、usage 插入、effect span 插入/结算、tip 更新、operation state 更新和队列更新必须原子可见。禁止把这些逻辑拆成多个独立事务。
 
-初始 SQLite schema 至少包含：`sessions`、`entries`、`values`、`list_elements`、`usage_rows` 和 `schema_migrations`。为 `(session_id, seq)`、`(session_id, parent_id)`、value 地址和 list 地址建立查询索引。迁移只前进不回滚；每次迁移必须可在空库和已有库上重复安全执行。
+**派生索引**（values/lists 的一种用途）用于回答"有哪些"，不回答"是什么"：`lane/{lane}/operations` 按接纳顺序记录该 lane 接纳过的 `operation_id`/`kind`/`started_at`，`session/lanes` 记录该 session 出现过的 lane 名。二者分别写在唯一的接纳点（`Lane._admit`）与唯一的 lane 创建点（`Lane.attach`）的同一 mutation 事务中，重新挂载时允许回填补写早于索引存在的 lane。索引不是权威：operation metadata/state/result 与 entry 才是；读者据索引定位后必须校验边界，取不到边界时显式报错，而不是退化成可能错位的列表。查询侧不依赖 `trace_writes_with_ids`——它只在开启 `trace_recorder` 时写入，不能当作 turn 索引。
+
+**effect ledger（`effect_spans`）** 保存 `span_id`、`operation_id`、`call_id`、`kind`（`llm`/`tool`）、`lane`、`attempt`、`started_at`，以及结算时的 `outcome`、`error_class`、`ended_at`。`call_id` 是 effect 的 durable 关联键：工具用 `tool_call_id`（其名称、参数与源顺序已由 assistant entry 的 `tool_calls` 和 branch `seq` 提供，不在此重复），生成用 intent 预留的 assistant entry ID（因此同一次调用跨 retry 保持同一 `call_id`，`attempt` 区分各次尝试）。`UNIQUE(operation_id, call_id, attempt)` 保证一次尝试只有一行，`CHECK ((outcome = 'pending') = (ended_at IS NULL))` 保证"未结算"只能编码为 `pending`。span 只结算一次：结算已结算或不存在的 span 必须使该事务失败。
+
+usage ledger 的每条新记录携带 `operation_id` 与 `span_id`；早期只绑定 entry 的行保留 `operation_id IS NULL`，可由 `legacy_unattributed` 识别为不可归属，而不是被猜测到某个 turn。
+
+初始 SQLite schema 至少包含：`sessions`、`entries`、`values`、`list_elements`、`usage_rows`、`effect_spans` 和 `schema_migrations`。为 `(session_id, seq)`、`(session_id, parent_id)`、value 地址、list 地址、`(operation_id, started_at)` 和 usage 归属建立查询索引。迁移只前进不回滚；每次迁移必须可在空库和已有库上重复安全执行（v3 新增 `effect_spans`，v4 为 `usage_rows` 增加 `operation_id`/`span_id`；旧 Session 没有 span 是正常状态，表示该历史无法回答 call 级指标）。
 
 ## 5. Operation 状态机与副作用协议
 
 每个 operation 必须保存 immutable metadata、完整当前 state 和 terminal result。state 是恢复点，必须整体替换；不得通过扫描日志或事件推断下一步。
 
 ```text
-starting → checkpoint → assistant_ready → assistant_effect_pending → tools
-                 ↑             │                    │                  │
-                 └─────────────┴──── retry_wait ─────┴── terminal ──────┘
+run:
+  starting                 → checkpoint
+  checkpoint               → assistant.ready
+  assistant.ready          → assistant.effect_pending            （同时写入 intent 与该 attempt 的 span）
+  assistant.effect_pending → tools                                （响应含工具调用）
+  assistant.effect_pending → checkpoint                           （无工具调用，继续循环：inbox / follow-up）
+  assistant.effect_pending → terminal                             （无后续工作）
+  assistant.effect_pending → assistant.retry_wait                 （provider 失败且仍有重试预算）
+  assistant.retry_wait     → assistant.effect_pending             （退避结束：新 attempt、新 span）
+  tools                    → tools                                （逐一结算 calls，保持源顺序）
+  tools                    → checkpoint                           （calls 全部完成且无 terminate）
+  tools                    → terminal                             （某个调用 terminate，重放需换 lane）
+  任意状态（control = cancel_requested）→ terminal                （loop 顶部检查后立即收束）
+  重试预算耗尽 → terminal
 
-summary_deciding → summary_ready → summary_effect_pending → retry_wait / terminal
-navigation_ready → terminal
-deferred_suspended → deferred_effect_pending / terminal
+compaction:  starting → summary.effect_pending → terminal
+             （hook 拒绝压缩或直接给出摘要时从 starting 直达 terminal，不产生 provider effect）
+navigation:  starting → terminal
 ```
+
+`run` 在 `tools` 与 `checkpoint` 之间循环：每次生成后要么执行工具再回到 `checkpoint`，要么以 `terminal` 收束。streaming 期间每次内容 checkpoint 原地替换 `assistant.effect_pending` 的 state（不改变状态名）。`terminal` 只写一次，并以 `control="settled"` 标记该 operation 已收束。
 
 任何 LLM 或工具副作用固定使用四阶段协议：
 
 ```text
-准备不可变输入 → 持久化 effect intent → 调用外部系统 → 原子持久化 outcome 与下一状态
+准备不可变输入 → 持久化 effect intent（+ span-start）→ 调用外部系统 → 原子持久化 outcome 与下一状态（+ span-end）
 ```
 
 - LLM intent 至少保存 model identity、投影后的请求上下文、stream options、预留 assistant entry ID、usage ID、尝试次数和重试时间；
 - 工具 intent 至少保存已验证参数、`tool_call_id`、源顺序和 replay policy；
-- `safe` 工具可在恢复后重试；`never` 工具恢复时必须写入“执行中断、结果未知”的 tool result，不能盲目重放；
-- provider stream 在 effect-pending 崩溃后不能尝试续接同一 HTTP 连接，应按已 checkpoint 内容收束为明确 interrupted/aborted assistant 结果；
+- effect intent 与它的 `EffectSpan` 在同一事务写入，settlement 与 `SettleSpan`、usage 归属、entry、operation state 在同一事务写入；两者都不得拆成第二次提交；
+- `safe` 工具可在恢复后重试；重试是新的 attempt，被丢失的前一次 attempt 必须在授权重试的同一事务中结算为 `unknown`/`interrupted`，不允许留下永久 `pending` 的 span；`never` 工具恢复时必须写入“执行中断、结果未知”的 tool result，不能盲目重放；
+- provider stream 在 effect-pending 崩溃后不能尝试续接同一 HTTP 连接，应按已 checkpoint 内容收束为明确 interrupted/unknown assistant 结果；
 - 若 provider 或工具支持幂等键，使用 operation ID / tool-call ID；这只能降低重复风险，不能声称 exactly-once。
+
+### 5.1 状态与 outcome 词表
+
+`OperationStatus = completed | declined | aborted | failed | unknown`。`unknown` 表示该 operation 结束时没有可证明的结果（典型情形是 effect 已发出、结果随进程丢失）；它必须与"仍在运行"区分，因此不能把未结算状态留给查询方用"无 result + state 停在 effect_pending"去推断。
+
+`ControlStatus = running | cancel_requested | settled`。终态写入 `settled`，而不是保留 `running`：否则重启后的读者无法区分"还有人在跑"和"已经收束、只是没有 driver"。
+
+`EffectOutcome = pending | completed | failed | aborted | unknown`，`ErrorClass = provider_error | tool_error | hook_blocked | unknown_tool | interrupted`。`pending` 只表示"已发出、未结算"，是崩溃后未恢复的显式编码；被 recovery 收束的 span 记为 `unknown`。
+
+**耗时不得臆造**：`duration_ms` 只在 `completed`/`failed`/`aborted` 且 `ended_at` 存在时给出。`pending` 没有结束；`unknown` 的 `ended_at` 记录的是记录被关闭的时刻（可能远晚于 effect 停止），因此两者都返回空值。调用方也不得用 operation 的 `ended_at - started_at` 代替：它包含 retry backoff 与同 turn 的所有兄弟调用。
 
 ## 6. 公开 API、事件与 Hooks
 
@@ -132,7 +165,7 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 | 6. 结构操作 | compaction、branch summary、navigation、fork | 历史不可变；摘要/导航可恢复且 tip 原子更新 |
 | 7. SQLite 与恢复 | schema、migration、SQLite backend、crash injection suite | 在每个事务边界中断后可恢复到定义状态 |
 | 8. 观察与扩展 | hooks、watch、telemetry、文档与示例 | handler/listener 失败隔离；hook 结果遵守持久化边界 |
-| 9. 服务层（后置） | HTTP/RPC、认证、远程订阅、TUI 适配 | 仅复用库 API；不得把传输状态混入 domain/runtime。Web UI 的 catalog、durable trace 查询、指标与适配实施见 [Web UI 实施计划](web-ui-implementation-plan.md) |
+| 9. 服务层（后置） | HTTP/RPC、认证、远程订阅、TUI 适配 | 仅复用库 API；不得把传输状态混入 domain/runtime。Web UI 的 catalog、durable trace 查询、指标与适配实施见 [Web UI 实施计划](web-ui-implementation-plan.md)；该计划已交付 REST/SSE 适配、SPA 与部署入口（`api/serve.py` 的 `prale-web`，配置与运维契约见其 §4.3），本文件不重复其 schema |
 | 10. 长期资产（可选） | 持久化调度器与 runtime 生命周期、Session→L0 trace archive、L1--L3、Skill buffer/review、资产检索、保留/GC 与 SQLite | 跨 Session 资产经 scope 隔离；后台失败不阻塞 Drive；冻结 source snapshot、召回/Skill 版本进入 effect intent；进程重启后延迟任务不丢失且只执行一次 |
 
 每阶段顺序固定为：先写规格化/崩溃测试，再实现 memory backend 或 runtime，再接入 SQLite 或外部适配器。阶段完成前不得提前把服务框架或 UI 作为运行时依赖。
@@ -143,11 +176,13 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 
 必须持续验证：
 
-- entry 和 usage 只追加，entry 父引用存在，sequence 严格递增；
+- entry、usage 和 effect span 只追加，entry 父引用存在，sequence 严格递增；
 - 一个 Session 任一时刻只有一个写 mutation line；
 - 每条 lane 任一时刻只有一个活动 operation，同一 operation 不得创建多个 Drive；
 - terminal result 只提交一次，结果可在重启后查询；
-- assistant/tool outcome、branch tip、usage、operation state 同一事务提交；
+- assistant/tool outcome、branch tip、usage、effect span 结算与 operation state 同一事务提交；
+- operation 终结后该 operation 的每个 span 都已结算：只有正在执行（或崩溃后尚无人接管）的 effect 才可以是 `pending`；
+- 恢复写入的 span 不得携带可证明的耗时或 token；没有记录即显示未知，而不是回填 0；
 - 并行工具的完成事件可乱序，但 tool-result entries 必须保持 assistant tool-call 的源顺序；
 - 调用方取消等待不等于 operation 取消；operation 取消必须先关闭 effect gate，再持久化取消，再终止本地任务；
 - snapshot/event 非权威，重新挂载 lane 必须只依赖 durable state；
@@ -263,9 +298,11 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 
 **背景：** 阶段 9 的既有 RPC 与远程订阅可以驱动实时界面，但 event 是 best-effort 投影，不能在断线或重启后重建完整轨迹。现有 usage ledger 也没有稳定的 operation/call 查询关系，无法可靠回答逐 turn token 和 LLM/工具耗时。
 
-**决策：** Web UI 位于核心外的应用适配层，以受权 session catalog 定位一库一 Session；新增只读 trace/memory facade 而不将 SQL 或 storage 私有对象暴露给 HTTP。每个 LLM/tool effect attempt 追加 durable span，其开始与 intent 对齐，结束与 outcome、operation state、usage 一起原子结算。L1--L3 观察按认证主体映射的 `MemoryScope` 查询。完整接口、迁移和验收见 [Web UI 实施计划](web-ui-implementation-plan.md)。
+**决策：** Web UI 位于核心外的应用适配层，以受权 session catalog 定位一库一 Session；新增只读 trace/memory facade 而不将 SQL 或 storage 私有对象暴露给 HTTP。每个 LLM/tool effect attempt 追加 durable span（`domain/effects.py` 的 `EffectSpan` 与 `UsageRecord`），其开始与 intent 对齐，结束与 outcome、operation state、usage 一起原子结算。L1--L3 观察按配置的 `MemoryScope` 查询。不同 outcome 与耗时的编码规则见 §5.1；完整接口、迁移和验收见 [Web UI 实施计划](web-ui-implementation-plan.md)。
 
-**后果：** UI 能在刷新、重启和崩溃恢复后显示可审计的历史；未记录 span 的旧 Session 显式显示未知数据。系统新增 catalog、查询 DTO 和 append-only 观测数据，但保持 Web 框架、连接状态和项目路径配置不进入 domain/runtime。
+**后果：** UI 能在刷新、重启和崩溃恢复后显示可审计的历史；未记录 span 的旧 Session 显式显示未知数据，`legacy_unattributed` 标记的行不会被归属到任何 turn。系统新增 catalog、查询 DTO 和 append-only 观测数据，但保持 Web 框架、连接状态和项目路径配置不进入 domain/runtime。
+
+该适配层已由 `api/web.py` 交付（可选 extra `web`，仅此模块导入 Web 框架），并在应用层强制执行 ADR-008 的运维约束：本进程仍有该 lane 的 drive 时拒绝 `recover`；浏览器断开只结束订阅，绝不调用 `request_abort`。
 
 ### ADR-018：L0--L2 按 repository 隔离，L3 为本地全局 doctrine
 

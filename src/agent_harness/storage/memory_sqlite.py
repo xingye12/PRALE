@@ -15,10 +15,12 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from agent_harness.domain.memory import (
+    ArchiveSummary,
     AtomicCandidate,
     AtomicMemory,
     DoctrineCandidate,
     GLOBAL_L3_SCOPE,
+    MemoryAuditRecord,
     MemoryScope,
     PromotionJob,
     PromotionConflict,
@@ -304,6 +306,42 @@ class SQLiteMemoryStore:
         ).fetchone()
         return await self._read_archive(str(row[0])) if row else None
 
+    async def list_l0(
+        self, scope: MemoryScope, after: tuple[int, str] | None, limit: int
+    ) -> tuple[ArchiveSummary, ...]:
+        """Archives of this repository, newest first, without their items."""
+        sql = """SELECT a.*, (SELECT COUNT(*) FROM trace_items i WHERE i.archive_id=a.archive_id) AS item_count
+            FROM trace_archives a WHERE a.team_id=? AND a.agent_id=? AND a.user_id=?"""
+        params: list[object] = list(_scope(scope))
+        if after is not None:
+            sql += " AND (a.created_at<? OR (a.created_at=? AND a.archive_id<?))"
+            params += [after[0], after[0], after[1]]
+        sql += " ORDER BY a.created_at DESC, a.archive_id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(
+            ArchiveSummary(
+                row["archive_id"],
+                MemoryScope(row["team_id"], row["agent_id"], row["user_id"] or None),
+                row["session_id"],
+                row["lane"],
+                row["operation_id"],
+                row["operation_kind"],
+                row["tip_id"],
+                row["trace_format_version"],
+                row["created_at"],
+                row["item_count"],
+                row["parent_archive_id"],
+            )
+            for row in self._conn.execute(sql, params).fetchall()
+        )
+
+    async def read_archive(self, archive_id: str) -> SessionTraceArchive | None:
+        """One archive with its captured items, or ``None`` if it is unknown."""
+        try:
+            return await self._read_archive(archive_id)
+        except KeyError:
+            return None
+
     async def _refresh_embeddings(self, scope: MemoryScope) -> None:
         """Refresh only the derived side index; failures intentionally leave it stale."""
         provider = self._embeddings
@@ -544,33 +582,58 @@ class SQLiteMemoryStore:
             "SELECT * FROM atomic_memories WHERE team_id=? AND agent_id=? AND user_id=? AND status='active' AND CAST(json_extract(metadata,'$.input_high_watermark') AS INTEGER)>? ORDER BY updated_at",
             (*_scope(scope), watermark),
         ).fetchall()
-        return tuple(
-            AtomicMemory(
-                row["memory_id"],
-                scope,
-                row["version"],
-                row["status"],
-                row["type"],
-                row["content"],
-                row["background"],
-                row["scene_key"],
-                row["priority"],
-                row["confidence"],
-                json.loads(row["metadata"]),
-                tuple(
-                    item[0]
-                    for item in self._conn.execute(
-                        "SELECT source_record_id FROM atomic_memory_sources WHERE memory_id=?", (row["memory_id"],)
-                    )
-                ),
-                row["source_hash"],
-                tuple(json.loads(row["supersedes_ids"])),
-                row["created_at"],
-                row["updated_at"],
-                row["last_confirmed_at"],
-                row["content_hash"],
-            )
-            for row in rows
+        return tuple(self._atomic_memory(scope, row) for row in rows)
+
+    async def list_l1(
+        self,
+        scope: MemoryScope,
+        status: str | None,
+        after: tuple[int, str] | None,
+        limit: int,
+    ) -> tuple[AtomicMemory, ...]:
+        """Atomic memories for the browse view, newest first.
+
+        This is deliberately not a promotion read: it keeps every status, so a
+        memory the pipeline superseded or rejected stays visible instead of
+        disappearing from the UI along with the decision that removed it.
+        """
+        sql = "SELECT * FROM atomic_memories WHERE team_id=? AND agent_id=? AND user_id=?"
+        params: list[object] = list(_scope(scope))
+        if status is not None:
+            sql += " AND status=?"
+            params.append(status)
+        if after is not None:
+            sql += " AND (updated_at<? OR (updated_at=? AND memory_id<?))"
+            params += [after[0], after[0], after[1]]
+        sql += " ORDER BY updated_at DESC, memory_id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(self._atomic_memory(scope, row) for row in self._conn.execute(sql, params).fetchall())
+
+    def _atomic_memory(self, scope: MemoryScope, row: sqlite3.Row) -> AtomicMemory:
+        return AtomicMemory(
+            row["memory_id"],
+            scope,
+            row["version"],
+            row["status"],
+            row["type"],
+            row["content"],
+            row["background"],
+            row["scene_key"],
+            row["priority"],
+            row["confidence"],
+            json.loads(row["metadata"]),
+            tuple(
+                item[0]
+                for item in self._conn.execute(
+                    "SELECT source_record_id FROM atomic_memory_sources WHERE memory_id=?", (row["memory_id"],)
+                )
+            ),
+            row["source_hash"],
+            tuple(json.loads(row["supersedes_ids"])),
+            row["created_at"],
+            row["updated_at"],
+            row["last_confirmed_at"],
+            row["content_hash"],
         )
 
     async def apply_candidates(
@@ -809,31 +872,50 @@ class SQLiteMemoryStore:
         digest = content_hash("".join(f"{item.id}:{item.version}:{item.content}" for item in items))
         return RecallBundle(tuple(items), digest, total)
 
-    async def read_l2(self, scope: MemoryScope):
+    async def read_l2(self, scope: MemoryScope) -> tuple[WorkSceneMemory, ...]:
+        """Current scenes by heat, which is the order recall reads them in."""
         rows = self._conn.execute(
             "SELECT * FROM work_scene_memories WHERE team_id=? AND agent_id=? AND user_id=? AND status='current' ORDER BY heat DESC",
             _scope(scope),
         ).fetchall()
-        from agent_harness.domain.memory import WorkSceneMemory
+        return tuple(self._scene(scope, row) for row in rows)
 
-        return tuple(
-            WorkSceneMemory(
-                row["scene_id"],
-                scope,
-                row["scenario_key"],
-                row["version"],
-                row["status"],
-                row["content"],
-                row["summary"],
-                row["heat"],
-                tuple(json.loads(row["l1_ids"])),
-                row["l1_high_watermark"],
-                row["created_at"],
-                row["updated_at"],
-                row["content_hash"],
-                bool(row["persona_update_request"]),
-            )
-            for row in rows
+    async def list_l2(
+        self, scope: MemoryScope, status: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[WorkSceneMemory, ...]:
+        """Scene memories for the browse view, newest first.
+
+        ``read_l2`` answers "what is current right now" for recall; browsing
+        also has to reach a scene the pipeline has since marked dormant.
+        """
+        sql = "SELECT * FROM work_scene_memories WHERE team_id=? AND agent_id=? AND user_id=?"
+        params: list[object] = list(_scope(scope))
+        if status is not None:
+            sql += " AND status=?"
+            params.append(status)
+        if after is not None:
+            sql += " AND (updated_at<? OR (updated_at=? AND scene_id<?))"
+            params += [after[0], after[0], after[1]]
+        sql += " ORDER BY updated_at DESC, scene_id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(self._scene(scope, row) for row in self._conn.execute(sql, params).fetchall())
+
+    def _scene(self, scope: MemoryScope, row: sqlite3.Row) -> WorkSceneMemory:
+        return WorkSceneMemory(
+            row["scene_id"],
+            scope,
+            row["scenario_key"],
+            row["version"],
+            row["status"],
+            row["content"],
+            row["summary"],
+            row["heat"],
+            tuple(json.loads(row["l1_ids"])),
+            row["l1_high_watermark"],
+            row["created_at"],
+            row["updated_at"],
+            row["content_hash"],
+            bool(row["persona_update_request"]),
         )
 
     async def read_all_l2(self):
@@ -842,23 +924,7 @@ class SQLiteMemoryStore:
             "SELECT * FROM work_scene_memories WHERE status='current' ORDER BY updated_at DESC"
         ).fetchall()
         return tuple(
-            WorkSceneMemory(
-                row["scene_id"],
-                MemoryScope(row["team_id"], row["agent_id"], row["user_id"] or None),
-                row["scenario_key"],
-                row["version"],
-                row["status"],
-                row["content"],
-                row["summary"],
-                row["heat"],
-                tuple(json.loads(row["l1_ids"])),
-                row["l1_high_watermark"],
-                row["created_at"],
-                row["updated_at"],
-                row["content_hash"],
-                bool(row["persona_update_request"]),
-            )
-            for row in rows
+            self._scene(MemoryScope(row["team_id"], row["agent_id"], row["user_id"] or None), row) for row in rows
         )
 
     async def read_l3(self, scope: MemoryScope):
@@ -1213,6 +1279,42 @@ class SQLiteMemoryStore:
             row["prompt_version"],
             row["prompt_mode"],
             row["input_hash"],
+        )
+
+    async def list_jobs(
+        self, scope: MemoryScope, status: str | None, after: tuple[int, str] | None, limit: int
+    ) -> tuple[PromotionJob, ...]:
+        """Promotion jobs of this repository, newest first.
+
+        ``claim_job`` is a worker taking work; this is the pipeline's status
+        board, so it reports every job in every state rather than the due ones.
+        """
+        sql = "SELECT * FROM memory_jobs WHERE team_id=? AND agent_id=? AND user_id=?"
+        params: list[object] = list(_scope(scope))
+        if status is not None:
+            sql += " AND status=?"
+            params.append(status)
+        if after is not None:
+            sql += " AND (created_at<? OR (created_at=? AND job_id<?))"
+            params += [after[0], after[0], after[1]]
+        sql += " ORDER BY created_at DESC, job_id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(self._job(row) for row in self._conn.execute(sql, params).fetchall())
+
+    async def list_audit(
+        self, scope: MemoryScope, after: tuple[int] | None, limit: int
+    ) -> tuple[MemoryAuditRecord, ...]:
+        """Audit rows of this repository, newest first, keyed by insertion order."""
+        sql = "SELECT * FROM memory_audit WHERE team_id=? AND agent_id=? AND user_id=?"
+        params: list[object] = list(_scope(scope))
+        if after is not None:
+            sql += " AND id<?"
+            params.append(after[0])
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(limit)
+        return tuple(
+            MemoryAuditRecord(row["id"], scope, row["created_at"], row["event"], json.loads(row["data"]))
+            for row in self._conn.execute(sql, params).fetchall()
         )
 
     def close(self) -> None:

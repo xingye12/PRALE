@@ -14,7 +14,7 @@ harness = await Harness.open("session-1", storage)
 lane = await harness.acquire_lane("main")
 
 await lane.prompt("解释这个项目", operation_id="op-1")
-provider = DeepSeekProvider(api_key="…", model="deepseek-chat")
+provider = DeepSeekProvider(api_key="…", model="deepseek-flash")
 result = await lane.drive(provider)
 ```
 

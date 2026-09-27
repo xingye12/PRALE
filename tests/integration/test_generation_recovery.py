@@ -155,7 +155,7 @@ def test_generation_intent_is_settled_atomically_with_message_usage_tip_and_resu
     asyncio.run(scenario())
 
 
-def test_recovery_marks_an_unknown_provider_outcome_as_aborted_without_replaying_it() -> None:
+def test_recovery_marks_an_unknown_provider_outcome_as_unknown_without_replaying_it() -> None:
     async def scenario() -> None:
         storage = MemoryStorage()
         provider = BlockingProvider()
@@ -176,7 +176,7 @@ def test_recovery_marks_an_unknown_provider_outcome_as_aborted_without_replaying
         result = await recovered_lane.recover()
 
         assert result is not None
-        assert result.status == "aborted"
+        assert result.status == "unknown"
         entries = await storage.scan_branch(result.tip_id)
         assert entries[-1].payload["stop_reason"] == "aborted"
         assert not provider.release.is_set()
@@ -200,7 +200,7 @@ def test_streamed_content_is_checkpointed_and_preserved_when_the_effect_is_inter
             await task
 
         result = await (await (await Harness.open("session-1", storage)).acquire_lane("main")).recover()
-        assert result is not None and result.status == "aborted"
+        assert result is not None and result.status == "unknown"
         assert (await storage.scan_branch(result.tip_id))[-1].payload["content"] == "partial"
 
     asyncio.run(scenario())
@@ -214,7 +214,7 @@ def test_provider_failure_is_settled_as_unknown_instead_of_being_left_replayable
 
         result = await lane.drive(FailingProvider())
 
-        assert result.status == "aborted"
+        assert result.status == "unknown"
         assert (await lane.snapshot()).operation_id is None
         assert (await lane.recover()) is None
 
@@ -326,7 +326,7 @@ def test_abort_during_provider_effect_cancels_local_drive_and_settles_interrupte
         assert (await lane.request_abort()).newly_requested
         result = await drive
 
-        assert result.status == "aborted"
+        assert result.status == "unknown"
         assert result.error_code == "interrupted"
 
     asyncio.run(scenario())

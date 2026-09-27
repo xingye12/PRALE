@@ -4,7 +4,9 @@ from typing import Literal
 from agent_harness.domain.entries import JsonValue
 from agent_harness.domain.types import OperationKind
 
-ControlStatus = Literal["running", "cancel_requested"]
+ControlStatus = Literal["running", "cancel_requested", "settled"]
+"""``settled`` is written by the terminal state itself: an operation that ended
+must not keep claiming that a Drive is still running."""
 
 
 @dataclass(frozen=True, slots=True)
