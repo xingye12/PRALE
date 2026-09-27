@@ -108,13 +108,15 @@ archive 是**投递单位**，`TraceItem` 是**消费单位**：`MemoryStore` �
 
 仅在一个 operation 已 terminal、且 assistant/tool outcome 均已 durable 后 capture。这样一个 archive 天然包括 `base_tip_id` 之后的 user/assistant/tool entries；它不应只捕获单轮 prompt。导航和 compaction 是普通 operation：它们各自产生 archive，但 extractor 应通过 `operation_kind`、terminal status 和 content hash 去重，避免把同一历史反复当作新事实；`branch_summary` 一类结构性 entry 在抽取时**建议**折叠为背景而非新事实来源。
 
-现有 Session 已能形成完整的**已结算对话轨迹**，但还不能形成完整的**执行轨迹**：`OperationState` 是替换式 checkpoint，terminal 后 generation intent、重试次数、stream frame 和已完成的工具 intent 不再可通过公开 Storage 协议枚举。若 L0/Skill 需要审计“模型实际看到了什么、尝试过几次、哪个工具失败”，**必须**增加可选 `TraceRecorder`。每次 durable intent、retry、tool effect intent、tool outcome 和 terminal settlement 都在同一个 Session mutation 中：
+现有 Session 已能形成完整的**已结算对话轨迹**，但还不能形成完整的**执行轨迹**：`OperationState` 是替换式 checkpoint，terminal 后 generation intent、重试次数、stream frame 和已完成的工具 intent 不再可通过公开 Storage 协议枚举。若 L0/Skill 需要审计“模型实际看到了什么、尝试过几次、哪个工具失败”，**必须**增加可选 `TraceRecorder`。每次 durable generation/tool intent、retry、tool outcome 和 terminal settlement 都在同一个 Session mutation 中：
 
 1. 追加不可变 `custom` entry（`custom_type="trace_record"`，仅含脱敏结构化事件）；
 2. 向 `operation/{operation_id}/trace` append 该 entry ID；
 3. 再写对应的 operation state、conversation entry、usage、tip 或 result。
 
 trace list 是该 operation 的稳定索引，避免 trace custom entry 干扰 lane 的对话 branch projection；`TraceRecorder` 写入失败**必须**使该次 Session mutation 失败，不能制造“已执行但缺审计”的半个 trace。不开启 recorder 时，`trace_format_version` 明确标为 `conversation-v1`；开启后为 `execution-v1`。内存事件、未 checkpoint 的流 token 和外部系统未返回的未知 outcome 不属于“完整”定义，也不能事后伪造。
+
+流式文本 checkpoint 虽然为了崩溃恢复会替换 `OperationState.content_checkpoint`，但**不得**写入 TraceRecorder 或 L0 的 execution trace：它们是同一次未结算 generation 的内部进度，不是独立 effect intent/outcome。否则每个 token 都会制造携带完整 context 的 `custom` 项，既重复又会使 L0 晋升输入失真。
 
 在 archive 写入前必须对 entry payload 和 TraceRecord 执行字段级脱敏。密钥、认证头、cookie、私钥、环境变量值及被配置为私密的路径/内容必须替换为稳定标记；同时保留原条目 ID、字段路径和 hash，以支持审计与去重但不泄露值。脱敏是**写入 L0 时**的强制动作，不是抽取或导出时的可选步骤，因为 L0 是保留期最长的一层。
 

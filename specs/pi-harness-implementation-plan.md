@@ -102,7 +102,7 @@ compaction:  starting → summary.effect_pending → terminal
 navigation:  starting → terminal
 ```
 
-`run` 在 `tools` 与 `checkpoint` 之间循环：每次生成后要么执行工具再回到 `checkpoint`，要么以 `terminal` 收束。streaming 期间每次内容 checkpoint 原地替换 `assistant.effect_pending` 的 state（不改变状态名）。`terminal` 只写一次，并以 `control="settled"` 标记该 operation 已收束。
+`run` 在 `tools` 与 `checkpoint` 之间循环：每次生成后要么执行工具再回到 `checkpoint`，要么以 `terminal` 收束。streaming 期间每次内容 checkpoint 原地替换 `assistant.effect_pending` 的 state（不改变状态名）；provider 若将 function call 拆在多个 SSE delta 中，adapter 必须按 call index/id 重组参数，并在流结束时把完整 `ToolCall` 放入最终 `AssistantResult`，不能因流式传输丢失工具阶段。`terminal` 只写一次，并以 `control="settled"` 标记该 operation 已收束。
 
 任何 LLM 或工具副作用固定使用四阶段协议：
 
@@ -214,7 +214,7 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 
 **背景：** provider 的 HTTP/SSE 连接不能在进程重启后可靠续接，但 UI 仍需要看到已生成的内容，恢复也必须避免把未知远端结果当作未发生。
 
-**决策：** `assistant.effect_pending` intent 保存 `model`、`stream_options` 与 `content_checkpoint`。支持流式能力的 provider 每收到一个内容帧就原子替换该 state 并发出 `message_update`；流结束后仍通过正常 settlement 写入 assistant entry 和 usage。`recover()` 默认只收束未知 provider outcome；若已知 pending tool 为 `safe`，调用方必须以 `recover(provider)` 提供继续运行所需的 provider。
+**决策：** `assistant.effect_pending` intent 保存 `model`、`stream_options` 与 `content_checkpoint`。支持流式能力的 provider 每收到一个内容帧就原子替换该 state 并发出 `message_update`；流结束后仍通过正常 settlement 写入 assistant entry 和 usage。checkpoint 是同一 effect 的内部恢复进度，不写 execution trace/L0 `custom` record；TraceRecorder 只记录 effect intent、retry、tool outcome 与 terminal settlement，避免每个 token 复制完整 context。`recover()` 默认只收束未知 provider outcome；若已知 pending tool 为 `safe`，调用方必须以 `recover(provider)` 提供继续运行所需的 provider。
 
 **后果：** checkpoint 增加写放大，但不会保存或重连 provider transport 状态。崩溃恢复写入明确的 aborted assistant entry，内容为最后一个已 durable checkpoint；不会将其误报为完整回答。
 

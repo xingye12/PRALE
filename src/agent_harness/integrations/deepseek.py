@@ -81,6 +81,7 @@ class DeepSeekProvider:
         content = ""
         usage: dict[str, int | float] = {}
         finish_reason = "stop"
+        tool_fragments: dict[int, dict[str, str]] = {}
         while True:
             item = await queue.get()
             if item is None:
@@ -96,12 +97,45 @@ class DeepSeekProvider:
                 if part:
                     content += part
                     yield GenerationDelta(part)
+                raw_tool_calls = delta.get("tool_calls", [])
+                if not isinstance(raw_tool_calls, list):
+                    raise RuntimeError("provider stream tool_calls must be a list")
+                for position, raw_call in enumerate(raw_tool_calls):
+                    if not isinstance(raw_call, dict):
+                        raise RuntimeError("provider stream tool call must be an object")
+                    index = raw_call.get("index", position)
+                    if not isinstance(index, int):
+                        raise RuntimeError("provider stream tool call index must be an integer")
+                    fragment = tool_fragments.setdefault(index, {})
+                    call_id = raw_call.get("id")
+                    if isinstance(call_id, str):
+                        fragment["id"] = call_id
+                    function = raw_call.get("function", {})
+                    if not isinstance(function, dict):
+                        raise RuntimeError("provider stream tool call function must be an object")
+                    name = function.get("name")
+                    if isinstance(name, str):
+                        fragment["name"] = name
+                    arguments = function.get("arguments")
+                    if isinstance(arguments, str):
+                        fragment["arguments"] = fragment.get("arguments", "") + arguments
                 finish_reason = choice.get("finish_reason") or finish_reason
             chunk_usage = chunk.get("usage", {})
             if isinstance(chunk_usage, dict):
                 usage.update({key: value for key, value in chunk_usage.items() if isinstance(value, (int, float))})
         await producer
-        yield AssistantResult(content=content, usage=usage, finish_reason=finish_reason)
+        tool_calls: list[ToolCall] = []
+        for index, fragment in sorted(tool_fragments.items()):
+            call_id = fragment.get("id")
+            name = fragment.get("name")
+            arguments = fragment.get("arguments")
+            if not isinstance(call_id, str) or not isinstance(name, str) or not isinstance(arguments, str):
+                raise RuntimeError(f"provider stream tool call {index} was incomplete")
+            decoded_arguments = json.loads(arguments)
+            if not isinstance(decoded_arguments, dict):
+                raise RuntimeError(f"provider stream tool call {index} arguments must decode to an object")
+            tool_calls.append(ToolCall(call_id, name, decoded_arguments))
+        yield AssistantResult(content=content, usage=usage, finish_reason=finish_reason, tool_calls=tuple(tool_calls))
 
     def _post(self, payload: dict) -> dict:
         request = Request(

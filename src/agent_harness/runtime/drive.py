@@ -408,16 +408,21 @@ class Drive:
         await self._lane._session.mutate(consume)  # noqa: SLF001
 
     async def _transition(
-        self, operation: ActiveOperation, next_state: OperationState, extra: Sequence[Write] = ()
+        self,
+        operation: ActiveOperation,
+        next_state: OperationState,
+        extra: Sequence[Write] = (),
+        *,
+        trace: bool = True,
     ) -> None:
         async def transition(mutator: SessionMutator) -> None:
             current = await mutator.get_value(operation_state(operation.meta.operation_id))
             if current != operation.state:
                 raise RuntimeError("operation state changed while Drive was running")
-            await mutator.commit(
-                [
-                    *extra,
-                    *self._lane.trace_writes(
+            writes = [*extra]
+            if trace:
+                writes.extend(
+                    self._lane.trace_writes(
                         operation.meta.operation_id,
                         "state_transition",
                         {
@@ -427,10 +432,10 @@ class Drive:
                             # Lane redaction runs before this custom entry is committed.
                             "state_data": next_state.data,
                         },
-                    ),
-                    SetValue(operation_state(operation.meta.operation_id), next_state),
-                ]
-            )
+                    )
+                )
+            writes.append(SetValue(operation_state(operation.meta.operation_id), next_state))
+            await mutator.commit(writes)
 
         await self._lane._session.mutate(transition)  # noqa: SLF001
 
@@ -640,6 +645,7 @@ class Drive:
         await self._transition(
             latest,
             OperationState("assistant.effect_pending", latest.state.control, {**data, "content_checkpoint": content}),
+            trace=False,
         )
 
     async def _retry_or_abort(self, operation: ActiveOperation, error: str) -> OperationResult | None:

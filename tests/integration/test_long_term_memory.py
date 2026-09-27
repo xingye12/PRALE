@@ -14,6 +14,7 @@ from agent_harness.domain.memory import (
 )
 from agent_harness.domain.values import ListAddress
 from agent_harness.memory.runtime import MemoryRuntime
+from agent_harness.runtime.generation import AssistantResult, GenerationDelta, GenerationRequest
 from agent_harness.storage.memory import MemoryStorage
 from agent_harness.storage.memory_sqlite import SQLiteMemoryStore
 from agent_harness.storage.protocol import AppendList
@@ -57,6 +58,52 @@ def test_enabled_trace_is_indexed_and_frozen_with_capture(tmp_path) -> None:
         outbox = await session_store.read_list(ListAddress("memory/capture_outbox"))
         assert trace_ids
         assert set(trace_ids).issubset(set(outbox[0]["trace_entry_ids"]))
+
+    asyncio.run(scenario())
+
+
+def test_stream_checkpoints_do_not_expand_the_execution_trace_or_l0(tmp_path) -> None:
+    class StreamingProvider:
+        async def generate(self, request: GenerationRequest) -> AssistantResult:
+            raise AssertionError("the streaming path should be used")
+
+        async def stream(self, request: GenerationRequest):
+            yield GenerationDelta("a")
+            yield GenerationDelta("b")
+            yield GenerationDelta("c")
+            yield AssistantResult("abc", {})
+
+    async def scenario() -> None:
+        session_store = MemoryStorage()
+        assets = SQLiteMemoryStore(tmp_path / "memory.db")
+        runtime = MemoryRuntime(assets, poll_ms=1)
+        scope = MemoryScope("team", "agent", "user")
+        harness = await Harness.open(
+            "session", session_store, memory_scope=scope, memory_runtime=runtime, trace_recorder=True
+        )
+        lane = await harness.acquire_lane("main")
+        await lane.prompt("stream", operation_id="op")
+        await lane.drive(StreamingProvider())
+
+        trace_ids = await session_store.read_list(ListAddress("operation/op/trace"))
+        trace_entries = await session_store.get_entries(trace_ids)
+        assert not any(
+            entry.payload.get("event") == "state_transition"
+            and entry.payload["data"].get("from") == "assistant.effect_pending"
+            and entry.payload["data"].get("to") == "assistant.effect_pending"
+            for entry in trace_entries.values()
+        )
+
+        await runtime.start()
+        for _ in range(50):
+            if not await session_store.read_list(ListAddress("memory/capture_outbox")):
+                break
+            await asyncio.sleep(0.001)
+        await runtime.aclose()
+
+        [archive] = await assets.unconsumed_items(scope, 0)
+        custom_items = [item for item in archive.items if item.type == "custom"]
+        assert {item.source_entry_id for item in custom_items} == set(trace_ids)
 
     asyncio.run(scenario())
 

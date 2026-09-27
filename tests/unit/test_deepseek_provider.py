@@ -2,7 +2,13 @@ import asyncio
 from unittest.mock import patch
 
 from agent_harness.integrations.deepseek import DeepSeekProvider
-from agent_harness.runtime.generation import AssistantResult, GenerationDelta, GenerationRequest, ToolDefinition
+from agent_harness.runtime.generation import (
+    AssistantResult,
+    GenerationDelta,
+    GenerationRequest,
+    ToolCall,
+    ToolDefinition,
+)
 
 
 def test_deepseek_provider_maps_openai_compatible_tool_response() -> None:
@@ -63,5 +69,61 @@ def test_deepseek_provider_exposes_sse_chunks_before_its_final_result() -> None:
 
         assert frames[:2] == [GenerationDelta("hel"), GenerationDelta("lo")]
         assert frames[-1] == AssistantResult(content="hello", usage={"completion_tokens": 2})
+
+    asyncio.run(scenario())
+
+
+def test_deepseek_provider_reassembles_streamed_tool_calls() -> None:
+    async def scenario() -> None:
+        provider = DeepSeekProvider("secret", "deepseek-chat")
+
+        def post_stream(payload, emit):
+            emit(
+                {
+                    "choices": [
+                        {
+                            "delta": {
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call-read",
+                                        "type": "function",
+                                        "function": {"name": "read", "arguments": '{"path":"'},
+                                    }
+                                ]
+                            },
+                            "finish_reason": None,
+                        }
+                    ]
+                }
+            )
+            emit(
+                {
+                    "choices": [
+                        {
+                            "delta": {"tool_calls": [{"index": 0, "function": {"arguments": 'README.md"}'}}]},
+                            "finish_reason": "tool_calls",
+                        }
+                    ],
+                    "usage": {"completion_tokens": 4},
+                }
+            )
+
+        with patch.object(DeepSeekProvider, "_post_stream", side_effect=post_stream):
+            frames = [
+                frame
+                async for frame in provider.stream(
+                    GenerationRequest("session-1", "main", "op-1", ({"role": "user", "content": "inspect"},))
+                )
+            ]
+
+        assert frames == [
+            AssistantResult(
+                content="",
+                usage={"completion_tokens": 4},
+                finish_reason="tool_calls",
+                tool_calls=(ToolCall("call-read", "read", {"path": "README.md"}),),
+            )
+        ]
 
     asyncio.run(scenario())
