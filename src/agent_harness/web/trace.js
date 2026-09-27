@@ -68,6 +68,7 @@ export function createTraceView(app) {
   function entryNode(entry) {
     const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : {};
     const role = typeof payload.role === "string" ? payload.role : entry.type;
+    const isToolResult = role === "tool";
     const nodes = [
       h(
         "div",
@@ -81,8 +82,12 @@ export function createTraceView(app) {
       ),
     ];
     const content = typeof payload.content === "string" ? payload.content : "";
-    if (content) nodes.push(h("pre", { text: content }));
-    if (Array.isArray(payload.tool_calls)) {
+    if (isToolResult) {
+      nodes.push(toolResultNode(payload));
+    } else if (content) {
+      nodes.push(h("pre", { text: content }));
+    }
+    if (!isToolResult && Array.isArray(payload.tool_calls)) {
       for (const call of payload.tool_calls) {
         nodes.push(
           h(
@@ -102,13 +107,33 @@ export function createTraceView(app) {
     if (typeof payload.stop_reason === "string" && payload.stop_reason) {
       nodes.push(h("p", { class: "meta", text: `stop_reason: ${payload.stop_reason}` }));
     }
-    if (!content && !Array.isArray(payload.tool_calls) && entry.type !== "custom") {
+    if (!isToolResult && !content && !Array.isArray(payload.tool_calls) && entry.type !== "custom") {
       nodes.push(h("details", {}, h("summary", { text: "payload" }), h("pre", { class: "block", text: jsonText(payload) })));
     } else if (entry.type === "custom") {
       nodes.push(h("pre", { class: "block", text: jsonText(payload) }));
     }
     const roleClass = ["user", "assistant", "tool", "system"].includes(role) ? role : "system";
     return h("div", { class: "message", dataset: { role: roleClass } }, nodes);
+  }
+
+  /** Tool output may include command logs or file bodies, so it starts collapsed. */
+  function toolResultNode(payload) {
+    const callId = typeof payload.tool_call_id === "string" ? ` · ${shortId(payload.tool_call_id, 10)}` : "";
+    const result = [];
+    if (Object.hasOwn(payload, "content")) {
+      result.push(h("pre", { class: "block", text: jsonText(payload.content) }));
+    } else {
+      result.push(h("p", { class: "meta", text: "（空结果）" }));
+    }
+    if (Object.hasOwn(payload, "details")) {
+      result.push(h("pre", { class: "block", text: jsonText(payload.details) }));
+    }
+    return h(
+      "details",
+      { class: "tool-result" },
+      h("summary", { text: `工具返回结果${callId}（点击展开）` }),
+      h("div", { class: "tool-result-body" }, result),
+    );
   }
 
   function spanNode(span, detail) {

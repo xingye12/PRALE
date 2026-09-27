@@ -132,7 +132,7 @@ SQLite migration 只前进：为 operation/call usage、span 和查询索引加�
 | `GET /api/skills`、`/skills/{skill_id}`、`/skills/{skill_id}/versions` | 只读 skill 资产与版本历史（含 disabled/archived） |
 | `GET /api/skills/archives`、`/skills/archives/{id}`、`/skills/jobs`、`/skills/audit` | 来源归档（含 payload）、提取任务状态与技能审计 |
 
-前端布局：顶栏固定显示 `project_root` 与 `repository_id`；左侧导航为"对话 / 轨迹 / 记忆 / 技能"。对话页与轨迹页都有 session 与 lane 选择器；轨迹页内有 turn 列表，详情按时间线展示 message、LLM、tool、usage。
+前端布局：顶栏固定显示 `project_root` 与 `repository_id`；左侧导航为"对话 / 轨迹 / 记忆 / 技能"。对话页与轨迹页都有 session 与 lane 选择器；轨迹页内有 turn 列表，详情按时间线展示 message、LLM、tool、usage。工具调用参数和工具返回结果使用原生折叠块；尤其工具返回结果默认收起，用户点击后才读取完整输出与 details，避免命令日志或文件内容淹没对话和时间线。
 
 展示契约：
 

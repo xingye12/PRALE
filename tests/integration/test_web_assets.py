@@ -176,6 +176,16 @@ def test_agent_text_never_goes_through_inner_html() -> None:
         assert "insertAdjacentHTML" not in code, name
 
 
+def test_tool_results_start_collapsed_in_chat_and_trace() -> None:
+    """Verbose durable tool output must not dominate either primary view."""
+
+    for name in ("chat.js", "trace.js"):
+        code = _code(name)
+        assert 'class: "tool-result"' in code, name
+        assert "text: `工具返回结果${callId}（点击展开）`" in code, name
+        assert '"open"' not in code, name
+
+
 def test_each_view_renders_an_empty_state_and_an_unavailable_state() -> None:
     for name in VIEW_MODULES:
         source = _source(name)

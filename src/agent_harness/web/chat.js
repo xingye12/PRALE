@@ -105,6 +105,7 @@ export function createChatView(app) {
   function messageNode(entry) {
     const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : {};
     const role = typeof payload.role === "string" ? payload.role : entry.type;
+    const isToolResult = role === "tool";
     const tone = role === "user" ? "ok" : role === "tool" ? "warn" : "pending";
     const nodes = [
       h(
@@ -117,8 +118,12 @@ export function createChatView(app) {
       ),
     ];
     const content = typeof payload.content === "string" ? payload.content : "";
-    if (content) nodes.push(h("pre", { text: content }));
-    if (Array.isArray(payload.tool_calls)) {
+    if (isToolResult) {
+      nodes.push(toolResultNode(payload));
+    } else if (content) {
+      nodes.push(h("pre", { text: content }));
+    }
+    if (!isToolResult && Array.isArray(payload.tool_calls)) {
       for (const call of payload.tool_calls) {
         nodes.push(
           h(
@@ -133,7 +138,7 @@ export function createChatView(app) {
     if (payload.is_error) nodes.push(badge("tool 返回错误", "bad"));
     if (typeof payload.error === "string") nodes.push(h("p", { class: "meta", text: payload.error }));
     if (payload.terminate) nodes.push(badge("terminate", "warn"));
-    if (!content && !Array.isArray(payload.tool_calls)) {
+    if (!isToolResult && !content && !Array.isArray(payload.tool_calls)) {
       nodes.push(
         h("details", {}, h("summary", { text: "payload" }), h("pre", { class: "block", text: formatValue(payload) })),
       );
@@ -148,6 +153,26 @@ export function createChatView(app) {
     } catch {
       return String(value);
     }
+  }
+
+  /** Tool output is often verbose; keep it available without overwhelming chat. */
+  function toolResultNode(payload) {
+    const callId = typeof payload.tool_call_id === "string" ? ` · ${shortId(payload.tool_call_id, 10)}` : "";
+    const result = [];
+    if (Object.hasOwn(payload, "content")) {
+      result.push(h("pre", { class: "block", text: formatValue(payload.content) }));
+    } else {
+      result.push(h("p", { class: "meta", text: "（空结果）" }));
+    }
+    if (Object.hasOwn(payload, "details")) {
+      result.push(h("pre", { class: "block", text: formatValue(payload.details) }));
+    }
+    return h(
+      "details",
+      { class: "tool-result" },
+      h("summary", { text: `工具返回结果${callId}（点击展开）` }),
+      h("div", { class: "tool-result-body" }, result),
+    );
   }
 
   function composer() {
