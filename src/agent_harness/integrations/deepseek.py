@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from urllib.request import Request, urlopen
 
+from agent_harness.domain.entries import JsonValue
 from agent_harness.runtime.generation import AssistantResult, GenerationDelta, GenerationRequest, ToolCall
 
 
@@ -17,7 +18,7 @@ class DeepSeekProvider:
     async def generate(self, request: GenerationRequest) -> AssistantResult:
         payload = {
             "model": self.model,
-            "messages": list(request.messages),
+            "messages": _wire_messages(request.messages),
             "tools": [
                 {
                     "type": "function",
@@ -48,7 +49,7 @@ class DeepSeekProvider:
 
         payload = {
             "model": self.model,
-            "messages": list(request.messages),
+            "messages": _wire_messages(request.messages),
             "stream": True,
             "stream_options": {"include_usage": True},
             "tools": [
@@ -163,3 +164,67 @@ class DeepSeekProvider:
                 if data == "[DONE]":
                     break
                 on_chunk(json.loads(data))
+
+
+def _wire_messages(messages: tuple[JsonValue, ...]) -> list[dict[str, object]]:
+    """Translate durable, provider-neutral entries to OpenAI-compatible messages.
+
+    Tool entries retain structured result payloads in the Session, but the wire
+    protocol accepts only a string ``content``.  Assistant calls are similarly
+    stored with neutral ``name``/object ``arguments`` fields and become the
+    provider's function-call envelope only at this boundary.
+    """
+
+    wire: list[dict[str, object]] = []
+    for position, message in enumerate(messages):
+        if not isinstance(message, dict) or not isinstance(message.get("role"), str):
+            raise ValueError(f"message {position} must be an object with a string role")
+        role = message["role"]
+        if role == "tool":
+            tool_call_id = message.get("tool_call_id")
+            if not isinstance(tool_call_id, str):
+                raise ValueError(f"tool message {position} has no tool_call_id")
+            result = {"content": message.get("content"), "is_error": bool(message.get("is_error", False))}
+            if "details" in message:
+                result["details"] = message["details"]
+            wire.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call_id,
+                    "content": json.dumps(result, ensure_ascii=False, separators=(",", ":")),
+                }
+            )
+            continue
+        if role == "assistant" and "tool_calls" in message:
+            raw_calls = message["tool_calls"]
+            if not isinstance(raw_calls, list):
+                raise ValueError(f"assistant message {position} tool_calls must be a list")
+            tool_calls: list[dict[str, object]] = []
+            for call_position, call in enumerate(raw_calls):
+                if not isinstance(call, dict):
+                    raise ValueError(f"assistant message {position} tool call {call_position} must be an object")
+                call_id = call.get("id")
+                name = call.get("name")
+                arguments = call.get("arguments")
+                if not isinstance(call_id, str) or not isinstance(name, str):
+                    raise ValueError(f"assistant message {position} tool call {call_position} is incomplete")
+                tool_calls.append(
+                    {
+                        "id": call_id,
+                        "type": "function",
+                        "function": {
+                            "name": name,
+                            "arguments": json.dumps(arguments, ensure_ascii=False, separators=(",", ":")),
+                        },
+                    }
+                )
+            content = message.get("content")
+            if content is not None and not isinstance(content, str):
+                raise ValueError(f"assistant message {position} content must be a string or null")
+            wire.append({"role": "assistant", "content": content, "tool_calls": tool_calls})
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            raise ValueError(f"{role} message {position} content must be a string")
+        wire.append({"role": role, "content": content})
+    return wire

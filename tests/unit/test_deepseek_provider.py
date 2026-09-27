@@ -127,3 +127,54 @@ def test_deepseek_provider_reassembles_streamed_tool_calls() -> None:
         ]
 
     asyncio.run(scenario())
+
+
+def test_deepseek_provider_converts_durable_tool_history_to_wire_messages() -> None:
+    async def scenario() -> None:
+        provider = DeepSeekProvider("secret", "deepseek-chat")
+        response = {"choices": [{"finish_reason": "stop", "message": {"content": "done"}}]}
+        request = GenerationRequest(
+            "session-1",
+            "main",
+            "op-1",
+            (
+                {
+                    "role": "assistant",
+                    "content": "I will inspect it.",
+                    "tool_calls": [{"id": "call-1", "name": "read", "arguments": {"path": "README.md"}}],
+                },
+                {
+                    "role": "tool",
+                    "tool_call_id": "call-1",
+                    "content": {"text": "PRALE"},
+                    "is_error": False,
+                    "details": {"path": "README.md"},
+                    "terminate": False,
+                },
+            ),
+        )
+
+        with patch.object(DeepSeekProvider, "_post", return_value=response) as post:
+            result = await provider.generate(request)
+
+        assert result.content == "done"
+        assert post.call_args.args[0]["messages"] == [
+            {
+                "role": "assistant",
+                "content": "I will inspect it.",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "read", "arguments": '{"path":"README.md"}'},
+                    }
+                ],
+            },
+            {
+                "role": "tool",
+                "tool_call_id": "call-1",
+                "content": '{"content":{"text":"PRALE"},"is_error":false,"details":{"path":"README.md"}}',
+            },
+        ]
+
+    asyncio.run(scenario())

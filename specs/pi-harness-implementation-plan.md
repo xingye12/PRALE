@@ -112,6 +112,7 @@ navigation:  starting → terminal
 
 - LLM intent 至少保存 model identity、投影后的请求上下文、stream options、预留 assistant entry ID、usage ID、尝试次数和重试时间；
 - 工具 intent 至少保存已验证参数、`tool_call_id`、源顺序和 replay policy；
+- Session 中的 assistant/tool entry 是 provider 中立 DTO：provider adapter 在边界把 assistant `name`/对象参数映射为 function envelope，把 tool 的结构化 result 映射为 JSON string `content`，不得把内部字段直接透传到 OpenAI-compatible wire payload；
 - effect intent 与它的 `EffectSpan` 在同一事务写入，settlement 与 `SettleSpan`、usage 归属、entry、operation state 在同一事务写入；两者都不得拆成第二次提交；
 - `safe` 工具可在恢复后重试；重试是新的 attempt，被丢失的前一次 attempt 必须在授权重试的同一事务中结算为 `unknown`/`interrupted`，不允许留下永久 `pending` 的 span；`never` 工具恢复时必须写入“执行中断、结果未知”的 tool result，不能盲目重放；
 - provider stream 在 effect-pending 崩溃后不能尝试续接同一 HTTP 连接，应按已 checkpoint 内容收束为明确 interrupted/unknown assistant 结果；
