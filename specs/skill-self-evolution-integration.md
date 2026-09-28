@@ -90,6 +90,8 @@ Review 顺序如下：
 5. `SkillEvolutionRuntime` 本地校验 schema、frontmatter、资源路径、大小、敏感内容和版本，然后以乐观锁调用 `SkillStore`。
 6. 成功写入新的 `SkillVersion` 与 audit；冲突时重新读取当前版本，最多一次重新 review，之后进入 retry/dead-letter，绝不能静默覆盖。
 
+当前 coding 部署使用 `CodingSkillReviewer`：它将 immutable、已脱敏的 `SkillArchive` 和候选 `SkillListing` 交给 provider-neutral `ChatProvider`，要求返回单个严格 JSON `SkillProposal`。它用 `<<past-…>>` / `<<end-of-transcript>>` 标记历史 transcript，防止模型把末尾 assistant 内容误认为当前对话；它不持有 Store、Session、工具或外部副作用权限。JSON 解析失败是可审计的 job 失败，仍由 runtime 的重试/dead-letter 语义处理。
+
 Review LLM **不得**直接使用数据库、文件系统、shell、网络或删除工具。它只可通过受控 DTO 相当于以下动作：
 
 | 动作 | 约束 |

@@ -12,10 +12,11 @@ Three things are deliberately not configurable here:
 * **the scope** — ``repository_id`` is an operator value, never a request
   value (ADR-WEB-003), and it is passed straight to ``ProjectRuntimeConfig``,
   which refuses a filesystem path (ADR-018);
-* **the extraction prompt** — the memory and skill pipelines need prompt text
-  this package does not ship, so a deployment that has none runs with the
-  stores read-only.  ``PRALE_MEMORY_PROMPT`` points at a file for a deployment
-  that has one; without it, memory shows L0 archives and no promoted entries;
+* **the memory extraction prompt** — memory promotion needs prompt text this
+  package does not ship. ``PRALE_MEMORY_PROMPT`` points at a file for a
+  deployment that has one; without it, memory shows L0 archives and no
+  promoted entries. The coding Skill reviewer ships as a separate constrained
+  integration and is enabled whenever the SkillStore is enabled;
 * **the credential** — no default is invented.  A deployment with an unset
   ``PRALE_API_KEY`` is refused at startup rather than failing on the first turn.
 
@@ -40,6 +41,7 @@ from agent_harness.api.web import DEFAULT_MAX_CONCURRENT_DRIVES, WebApplication,
 from agent_harness.integrations.deepseek import DeepSeekProvider
 from agent_harness.integrations.local_tools import create_builtin_tools
 from agent_harness.integrations.memory_provider import JsonMemoryExtractor
+from agent_harness.integrations.skill_reviewer import CodingSkillReviewer
 from agent_harness.runtime.generation import GenerationRequest
 from agent_harness.storage.memory_sqlite import SQLiteMemoryStore
 from agent_harness.storage.skill_sqlite import SQLiteSkillStore
@@ -348,9 +350,7 @@ def build_application(settings: Settings) -> Deployment:
         memory_store=memory_store,
         skill_store=skill_store,
         memory_extractor=build_extractor(settings),
-        # A reviewer is a deployment artifact in the same sense as the memory
-        # prompt: without one, archives accumulate and no skill is proposed.
-        skill_reviewer=None,
+        skill_reviewer=CodingSkillReviewer(provider) if skill_store is not None else None,
         trace_recorder=settings.traces,
         tokens=settings.tokens,
         max_concurrent_drives=settings.max_concurrent_drives,
