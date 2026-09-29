@@ -329,6 +329,22 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 
 **后果：** Skill 不会从可变 Session 回读，memory 暂未投递时只会延迟 Skill Review，不影响用户 operation。
 
+### ADR-021：L1 job 必须以 materialized L0 的 item watermark 去重
+
+**背景：** `SessionTraceArchive` 在 materialize 前只是冻结的输入 DTO；其 `TraceItem.store_seq` 仍为默认值。只有 `MemoryStore.capture_archive()` 成功写入后，返回的 archive 才带有该 scope 内实际分配的单调序列。若调度器用输入 DTO 的默认序列创建 job，所有 L1 trigger 都会落到 watermark `0`；第一个 completed job 会吞掉后续 trigger，而 L0 将无限积压。
+
+**决策：** capture dispatcher 必须使用 `capture_archive()` 返回的 stored archive 计算 L1 `input_high_watermark` 与 job 去重 key。显式 L1 flush 也必须先读取未消费 L0，使用其中最大 materialized `store_seq`，并冻结对应 archive IDs。不得以 L1 的当前 watermark 或尚未 materialize 的 DTO 作为待消费 job 的输入 watermark。L1 worker 对每次 extractor 调用设置字符预算：超长 item 以携带原 payload hash 的 excerpt 投影，L0 权威记录不被修改；一个 job 只覆盖预算内连续 item 的最大 watermark，完成后若仍有达到轮次阈值的输入则创建下一批 job。
+
+**后果：** 每个新 L0 批次会产生可区分、可恢复的 L1 job；已完成 job 不会压制后续 archive，也不会把多 MB 的工具结果整体送入 provider。历史上以 watermark `0` 错误完成的 job 可通过显式 flush 重新排入以真实 watermark 标识的 job，且无需重写或删除 L0。
+
+### ADR-022：遥测是已提交事实的投影，脱敏发生在适配器内
+
+**背景：** 用 Langfuse 对 Agent 表现做固定评测集，需要每个 Operation 的 trace 与 dataset experiment。但 PRALE 的 effect intent、settlement 与崩溃恢复不能被可失败的第三方遥测耦合；而 trace 会把 prompt、工具输入输出、记忆投影和凭据带出本机。
+
+**决策：** `runtime/telemetry.py` 定义 provider-neutral 的已结算事实 DTO（operation、generation、tool attempt）与同步 `record()` 协议；Drive 只在对应 `Session.mutate` 成功提交之后发布事实，因此任何事实都描述一个已经提交的结果，且发布路径不参与 Session 状态。Langfuse 只出现在 `integrations/langfuse.py`，且仅在 `LANGFUSE_TRACING_ENABLED` 为真时才导入 SDK：`record()` 同步脱敏后放入有界队列，单 worker 调用 SDK；队列满时 operation 终止事件可顶替更早的非终止事件，任何适配器错误只降级可观测性，绝不进入 Drive 的结果。
+
+**后果：** 每个 Operation 是一棵以 `prale.run` 为根、`prale.generate` 与 `prale.tool.<name>` 为子 observation 的 trace；根 observation 的 input/output 即离线评测的评分契约，`operation_id`、`lane`、`kind` 只作为 metadata（ADR-017 的耗时持久化让 observation 的起止时间等于效果本身的起止时间，而不是 worker 处理它的时间）。规格中的记忆与 Skill 不单独建 observation，而是以哈希、ID 与计数进入 generation metadata，避免把长期资产正文送上远端。脱敏与队列因此是 `integrations/` 内需要独立测试的一层，而不再只是薄 I/O 适配器；关闭遥测时逐字节行为与接入前一致。
+
 ## 10. 首个可执行里程碑
 
 第一个编码里程碑仅实现阶段 0–3：纯领域 DTO、storage/session 协议、内存后端、entry tree/branch projection、lane operation admission、snapshot 和结果查询。此里程碑不调用 DeepSeek、不执行工具，但必须已经具备“先持久化 operation、后由 Drive 领取”的恢复基础。

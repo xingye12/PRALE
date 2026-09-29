@@ -8,7 +8,9 @@ way an absence means anything.
 """
 
 import asyncio
+import importlib.util
 import logging
+import sys
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,13 +20,8 @@ import pytest
 
 from agent_harness.api.errors import ProjectConfigError
 from agent_harness.api.project import ProjectRuntimeConfig
-from agent_harness.api.serve import (
-    DEFAULT_GRACEFUL_SHUTDOWN_SECONDS,
-    RedactingFilter,
-    Settings,
-    build_application,
-    main,
-)
+from agent_harness.api.serve import RedactingFilter, build_application, main
+from agent_harness.api.settings import DEFAULT_GRACEFUL_SHUTDOWN_SECONDS, Settings
 from agent_harness.api.web import DEFAULT_MAX_CONCURRENT_DRIVES, WebApplication, create_app
 from agent_harness.runtime.generation import AssistantResult, GenerationRequest
 from agent_harness.storage.memory_sqlite import SQLiteMemoryStore
@@ -373,6 +370,18 @@ def test_settings_refuse_a_deployment_without_an_identity_or_a_credential(tmp_pa
         Settings.from_environment(_environment(tmp_path, PRALE_GRACEFUL_SHUTDOWN_SECONDS="0"))
     with pytest.raises(ProjectConfigError, match="name:token"):
         Settings.from_environment(_environment(tmp_path, PRALE_TOKENS="missing-separator"))
+    with pytest.raises(ProjectConfigError, match="PRALE_REPOSITORY_INDEX_DIR is required"):
+        Settings.from_environment(_environment(tmp_path, PRALE_TOOLS="repository_explore"))
+    with pytest.raises(ProjectConfigError, match="outside PRALE_PROJECT_ROOT"):
+        Settings.from_environment(
+            _environment(
+                tmp_path,
+                PRALE_TOOLS="repository_explore",
+                PRALE_REPOSITORY_INDEX_DIR=str(tmp_path / "index"),
+            )
+        )
+    with pytest.raises(ProjectConfigError, match="between 256 and 6000"):
+        Settings.from_environment(_environment(tmp_path, PRALE_REPOSITORY_MAX_EXPORT_TOKENS="6001"))
     # A checkout path is not an identity (ADR-018): refused by the config this
     # settings object builds, not only by the flag parser.
     with pytest.raises(ProjectConfigError, match="stable identifier"):
@@ -428,6 +437,30 @@ def test_print_config_shows_the_deployment_without_echoing_a_credential(
     assert "api_key           <set>" in printed
 
 
+def test_repository_explorer_extra_is_checked_only_during_composition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings.from_environment(
+        _environment(
+            tmp_path,
+            PRALE_TOOLS="repository_explore",
+            PRALE_REPOSITORY_INDEX_DIR=str(tmp_path.parent / "repository-index"),
+        )
+    )
+
+    original_find_spec = importlib.util.find_spec
+
+    def missing_extra(name: str, package: str | None = None):
+        if name == "tree_sitter_python":
+            return None
+        return original_find_spec(name, package)
+
+    monkeypatch.setattr(importlib.util, "find_spec", missing_extra)
+    assert "repository_explore on" in settings.describe()
+    with pytest.raises(ProjectConfigError, match="repository-explorer extra"):
+        build_application(settings)
+
+
 def test_a_misconfigured_deployment_exits_with_an_explanation(
     monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -445,3 +478,155 @@ def test_a_misconfigured_deployment_exits_with_an_explanation(
     assert "PRALE_REPOSITORY_ID is required" in captured.err
     assert "Traceback" not in captured.err
     assert API_KEY not in captured.err + captured.out
+
+
+# Tracing is an optional deployment capability: off unless the environment asks
+# for it, and then never at the cost of a credential.
+
+LANGFUSE_PUBLIC_KEY = "pk-lf-public-for-tests"
+LANGFUSE_SECRET_KEY = "sk-lf-secret-for-tests"
+
+
+def _tracing(tmp_path: Path, **overrides: str) -> dict[str, str]:
+    """An environment for a deployment that opted into tracing."""
+
+    return _environment(
+        tmp_path,
+        LANGFUSE_TRACING_ENABLED="1",
+        LANGFUSE_PUBLIC_KEY=LANGFUSE_PUBLIC_KEY,
+        LANGFUSE_SECRET_KEY=LANGFUSE_SECRET_KEY,
+        **overrides,
+    )
+
+
+def test_tracing_is_off_until_the_deployment_turns_it_on(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """An untraced deployment must not need the extra, let alone import it."""
+
+    settings = Settings.from_environment(_environment(tmp_path))
+    assert settings.langfuse is None
+    assert settings.secrets == (API_KEY, TOKEN)
+    assert "langfuse          off" in settings.describe()
+
+    # The SDK is not part of the core dependencies, and a deployment that never
+    # enables tracing is unaffected by it being absent.
+    monkeypatch.setitem(sys.modules, "langfuse", None)
+    deployment = build_application(settings)
+    deployment.close()
+
+
+def test_an_enabled_deployment_without_its_keys_is_refused(tmp_path: Path) -> None:
+    """Half-configured tracing would look like a monitored deployment."""
+
+    with pytest.raises(ProjectConfigError, match="LANGFUSE_PUBLIC_KEY"):
+        Settings.from_environment(_environment(tmp_path, LANGFUSE_TRACING_ENABLED="1"))
+    with pytest.raises(ProjectConfigError, match="LANGFUSE_SECRET_KEY"):
+        Settings.from_environment(
+            _environment(tmp_path, LANGFUSE_TRACING_ENABLED="1", LANGFUSE_PUBLIC_KEY=LANGFUSE_PUBLIC_KEY)
+        )
+
+
+def test_an_enabled_deployment_keeps_its_keys_to_itself(tmp_path: Path) -> None:
+    settings = Settings.from_environment(
+        _tracing(tmp_path, LANGFUSE_TRACING_ENVIRONMENT="staging", PRALE_LANGFUSE_CAPTURE="metadata")
+    )
+
+    assert settings.langfuse is not None
+    assert (settings.langfuse.environment, settings.langfuse.capture) == ("staging", "metadata")
+    described = settings.describe()
+    assert "langfuse          on env=staging capture=metadata" in described
+    assert "public_key=<set> secret_key=<set>" in described
+    assert LANGFUSE_PUBLIC_KEY not in described
+    assert LANGFUSE_SECRET_KEY not in described
+    # The tracing secret is a credential like any other: it joins the values the
+    # log filter and the sanitizer strip before anything leaves the process.
+    assert settings.secrets == (API_KEY, TOKEN, LANGFUSE_SECRET_KEY)
+
+
+def test_the_tracing_environment_and_capture_are_checked_at_startup(tmp_path: Path) -> None:
+    with pytest.raises(ProjectConfigError, match="LANGFUSE_TRACING_ENVIRONMENT"):
+        Settings.from_environment(_tracing(tmp_path, LANGFUSE_TRACING_ENVIRONMENT="nightly"))
+    with pytest.raises(ProjectConfigError, match="PRALE_LANGFUSE_CAPTURE"):
+        Settings.from_environment(_tracing(tmp_path, PRALE_LANGFUSE_CAPTURE="verbose"))
+
+    # The three names a gateway recognises are the three that are accepted.
+    for environment in ("development", "staging", "production"):
+        settings = Settings.from_environment(_tracing(tmp_path, LANGFUSE_TRACING_ENVIRONMENT=environment))
+        assert settings.langfuse is not None and settings.langfuse.environment == environment
+
+
+def test_an_enabled_deployment_without_the_sdk_fails_before_it_opens_a_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = Settings.from_environment(_tracing(tmp_path))
+    monkeypatch.setitem(sys.modules, "langfuse", None)
+
+    with pytest.raises(ProjectConfigError, match=r"prale-agent-harness\[langfuse\]"):
+        build_application(settings)
+
+    # Composition failed before the stores were opened: nothing to clean up and
+    # no server that would start half-instrumented.
+    assert not (tmp_path / "data" / "catalog.sqlite").exists()
+
+
+def test_print_config_shows_tracing_without_echoing_its_keys(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    for name, value in _tracing(tmp_path, LANGFUSE_TRACING_ENVIRONMENT="staging").items():
+        monkeypatch.setenv(name, value)
+    root = logging.getLogger()
+    handlers, level = root.handlers[:], root.level
+    try:
+        assert main(["--print-config"]) == 0
+    finally:
+        root.handlers[:] = handlers
+        root.setLevel(level)
+
+    printed = capsys.readouterr().out
+    assert "langfuse          on env=staging capture=metadata" in printed
+    assert "public_key=<set> secret_key=<set>" in printed
+    assert LANGFUSE_PUBLIC_KEY not in printed
+    assert LANGFUSE_SECRET_KEY not in printed
+
+
+def test_a_served_turn_publishes_facts_for_the_session_that_ran_it(tmp_path: Path) -> None:
+    """The deployment's sink is wired to the runtime, not only to the config.
+
+    Nothing here reaches the network: a sink is any object with ``record``, and
+    what it receives has to name the session the deployment served.
+    """
+
+    class Collector:
+        def __init__(self) -> None:
+            self.events: list = []
+
+        def record(self, event) -> None:
+            self.events.append(event)
+
+    async def scenario() -> None:
+        collector = Collector()
+        web = create_app(_config(tmp_path), Provider(), telemetry=collector)
+        await web.start()
+        try:
+            await web.supervisor.create_session("s-1")
+            async with _client(web) as client:
+                submitted = await client.post("/api/sessions/s-1/lanes/main/turns", json={"prompt": "hello"})
+                assert submitted.status_code == 202
+                operation_id = submitted.json()["operation_id"]
+                for _ in range(500):
+                    detail = (await client.get(f"/api/sessions/s-1/turns/{operation_id}")).json()
+                    if detail["summary"]["status"] is not None:
+                        break
+                    await asyncio.sleep(0.01)
+                assert detail["summary"]["status"] == "completed"
+        finally:
+            await web.aclose()
+
+        assert [event.session_id for event in collector.events] == ["s-1"] * len(collector.events)
+        started, terminal = (
+            collector.events[0],
+            [event for event in collector.events if getattr(event, "phase", None) == "terminal"],
+        )
+        assert (started.lane, started.operation_id, started.input) == ("main", operation_id, {"prompt": "hello"})
+        assert terminal[-1].output["content"] == "ok"
+
+    asyncio.run(scenario())

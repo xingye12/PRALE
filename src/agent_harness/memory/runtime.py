@@ -8,6 +8,7 @@ import re
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 
 from agent_harness.domain.entries import Entry
 from agent_harness.domain.memory import (
@@ -48,9 +49,11 @@ class MemoryRuntime:
         max_job_attempts: int = 3,
         max_scenes: int = 20,
         poll_ms: int = 100,
+        l1_max_input_chars: int = 96_000,
+        l1_max_item_chars: int = 12_000,
     ) -> None:
-        if max_job_attempts < 1:
-            raise ValueError("max_job_attempts must be positive")
+        if max_job_attempts < 1 or l1_max_input_chars < 1 or l1_max_item_chars < 1:
+            raise ValueError("memory runtime limits must be positive")
         self._store, self._extractor = store, extractor
         self._ids, self._now = id_factory or (lambda: str(uuid.uuid4())), now_ms or _now
         self._threshold, self._poll_ms = l1_turn_threshold, poll_ms
@@ -59,6 +62,8 @@ class MemoryRuntime:
         self._l3_l1_threshold = l3_l1_threshold
         self._max_job_attempts = max_job_attempts
         self._max_scenes = max_scenes
+        self._l1_max_input_chars = l1_max_input_chars
+        self._l1_max_item_chars = l1_max_item_chars
         self._sessions: dict[str, tuple[Session, MemoryScope]] = {}
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -114,11 +119,21 @@ class MemoryRuntime:
         if stage == "l3":
             await self._store.create_or_wake_job(GLOBAL_L3_SCOPE, "l3", self._now(), self._now())
             return
-        watermark = (
-            await self._store.current_l1_watermark(scope)
-            if stage == "l1"
-            else await self._store.stage_watermark(scope, "l2" if stage == "l3" else "l1")
-        )
+        if stage == "l1":
+            consumed = await self._store.current_l1_watermark(scope)
+            archives, watermark = await self._l1_batch(scope, consumed)
+            await self._store.create_or_wake_job(
+                scope,
+                stage,
+                watermark,
+                self._now(),
+                getattr(self._extractor, "prompt_id", None),
+                getattr(self._extractor, "prompt_version", None),
+                getattr(self._extractor, "mode", None),
+                tuple(archive.archive_id for archive in archives),
+            )
+            return
+        watermark = await self._store.stage_watermark(scope, "l1")
         await self._store.create_or_wake_job(scope, stage, watermark, self._now())
 
     async def replay_capture_dead_letters(self, session_id: str) -> int:
@@ -208,17 +223,7 @@ class MemoryRuntime:
                 _, created = await self._store.capture_archive(archive)
                 if created:
                     watermark = await self._store.current_l1_watermark(scope)
-                    pending_archives = await self._store.unconsumed_items(scope, watermark)
-                    max_seq = max((item.store_seq for item in archive.items), default=watermark)
-                    turns = sum(item.role == "user" for candidate in pending_archives for item in candidate.items)
-                    if turns >= self._threshold:
-                        await self._store.create_or_wake_job(
-                            scope,
-                            "l1",
-                            max_seq,
-                            self._now(),
-                            input_ids=tuple(item.archive_id for item in pending_archives),
-                        )
+                    await self._enqueue_l1(scope, watermark)
                 delivered.append(raw)
             except Exception as error:
                 await self._store.audit(scope, "capture_dead_letter", {"error": type(error).__name__, "outbox": raw})
@@ -319,9 +324,8 @@ class MemoryRuntime:
             )
             if job.stage == "l1":
                 after = await self._store.current_l1_watermark(job.scope)
-                archives = await self._store.unconsumed_items(job.scope, after)
+                archives, watermark = await self._l1_batch(job.scope, after, job.input_high_watermark)
                 l1_candidates = await self._extractor.extract_l1(archives)
-                watermark = max((item.store_seq for archive in archives for item in archive.items), default=after)
                 await self._store.apply_candidates(job.scope, l1_candidates, watermark)
                 await self._store.complete_job(job.job_id, job.lease_id or "", content_hash(str(l1_candidates)))
                 await self._safe_audit(
@@ -341,6 +345,7 @@ class MemoryRuntime:
                     getattr(self._extractor, "mode", "code"),
                     tuple(memory.memory_id for memory in await self._store.read_l1_since(job.scope, after)),
                 )
+                await self._enqueue_l1(job.scope, watermark)
                 return
             if job.stage == "l2":
                 scenes = await self._store.read_l2(job.scope)
@@ -408,6 +413,62 @@ class MemoryRuntime:
             except Exception:
                 await self._safe_audit(job.scope, "job_settlement_error", {"job_id": job.job_id})
 
+    async def _enqueue_l1(self, scope: MemoryScope, after: int, *, force: bool = False) -> None:
+        """Durably schedule exactly the bounded L0 slice an L1 worker may consume."""
+        pending = await self._store.unconsumed_items(scope, after)
+        turns = sum(item.role == "user" for archive in pending for item in archive.items)
+        if not force and turns < self._threshold:
+            return
+        archives, watermark = self._bounded_l1_archives(pending, after)
+        if watermark <= after:
+            return
+        await self._store.create_or_wake_job(
+            scope,
+            "l1",
+            watermark,
+            self._now(),
+            getattr(self._extractor, "prompt_id", None),
+            getattr(self._extractor, "prompt_version", None),
+            getattr(self._extractor, "mode", None),
+            tuple(archive.archive_id for archive in archives),
+        )
+
+    async def _l1_batch(
+        self, scope: MemoryScope, after: int, upto: int | None = None
+    ) -> tuple[tuple[SessionTraceArchive, ...], int]:
+        archives = await self._store.unconsumed_items(scope, after)
+        return self._bounded_l1_archives(archives, after, upto)
+
+    def _bounded_l1_archives(
+        self, archives: tuple[SessionTraceArchive, ...], after: int, upto: int | None = None
+    ) -> tuple[tuple[SessionTraceArchive, ...], int]:
+        """Bound LLM input without changing the immutable, auditable L0 archive.
+
+        A tool result can be megabytes long.  The worker consumes its item
+        watermark once, but receives a hash-addressable excerpt; L0 remains the
+        complete source of truth for audit and later inspection.
+        """
+        used, watermark, selected_archives = 0, after, []
+        for archive in archives:
+            selected_items = []
+            for item in archive.items:
+                if item.store_seq <= after or (upto is not None and item.store_seq > upto):
+                    continue
+                projected = _l1_item_excerpt(item, self._l1_max_item_chars)
+                size = _trace_item_size(projected)
+                if selected_items and used + size > self._l1_max_input_chars:
+                    selected_archives.append(replace(archive, items=tuple(selected_items)))
+                    return tuple(selected_archives), watermark
+                selected_items.append(projected)
+                used += size
+                watermark = item.store_seq
+                if used >= self._l1_max_input_chars:
+                    selected_archives.append(replace(archive, items=tuple(selected_items)))
+                    return tuple(selected_archives), watermark
+            if selected_items:
+                selected_archives.append(replace(archive, items=tuple(selected_items)))
+        return tuple(selected_archives), watermark
+
 
 def _scope_json(scope: MemoryScope) -> dict[str, str | None]:
     return {"repository_id": scope.repository_id}
@@ -445,6 +506,32 @@ def _trace_item(entry: Entry) -> TraceItem:
         redacted,
         paths,
     )
+
+
+def _l1_item_excerpt(item: TraceItem, limit: int) -> TraceItem:
+    """Make a bounded, provenance-preserving projection for an extractor call."""
+    content = _excerpt(item.content, limit)
+    payload_json = json.dumps(item.payload, sort_keys=True, ensure_ascii=False, default=str)
+    if len(payload_json) <= limit:
+        payload = item.payload
+    else:
+        payload = {
+            "excerpt": _excerpt(payload_json, limit),
+            "original_payload_hash": content_hash(payload_json),
+            "truncated": True,
+        }
+    return replace(item, content=content, payload=payload)
+
+
+def _trace_item_size(item: TraceItem) -> int:
+    return len(item.content or "") + len(json.dumps(item.payload, ensure_ascii=False, default=str))
+
+
+def _excerpt(value: str | None, limit: int) -> str | None:
+    if value is None or len(value) <= limit:
+        return value
+    digest = content_hash(value)[:12]
+    return f"{value[:limit]}\n[TRUNCATED sha256:{digest}]"
 
 
 def _redact(value: object, path: str = "") -> tuple[dict[str, object], tuple[str, ...]]:

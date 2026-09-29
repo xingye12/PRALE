@@ -31,37 +31,26 @@ import logging
 import os
 import re
 import sys
-from collections.abc import Iterable, Mapping, Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass, field
-from pathlib import Path
 
 from agent_harness.api.errors import ProjectConfigError
-from agent_harness.api.project import ProjectRuntimeConfig
-from agent_harness.api.web import DEFAULT_MAX_CONCURRENT_DRIVES, WebApplication, create_app
+from agent_harness.api.settings import Settings
+from agent_harness.api.web import WebApplication, create_app
 from agent_harness.integrations.deepseek import DeepSeekProvider
+from agent_harness.integrations.langfuse import LangfuseTelemetry
 from agent_harness.integrations.local_tools import create_builtin_tools
 from agent_harness.integrations.memory_provider import JsonMemoryExtractor
+from agent_harness.integrations.repository_explorer import (
+    RepositoryExplorerConfig,
+    RepositoryExplorerTool,
+    RepositoryIndexError,
+    TreeSitterRepositoryIndexer,
+)
 from agent_harness.integrations.skill_reviewer import CodingSkillReviewer
 from agent_harness.runtime.generation import GenerationRequest
 from agent_harness.storage.memory_sqlite import SQLiteMemoryStore
 from agent_harness.storage.skill_sqlite import SQLiteSkillStore
-
-DEFAULT_HOST = "127.0.0.1"
-"""Loopback by default: a deployment that should be reachable says so."""
-
-DEFAULT_PORT = 8787
-DEFAULT_MODEL = "deepseek-flash"
-"""The provider's current fast model; ``PRALE_MODEL`` overrides it."""
-DEFAULT_BASE_URL = "https://api.deepseek.com/chat/completions"
-"""The whole endpoint, not a base to append a path to."""
-DEFAULT_GRACEFUL_SHUTDOWN_SECONDS = 10.0
-"""Bound the time Uvicorn waits for long-lived SSE requests to finish."""
-DEFAULT_LANE = "main"
-DATA_DIR_NAME = ".prale"
-"""Where the stores live when ``PRALE_DATA_DIR`` does not say otherwise."""
-
-BUILTIN_TOOLS = ("read", "write", "edit", "bash")
-"""The local tool set, named individually because enabling ``bash`` is a decision."""
 
 _REDACTED = "<redacted>"
 _BEARER = re.compile(r"(?i)\b(bearer)\s+[A-Za-z0-9._~+/=-]{8,}")
@@ -109,158 +98,6 @@ class RedactingFilter(logging.Filter):
         if record.stack_info is not None:
             record.stack_info = self.scrub(record.stack_info)
         return True
-
-
-@dataclass(frozen=True, slots=True)
-class Settings:
-    """One deployment's values, parsed and validated before anything opens.
-
-    This holds what the environment said, not the objects built from it: the
-    parsing is separable from the composition so that a misconfigured deployment
-    fails with an explanation instead of a traceback from inside a driver.
-    """
-
-    project_root: Path
-    repository_id: str
-    project_id: str | None
-    default_lane: str
-    sessions_dir: Path
-    catalog_db: Path
-    memory_db: Path | None
-    skill_db: Path | None
-    api_key: str
-    model: str
-    base_url: str
-    timeout_seconds: float
-    tokens: dict[str, str]
-    tools: tuple[str, ...]
-    traces: bool
-    max_concurrent_drives: int
-    memory_prompt_file: Path | None
-    host: str
-    port: int
-    max_connections: int | None
-    graceful_shutdown_seconds: float
-    log_level: str
-
-    @property
-    def config(self) -> ProjectRuntimeConfig:
-        return ProjectRuntimeConfig(
-            project_root=self.project_root,
-            repository_id=self.repository_id,
-            sessions_dir=self.sessions_dir,
-            catalog_db=self.catalog_db,
-            memory_db=self.memory_db,
-            skill_db=self.skill_db,
-            project_id=self.project_id,
-            default_lane=self.default_lane,
-        )
-
-    @property
-    def secrets(self) -> tuple[str, ...]:
-        """Every value the log filter must never print.
-
-        The token map is credential → identity (that is the shape
-        ``StaticTokenAuthenticator`` looks a bearer credential up in), so its
-        keys are the secrets and its values are the names a log may show.
-        """
-
-        return (self.api_key, *self.tokens)
-
-    def describe(self) -> str:
-        """The deployment as text, with credentials reduced to their presence."""
-
-        memory = "off" if self.memory_db is None else str(self.memory_db)
-        skills = "off" if self.skill_db is None else str(self.skill_db)
-        prompt = "none" if self.memory_prompt_file is None else str(self.memory_prompt_file)
-        tools = ", ".join(self.tools) or "none"
-        tokens = ", ".join(sorted(self.tokens.values())) or "none (unauthenticated)"
-        return "\n".join(
-            [
-                f"project_root      {self.project_root}",
-                f"repository_id     {self.repository_id}",
-                f"project_id        {self.project_id or self.repository_id}",
-                f"default_lane      {self.default_lane}",
-                f"sessions_dir      {self.sessions_dir}",
-                f"catalog_db        {self.catalog_db}",
-                f"memory_db         {memory}",
-                f"skill_db          {skills}",
-                f"provider          deepseek {self.model} @ {self.base_url}",
-                f"api_key           {'<set>' if self.api_key else '<unset>'}",
-                f"tokens            {tokens}",
-                f"tools             {tools}",
-                f"traces            {'on' if self.traces else 'off'}",
-                f"memory_prompt     {prompt}",
-                f"max_drives        {self.max_concurrent_drives}",
-                f"max_connections   {self.max_connections if self.max_connections else 'unlimited'}",
-                f"graceful_shutdown {self.graceful_shutdown_seconds}s",
-                f"listen            {self.host}:{self.port}",
-            ]
-        )
-
-    @classmethod
-    def from_environment(cls, environ: Mapping[str, str], *, cwd: Path | None = None) -> "Settings":
-        """Parse the deployment's values, or explain what is missing.
-
-        ``environ`` is a parameter rather than ``os.environ`` so that the
-        parsing can be exercised without a subprocess.
-        """
-
-        base = Path(cwd or Path.cwd())
-        root = _path(environ, "PRALE_PROJECT_ROOT", base)
-        data_dir = _path(environ, "PRALE_DATA_DIR", root / DATA_DIR_NAME)
-        repository_id = environ.get("PRALE_REPOSITORY_ID", "").strip()
-        if not repository_id:
-            raise ProjectConfigError(
-                "PRALE_REPOSITORY_ID is required: a stable identity (for example a canonical Git remote), "
-                "not a checkout path"
-            )
-        api_key = environ.get("PRALE_API_KEY", "").strip()
-        if not api_key:
-            raise ProjectConfigError("PRALE_API_KEY is required: this deployment needs a provider credential")
-        model = environ.get("PRALE_MODEL", "").strip() or DEFAULT_MODEL
-        tools = _tools(environ.get("PRALE_TOOLS", ""))
-        unknown = sorted(set(tools) - set(BUILTIN_TOOLS))
-        if unknown:
-            raise ProjectConfigError(f"PRALE_TOOLS names unknown tools: {unknown}; known: {list(BUILTIN_TOOLS)}")
-        prompt_file = environ.get("PRALE_MEMORY_PROMPT", "").strip()
-        memory_db = (
-            None if _off(environ, "PRALE_MEMORY") else _path(environ, "PRALE_MEMORY_DB", data_dir / "memory.sqlite")
-        )
-        skill_db = (
-            None if _off(environ, "PRALE_SKILLS") else _path(environ, "PRALE_SKILL_DB", data_dir / "skills.sqlite")
-        )
-        if skill_db is not None and memory_db is None:
-            # Said here rather than left to composition: skill extraction reads
-            # L0 archives through the memory store, and the runtime's own error
-            # for that mismatch arrives much further from the configuration.
-            raise ProjectConfigError("PRALE_SKILLS requires the memory store: extraction reads L0 archives from it")
-        return cls(
-            project_root=root,
-            repository_id=repository_id,
-            project_id=environ.get("PRALE_PROJECT_ID", "").strip() or None,
-            default_lane=environ.get("PRALE_DEFAULT_LANE", "").strip() or DEFAULT_LANE,
-            sessions_dir=_path(environ, "PRALE_SESSIONS_DIR", data_dir / "sessions"),
-            catalog_db=_path(environ, "PRALE_CATALOG_DB", data_dir / "catalog.sqlite"),
-            memory_db=memory_db,
-            skill_db=skill_db,
-            api_key=api_key,
-            model=model,
-            base_url=environ.get("PRALE_BASE_URL", "").strip() or DEFAULT_BASE_URL,
-            timeout_seconds=_float(environ, "PRALE_TIMEOUT_SECONDS", 60.0),
-            tokens=_tokens(environ.get("PRALE_TOKENS", "")),
-            tools=tools,
-            traces=not _off(environ, "PRALE_TRACES"),
-            max_concurrent_drives=_int(environ, "PRALE_MAX_DRIVES", DEFAULT_MAX_CONCURRENT_DRIVES),
-            memory_prompt_file=Path(prompt_file) if prompt_file else None,
-            host=environ.get("PRALE_HOST", "").strip() or DEFAULT_HOST,
-            port=_int(environ, "PRALE_PORT", DEFAULT_PORT),
-            max_connections=_optional_int(environ, "PRALE_MAX_CONNECTIONS"),
-            graceful_shutdown_seconds=_positive_float(
-                environ, "PRALE_GRACEFUL_SHUTDOWN_SECONDS", DEFAULT_GRACEFUL_SHUTDOWN_SECONDS
-            ),
-            log_level=environ.get("PRALE_LOG_LEVEL", "").strip() or "info",
-        )
 
 
 @dataclass(slots=True)
@@ -333,7 +170,15 @@ def build_application(settings: Settings) -> Deployment:
         base_url=settings.base_url,
         timeout_seconds=settings.timeout_seconds,
     )
-    tools = create_builtin_tools(settings.project_root) if settings.tools else ()
+    # Built before anything durable opens: this is the one step that can still
+    # fail on configuration (the SDK is an optional extra), and failing here
+    # leaves no store and no server behind.
+    telemetry = None if settings.langfuse is None else LangfuseTelemetry(settings.langfuse)
+    explorer = _repository_explorer(settings)
+    available_tools = (
+        create_builtin_tools(settings.project_root, repository_explorer=explorer) if settings.tools else ()
+    )
+    tools = tuple(tool for tool in available_tools if tool.name in settings.tools)
     stores: list[SQLiteMemoryStore | SQLiteSkillStore] = []
     memory_store = None
     skill_store = None
@@ -352,10 +197,30 @@ def build_application(settings: Settings) -> Deployment:
         memory_extractor=build_extractor(settings),
         skill_reviewer=CodingSkillReviewer(provider) if skill_store is not None else None,
         trace_recorder=settings.traces,
+        telemetry=telemetry,
         tokens=settings.tokens,
         max_concurrent_drives=settings.max_concurrent_drives,
     )
     return Deployment(web, tuple(stores))
+
+
+def _repository_explorer(settings: Settings) -> RepositoryExplorerTool | None:
+    if "repository_explore" not in settings.tools:
+        return None
+    assert settings.repository_index_dir is not None
+    try:
+        config = RepositoryExplorerConfig(
+            settings.project_root,
+            settings.repository_index_dir,
+            limits=settings.repository_scan_limits,
+            max_export_tokens=settings.repository_export_tokens,
+            cache_max_entries=settings.repository_cache_entries,
+            cache_ttl_ms=settings.repository_cache_ttl_ms,
+            max_concurrent_indexes=settings.repository_max_concurrent_indexes,
+        )
+        return RepositoryExplorerTool(config, TreeSitterRepositoryIndexer(config))
+    except (RepositoryIndexError, ValueError) as error:
+        raise ProjectConfigError(f"repository_explore is unavailable: {error}") from error
 
 
 def configure_logging(level: str, secrets: Iterable[str]) -> None:
@@ -406,7 +271,14 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     import uvicorn  # imported here so that --print-config needs no server installed
 
-    deployment = build_application(settings)
+    try:
+        deployment = build_application(settings)
+    except ProjectConfigError as error:
+        # Composition can still refuse: an uninstallable optional extra, an
+        # index directory that cannot be built.  Both are configuration, and
+        # both should read as configuration rather than as a traceback.
+        print(f"configuration error: {error}", file=sys.stderr)
+        return 2
     try:
         # ``log_config=None`` leaves logging to the root handler installed
         # above, so an access line cannot bypass the redacting filter.
@@ -441,68 +313,6 @@ def _json_request(prompt: str, payload: dict[str, object]) -> GenerationRequest:
         ),
         tools=(),
     )
-
-
-def _off(environ: Mapping[str, str], name: str) -> bool:
-    return environ.get(name, "").strip().lower() in {"off", "0", "false", "no"}
-
-
-def _path(environ: Mapping[str, str], name: str, default: Path) -> Path:
-    value = environ.get(name, "").strip()
-    return Path(value).expanduser() if value else default
-
-
-def _int(environ: Mapping[str, str], name: str, default: int) -> int:
-    value = environ.get(name, "").strip()
-    if not value:
-        return default
-    try:
-        parsed = int(value)
-    except ValueError as error:
-        raise ProjectConfigError(f"{name} must be an integer, not {value!r}") from error
-    if parsed < 1:
-        raise ProjectConfigError(f"{name} must be at least 1, not {parsed}")
-    return parsed
-
-
-def _optional_int(environ: Mapping[str, str], name: str) -> int | None:
-    return _int(environ, name, 1) if environ.get(name, "").strip() else None
-
-
-def _float(environ: Mapping[str, str], name: str, default: float) -> float:
-    value = environ.get(name, "").strip()
-    if not value:
-        return default
-    try:
-        return float(value)
-    except ValueError as error:
-        raise ProjectConfigError(f"{name} must be a number, not {value!r}") from error
-
-
-def _positive_float(environ: Mapping[str, str], name: str, default: float) -> float:
-    parsed = _float(environ, name, default)
-    if parsed <= 0:
-        raise ProjectConfigError(f"{name} must be greater than 0, not {parsed}")
-    return parsed
-
-
-def _tools(raw: str) -> tuple[str, ...]:
-    return tuple(name.strip() for name in raw.split(",") if name.strip())
-
-
-def _tokens(raw: str) -> dict[str, str]:
-    """Parse ``name:token`` pairs; the name is what appears in a log line."""
-
-    tokens: dict[str, str] = {}
-    for entry in raw.split(","):
-        entry = entry.strip()
-        if not entry:
-            continue
-        name, separator, value = entry.partition(":")
-        if not separator or not name.strip() or not value.strip():
-            raise ProjectConfigError(f"PRALE_TOKENS entry {entry!r} must be 'name:token'")
-        tokens[value.strip()] = name.strip()
-    return tokens
 
 
 if __name__ == "__main__":  # pragma: no cover - exercised through main()

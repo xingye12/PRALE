@@ -41,6 +41,24 @@ SQLite 是单机持久化后端，`MemoryStorage` 用于测试。工具可标记
 
 核心库不绑定 HTTP 框架。`HarnessRpc` 提供传输无关的 JSON-RPC-shaped dispatch；`AuthenticatedHarnessService` 叠加可替换认证与可关闭的远程订阅，供 WebSocket、SSE 或 TUI 外壳使用。认证凭据和连接状态不会写入 Session。
 
+## 追踪与评测
+
+`agent_harness.integrations.langfuse` 在每次 settlement 提交之后，把执行事实（operation 起止、每次 generation、每次 tool attempt）投影为 Langfuse observation。它订阅事实流，不参与 Drive 的判定：整条 trace 丢失也不改变 Session。默认关闭，需设置 `LANGFUSE_TRACING_ENABLED` 与两个 key 才启用（启动时只给开关不给 key 会被拒绝），并需要 `langfuse` extra。
+
+`PRALE_LANGFUSE_CAPTURE` 决定多少正文可以离开本进程：默认 `metadata` 只上传长度、计数与哈希，不上传 prompt、消息、记忆或工具结果正文；`redacted` 上传去除秘密后的文本；`full` 原样上传。选择即出口，见 `deploy/web.env.example`。
+
+`scripts/eval_harness.py` 用同一套环境变量把数据集跑成一次可对比的评测：每个 case 在自己的临时 workspace 与 SQLite session 中运行真实的 Agent（同一 Session、Drive、工具与 settlement 路径），再由 `agent_harness.integrations.evaluation` 从已提交的事实而非模型散文里打分。
+
+```bash
+python scripts/eval_harness.py --from-json dataset.json --report report.json  # 只本地运行，不上传
+python scripts/eval_harness.py --from-json dataset.json --upload-to prale/harness-regression  # 建/更新固定集
+python scripts/eval_harness.py --dataset prale/harness-regression             # 从 Langfuse 取物品并回传
+```
+
+`--upload-to` 把解析后的 case 逐个写进数据集（case id 即 item id，重复上传是更新而不是翻倍），写完即停，不打分；仓库里的 JSON 因此始终是「这个固定集是什么」的真相，Langfuse 是两次运行被并排比较的地方。`--run-name` 建议填 git sha 或 tag，配合 `PRALE_LANGFUSE_RELEASE` 才能看出是哪一版跑出的分数。
+
+退出码即接口：0 已打分，1 有 gate 未达标（`--gate terminal_success_rate=0.9`），2 在任何模型调用之前被拒绝——数据集有歧义、scorer 或 gate 不可用、case 要求本次不授予的工具。`--dry-run` 只打印计划。打分口径与沙箱边界见 `src/agent_harness/integrations/evaluation.py`：`read`/`write`/`edit` 的路径被限制在 case 的临时工作目录内，但 `bash` 不是操作系统沙箱，因此写入类工具默认不授予，需要 `--allow-writing`。
+
 ## 验证
 
 安装开发依赖后运行：

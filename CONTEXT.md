@@ -16,6 +16,16 @@ _Avoid_: Run, worker
 Lane 中一个可恢复、可终止的工作单元，拥有不可变元数据和可整体替换的状态。
 _Avoid_: Task, job
 
+## Telemetry
+
+**Telemetry fact**:
+在一次 settlement 提交之后发布的执行事实投影（operation 起止、每次 provider generation、每次 tool attempt）；它不是权威状态，整体丢失也不改变 Session。
+_Avoid_: Trace record, audit log, event
+
+**Capture profile**:
+决定事实中哪些内容可以离开本进程的部署配置（`metadata`、`redacted`、`full`）；默认档只上传长度、计数与哈希，不上传任何正文。
+_Avoid_: Log level, verbosity, redaction rule
+
 ## Long-lived assets
 
 **Memory scope**:
@@ -41,6 +51,14 @@ _Avoid_: Chat summary, project memory, scenario memory
 **Session trace archive**:
 在 Operation terminal 时派生、只包含该 Operation 新增 entry 的不可变 L0 记录。它以 base tip 与 terminal tip 界定增量，并以受限祖先链携带背景；它不是 dispatch 时读取的当前上下文，也不是完整 branch 的副本。
 _Avoid_: Current transcript, conversation copy
+
+**Repository index**:
+由当前 checkout 可重建的源码符号和引用关系视图，用于按需定位代码；它不是 Session 状态、长期记忆或工作树真相的持久副本。
+_Avoid_: Repository memory, implicit prompt context
+
+**Repository map**:
+按一次探索请求的焦点和预算，从 Repository index 导出的紧凑代码导航视图。它是一次 tool result，而非每轮自动注入的上下文。
+_Avoid_: Global system prompt, current workspace truth
 
 **Terminal tip / base tip**:
 一次 Operation 结算时写入 lane 的 `tip_id`，以及同一 Operation 启动时的 `source_tip_id`。二者都从已持久化的 operation result 读回，无需重新扫描 Session；其差集定义了 L0 增量。

@@ -2,14 +2,14 @@
 
 import asyncio
 import time
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 from agent_harness.api.errors import ProviderNotConfigured, UnknownTarget
 from agent_harness.api.models import OperationResult
 from agent_harness.domain.compaction import select_compaction_window
 from agent_harness.domain.context import project_messages
 from agent_harness.domain.effects import EffectKind, EffectOutcome, EffectSpan, ErrorClass
-from agent_harness.domain.entries import NewEntry
+from agent_harness.domain.entries import JsonValue, NewEntry
 from agent_harness.domain.operations import ActiveOperation, OperationState
 from agent_harness.domain.session import SessionMutator
 from agent_harness.domain.types import OperationStatus
@@ -21,8 +21,16 @@ from agent_harness.domain.values import (
     operation_result,
     operation_state,
 )
-from agent_harness.runtime.generation import AssistantResult, ChatProvider, GenerationDelta, GenerationRequest
+from agent_harness.runtime.generation import AssistantResult, ChatProvider, GenerationDelta, GenerationRequest, ToolCall
 from agent_harness.runtime.lane import Lane
+from agent_harness.runtime.telemetry import (
+    EffectStatus,
+    GenerationTelemetry,
+    OperationTelemetry,
+    TelemetryEvent,
+    ToolTelemetry,
+    publish,
+)
 from agent_harness.storage.protocol import (
     ClearList,
     DeleteValue,
@@ -48,6 +56,25 @@ def _tool_outcome(result: dict[str, object]) -> tuple[EffectOutcome, ErrorClass 
     if result.get("is_error"):
         return "failed", "tool_error"
     return "completed", None
+
+
+def _text(value: object) -> str | None:
+    return value if isinstance(value, str) else None
+
+
+def _text_length(value: object) -> int:
+    return len(value) if isinstance(value, str) else 0
+
+
+def _optional_int(value: object) -> int | None:
+    return value if isinstance(value, int) and not isinstance(value, bool) else None
+
+
+def _required_text(value: object) -> str:
+    """Durable tool call state always carries these; recovery of an older
+    operation may not, and a telemetry read must not be what fails a turn."""
+
+    return value if isinstance(value, str) else ""
 
 
 class Drive:
@@ -77,13 +104,183 @@ class Drive:
         return span, InsertSpan(span)
 
     def _settle_span(
-        self, span_id: object, outcome: EffectOutcome, error_class: ErrorClass | None = None
+        self,
+        span_id: object,
+        outcome: EffectOutcome,
+        error_class: ErrorClass | None = None,
+        ended_at: int | None = None,
     ) -> list[Write]:
-        """Close one attempt; intents written before spans existed close nothing."""
+        """Close one attempt; intents written before spans existed close nothing.
+
+        ``ended_at`` lets a caller settling a span next to an operation result
+        or a published fact use one reading of the clock for all of them, so an
+        effect, its span and its trace cannot carry three different end times.
+        """
 
         if not isinstance(span_id, str):
             return []
-        return [SettleSpan(span_id, self._lane.now_ms(), outcome, error_class)]
+        return [SettleSpan(span_id, self._lane.now_ms() if ended_at is None else ended_at, outcome, error_class)]
+
+    # Telemetry -----------------------------------------------------------------
+    #
+    # Each publisher below is called *after* the transaction that settled what it
+    # reports, and only reads durable state.  A fact is therefore never announced
+    # before the Session can prove it, and an observer can never change a turn.
+
+    def _publish(self, event: TelemetryEvent) -> None:
+        publish(self._lane.telemetry, event)
+
+    def _operation_started(self, operation: ActiveOperation) -> OperationTelemetry:
+        request = operation.meta.request if isinstance(operation.meta.request, dict) else {}
+        # The turn's input contract: the prompt a run was admitted with, the
+        # target of a navigation, nothing for a compaction.
+        prompt = request.get("prompt")
+        target = request.get("target_id")
+        admitted: JsonValue = None
+        if isinstance(prompt, str):
+            admitted = {"prompt": prompt}
+        elif isinstance(target, str):
+            admitted = {"target_id": target}
+        return OperationTelemetry(
+            session_id=self._lane.session_id,
+            lane=self._lane.name,
+            operation_id=operation.meta.operation_id,
+            kind=operation.meta.kind,
+            phase="started",
+            input=admitted,
+            started_at=operation.meta.started_at,
+        )
+
+    def _operation_terminal(self, result: OperationResult, output: JsonValue) -> OperationTelemetry:
+        return OperationTelemetry(
+            session_id=self._lane.session_id,
+            lane=self._lane.name,
+            operation_id=result.operation_id,
+            kind=result.kind,
+            phase="terminal",
+            output=output,
+            status=result.status,
+            error_code=result.error_code,
+            error_message=result.error_message,
+            started_at=result.started_at,
+            ended_at=result.ended_at,
+        )
+
+    def _generation_telemetry(
+        self,
+        operation: ActiveOperation,
+        intent: Mapping[str, object],
+        *,
+        content: JsonValue,
+        usage: Mapping[str, int | float],
+        finish_reason: str | None,
+        tool_calls: Sequence[ToolCall] = (),
+        outcome: EffectStatus,
+        error_class: str | None = None,
+        error: str | None = None,
+        ended_at: int | None = None,
+    ) -> GenerationTelemetry:
+        attempt = intent.get("attempt", 1)
+        output: JsonValue = {"content": content}
+        if tool_calls:
+            output = {
+                "content": content,
+                "tool_calls": [{"id": call.id, "name": call.name, "arguments": call.arguments} for call in tool_calls],
+            }
+        return GenerationTelemetry(
+            session_id=self._lane.session_id,
+            lane=self._lane.name,
+            operation_id=operation.meta.operation_id,
+            attempt=attempt if isinstance(attempt, int) else 1,
+            model=intent.get("model") if isinstance(intent.get("model"), str) else None,
+            input=intent.get("messages") if isinstance(intent.get("messages"), list) else [],
+            output=output,
+            usage=usage,
+            finish_reason=finish_reason,
+            outcome=outcome,
+            error_class=error_class,
+            error=error,
+            started_at=_optional_int(intent.get("span_started_at")),
+            ended_at=self._lane.now_ms() if ended_at is None else ended_at,
+            metadata=self._loadout_metadata(intent),
+        )
+
+    def _tool_telemetry(
+        self,
+        operation: ActiveOperation,
+        call: Mapping[str, object],
+        result: Mapping[str, object],
+        outcome: EffectStatus,
+        error_class: ErrorClass | None,
+    ) -> ToolTelemetry:
+        arguments = call.get("arguments")
+        attempt = call.get("attempt")
+        return ToolTelemetry(
+            session_id=self._lane.session_id,
+            lane=self._lane.name,
+            operation_id=operation.meta.operation_id,
+            tool_call_id=_required_text(call.get("tool_call_id")),
+            name=_required_text(call.get("tool_name")),
+            attempt=attempt if isinstance(attempt, int) else 1,
+            input=arguments
+            if isinstance(arguments, (dict, list, str, int, float, bool)) or arguments is None
+            else None,
+            output=dict(result),
+            is_error=bool(result.get("is_error", False)),
+            outcome=outcome,
+            error_class=error_class,
+            started_at=_optional_int(call.get("span_started_at")),
+            ended_at=self._lane.now_ms(),
+        )
+
+    def _loadout_metadata(self, intent: Mapping[str, object]) -> dict[str, JsonValue]:
+        """What a call was given, as identity rather than text.
+
+        A regression usually comes from a change in the retrieved memory or the
+        loaded Skills, so their ids, versions and hashes are published even in
+        the profiles that never upload their bodies.
+        """
+
+        metadata: dict[str, JsonValue] = {}
+        bundle_hash = intent.get("memory_bundle_hash")
+        if isinstance(bundle_hash, str):
+            metadata["memory_bundle_hash"] = bundle_hash
+        items = intent.get("memory_items")
+        if isinstance(items, list):
+            metadata["memory_item_count"] = len(items)
+            metadata["memory_items"] = [
+                {
+                    "id": _text(item.get("id")),
+                    "level": _text(item.get("level")),
+                    "chars": _text_length(item.get("content")),
+                }
+                for item in items
+                if isinstance(item, dict)
+            ]
+        listing = intent.get("skill_listing")
+        if isinstance(listing, list):
+            metadata["skill_listing"] = [
+                {
+                    "skill_id": _text(item.get("skill_id")),
+                    "version": _optional_int(item.get("version")),
+                    "name": _text(item.get("name")),
+                }
+                for item in listing
+                if isinstance(item, dict)
+            ]
+        loadout = intent.get("skill_loadout")
+        if isinstance(loadout, list):
+            metadata["skill_loadout"] = [
+                {
+                    "skill_id": _text(item.get("skill_id")),
+                    "version": _optional_int(item.get("version")),
+                    "content_hash": _text(item.get("content_hash")),
+                    "budget": _optional_int(item.get("budget")),
+                }
+                for item in loadout
+                if isinstance(item, dict)
+            ]
+        return metadata
 
     async def run(self) -> OperationResult:
         initial = await self._required_operation()
@@ -93,6 +290,7 @@ class Drive:
             fail_closed=True,
         )
         await self._lane.emit("operation_started", initial.meta.operation_id, {"kind": initial.meta.kind})
+        self._publish(self._operation_started(initial))
         while True:
             operation = await self._required_operation()
             if operation.meta.kind == "navigation":
@@ -224,7 +422,9 @@ class Drive:
             await mutator.commit(writes)
             return result
 
-        return await self._lane._session.mutate(navigate)  # noqa: SLF001
+        result = await self._lane._session.mutate(navigate)  # noqa: SLF001
+        self._publish(self._operation_terminal(result, {"target_id": target_id, "branch_summary": summary}))
+        return result
 
     async def _run_compaction(self, operation: ActiveOperation) -> OperationResult:
         if operation.state.at == "starting":
@@ -337,7 +537,9 @@ class Drive:
             )
             return result
 
-        return await self._lane._session.mutate(settle)  # noqa: SLF001
+        result = await self._lane._session.mutate(settle)  # noqa: SLF001
+        self._publish(self._operation_terminal(result, {"summary": summary, "retained_message_ids": retained_ids}))
+        return result
 
     async def _settle_interrupted_compaction(self, operation: ActiveOperation) -> OperationResult:
         data = operation.state.data
@@ -382,7 +584,9 @@ class Drive:
             )
             return result
 
-        return await self._lane._session.mutate(settle)  # noqa: SLF001
+        result = await self._lane._session.mutate(settle)  # noqa: SLF001
+        self._publish(self._operation_terminal(result, {"summary_interrupted": True}))
+        return result
 
     async def _consume_inbox(self) -> None:
         async def consume(mutator: SessionMutator) -> None:
@@ -518,6 +722,9 @@ class Drive:
             "assistant_entry_id": assistant_entry_id,
             "usage_id": usage_id,
             "span_id": span.span_id,
+            # The durable span is the effect's own record; this copy lets the
+            # telemetry published at settlement carry the attempt's real start.
+            "span_started_at": span.started_at,
             "messages": payload["messages"],
             "attempt": 1,
             "model": getattr(self._provider, "model", type(self._provider).__name__) if self._provider else None,
@@ -620,7 +827,11 @@ class Drive:
                 await self._lane.emit(
                     "message_update",
                     operation.meta.operation_id,
-                    {"role": "assistant", "content": content},
+                    # ``GenerationDelta.content`` is append-only.  Keep the
+                    # durable checkpoint cumulative for recovery, but publish
+                    # only this frame to observers: clients concatenate update
+                    # events and must not render the prior completion again.
+                    {"role": "assistant", "content": frame.content},
                 )
             elif isinstance(frame, AssistantResult):
                 final = frame
@@ -666,10 +877,27 @@ class Drive:
             "not_before": time.time_ns() // 1_000_000 + self._lane.retry.delay_ms(next_attempt),
             "last_error": error,
         }
+        ended_at = self._lane.now_ms()
         await self._transition(
             operation,
             OperationState("assistant.retry_wait", "running", next_data),
-            self._settle_span(data.get("span_id"), "failed", "provider_error"),
+            self._settle_span(data.get("span_id"), "failed", "provider_error", ended_at=ended_at),
+        )
+        # The attempt is settled as failed before the retry; reporting it here
+        # keeps one generation per model call rather than one per operation.
+        checkpoint = data.get("content_checkpoint")
+        self._publish(
+            self._generation_telemetry(
+                operation,
+                data,
+                content=checkpoint if isinstance(checkpoint, str) else "",
+                usage={},
+                finish_reason=None,
+                outcome="failed",
+                error_class="provider_error",
+                error=error,
+                ended_at=ended_at,
+            )
         )
         return None
 
@@ -693,7 +921,11 @@ class Drive:
         span, span_write = self._open_span(latest, call_id, "llm", attempt)
         await self._transition(
             latest,
-            OperationState("assistant.effect_pending", latest.state.control, {**latest_data, "span_id": span.span_id}),
+            OperationState(
+                "assistant.effect_pending",
+                latest.state.control,
+                {**latest_data, "span_id": span.span_id, "span_started_at": span.started_at},
+            ),
             [span_write],
         )
 
@@ -725,6 +957,10 @@ class Drive:
             for call in calls
         ]
 
+        # The provider call is over by the time the settlement starts, so one
+        # reading serves the span, the operation result and the published fact.
+        ended_at = self._lane.now_ms()
+
         async def settle(mutator: SessionMutator) -> OperationResult | None:
             current = await mutator.get_value(operation_state(operation.meta.operation_id))
             if current != operation.state:
@@ -752,7 +988,7 @@ class Drive:
                         span_id=intent.get("span_id") if isinstance(intent.get("span_id"), str) else None,
                     )
                 ),
-                *self._settle_span(intent.get("span_id"), "completed"),
+                *self._settle_span(intent.get("span_id"), "completed", ended_at=ended_at),
                 SetValue(lane_tip(self._lane.name), assistant_entry_id),
             ]
             if calls:
@@ -784,13 +1020,37 @@ class Drive:
                 )
                 await mutator.commit(writes)
                 return None
-            result = self._terminal_result(operation, assistant_entry_id, "completed")
+            result = self._terminal_result(operation, assistant_entry_id, "completed", ended_at=ended_at)
             writes.extend(await self._lane.memory_capture_writes(mutator, result, (assistant_entry_id,)))
             writes.extend(self._terminal_writes(operation, result, "completed"))
             await mutator.commit(writes)
             return result
 
-        return await self._lane._session.mutate(settle)  # noqa: SLF001
+        result = await self._lane._session.mutate(settle)  # noqa: SLF001
+        self._publish(
+            self._generation_telemetry(
+                operation,
+                intent,
+                content=response.content,
+                usage=response.usage,
+                finish_reason=response.finish_reason,
+                tool_calls=response.tool_calls,
+                outcome="completed",
+                ended_at=ended_at,
+            )
+        )
+        if result is not None:
+            self._publish(
+                self._operation_terminal(
+                    result,
+                    {
+                        "content": response.content,
+                        "stop_reason": response.finish_reason,
+                        "tool_calls": [call.name for call in response.tool_calls],
+                    },
+                )
+            )
+        return result
 
     async def _run_next_tool(self, operation: ActiveOperation) -> OperationResult | None:
         data = operation.state.data
@@ -811,11 +1071,24 @@ class Drive:
                 # The replay is a new attempt.  Close the lost one as unknown in
                 # the same transaction that authorizes the retry, so a span is
                 # never left pending for an effect that nothing is waiting on.
+                ended_at = self._lane.now_ms()
                 await self._transition_tool(
                     operation,
                     pending,
                     "planned",
-                    extra=self._settle_span(pending.get("span_id"), "unknown", "interrupted"),
+                    extra=self._settle_span(pending.get("span_id"), "unknown", "interrupted", ended_at=ended_at),
+                )
+                # The lost attempt is a fact in its own right: an evaluator must
+                # see that the tool may have run twice, not only the replay that
+                # produced the answer.
+                self._publish(
+                    self._tool_telemetry(
+                        operation,
+                        pending,
+                        {"content": "tool execution interrupted; outcome is unknown", "is_error": True},
+                        "unknown",
+                        "interrupted",
+                    )
                 )
                 return
             await self._settle_tool(
@@ -849,7 +1122,10 @@ class Drive:
         attempt = planned.get("attempt", 0) + 1 if isinstance(planned.get("attempt"), int) else 1
         span, span_write = self._open_span(operation, planned["tool_call_id"], "tool", attempt)
         await self._transition_tool(
-            operation, {**planned, "attempt": attempt, "span_id": span.span_id}, "effect_pending", extra=[span_write]
+            operation,
+            {**planned, "attempt": attempt, "span_id": span.span_id, "span_started_at": span.started_at},
+            "effect_pending",
+            extra=[span_write],
         )
         latest = await self._required_operation()
         active = next(call for call in latest.state.data["calls"] if call["tool_call_id"] == planned["tool_call_id"])
@@ -926,7 +1202,7 @@ class Drive:
         for call, _ in prepared:
             attempt = call.get("attempt", 0) + 1 if isinstance(call.get("attempt"), int) else 1
             span, span_write = self._open_span(operation, call["tool_call_id"], "tool", attempt)
-            targets.append({**call, "attempt": attempt, "span_id": span.span_id})
+            targets.append({**call, "attempt": attempt, "span_id": span.span_id, "span_started_at": span.started_at})
             span_writes.append(span_write)
         await self._transition_tools(operation, targets, "effect_pending", extra=span_writes)
         latest = await self._required_operation()
@@ -1042,6 +1318,7 @@ class Drive:
             )
 
         await self._lane._session.mutate(settle)  # noqa: SLF001
+        self._publish(self._tool_telemetry(operation, active, result, outcome, error_class))
 
     async def _settle_tool_batch(
         self,
@@ -1102,6 +1379,10 @@ class Drive:
             await mutator.commit(writes)
 
         await self._lane._session.mutate(settle)  # noqa: SLF001
+        # One observation per call: a parallel batch is a set of independent
+        # effects, and a failure in one of them must not be read as the batch's.
+        for call, result, (outcome, error_class) in zip(active, results, outcomes):
+            self._publish(self._tool_telemetry(operation, call, result, outcome, error_class))
 
     async def _settle_interrupted(
         self,
@@ -1144,7 +1425,11 @@ class Drive:
             await mutator.commit([*writes, *self._terminal_writes(operation, result, status)])
             return result
 
-        return await self._lane._session.mutate(settle)  # noqa: SLF001
+        result = await self._lane._session.mutate(settle)  # noqa: SLF001
+        # The turn ended on a tool that asked to terminate, so the last
+        # assistant content is not at hand here; the tip names what it settled on.
+        self._publish(self._operation_terminal(result, {"tip_id": result.tip_id}))
+        return result
 
     async def _settle_cancelled(self, operation: ActiveOperation) -> OperationResult:
         if operation.state.at == "assistant.effect_pending":
@@ -1168,7 +1453,9 @@ class Drive:
             await mutator.commit([*writes, *self._terminal_writes(operation, result, "aborted")])
             return result
 
-        return await self._lane._session.mutate(settle)  # noqa: SLF001
+        result = await self._lane._session.mutate(settle)  # noqa: SLF001
+        self._publish(self._operation_terminal(result, {"cancelled": True, "tip_id": result.tip_id}))
+        return result
 
     async def _settle(
         self,
@@ -1190,6 +1477,10 @@ class Drive:
         if not isinstance(assistant_entry_id, str) or not isinstance(usage_id, str):
             raise RuntimeError("generation intent is missing reserved identifiers")
 
+        # One clock reading for the whole settlement: the operation result, its
+        # effect span and the fact published from them all report the same end.
+        ended_at = self._lane.now_ms()
+
         async def settle(mutator: SessionMutator) -> OperationResult:
             current = await mutator.get_value(operation_state(operation.meta.operation_id))
             if current != operation.state:
@@ -1204,7 +1495,7 @@ class Drive:
                 from_tip_id=operation.meta.source_tip_id,
                 tip_id=assistant_entry_id,
                 started_at=operation.meta.started_at,
-                ended_at=self._lane._now_ms(),  # noqa: SLF001
+                ended_at=ended_at,
                 error_code=error_code,
                 error_message=error_message,
             )
@@ -1225,6 +1516,7 @@ class Drive:
                         span_id,
                         span_outcome or _TERMINAL_OUTCOME[status],
                         span_error_class,
+                        ended_at=ended_at,
                     ),
                     SetValue(lane_tip(self._lane.name), assistant_entry_id),
                     *await self._lane.memory_capture_writes(mutator, result, (assistant_entry_id,)),
@@ -1241,7 +1533,25 @@ class Drive:
             )
             return result
 
-        return await self._lane._session.mutate(settle)  # noqa: SLF001
+        result = await self._lane._session.mutate(settle)  # noqa: SLF001
+        # ``span_outcome`` separates the attempt's fate from the operation's:
+        # a provider that failed on its last allowed attempt leaves an operation
+        # whose outcome nobody can prove, and the generation that failed.
+        self._publish(
+            self._generation_telemetry(
+                operation,
+                intent,
+                content=assistant_payload["content"],
+                usage=usage,
+                finish_reason=assistant_payload.get("stop_reason"),
+                outcome=span_outcome or _TERMINAL_OUTCOME[status],
+                error_class=span_error_class,
+                error=error_message,
+                ended_at=ended_at,
+            )
+        )
+        self._publish(self._operation_terminal(result, {**assistant_payload, "status": status}))
+        return result
 
     def _terminal_result(
         self,
@@ -1250,6 +1560,7 @@ class Drive:
         status: OperationStatus,
         error_code: str | None = None,
         error_message: str | None = None,
+        ended_at: int | None = None,
     ) -> OperationResult:
         return OperationResult(
             operation_id=operation.meta.operation_id,
@@ -1258,7 +1569,7 @@ class Drive:
             from_tip_id=operation.meta.source_tip_id,
             tip_id=tip_id,
             started_at=operation.meta.started_at,
-            ended_at=self._lane._now_ms(),  # noqa: SLF001
+            ended_at=self._lane.now_ms() if ended_at is None else ended_at,
             error_code=error_code,
             error_message=error_message,
         )

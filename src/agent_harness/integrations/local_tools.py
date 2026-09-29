@@ -17,7 +17,7 @@ from pathlib import Path
 from typing import Final
 
 from agent_harness.domain.entries import JsonValue
-from agent_harness.runtime.tools import ToolExecutionResult
+from agent_harness.runtime.tools import AgentTool, ToolExecutionResult
 
 MAX_OUTPUT_LINES: Final = 2_000
 MAX_OUTPUT_BYTES: Final = 50 * 1024
@@ -418,7 +418,16 @@ class BashTool:
 
 
 def create_builtin_tools(
-    cwd: Path | str, *, bash_environment: Mapping[str, str] | None = None
-) -> tuple[ReadTool, WriteTool, EditTool, BashTool]:
+    cwd: Path | str,
+    *,
+    bash_environment: Mapping[str, str] | None = None,
+    repository_explorer: AgentTool | None = None,
+) -> tuple[AgentTool, ...]:
     """Return the Pi-compatible local tool set for a session working directory."""
-    return (ReadTool(cwd), WriteTool(cwd), EditTool(cwd), BashTool(cwd, environment=bash_environment))
+    tools: tuple[AgentTool, ...] = (
+        ReadTool(cwd),
+        WriteTool(cwd),
+        EditTool(cwd),
+        BashTool(cwd, environment=bash_environment),
+    )
+    return (*tools, repository_explorer) if repository_explorer is not None else tools

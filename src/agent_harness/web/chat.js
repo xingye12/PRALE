@@ -4,7 +4,7 @@
 // 一个明确标注为"流式接收中（未落盘）"的临时气泡。刷新页面后看到的历史与流中
 // 看到的一致，因为两者来自同一次查询。
 
-import { append, badge, card, clear, empty, h, notice, tag } from "./dom.js";
+import { append, badge, card, clear, empty, h, markdown, notice, tag } from "./dom.js";
 import { clock, count, duration, errorText, operationStatus, shortId } from "./format.js";
 
 const TURN_LIMIT = 20;
@@ -95,7 +95,7 @@ export function createChatView(app) {
             badge("assistant", "ok"),
             h("span", { text: "流式接收中（尚未落盘）" }),
           ),
-          h("pre", { class: "live", text: live.text }),
+          h("div", { class: "live" }, markdown(live.text)),
         ),
       );
     }
@@ -121,7 +121,7 @@ export function createChatView(app) {
     if (isToolResult) {
       nodes.push(toolResultNode(payload));
     } else if (content) {
-      nodes.push(h("pre", { text: content }));
+      nodes.push(markdown(content));
     }
     if (!isToolResult && Array.isArray(payload.tool_calls)) {
       for (const call of payload.tool_calls) {
@@ -287,7 +287,12 @@ export function createChatView(app) {
       turns = page.items;
       nextCursor = page.next_cursor;
       error = null;
-      const wanted = turns.filter((turn) => !details.has(turn.operation_id) || turn.status === null);
+      // A list read and its detail reads are separate HTTP requests.  A
+      // pre-settlement detail request may complete after ``message_end`` and
+      // otherwise reinsert a user-only timeline into this cache.  Re-read the
+      // visible page on each refresh so the terminal assistant entry always
+      // wins that race (the page is bounded by TURN_LIMIT).
+      const wanted = turns;
       const fetched = await Promise.all(
         wanted.map((turn) =>
           app.api
@@ -350,6 +355,10 @@ export function createChatView(app) {
         live.text += typeof data.data?.content === "string" ? data.data.content : "";
         app.live.set(data.operation_id, live);
         render();
+      } else if (name === "message_end" && data.operation_id) {
+        // The cached detail may be the pre-settlement read (user prompt only).
+        // Drop it so the scheduled durable refresh fetches the assistant entry.
+        details.delete(data.operation_id);
       }
     },
   };

@@ -77,6 +77,103 @@ export function notice(message, tone = "warn") {
   return h("div", { class: "notice", dataset: { tone }, text: message });
 }
 
+/**
+ * Render the small, common Markdown subset used by assistant messages.
+ *
+ * This intentionally builds DOM nodes rather than assigning HTML: model output
+ * is untrusted, so a markdown-looking ``<script>`` remains literal text.
+ */
+export function markdown(text) {
+  const root = h("div", { class: "markdown" });
+  const lines = String(text).replace(/\r\n?/g, "\n").split("\n");
+  for (let index = 0; index < lines.length; ) {
+    const line = lines[index];
+    const fence = line.match(/^```([^`]*)$/);
+    if (fence) {
+      const code = [];
+      index += 1;
+      while (index < lines.length && !/^```\s*$/.test(lines[index])) code.push(lines[index++]);
+      if (index < lines.length) index += 1;
+      root.append(h("pre", { class: "block" }, h("code", { text: code.join("\n") })));
+      continue;
+    }
+    const heading = line.match(/^(#{1,6})\s+(.+)$/);
+    if (heading) {
+      root.append(h(`h${heading[1].length}`, {}, inlineMarkdown(heading[2])));
+      index += 1;
+      continue;
+    }
+    if (/^\s{0,3}([-*_])(?:\s*\1){2,}\s*$/.test(line)) {
+      root.append(h("hr"));
+      index += 1;
+      continue;
+    }
+    const list = line.match(/^\s*([-*+])\s+(.+)$/);
+    const ordered = line.match(/^\s*\d+[.)]\s+(.+)$/);
+    if (list || ordered) {
+      const pattern = list ? /^\s*[-*+]\s+(.+)$/ : /^\s*\d+[.)]\s+(.+)$/;
+      const items = [];
+      while (index < lines.length) {
+        const item = lines[index].match(pattern);
+        if (!item) break;
+        items.push(h("li", {}, inlineMarkdown(item[1])));
+        index += 1;
+      }
+      root.append(h(list ? "ul" : "ol", {}, items));
+      continue;
+    }
+    if (line.startsWith(">")) {
+      const quote = [];
+      while (index < lines.length && lines[index].startsWith(">")) quote.push(lines[index++].replace(/^>\s?/, ""));
+      root.append(h("blockquote", {}, inlineMarkdown(quote.join("\n"))));
+      continue;
+    }
+    if (!line.trim()) {
+      index += 1;
+      continue;
+    }
+    const paragraph = [];
+    while (index < lines.length && lines[index].trim() && !/^```/.test(lines[index])) paragraph.push(lines[index++]);
+    root.append(h("p", {}, inlineMarkdown(paragraph.join("\n"))));
+  }
+  return root;
+}
+
+function inlineMarkdown(text) {
+  const fragment = document.createDocumentFragment();
+  const token = /(`[^`]*`|\[([^\]]+)\]\(([^)\s]+)\)|\*\*([^*]+)\*\*|__([^_]+)__|\*([^*]+)\*|_([^_]+)_)/g;
+  let last = 0;
+  for (const match of text.matchAll(token)) {
+    appendInlineText(fragment, text.slice(last, match.index));
+    const [raw, , linkText, href, boldA, boldB, emphasisA, emphasisB] = match;
+    if (raw.startsWith("`")) fragment.append(h("code", { text: raw.slice(1, -1) }));
+    else if (linkText !== undefined && safeHref(href)) {
+      fragment.append(h("a", { href, target: "_blank", rel: "noopener noreferrer" }, inlineMarkdown(linkText)));
+    } else if (boldA !== undefined || boldB !== undefined) fragment.append(h("strong", {}, inlineMarkdown(boldA ?? boldB)));
+    else if (emphasisA !== undefined || emphasisB !== undefined) fragment.append(h("em", {}, inlineMarkdown(emphasisA ?? emphasisB)));
+    else appendInlineText(fragment, raw);
+    last = (match.index || 0) + raw.length;
+  }
+  appendInlineText(fragment, text.slice(last));
+  return fragment;
+}
+
+function appendInlineText(parent, text) {
+  const parts = text.split("\n");
+  parts.forEach((part, index) => {
+    if (index) parent.append(h("br"));
+    if (part) parent.append(document.createTextNode(part));
+  });
+}
+
+function safeHref(value) {
+  try {
+    return ["http:", "https:", "mailto:"].includes(new URL(value, window.location.origin).protocol);
+  } catch {
+    return false;
+  }
+}
+
 export function tabs(items, active, onSelect) {
   return h(
     "div",

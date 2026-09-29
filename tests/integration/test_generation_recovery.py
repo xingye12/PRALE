@@ -206,6 +206,35 @@ def test_streamed_content_is_checkpointed_and_preserved_when_the_effect_is_inter
     asyncio.run(scenario())
 
 
+def test_stream_updates_publish_only_the_new_delta() -> None:
+    class Provider:
+        async def generate(self, request: GenerationRequest) -> AssistantResult:
+            raise AssertionError("streaming capability should be used")
+
+        async def stream(self, request: GenerationRequest):
+            yield GenerationDelta("记")
+            yield GenerationDelta("忆")
+            yield GenerationDelta("模块")
+            yield AssistantResult(content="记忆模块", usage={})
+
+    async def scenario() -> None:
+        storage = MemoryStorage()
+        lane = await (await Harness.open("session-1", storage)).acquire_lane("main")
+        updates: list[str] = []
+        _, unsubscribe = await lane.watch(
+            lambda event: updates.append(event.data["content"]) if event.type == "message_update" else None
+        )
+        try:
+            await lane.prompt("hi", operation_id="op-1")
+            await lane.drive(Provider())
+        finally:
+            unsubscribe()
+
+        assert updates == ["记", "忆", "模块"]
+
+    asyncio.run(scenario())
+
+
 def test_provider_failure_is_settled_as_unknown_instead_of_being_left_replayable() -> None:
     async def scenario() -> None:
         storage = MemoryStorage()

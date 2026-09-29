@@ -165,7 +165,7 @@ SQLite migration 只前进：为 operation/call usage、span 和查询索引加�
 
 **事件流**：用 `fetch` + `ReadableStream` 读取 SSE，而不是 `EventSource`——后者无法设置 `Authorization` 头，会给已配置 token 的部署留下"把 token 放进 URL"的唯一出路，而 URL 会进入访问日志。客户端自己解析 SSE 帧、按服务端 `retry:` 提示重连，并在重连时带上 `Last-Event-ID`；服务端返回的 `resumed_from` 会提示"已确认但未回放"。
 
-**实时与 durable 的分界**：`message_update` 只驱动一个明确标注"流式接收中（尚未落盘）"的临时气泡，一旦 durable 读回该 turn 已有 status 就丢弃它；`operation_admitted`/`input_queued`/`message_end`/`tool_start`/`tool_end` 触发合并后的重读（默认 300ms 合并窗口）。没有事件时页面依然完整，只是不再自动更新。
+**实时与 durable 的分界**：`message_update` 的 `content` 是单帧增量，只驱动一个明确标注"流式接收中（尚未落盘）"的临时气泡；客户端追加它。一旦 durable 读回该 turn 已有 status 就丢弃临时气泡。因为列表与详情是独立读取，较早的未结算详情响应可晚于 `message_end` 返回；故每次合并刷新必须重读当前页面内所有 turn 的 detail，不能复用该页面的 detail 缓存。`operation_admitted`/`input_queued`/`message_end`/`tool_start`/`tool_end` 触发合并后的重读（默认 300ms 合并窗口）。没有事件时页面依然完整，只是不再自动更新。助手消息以安全 DOM 节点渲染常用 Markdown（标题、段落、列表、引用、代码、强调和安全链接），不得把模型内容作为 HTML 注入。
 
 **展示契约由前端强制**：`format.js` 是唯一把值变成字符串的地方——缺失 token 显示 `—`、未结算显示"未结算"、`unknown` 显示"结果未知"、`duration_ms` 为 `null` 时显示 `—`，并附上"为什么没有耗时"的说明；视图只读 provider/domain 给出的数，不从时间戳相减推导耗时。agent 产出的一切文本都经 `textContent` 渲染，从不使用 `innerHTML`。
 

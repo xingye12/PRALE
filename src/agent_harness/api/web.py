@@ -47,6 +47,7 @@ from agent_harness.api.models import AbortResult, LaneSnapshot, OperationAdmissi
 from agent_harness.api.pagination import Page
 from agent_harness.api.project import ProjectRuntimeConfig
 from agent_harness.api.service import AuthenticationError, RemoteSubscription, StaticTokenAuthenticator
+from agent_harness.api.settings import DEFAULT_MAX_CONCURRENT_DRIVES
 from agent_harness.api.skill import SkillQueryService
 from agent_harness.api.trace import TraceQueryService
 from agent_harness.domain.memory import MemoryScope
@@ -56,6 +57,7 @@ from agent_harness.memory.runtime import MemoryExtractor, MemoryRuntime
 from agent_harness.runtime.events import HarnessEvent
 from agent_harness.runtime.generation import ChatProvider
 from agent_harness.runtime.lane import ActiveOperation, Lane
+from agent_harness.runtime.telemetry import TelemetrySink, close_telemetry
 from agent_harness.runtime.tools import AgentTool
 from agent_harness.skill.protocol import SkillReviewer, SkillStore
 from agent_harness.skill.runtime import SkillEvolutionRuntime
@@ -70,15 +72,6 @@ HEARTBEAT_SECONDS = 15.0
 
 A connection that only speaks when the agent does is indistinguishable from a
 dropped one, both to proxies and to the browser's reconnect logic.
-"""
-
-DEFAULT_MAX_CONCURRENT_DRIVES = 8
-"""How many turns one deployment drives at once, unless it is configured otherwise.
-
-Each drive is an agent loop that may run tools, so an unbounded number of
-simultaneously admitted turns is a resource decision rather than a detail.
-Refusing *before* the prompt is written keeps a refusal from leaving an
-undriven durable operation behind.
 """
 
 
@@ -236,6 +229,7 @@ class SessionSupervisor:
         skill_reviewer: SkillReviewer | None = None,
         trace_recorder: bool = False,
         max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
+        telemetry: TelemetrySink | None = None,
     ) -> None:
         if skill_store is not None and memory_store is None:
             raise ValueError("skill_store requires memory_store for L0 archive materialization")
@@ -246,6 +240,7 @@ class SessionSupervisor:
         self._tools = tools
         self._trace_recorder = trace_recorder
         self._max_drives = max_concurrent_drives
+        self._telemetry = telemetry
         self._sessions: dict[str, _OpenSession] = {}
         self._open_lock = asyncio.Lock()
         self._drives: dict[tuple[str, str], asyncio.Task[None]] = {}
@@ -475,6 +470,7 @@ class SessionSupervisor:
             skill_scope=self._skill_scope,
             skill_runtime=self._skill_runtime,
             trace_recorder=self._trace_recorder,
+            telemetry=self._telemetry,
         )
         return _OpenSession(harness, storage)
 
@@ -524,8 +520,12 @@ class WebApplication:
         trace_recorder: bool = False,
         tokens: dict[str, str] | None = None,
         max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
+        telemetry: TelemetrySink | None = None,
     ) -> None:
         self._config = config
+        # The deployment's optional observer.  It is closed last, after the
+        # drives it reports on have stopped settling.
+        self._telemetry = telemetry
         # Which stores exist, never where they are: a health answer is served to
         # whoever is probing, and a database path is deployment layout.
         self._stores = {
@@ -555,6 +555,7 @@ class WebApplication:
             skill_reviewer=skill_reviewer,
             trace_recorder=trace_recorder,
             max_concurrent_drives=max_concurrent_drives,
+            telemetry=telemetry,
         )
         self.app = self._build_app(tokens or {})
 
@@ -563,6 +564,11 @@ class WebApplication:
 
     async def aclose(self) -> None:
         await self.supervisor.aclose()
+        if self._telemetry is not None:
+            # Draining here, on the loop, is what makes a short-lived deployment
+            # deliver its last turns: after ``uvicorn.run`` returns there is no
+            # loop left to flush on.
+            await close_telemetry(self._telemetry)
         self._catalog_store.close()
 
     @asynccontextmanager
@@ -886,6 +892,7 @@ def create_app(
     trace_recorder: bool = False,
     tokens: dict[str, str] | None = None,
     max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
+    telemetry: TelemetrySink | None = None,
 ) -> WebApplication:
     """Build the web application for one deployment.
 
@@ -905,6 +912,7 @@ def create_app(
         trace_recorder=trace_recorder,
         tokens=tokens,
         max_concurrent_drives=max_concurrent_drives,
+        telemetry=telemetry,
     )
 
 

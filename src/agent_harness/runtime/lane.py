@@ -27,6 +27,7 @@ from agent_harness.domain.values import (
 from agent_harness.runtime.events import EventBus, EventListener, HarnessEvent
 from agent_harness.runtime.hooks import HookRegistry
 from agent_harness.runtime.retry import RetryPolicy
+from agent_harness.runtime.telemetry import TelemetrySink
 from agent_harness.runtime.tools import AgentTool, ToolRegistry
 from agent_harness.storage.protocol import AppendList, DeleteValue, InsertEntry, SetValue, Write
 
@@ -81,6 +82,7 @@ class Lane:
         skill_scope: "SkillScope | None" = None,
         skill_runtime: "SkillEvolutionRuntime | None" = None,
         trace_recorder: bool = False,
+        telemetry: TelemetrySink | None = None,
     ) -> None:
         self.name = name
         self._session = session
@@ -96,6 +98,7 @@ class Lane:
         self._skill_scope = skill_scope
         self._skill_runtime = skill_runtime
         self._trace_recorder = trace_recorder
+        self._telemetry = telemetry
 
     async def attach(self, at: str | None = None) -> None:
         """Durably create the lane's idle projection if this is its first attachment."""
@@ -361,6 +364,16 @@ class Lane:
             return await self._skill_runtime.load(self._skill_scope, skill_id, version)
         except Exception:
             return None
+
+    @property
+    def session_id(self) -> str:
+        return self._session.id
+
+    @property
+    def telemetry(self) -> TelemetrySink | None:
+        """The deployment's optional observer, or ``None`` for a bare harness."""
+
+        return self._telemetry
 
     @property
     def tools(self) -> ToolRegistry:

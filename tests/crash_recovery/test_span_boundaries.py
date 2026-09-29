@@ -14,6 +14,7 @@ from agent_harness.api.harness import Harness
 from agent_harness.domain.effects import EffectSpan, UsageRecord
 from agent_harness.domain.entries import Entry
 from agent_harness.domain.values import ListAddress, ValueAddress
+from agent_harness.integrations.repository_explorer import RepositoryExplorerConfig, RepositoryExplorerTool
 from agent_harness.runtime.generation import AssistantResult, GenerationRequest, ToolCall
 from agent_harness.runtime.retry import RetryPolicy
 from agent_harness.runtime.tools import ToolExecutionResult
@@ -160,6 +161,18 @@ class ToolThenTextProvider:
         return AssistantResult(content="tool completed", usage={})
 
 
+class RepositoryToolThenTextProvider(ToolThenTextProvider):
+    async def generate(self, request: GenerationRequest) -> AssistantResult:
+        self.calls += 1
+        if self.calls == 1:
+            return AssistantResult(
+                content="",
+                usage={},
+                tool_calls=(ToolCall("call-1", "repository_explore", {"identifiers": ["target"]}),),
+            )
+        return AssistantResult(content="tool completed", usage={})
+
+
 async def _open_tool_lane(storage: Storage, tool) -> None:
     lane = await (await Harness.open("session-1", storage, tools=(tool,))).acquire_lane("main")
     await lane.prompt("use the tool", operation_id="op-1")
@@ -234,6 +247,27 @@ def test_a_replayed_tool_call_keeps_both_attempts_on_the_record() -> None:
         assert first.duration_ms is None
         assert (second.attempt, second.outcome, second.error_class) == (2, "completed", None)
         assert second.call_id == first.call_id == "call-1"
+
+    asyncio.run(scenario())
+
+
+def test_repository_explorer_safe_attempt_is_replayed_after_settlement_crash(tmp_path) -> None:
+    async def scenario() -> None:
+        (tmp_path / "target.py").write_text("def target():\n    return 1\n")
+        config = RepositoryExplorerConfig(tmp_path, tmp_path.parent / f"{tmp_path.name}-repository-index")
+        tool = RepositoryExplorerTool(config)
+        assert tool.replay_policy == "safe"
+        storage = CrashAtStorage(MemoryStorage(), lambda writes: _commits_a_message("tool", writes))
+        await _open_tool_lane(storage, tool)
+        provider = RepositoryToolThenTextProvider()
+        lane = await (await Harness.open("session-1", storage, tools=(tool,))).acquire_lane("main")
+        with pytest.raises(SimulatedProcessDeath):
+            await lane.drive(provider)
+
+        result = await _recover_tool_lane(storage, tool, provider)
+        assert result is not None and result.status == "completed"
+        first, second = (span for span in await storage.list_spans("op-1") if span.kind == "tool")
+        assert (first.outcome, first.error_class, second.outcome) == ("unknown", "interrupted", "completed")
 
     asyncio.run(scenario())
 

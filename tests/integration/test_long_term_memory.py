@@ -130,6 +130,61 @@ def test_runtime_start_dispatches_existing_outbox(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_l1_promotion_uses_materialized_store_watermark_and_writes_memory(tmp_path) -> None:
+    """L0 input objects have store_seq=0; only their stored copies may key a job."""
+
+    class Extractor:
+        async def extract_l1(self, archives):
+            source_id = archives[0].items[0].source_entry_id
+            return (
+                AtomicCandidate(
+                    "work_fact",
+                    "The promotion pipeline records materialized L0 sequence numbers.",
+                    "integration test",
+                    "memory-promotion",
+                    90,
+                    1.0,
+                    {
+                        "work_object": "memory promotion",
+                        "status": "verified",
+                        "activity_start_time": "now",
+                        "activity_end_time": "now",
+                    },
+                    (source_id,),
+                ),
+            )
+
+        async def extract_l2(self, l1, scenes):
+            return ()
+
+        async def extract_l3(self, scenes, current):
+            return None
+
+    async def scenario() -> None:
+        session_store = MemoryStorage()
+        store = SQLiteMemoryStore(tmp_path / "memory.db")
+        runtime = MemoryRuntime(store, Extractor(), l1_turn_threshold=5)
+        scope = MemoryScope("repository")
+        harness = await Harness.open("session", session_store, memory_scope=scope, memory_runtime=runtime)
+        lane = await harness.acquire_lane("main")
+        for number in range(5):
+            await lane.prompt(f"durable memory turn {number}", operation_id=f"op-{number}")
+            await lane.request_abort()
+            await lane.drive(None)  # type: ignore[arg-type]
+
+        await runtime._dispatch_session(runtime._sessions["session"][0], scope)  # noqa: SLF001
+        expected = max(item.store_seq for archive in await store.unconsumed_items(scope, 0) for item in archive.items)
+        job = await store.claim_job(10**15, "worker", 30_000)
+        assert job is not None and job.stage == "l1"
+        assert job.input_high_watermark == expected and job.input_high_watermark > 0
+
+        await runtime._run_job(job)  # noqa: SLF001
+        assert await store.current_l1_watermark(scope) == expected
+        assert len(await store.read_l1_since(scope, 0)) == 1
+
+    asyncio.run(scenario())
+
+
 def test_missing_frozen_entry_moves_capture_to_dead_letter(tmp_path) -> None:
     async def scenario() -> None:
         session_store = MemoryStorage()

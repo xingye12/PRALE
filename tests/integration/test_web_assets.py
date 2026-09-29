@@ -176,6 +176,25 @@ def test_agent_text_never_goes_through_inner_html() -> None:
         assert "insertAdjacentHTML" not in code, name
 
 
+def test_chat_treats_message_updates_as_incremental_content() -> None:
+    """The runtime sends one delta per update, so the live bubble appends it once."""
+
+    code = _code("chat.js")
+    assert 'live.text += typeof data.data?.content === "string" ? data.data.content : ""' in code
+
+
+def test_chat_refetches_settled_messages_and_renders_markdown_safely() -> None:
+    chat = _code("chat.js")
+    dom = _code("dom.js")
+
+    assert 'name === "message_end"' in chat
+    assert "details.delete(data.operation_id)" in chat
+    assert "const wanted = turns;" in chat
+    assert "markdown(content)" in chat
+    assert "export function markdown(text)" in dom
+    assert "document.createElement" in dom
+
+
 def test_tool_results_start_collapsed_in_chat_and_trace() -> None:
     """Verbose durable tool output must not dominate either primary view."""
 
