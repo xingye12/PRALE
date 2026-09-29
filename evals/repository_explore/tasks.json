@@ -1,0 +1,241 @@
+{
+  "benchmark_id": "prale-repository-explore-v1",
+  "repository": "PRALE",
+  "pinned_git_sha": "f384fac099fe2dc5d947d4cbebe22a0fa363f1db",
+  "language": "zh-CN",
+  "global_output_contract": {
+    "format": "JSON object only",
+    "required_fields": ["summary", "components", "flow", "evidence", "uncertainties"],
+    "evidence_item": {"path": "repository-relative path", "symbol": "class/function/section", "claim": "the fact supported"},
+    "max_summary_chars": 900,
+    "max_evidence_items": 8,
+    "rule": "Cite only evidence you can verify in the current checkout. Say unknown rather than inventing a dependency or lifecycle step."
+  },
+  "judge_rubric": {
+    "factual_correctness": "0-4: reference facts are correct, mutually consistent, and no prohibited claim is made.",
+    "coverage": "0-4: covers the task's required facts; do not award detail unrelated to the question.",
+    "architecture_reasoning": "0-4: explains ownership, boundaries, ordering, and failure behavior rather than merely listing files.",
+    "evidence_quality": "0-4: citations name relevant repository-relative paths and real symbols; cited evidence supports the stated claim."
+  },
+  "tasks": [
+    {
+      "id": "memory-design",
+      "category": "cross-module architecture",
+      "difficulty": "hard",
+      "prompt": "PRALE 的长期记忆模块是如何设计的？请说明 L0-L3 各自保存什么、从一次 operation 结束到下一次 LLM 请求的完整数据流、模块边界，以及检索失败时系统如何降级。不要讨论未实现的设想。",
+      "required_facts": [
+        "MemoryScope 以稳定的 repository_id 作为 L0-L2 的归属；L3 使用 GLOBAL_L3_SCOPE，是全局 doctrine。",
+        "operation 的 terminal settlement 通过 Lane.memory_capture_writes 将冻结的 source entry IDs、hash、lane、operation 和 tip 信息追加到 Session 的 memory/capture_outbox。",
+        "MemoryRuntime 是后台消费者：materialize 出 SessionTraceArchive，capture_archive 到 MemoryStore，并创建/唤醒升级 job。它不拥有 Session 状态。",
+        "L0 是会话 trace archive；L1 是原子记忆；L2 是 repository-scoped work scene；L3 是 global operating doctrine。",
+        "Drive 在 generation intent 前调用 recall；有结果时 ContextAssembler 将 bundle 按 l3/l2/l1/l0 组装为只读 system message，再记录 recall_injected 审计。",
+        "recall 的搜索或超时异常返回空 RecallBundle 和 degraded_reason，不阻止主 operation。"
+      ],
+      "evidence_anchors": [
+        ["src/agent_harness/domain/memory.py", "MemoryScope, GLOBAL_L3_SCOPE"],
+        ["src/agent_harness/runtime/lane.py", "memory_capture_writes"],
+        ["src/agent_harness/memory/runtime.py", "MemoryRuntime._dispatch_session, recall"],
+        ["src/agent_harness/memory/context.py", "ContextAssembler.assemble"],
+        ["src/agent_harness/runtime/drive.py", "Drive._persist_generation_intent"]
+      ],
+      "disallowed_claims": [
+        "记忆内容自动永久写入每一个 prompt",
+        "MemoryRuntime 是 Session 的权威持有者",
+        "L3 按 repository_id 隔离",
+        "recall 失败会使 operation 失败"
+      ],
+      "reference_answer": "长期记忆由 Session 中冻结的捕获意图和独立的 MemoryStore 组成。L0 保存一次 operation 的 SessionTraceArchive；L1 是从 archive 提炼出的原子事实/任务/方法/工件；L2 是仓库范围的工作场景；L3 是全局工程 doctrine。终态结算时 Lane 在同一 Session mutation 中向 memory/capture_outbox 追加带 source IDs/hash 的请求。MemoryRuntime 后台消费该 outbox，物化 archive、幂等写入 store 并安排 L1/L2/L3 promotion job；它不保存或拥有 Session 状态。下一次生成写 intent 前，Drive 调用 recall，只有非空 bundle 才由 ContextAssembler 以只读 long_term_memory system message 注入，并审计注入的 bundle。搜索超时或异常会返回空 bundle/degraded_reason，因此主生成继续。"
+    },
+    {
+      "id": "memory-recovery-and-consistency",
+      "category": "durability and recovery",
+      "difficulty": "hard",
+      "prompt": "分析 PRALE 如何保证长期记忆捕获在崩溃、重复调度和失败时不会静默丢失或重复污染。请从 frozen outbox、幂等、dead letter、promotion job lease/retry 和审计五方面说明；同时区分哪些状态属于 Session，哪些属于 MemoryStore。",
+      "required_facts": [
+        "outbox record freezes source_entry_ids、source_entry_hash 和 operation/tip identity；同一 key 已存在则不再追加。",
+        "_materialize 重新读取被冻结的 entries 并验证 entry 集合及 hash；MemoryStore.capture_archive 返回 archive 与 created，因而重复投递可被识别。",
+        "成功/失败的 outbox 项在后续 Session mutation 中被移除；失败项会审计 capture_dead_letter 并移到 memory/capture_dead_letters，可经 replay_capture_dead_letters 显式重放。",
+        "MemoryRuntime worker 以 claim_job(now, lease_id, lease_ms) 领取持久 promotion job，并使用 complete_job 或 fail_job；失败可 retry 或 dead_letter。",
+        "审计是 best effort（_safe_audit 吞掉审计自身异常），不能把审计说成主流程的事务保证。",
+        "Session outbox/entries 属于 Session；archive、job、watermark、L1/L2/L3、audit 属于 MemoryStore。"
+      ],
+      "evidence_anchors": [
+        ["src/agent_harness/runtime/lane.py", "memory_capture_writes"],
+        ["src/agent_harness/memory/runtime.py", "_dispatch_session, _materialize, replay_capture_dead_letters, _worker"],
+        ["src/agent_harness/memory/protocol.py", "MemoryStore"],
+        ["tests/crash_recovery/test_memory_recovery.py", "recovery scenarios"]
+      ],
+      "disallowed_claims": [
+        "MemoryStore 与 Session outbox 在同一个跨库原子事务中提交",
+        "dead-letter 会自动无限重放",
+        "审计失败会回滚捕获",
+        "capture_archive 不具备去重语义"
+      ],
+      "reference_answer": "一致性边界是先在 Session 终态 mutation 中冻结并追加 outbox，再由后台交付到独立 MemoryStore，而不是跨库事务。outbox 的 key 防止同一终态重复排队；消费者用冻结 IDs/hash 重建并校验输入，capture_archive 的 created 结果使重复交付幂等。交付成功后才从 outbox 删除；失败记录 capture_dead_letter、移入 dead-letter list，只有显式 replay API 才移回 outbox。promotion 是 MemoryStore 中可 claim 的 leased job，worker 以 complete/fail 结算并按策略 retry/dead-letter。审计用于可观测性且是 best effort。Session 负责 entries/outbox，MemoryStore 负责 archives、jobs/watermarks、各级记忆和 audit。"
+    },
+    {
+      "id": "repository-explorer-design",
+      "category": "tool implementation",
+      "difficulty": "hard",
+      "prompt": "repository_explore 工具解决什么问题，如何索引、检索、限制和接入 PRALE runtime？请解释它与 read/bash 的使用边界、Tree-sitter 与缓存的角色、路径与资源限制、输出截断，以及为何它可以在恢复后重放。",
+      "required_facts": [
+        "工具用于从 identifier 或已知代码定位相关实现；已知精确路径应 read，能用一次精确 bash 搜索时不应调用该工具。",
+        "TreeSitterRepositoryIndexer 扫描受支持语言并产生 definitions/references tags；SQLite tag cache 按文件 stat/manifest 复用结果。",
+        "参数包括 identifiers/query/focus_paths/path_prefixes/known_paths/include_tests/max_tokens，并校验 workspace-relative 路径。",
+        "扫描跳过默认目录和 cache，限制文件数、单文件/总字节与扫描时间；渲染也受 wire bytes/lines/token budget 控制且可标记 truncated。",
+        "工具通过 RepositoryExplorerTool 实现，Settings 只有在 PRALE_TOOLS 启用且提供项目外 PRALE_REPOSITORY_INDEX_DIR 时才组合；create_builtin_tools 接收可选 explorer。",
+        "它只读 workspace 和受控 cache，replay_policy 为 safe；不会 terminate operation。"
+      ],
+      "evidence_anchors": [
+        ["specs/repository-exploration-tool-design.md", "tool usage and durability sections"],
+        ["src/agent_harness/integrations/repository_explorer.py", "TreeSitterRepositoryIndexer, RepositoryExplorerTool"],
+        ["src/agent_harness/api/settings.py", "Settings.from_environment"],
+        ["src/agent_harness/integrations/local_tools.py", "create_builtin_tools"],
+        ["tests/integration/test_repository_explorer.py", "tool behavior tests"]
+      ],
+      "disallowed_claims": [
+        "repository_explore 默认启用",
+        "它读取或修改任何绝对路径",
+        "它替代 read 来读取已知文件",
+        "它是 never/recovery 时不可重放的工具"
+      ],
+      "reference_answer": "repository_explore 是受限的代码导航/关联发现工具，不是通用文件阅读器：精确已知路径用 read，已启用 bash 且单次精确搜索足够时也不应使用它。索引器以 Tree-sitter 为支持语言提取定义和引用 tag，并用外部 SQLite cache 复用未变文件；工具按 identifiers、query 和路径偏好排序渲染相关片段。它验证参数和相对路径，跳过无关目录，限制扫描文件/字节/时间，并以 wire/token/line/byte budget 截断输出。配置必须显式启用且 index dir 在项目根外，随后作为 create_builtin_tools 的可选 tool 接入。它仅读 workspace 与受控缓存，因此 replay_policy=safe，且不终止 operation。"
+    },
+    {
+      "id": "tool-effect-recovery",
+      "category": "runtime state machine",
+      "difficulty": "hard",
+      "prompt": "PRALE 如何执行工具调用并处理崩溃恢复？请按 durable intent → effect → settlement 的顺序解释 assistant tool call、EffectSpan、safe/never replay policy、工具结果 entry 的顺序以及 unknown outcome 的语义。",
+      "required_facts": [
+        "工具调用前持久化验证后的 intent 与 effect span；外部执行后将 outcome、tool result entry、下一 operation state 等在原子 settlement 中落盘。",
+        "EffectSpan 以 operation_id/call_id/attempt 关联一次 attempt，pending 只表示发出尚未结算。",
+        "safe 可在恢复时重放；never 不自动重放，而是将中断结果明确收束为 unknown。",
+        "工具可以并行完成并发事件，但写入的 tool-result entries 必须按 assistant 原始 tool-call 顺序。",
+        "unknown 是终态中无法证明结果的状态，不等同于仍在运行；不能用 operation 总时间伪造 effect duration。"
+      ],
+      "evidence_anchors": [
+        ["specs/AGENTS.md", "Operation state machine and effect protocol"],
+        ["src/agent_harness/storage/protocol.py", "InsertSpan, SettleSpan"],
+        ["src/agent_harness/domain/effects.py", "EffectSpan and outcome types"],
+        ["src/agent_harness/runtime/tools.py", "tool execution/recovery"],
+        ["tests/crash_recovery/test_effect_boundaries.py", "effect recovery tests"]
+      ],
+      "disallowed_claims": [
+        "所有工具恢复时都会重跑",
+        "工具结果按完成时间写入 branch",
+        "pending span 就是 unknown 终态",
+        "PRALE 为外部工具保证 exactly-once"
+      ],
+      "reference_answer": "工具 effect 遵循四阶段：准备不可变输入，持久化 intent 与 pending EffectSpan，调用外部工具，再在一次 settlement mutation 中写结果/outcome/下一状态。span 用 operation、call 和 attempt 归属一次外部尝试；pending 仅是崩溃窗口。恢复时 safe 工具可形成新 attempt 重试，never 工具不能盲重放而要写明确的未知结果。并发工具可按完成顺序发事件，但 branch 中 tool-result entry 仍按 assistant 原始 call 顺序提交。unknown 表示无法证明 effect 的结果并已收束，不是运行中；系统也不承诺外部 effect exactly-once。"
+    },
+    {
+      "id": "project-architecture",
+      "category": "project skeleton",
+      "difficulty": "medium",
+      "prompt": "说明 PRALE 的项目骨架和依赖方向：domain、storage、runtime、integrations、api 分别负责什么？再给出一次用户 prompt 从公开 API 到 provider/tool 再到持久化结果的主路径。重点指出哪些层不能依赖什么。",
+      "required_facts": [
+        "domain 是纯领域模型/计算，不导入数据库、Web、LLM SDK 或 runtime。",
+        "runtime 编排 Lane/Drive 状态机；storage 封装 session transaction、SQLite/memory 后端和迁移；integrations 隔离 provider/local tools/telemetry；api 提供稳定 DTO/facade 和传输适配。",
+        "允许的主要方向为 api→runtime→domain、storage→domain、integrations→api/domain，不能以循环导入绕过反向依赖。",
+        "Harness.open/acquire_lane 后，Lane.prompt durable admission，Lane.drive 运行 Drive；Drive 写 provider/tool effect intent 与 settlement；Session/Storage 原子保存 entries、usage、spans、tip 和 state。",
+        "HTTP/RPC/TUI 是后置 adapter，不应进入核心状态机。"
+      ],
+      "evidence_anchors": [
+        ["specs/AGENTS.md", "Architecture boundaries"],
+        ["specs/pi-harness-implementation-plan.md", "Target architecture"],
+        ["src/agent_harness/api/harness.py", "Harness"],
+        ["src/agent_harness/runtime/lane.py", "Lane"],
+        ["src/agent_harness/storage/protocol.py", "Storage"],
+        ["src/agent_harness/api/serve.py", "deployment composition"]
+      ],
+      "disallowed_claims": [
+        "domain 可以直接调用 SQLite 或 DeepSeek",
+        "Web server 是 runtime 的必要依赖",
+        "api 是 storage 的实现层",
+        "entry/usage/state 分别在无关事务中提交"
+      ],
+      "reference_answer": "PRALE 采用向内依赖的 harness：domain 只放纯模型和计算；storage 实现事务、内存/SQLite 和迁移；runtime 用 Lane/Drive 编排可恢复状态机；integrations 把 DeepSeek、本地工具和 telemetry 留在边界；api 提供稳定 facade/DTO，并由 Web/RPC/TUI 适配。主要依赖为 api→runtime→domain、storage→domain、integrations→api/domain，domain 不得依赖 DB、Web、SDK 或 runtime。主路径是 Harness.open/acquire_lane，Lane.prompt 原子接纳 operation，Lane.drive 驱动 provider/tool effect，settlement 原子写 entries、usage、span、tip 与 operation state。"
+    },
+    {
+      "id": "evaluation-and-langfuse",
+      "category": "observability and evaluation",
+      "difficulty": "medium",
+      "prompt": "PRALE 现有的 Langfuse 与评测机制如何工作？请区分 telemetry、dataset experiment、deterministic evaluator 和 run-level metric；说明它们读取什么事实、默认隐私行为是什么，以及当前评测 harness 对真实仓库探索有哪些限制。",
+      "required_facts": [
+        "LangfuseTelemetry 在 settlement 后消费 runtime telemetry facts；追踪失败不改变 Session 或 Drive 决策。",
+        "capture 默认 metadata，只上传长度/计数/hash；redacted/full 是显式选择。",
+        "scripts/eval_harness.py 用真实 Harness/Drive/tools 和临时 SQLite session 跑 case；case 输出来自已提交 telemetry facts，而不是模型自述。",
+        "现有确定性 evaluator 包括 terminal_success、required/forbidden tools、tool_error_free、answer_contract；budget evaluator 包括 tool_count、latency、token_cost。",
+        "run_metrics 汇总 item results；Langfuse dataset run 将 task/evaluator 和 run evaluator 分开。",
+        "当前 EvalCase 仅把 input.files 写入临时 workspace，因此不能直接让模型探索真实 PRALE checkout。"
+      ],
+      "evidence_anchors": [
+        ["README.md", "Tracing and evaluation"],
+        ["scripts/eval_harness.py", "_run_experiment, _upload"],
+        ["src/agent_harness/integrations/evaluation.py", "run_case, EVALUATORS, run_metrics"],
+        ["src/agent_harness/integrations/langfuse.py", "LangfuseTelemetry"],
+        ["specs/langfuse-integration-design.md", "evaluation design"]
+      ],
+      "disallowed_claims": [
+        "Langfuse 是 runtime 正确性的依赖",
+        "默认上传完整 prompt 与工具正文",
+        "现有 eval harness 会自动复制当前 Git 仓库",
+        "answer_contract 本身就是 LLM judge"
+      ],
+      "reference_answer": "Telemetry 是运行时在 settlement 后发布的事实流，LangfuseTelemetry 只是订阅者，失败不会改变 durable execution。默认 capture=metadata，正文默认不出进程；redacted/full 才允许更多内容。eval_harness 让每个 case 在临时 workspace/SQLite 中走真实 Harness、Drive 和工具，从已提交事实构造 output；它有确定性 contract/tool/status scorer 与 token/latency/tool-count budget scorer，并在 dataset experiment 中另算 run-level metrics。它尚非真实 repo benchmark：EvalCase 只写 input.files 到临时目录，需先提供只读 checkout/snapshot 输入。"
+    },
+    {
+      "id": "web-composition-and-config",
+      "category": "deployment composition",
+      "difficulty": "medium",
+      "prompt": "从环境配置到 Web deployment，PRALE 如何组合 provider、Session 存储、memory、skills、repository_explore 和 Langfuse？请说明关键配置校验和关闭/隔离语义，不要把 Web adapter 描述成核心运行时。",
+      "required_facts": [
+        "Settings.from_environment 集中解析部署与 eval 共用配置，要求 PRALE_REPOSITORY_ID 和 PRALE_API_KEY。",
+        "PRALE_TOOLS 只允许 BUILTIN_TOOLS；repository_explore 启用时必须提供项目根外的 PRALE_REPOSITORY_INDEX_DIR。",
+        "PRALE_MEMORY/PRALE_SKILLS 可关闭；skills 依赖 memory store，因为 extraction 读取 L0 archive。",
+        "serve/web 负责组合 DeepSeek provider、storage/catalog、memory/skill runtime、repository explorer 和 optional Langfuse telemetry。",
+        "repository_id 是稳定身份，不应使用临时 checkout path；HTTP/Web 适配层不改变 domain/runtime 边界。"
+      ],
+      "evidence_anchors": [
+        ["src/agent_harness/api/settings.py", "Settings.from_environment"],
+        ["src/agent_harness/api/serve.py", "_repository_explorer and app composition"],
+        ["src/agent_harness/api/web.py", "Web service composition"],
+        ["src/agent_harness/api/project.py", "ProjectRuntimeConfig"],
+        ["deploy/web.env.example", "deployment configuration"]
+      ],
+      "disallowed_claims": [
+        "repository index directory 必须位于项目根内",
+        "skills 无需 memory store",
+        "repository_id 可以是每次 checkout 的绝对路径",
+        "Settings 只被 Web server 使用"
+      ],
+      "reference_answer": "Settings 是集中配置边界，Web 与 eval 都读取它；启动要求稳定的 PRALE_REPOSITORY_ID 和 provider API key，并拒绝未知工具。memory 与 skills 可关闭，但启用 skills 时必须有 memory store；启用 repository_explore 时还必须配置一个在项目根外的 index dir。serve/web 在外层组合 DeepSeek、Session/catalog/storage、可选 memory/skill runtime、explorer 和 Langfuse。repository_id 是稳定仓库身份而非 checkout 路径；Web 只做传输/部署组合，核心 domain/runtime 仍保持独立。"
+    },
+    {
+      "id": "repository-explorer-query-behavior",
+      "category": "tool behavior",
+      "difficulty": "hard",
+      "prompt": "当模型调用 repository_explore 时，identifiers、query、focus_paths、known_paths 与 path_prefixes 分别怎样影响结果？请说明未命中 identifier 的回退、query-only 的关联发现、排序/渲染稳定性，以及工具如何应对索引或渲染期间的文件变化。",
+      "required_facts": [
+        "identifiers 用于符号定义/引用发现；未命中时只作为 filename hints，不应伪造 symbol location。",
+        "query-only 可根据概念 hint 找 seed definitions 并包含对这些定义的 references。",
+        "focus_paths 是受验证的扩展目标；known_paths 用于不重复渲染模型已知文件；path_prefixes 仅是偏好，不能切掉全局 identifier discovery。",
+        "选择在渲染前完成，输出以稳定 path/line/name 规则组织；结果按 max_tokens/wire budget 截断并报告 truncated。",
+        "渲染验证 snapshot/hash；并发变化时重试一次，仍不一致则返回 workspace_changed_during_render。"
+      ],
+      "evidence_anchors": [
+        ["src/agent_harness/integrations/repository_explorer.py", "argument parsing, ranking and render logic"],
+        ["tests/integration/test_repository_explorer.py", "unmatched/query/path behavior tests"],
+        ["tests/unit/test_repository_explorer_unit.py", "render retry and wire budget tests"],
+        ["specs/repository-exploration-tool-design.md", "ranking/rendering design"]
+      ],
+      "disallowed_claims": [
+        "path_prefixes 是严格过滤器",
+        "未命中 identifier 会返回虚构的定义位置",
+        "known_paths 会禁止索引这些文件而非只避免渲染",
+        "文件变化时工具静默返回过期内容"
+      ],
+      "reference_answer": "identifier 查询寻找符号定义/引用；若 identifier 不存在，工具只把它降级为文件名 hint 并明确未找到，不制造位置。query-only 可以以概念匹配找到定义种子，并扩展到对种子的引用。focus_paths 请求展开受控文件，known_paths 防止重复渲染已知文件，path_prefixes 只是排序偏好而不是全局发现过滤器。候选先按稳定规则选择再渲染，输出受 token/wire budget 限制并可截断。渲染用快照保证一致性；若文件并发变动，重试一次，仍变化则显式报 workspace_changed_during_render。"
+    }
+  ]
+}

@@ -99,6 +99,11 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-concurrency", type=int, default=DEFAULT_CONCURRENCY)
     parser.add_argument("--allow-writing", action="store_true", help="let a case use write, edit or bash")
     parser.add_argument(
+        "--repository-root",
+        type=Path,
+        help="local Git repository used to materialise input.repository_snapshot commits",
+    )
+    parser.add_argument(
         "--gate",
         action="append",
         default=[],
@@ -146,9 +151,13 @@ def _load_cases(items: Sequence[Any]) -> list[EvalCase]:
     if not cases:
         raise CaseError("the dataset is empty: there is nothing to score")
     seen: set[str] = set()
-    duplicates = sorted({case.id for case in cases if case.id in seen or seen.add(case.id)})
+    duplicates: set[str] = set()
+    for case in cases:
+        if case.id in seen:
+            duplicates.add(case.id)
+        seen.add(case.id)
     if duplicates:
-        raise CaseError(f"duplicate case ids: {', '.join(duplicates)}")
+        raise CaseError(f"duplicate case ids: {', '.join(sorted(duplicates))}")
     return cases
 
 
@@ -226,6 +235,10 @@ def _plan(settings: Settings, args: argparse.Namespace, cases: Sequence[EvalCase
         f"tracing            {'off' if settings.langfuse is None else settings.langfuse.describe()}",
         f"max concurrency    {args.max_concurrency}",
     ]
+    snapshots = [case.repository_snapshot.git_sha for case in cases if case.repository_snapshot is not None]
+    if snapshots:
+        lines.append(f"repository root    {args.repository_root or '<required to run snapshots>'}")
+        lines.append(f"snapshot commits   {len(set(snapshots))}")
     if args.upload_to:
         lines.append(f"upload to          {args.upload_to} (then stop)")
     if risky:
@@ -251,6 +264,7 @@ async def _run_local(
     *,
     telemetry: TelemetrySink | None,
     allow_writing: bool,
+    repository_root: Path | None,
 ) -> list[ScoredItem]:
     """Score a dataset that lives in a file: nothing is uploaded."""
 
@@ -258,7 +272,12 @@ async def _run_local(
     for case in cases:
         with tempfile.TemporaryDirectory(prefix=f"prale-eval-{case.id}-") as directory:
             output = await run_case(
-                case, provider, workdir=Path(directory), telemetry=telemetry, allow_writing=allow_writing
+                case,
+                provider,
+                workdir=Path(directory),
+                telemetry=telemetry,
+                allow_writing=allow_writing,
+                repository_root=repository_root,
             )
         item = ScoredItem(case_id=case.id, output=output.as_dict())
         item.evaluations = _score(case, item.output, evaluators)
@@ -284,7 +303,12 @@ def _run_experiment(
         case = by_id[_case_id(_raw_item(item), 0)]
         with tempfile.TemporaryDirectory(prefix=f"prale-eval-{case.id}-") as directory:
             output = await run_case(
-                case, provider, workdir=Path(directory), telemetry=telemetry, allow_writing=args.allow_writing
+                case,
+                provider,
+                workdir=Path(directory),
+                telemetry=telemetry,
+                allow_writing=args.allow_writing,
+                repository_root=args.repository_root,
             )
         if isinstance(telemetry, LangfuseTelemetry):
             # The runner closes its loop when the experiment returns; this
@@ -365,7 +389,10 @@ DATASET_DESCRIPTION = "PRALE harness evaluation cases, uploaded by scripts/eval_
 def _item_input(case: EvalCase) -> dict[str, Any]:
     """A case as a dataset item's input, in the shape ``parse_case`` reads."""
 
-    return {"prompt": case.prompt, "files": dict(case.files), "tools": list(case.tools)}
+    value: dict[str, Any] = {"prompt": case.prompt, "files": dict(case.files), "tools": list(case.tools)}
+    if case.repository_snapshot is not None:
+        value["repository_snapshot"] = {"git_sha": case.repository_snapshot.git_sha}
+    return value
 
 
 def _dataset(client: Any, name: str) -> Any:
@@ -502,6 +529,9 @@ def main(
             # where it costs nothing, rather than mid-experiment where it would
             # look like the Agent failed to use a tool it never had.
             parse_case_tools(case, allow_writing=args.allow_writing)
+        if args.upload_to is None and any(case.repository_snapshot is not None for case in cases):
+            if args.repository_root is None:
+                raise CaseError("--repository-root is required when a case uses input.repository_snapshot")
     except (ProjectConfigError, CaseError, OSError, ValueError) as error:
         print(f"evaluation error: {error}", file=sys.stderr)
         return 2
@@ -522,7 +552,14 @@ def main(
     try:
         if args.from_json is not None:
             scored = asyncio.run(
-                _run_local(cases, chat, evaluators, telemetry=telemetry, allow_writing=args.allow_writing)
+                _run_local(
+                    cases,
+                    chat,
+                    evaluators,
+                    telemetry=telemetry,
+                    allow_writing=args.allow_writing,
+                    repository_root=args.repository_root,
+                )
             )
         else:
             scored = _run_experiment(args, settings, cases, chat, evaluators, telemetry, client)

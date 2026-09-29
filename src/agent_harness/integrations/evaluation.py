@@ -14,6 +14,9 @@ run does and does not isolate.
 """
 
 import json
+import os
+import re
+import subprocess
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -46,6 +49,7 @@ __all__ = [
     "Evaluation",
     "Expectations",
     "RunOutput",
+    "RepositorySnapshot",
     "ToolCallFact",
     "evaluators_for",
     "parse_case",
@@ -96,12 +100,25 @@ class Expectations:
 
 
 @dataclass(frozen=True, slots=True)
+class RepositorySnapshot:
+    """An immutable Git commit that an evaluation case explores.
+
+    The checkout location is intentionally not dataset data: it is deployment
+    local and may disclose filesystem layout.  A runner supplies that trusted
+    location separately, then materialises this commit in the case workspace.
+    """
+
+    git_sha: str
+
+
+@dataclass(frozen=True, slots=True)
 class EvalCase:
     """One dataset item, validated into something runnable."""
 
     id: str
     prompt: str
     files: Mapping[str, str] = field(default_factory=dict)
+    repository_snapshot: RepositorySnapshot | None = None
     tools: tuple[str, ...] = ("read",)
     expectations: Expectations = field(default_factory=Expectations)
     risk: str = "normal"
@@ -194,6 +211,10 @@ def parse_case(item: Mapping[str, Any], *, fallback_id: str = "item") -> EvalCas
             raise CaseError(f"{fallback_id}: input.files[{name!r}] must stay inside the workspace")
         files[str(name)] = content
 
+    snapshot = _parse_snapshot(raw_input.get("repository_snapshot"), where=f"{fallback_id}: input.repository_snapshot")
+    if snapshot is not None and files:
+        raise CaseError(f"{fallback_id}: input.files cannot be combined with input.repository_snapshot")
+
     metadata = item.get("metadata") or {}
     if not isinstance(metadata, Mapping):
         raise CaseError(f"{fallback_id}: metadata must be an object")
@@ -211,6 +232,7 @@ def parse_case(item: Mapping[str, Any], *, fallback_id: str = "item") -> EvalCas
         id=case_id,
         prompt=prompt,
         files=files,
+        repository_snapshot=snapshot,
         tools=_text_tuple(raw_input.get("tools"), where=f"{case_id}: input.tools") or ("read",),
         expectations=Expectations(
             terminal_status=str(expected.get("terminal_status", "completed")),
@@ -221,6 +243,20 @@ def parse_case(item: Mapping[str, Any], *, fallback_id: str = "item") -> EvalCas
         ),
         risk=risk if isinstance(risk, str) and risk else "normal",
     )
+
+
+def _parse_snapshot(value: object, *, where: str) -> RepositorySnapshot | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise CaseError(f"{where} must be an object with git_sha")
+    sha = value.get("git_sha")
+    if not isinstance(sha, str) or not re.fullmatch(r"[0-9a-fA-F]{40,64}", sha):
+        raise CaseError(f"{where}.git_sha must be a full hexadecimal commit SHA")
+    unknown = set(value) - {"git_sha"}
+    if unknown:
+        raise CaseError(f"{where} names unknown fields: {', '.join(sorted(map(str, unknown)))}")
+    return RepositorySnapshot(sha.lower())
 
 
 def parse_case_tools(case: EvalCase, *, allow_writing: bool = False) -> tuple[str, ...]:
@@ -236,6 +272,12 @@ def parse_case_tools(case: EvalCase, *, allow_writing: bool = False) -> tuple[st
     unknown = [name for name in wanted if name not in READ_ONLY_TOOLS | WRITING_TOOLS]
     if unknown:
         raise CaseError(f"{case.id}: unknown tools {', '.join(sorted(unknown))}")
+    if case.repository_snapshot is not None:
+        writing = [name for name in wanted if name in WRITING_TOOLS]
+        if writing:
+            raise CaseError(
+                f"{case.id}: input.repository_snapshot is read-only and cannot use {', '.join(sorted(writing))}"
+            )
     if allow_writing:
         return wanted
     writing = [name for name in wanted if name in WRITING_TOOLS]
@@ -364,14 +406,15 @@ async def run_case(
     storage: Storage | None = None,
     allow_writing: bool = False,
     repository_explorer: AgentTool | None = None,
+    repository_root: Path | None = None,
     session_id: str | None = None,
 ) -> RunOutput:
     """Run one item to a terminal result and describe what it produced.
 
-    ``workdir`` is the run's whole world: fixtures are written into it, the
-    tools are rooted in it, and the durable session is kept beside the
-    workspace rather than inside it, so the Agent cannot rewrite its own
-    history with a relative path.
+    ``workdir`` is the run's whole world: fixtures are written into it, or a
+    declared Git commit is materialised as a detached read-only worktree. The
+    tools are rooted in that workspace and the durable session is kept beside
+    it, so the Agent cannot rewrite its own history with a relative path.
 
     What this isolates is the *workspace*: a fresh directory and a fresh
     session per item, with path-taking tools confined to the first (see
@@ -382,30 +425,101 @@ async def run_case(
     """
 
     cwd = workdir / "workspace"
-    cwd.mkdir(parents=True, exist_ok=True)
-    for name, content in case.files.items():
-        target = cwd / name
-        target.parent.mkdir(parents=True, exist_ok=True)
-        target.write_text(content, encoding="utf-8")
-
-    tools = sandbox_tools(
-        cwd, parse_case_tools(case, allow_writing=allow_writing), repository_explorer=repository_explorer
-    )
-    collector = _Collecting(telemetry)
-    owned = storage is None
-    opened: Storage = SQLiteStorage(workdir / "session.sqlite") if storage is None else storage
-    identifier = session_id or f"eval:{case.id}"
-    harness = await Harness.open(identifier, opened, tools=tools, telemetry=collector)
+    snapshot_created = False
     try:
-        lane = await harness.acquire_lane("main")
-        await lane.prompt(case.prompt, operation_id=f"{case.id}-1")
-        result: OperationResult = await lane.drive(provider)
+        if case.repository_snapshot is None:
+            cwd.mkdir(parents=True, exist_ok=True)
+            for name, content in case.files.items():
+                target = cwd / name
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(content, encoding="utf-8")
+        else:
+            if repository_root is None:
+                raise CaseError(f"{case.id}: repository_root is required for input.repository_snapshot")
+            _create_snapshot(repository_root, case.repository_snapshot, cwd)
+            snapshot_created = True
+
+        names = parse_case_tools(case, allow_writing=allow_writing)
+        explorer = repository_explorer
+        if "repository_explore" in names and explorer is None:
+            explorer = _snapshot_explorer(cwd, workdir / "repository-index")
+        tools = sandbox_tools(cwd, names, repository_explorer=explorer)
+        collector = _Collecting(telemetry)
+        owned = storage is None
+        opened: Storage = SQLiteStorage(workdir / "session.sqlite") if storage is None else storage
+        identifier = session_id or f"eval:{case.id}"
+        harness = await Harness.open(identifier, opened, tools=tools, telemetry=collector)
+        try:
+            lane = await harness.acquire_lane("main")
+            await lane.prompt(case.prompt, operation_id=f"{case.id}-1")
+            result: OperationResult = await lane.drive(provider)
+        finally:
+            await harness.close()
+            if owned and isinstance(opened, SQLiteStorage):
+                opened.close()
     finally:
-        await harness.close()
-        if owned and isinstance(opened, SQLiteStorage):
-            opened.close()
+        if snapshot_created:
+            _remove_snapshot(repository_root, cwd)
 
     return _summarize(result, collector, session_id=identifier)
+
+
+def _git(root: Path, arguments: list[str]) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, text=True, check=False, timeout=30)
+
+
+def _create_snapshot(repository_root: Path, snapshot: RepositorySnapshot, destination: Path) -> None:
+    """Create one detached, permission-read-only worktree at a verified commit."""
+
+    root = repository_root.resolve()
+    if not root.is_dir():
+        raise CaseError(f"repository_root does not exist or is not a directory: {repository_root}")
+    resolved = _git(root, ["rev-parse", "--verify", f"{snapshot.git_sha}^{{commit}}"])
+    if resolved.returncode != 0 or resolved.stdout.strip().lower() != snapshot.git_sha:
+        raise CaseError(f"repository snapshot commit is unavailable: {snapshot.git_sha}")
+    created = _git(root, ["worktree", "add", "--detach", "--force", str(destination), snapshot.git_sha])
+    if created.returncode != 0:
+        detail = created.stderr.strip() or created.stdout.strip() or "git worktree add failed"
+        raise CaseError(f"could not create repository snapshot: {detail}")
+    _set_read_only(destination)
+
+
+def _remove_snapshot(repository_root: Path | None, destination: Path) -> None:
+    if repository_root is None:
+        return
+    if destination.exists():
+        _set_writable(destination)
+    removed = _git(repository_root.resolve(), ["worktree", "remove", "--force", str(destination)])
+    if removed.returncode != 0 and destination.exists():
+        # The surrounding TemporaryDirectory will clean this last resort; do
+        # not hide the operation result because cleanup is not part of it.
+        return
+
+
+def _set_read_only(root: Path) -> None:
+    for path in sorted(root.rglob("*"), reverse=True):
+        if path.is_symlink():
+            continue
+        mode = path.stat().st_mode
+        os.chmod(path, (mode & 0o555) if path.is_dir() else (mode & 0o444))
+    os.chmod(root, root.stat().st_mode & 0o555)
+
+
+def _set_writable(root: Path) -> None:
+    for path in sorted(root.rglob("*")):
+        if path.is_symlink():
+            continue
+        mode = path.stat().st_mode
+        os.chmod(path, (mode | 0o700) if path.is_dir() else (mode | 0o600))
+    os.chmod(root, root.stat().st_mode | 0o700)
+
+
+def _snapshot_explorer(workspace: Path, cache_dir: Path) -> AgentTool:
+    """Compose an explorer against this run's snapshot, never the source checkout."""
+
+    from agent_harness.integrations.repository_explorer import RepositoryExplorerConfig, RepositoryExplorerTool
+
+    return RepositoryExplorerTool(RepositoryExplorerConfig(workspace, cache_dir))
 
 
 def _summarize(result: OperationResult, collector: _Collecting, *, session_id: str) -> RunOutput:

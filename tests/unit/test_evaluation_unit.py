@@ -21,6 +21,7 @@ from agent_harness.integrations.evaluation import (
     EvalCase,
     Evaluation,
     Expectations,
+    RepositorySnapshot,
     RunOutput,
     ToolCallFact,
     evaluators_for,
@@ -139,6 +140,56 @@ def test_an_item_is_read_whole_into_its_case() -> None:
     assert case.expectations.forbidden_tools == ("bash",)
     assert case.expectations.expected_tool_errors == ("read",)
     assert case.expectations.answer_contract == {"contains": ["durable"]}
+
+
+def test_a_repository_snapshot_is_a_portable_commit_reference() -> None:
+    sha = "a" * 40
+    case = parse_case(
+        {"input": {"prompt": "explain memory", "repository_snapshot": {"git_sha": sha}, "tools": ["read"]}}
+    )
+
+    assert case.repository_snapshot == RepositorySnapshot(sha)
+    assert case.files == {}
+
+
+@pytest.mark.parametrize(
+    "snapshot",
+    [
+        "not-an-object",
+        {},
+        {"git_sha": "short"},
+        {"git_sha": "a" * 39},
+        {"git_sha": "a" * 40, "path": "/private/repo"},
+    ],
+)
+def test_a_snapshot_must_name_only_a_full_commit_sha(snapshot) -> None:
+    with pytest.raises(CaseError, match="repository_snapshot"):
+        parse_case({"input": {"prompt": "x", "repository_snapshot": snapshot}})
+
+
+def test_a_snapshot_and_inline_fixtures_are_mutually_exclusive() -> None:
+    with pytest.raises(CaseError, match="cannot be combined"):
+        parse_case(
+            {
+                "input": {
+                    "prompt": "x",
+                    "files": {"README.md": "inline"},
+                    "repository_snapshot": {"git_sha": "a" * 40},
+                }
+            }
+        )
+
+
+def test_a_snapshot_refuses_writing_tools_even_when_the_runner_allows_writes() -> None:
+    case = EvalCase(
+        id="snapshot",
+        prompt="x",
+        repository_snapshot=RepositorySnapshot("a" * 40),
+        tools=("read", "bash"),
+    )
+
+    with pytest.raises(CaseError, match="read-only"):
+        parse_case_tools(case, allow_writing=True)
 
 
 @pytest.mark.parametrize(

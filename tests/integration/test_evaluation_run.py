@@ -10,6 +10,7 @@ result that gets scored.
 """
 
 import asyncio
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -19,6 +20,7 @@ from agent_harness.integrations.evaluation import (
     CaseError,
     EvalCase,
     Expectations,
+    RepositorySnapshot,
     RunOutput,
     run_case,
 )
@@ -240,3 +242,47 @@ def test_the_same_item_run_twice_is_two_isolated_sessions(tmp_path: Path) -> Non
     first, second = asyncio.run(scenario())
 
     assert first == second == ("eval:readme-summary", ["README.md"])
+
+
+def _git(root: Path, *arguments: str) -> str:
+    completed = subprocess.run(["git", "-C", str(root), *arguments], capture_output=True, text=True, check=True)
+    return completed.stdout.strip()
+
+
+def test_a_case_can_explore_a_detached_read_only_git_snapshot(tmp_path: Path) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    _git(source, "init")
+    _git(source, "config", "user.email", "tests@example.invalid")
+    _git(source, "config", "user.name", "PRALE tests")
+    (source / "README.md").write_text(FIXTURE, encoding="utf-8")
+    _git(source, "add", "README.md")
+    _git(source, "commit", "-m", "fixture")
+    sha = _git(source, "rev-parse", "HEAD")
+    case = EvalCase(
+        id="snapshot-readme",
+        prompt="summarise the readme",
+        repository_snapshot=RepositorySnapshot(sha),
+        tools=("read",),
+    )
+    workdir = tmp_path / "run"
+
+    output = asyncio.run(run_case(case, ScriptedProvider(), workdir=workdir, repository_root=source))
+
+    assert output.answer == ANSWER
+    # The worktree is detached at the requested commit and removed when the
+    # run ends, so one case cannot mutate a later case's checkout.
+    assert not (workdir / "workspace").exists()
+    assert str(workdir / "workspace") not in _git(source, "worktree", "list", "--porcelain")
+    assert (source / "README.md").read_text(encoding="utf-8") == FIXTURE
+
+
+def test_a_snapshot_case_refuses_to_run_without_its_local_repository(tmp_path: Path) -> None:
+    case = EvalCase(
+        id="snapshot-needs-root",
+        prompt="x",
+        repository_snapshot=RepositorySnapshot("a" * 40),
+    )
+
+    with pytest.raises(CaseError, match="repository_root is required"):
+        asyncio.run(run_case(case, ScriptedProvider(), workdir=tmp_path / "run"))
