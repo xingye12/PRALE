@@ -46,6 +46,11 @@ case. `input.files` and `repository_snapshot` are intentionally mutually
 exclusive. When a case requests `repository_explore`, the harness composes it
 against that temporary snapshot rather than the source checkout.
 
+Langfuse requires dataset item IDs to be unique across the whole project, not
+only inside a dataset. `scripts/build_repository_explore_datasets.py` therefore
+prefixes each task ID with its condition (`baseline--` or `with-explorer--`);
+compare paired reports by the suffix after that prefix.
+
 ## Judge protocol
 
 Blind the judge to condition and randomize A/B display order.  First verify

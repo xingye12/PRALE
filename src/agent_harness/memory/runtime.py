@@ -17,6 +17,7 @@ from agent_harness.domain.memory import (
     MemoryRetentionPolicy,
     RecallBudget,
     RecallBundle,
+    RecallItem,
     RecallQuery,
     SessionTraceArchive,
     TraceItem,
@@ -111,6 +112,21 @@ class MemoryRuntime:
         except Exception as error:
             await self._safe_audit(scope, "recall_degraded", {"reason": type(error).__name__})
             return RecallBundle((), content_hash(""), 0, type(error).__name__)
+
+    async def prompt_memory(self, scope: MemoryScope) -> RecallBundle:
+        """Return the only memory automatically admitted into a provider request.
+
+        L0 and L1 remain deliberately absent: the model must use a memory tool
+        when it needs evidence.  L2 contributes its catalogue, never a scene
+        body; a selected body is read through ``memory_read_scene``.
+        """
+        doctrine, index = await self._store.read_l3(scope), await self._store.read_l2_index(scope)
+        items = []
+        if doctrine is not None:
+            items.append(RecallItem(doctrine.doctrine_id, doctrine.version, "l3", doctrine.content, 1.0))
+        items.append(RecallItem("l2-index", 1, "l2", index, 1.0))
+        digest = content_hash("".join(f"{item.id}:{item.version}:{item.content}" for item in items))
+        return RecallBundle(tuple(items), digest, sum(len(item.content) for item in items))
 
     async def flush(self, scope: MemoryScope, stage: str = "l1") -> None:
         """Explicitly enqueue one promotion stage without depending on an idle timer."""

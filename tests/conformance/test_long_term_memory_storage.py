@@ -262,6 +262,23 @@ def test_embedding_failure_falls_back_to_fts(tmp_path) -> None:
     asyncio.run(scenario())
 
 
+def test_enabling_embeddings_lazily_backfills_existing_l1(tmp_path) -> None:
+    async def scenario() -> None:
+        scope = MemoryScope("team", "agent", "user")
+        metadata = {"work_object": "repo", "status": "active", "activity_start_time": "1", "activity_end_time": "2"}
+        writer = SQLiteMemoryStore(tmp_path / "memory.db")
+        await writer.apply_candidates(
+            scope, (AtomicCandidate("work_fact", "existing semantic fact", "", "repo", 1, 1, metadata, ("one",)),), 1
+        )
+        reader = SQLiteMemoryStore(tmp_path / "memory.db", embedding_provider=_Embeddings())
+
+        await reader.search(scope, RecallQuery("semantic"), RecallBudget(include_l2=False, include_l3=False))
+
+        assert reader._conn.execute("SELECT COUNT(*) FROM memory_embeddings").fetchone()[0] == 1  # noqa: SLF001
+
+    asyncio.run(scenario())
+
+
 def test_index_rebuild_derives_fts_from_authoritative_l1_rows(tmp_path) -> None:
     async def scenario() -> None:
         store = SQLiteMemoryStore(tmp_path / "memory.db")

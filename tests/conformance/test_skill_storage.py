@@ -9,6 +9,7 @@ from agent_harness.domain.skill import (
     SkillProposal,
     SkillScope,
     VersionConflict,
+    is_successful_tool_result,
     patch_markdown,
     validate_skill_proposal,
 )
@@ -117,7 +118,7 @@ def test_durable_buffer_seals_once_at_threshold_and_job_respects_not_before() ->
             "conversation-v1",
             1,
             "payload-hash",
-            (TraceItem("tool", 1, 1, "message", "tool", "verified", {"success": True}),),
+            (TraceItem("tool", 1, 1, "message", "tool", "verified", {"is_error": False}),),
         )
         scope = SkillScope("repo")
         assert await store.buffer_source(scope, source, tool_threshold=2, byte_threshold=1000, max_bytes=2000) is None
@@ -137,7 +138,7 @@ def test_durable_buffer_seals_once_at_threshold_and_job_respects_not_before() ->
             "conversation-v1",
             2,
             "payload2",
-            (TraceItem("tool2", 2, 2, "message", "tool", "verified", {"success": True}),),
+            (TraceItem("tool2", 2, 2, "message", "tool", "verified", {"is_error": False}),),
         )
         sealed = await store.buffer_source(scope, source, tool_threshold=2, byte_threshold=1000, max_bytes=2000)
         assert sealed is not None and sealed.reason == "tool_calls" and sealed.successful_tool_calls == 2
@@ -193,7 +194,10 @@ def test_skill_evidence_must_reference_successful_tool_result() -> None:
         "conversation-v1",
         1,
         "payload",
-        (TraceItem("tool-ok", 1, 1, "message", "tool", "ok", {"success": True}),),
+        (
+            TraceItem("tool-ok", 1, 1, "message", "tool", "ok", {"is_error": False}),
+            TraceItem("tool-failed", 2, 2, "message", "tool", "failed", {"is_error": True}),
+        ),
     )
     from agent_harness.domain.skill import SkillArchive
 
@@ -201,7 +205,22 @@ def test_skill_evidence_must_reference_successful_tool_result() -> None:
         "a", SkillScope("repo"), "s", "l0", "p", "forced", "conversation-v1", (archive,), 0, 1, 0, 1
     )
     assert _has_successful_evidence(skill_archive, ("tool-ok",))
+    assert not _has_successful_evidence(skill_archive, ("tool-failed",))
     assert not _has_successful_evidence(skill_archive, ("assistant-claim",))
+
+
+@pytest.mark.parametrize(
+    ("payload", "expected"),
+    [
+        ({"is_error": False}, True),
+        ({"is_error": True}, False),
+        ({"success": True}, True),
+        ({"success": False}, False),
+        ({}, False),
+    ],
+)
+def test_tool_success_uses_current_outcome_and_legacy_compatibility(payload: dict[str, bool], expected: bool) -> None:
+    assert is_successful_tool_result(TraceItem("tool", 1, 1, "message", "tool", "result", payload)) is expected
 
 
 def test_explicit_session_close_seals_low_volume_buffer() -> None:

@@ -37,10 +37,13 @@ from dataclasses import dataclass, field
 from agent_harness.api.errors import ProjectConfigError
 from agent_harness.api.settings import Settings
 from agent_harness.api.web import WebApplication, create_app
+from agent_harness.domain.memory import MemoryScope
+from agent_harness.integrations.bge_m3 import LocalBgeM3EmbeddingProvider
 from agent_harness.integrations.deepseek import DeepSeekProvider
 from agent_harness.integrations.langfuse import LangfuseTelemetry
 from agent_harness.integrations.local_tools import create_builtin_tools
 from agent_harness.integrations.memory_provider import JsonMemoryExtractor
+from agent_harness.integrations.memory_tools import create_memory_tools
 from agent_harness.integrations.repository_explorer import (
     RepositoryExplorerConfig,
     RepositoryExplorerTool,
@@ -156,6 +159,8 @@ def prepare_directories(settings: Settings) -> None:
 
     wanted = [settings.sessions_dir, settings.catalog_db.parent]
     wanted.extend(store.parent for store in (settings.memory_db, settings.skill_db) if store is not None)
+    if settings.memory_assets_dir is not None:
+        wanted.append(settings.memory_assets_dir)
     for directory in wanted:
         directory.mkdir(parents=True, exist_ok=True)
 
@@ -183,8 +188,16 @@ def build_application(settings: Settings) -> Deployment:
     memory_store = None
     skill_store = None
     if settings.memory_db is not None:
-        memory_store = SQLiteMemoryStore(settings.memory_db)
+        embeddings = (
+            LocalBgeM3EmbeddingProvider(settings.memory_embedding_model)
+            if settings.memory_embedding_model is not None
+            else None
+        )
+        memory_store = SQLiteMemoryStore(
+            settings.memory_db, embedding_provider=embeddings, assets_dir=settings.memory_assets_dir
+        )
         stores.append(memory_store)
+        tools = (*tools, *create_memory_tools(memory_store, MemoryScope(settings.repository_id)))
     if settings.skill_db is not None:
         skill_store = SQLiteSkillStore(settings.skill_db)
         stores.append(skill_store)

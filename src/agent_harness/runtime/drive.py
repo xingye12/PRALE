@@ -649,12 +649,12 @@ class Drive:
         if not isinstance(transformed, dict) or not isinstance(transformed.get("messages"), list):
             raise RuntimeError("transform_context must return a request object with messages")
         prompt = operation.meta.request.get("prompt", "") if isinstance(operation.meta.request, dict) else ""
-        bundle = await self._lane.recall_memory(prompt if isinstance(prompt, str) else "")
+        bundle = await self._lane.prompt_memory()
         skills = await self._lane.available_skills(prompt if isinstance(prompt, str) else "")
         if bundle is not None and bundle.items:
             from agent_harness.memory.context import ContextAssembler
 
-            memory_message = ContextAssembler().assemble(bundle)
+            memory_message = ContextAssembler().assemble_prompt_memory(bundle)
             assert memory_message is not None
             transformed = {
                 **transformed,

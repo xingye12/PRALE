@@ -1,5 +1,6 @@
 """External provider, tool and telemetry adapters."""
 
+from agent_harness.integrations.bge_m3 import LocalBgeM3EmbeddingProvider
 from agent_harness.integrations.deepseek import DeepSeekProvider
 from agent_harness.integrations.local_tools import BashTool, EditTool, ReadTool, WriteTool, create_builtin_tools
 from agent_harness.integrations.repository_explorer import RepositoryExplorerConfig, RepositoryExplorerTool
@@ -12,6 +13,7 @@ __all__ = [
     "DeepSeekProvider",
     "EditTool",
     "InMemoryTelemetry",
+    "LocalBgeM3EmbeddingProvider",
     "ReadTool",
     "RepositoryExplorerConfig",
     "RepositoryExplorerTool",

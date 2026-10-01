@@ -23,6 +23,7 @@ from agent_harness.domain.skill import (
     SkillScope,
     SkillVersion,
     VersionConflict,
+    is_successful_tool_result,
     skill_content_hash,
     validate_skill_proposal,
 )
@@ -151,7 +152,7 @@ class SQLiteSkillStore:
             archives = (*archives, source)
             items = tuple(item for archive in archives for item in archive.items)
             bytes_count = sum(len((item.content or "").encode()) for item in items)
-            calls = sum(item.role == "tool" and bool(item.payload.get("success", True)) for item in items)
+            calls = sum(is_successful_tool_result(item) for item in items)
             turns = sum(item.role == "user" for item in items)
             data = _archive_data(
                 SkillArchive(

@@ -11,6 +11,7 @@ import sqlite3
 import time
 import uuid
 from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -22,6 +23,7 @@ from agent_harness.domain.memory import (
     GLOBAL_L3_SCOPE,
     MemoryAuditRecord,
     MemoryScope,
+    OperatingDoctrine,
     PromotionJob,
     PromotionConflict,
     RecallBudget,
@@ -37,6 +39,7 @@ from agent_harness.domain.memory import (
     validate_doctrine_content,
     validate_scene_content,
 )
+from agent_harness.storage.memory_assets import MarkdownMemoryAssets
 
 if TYPE_CHECKING:
     from agent_harness.memory.protocol import EmbeddingProvider
@@ -83,6 +86,7 @@ class SQLiteMemoryStore:
         id_factory: Callable[[], str] | None = None,
         now_ms: Callable[[], int] | None = None,
         embedding_provider: "EmbeddingProvider | None" = None,
+        assets_dir: str | Path | None = None,
     ) -> None:
         self._conn = sqlite3.connect(str(path), isolation_level=None)
         self._conn.row_factory = sqlite3.Row
@@ -90,6 +94,9 @@ class SQLiteMemoryStore:
         self._ids = id_factory or (lambda: str(uuid.uuid4()))
         self._now = now_ms or _now
         self._embeddings = embedding_provider
+        self._assets = MarkdownMemoryAssets(
+            Path(assets_dir) if assets_dir is not None else Path(path).parent / "memory-assets"
+        )
         self._migrate()
 
     def _migrate(self) -> None:
@@ -139,13 +146,137 @@ class SQLiteMemoryStore:
             CREATE VIRTUAL TABLE IF NOT EXISTS memory_fts USING fts5(memory_id UNINDEXED, team_id UNINDEXED, agent_id UNINDEXED, user_id UNINDEXED, content);
             CREATE TABLE IF NOT EXISTS memory_embeddings(memory_id TEXT NOT NULL, model_id TEXT NOT NULL, content_hash TEXT NOT NULL,
               vector TEXT NOT NULL, updated_at INTEGER NOT NULL, PRIMARY KEY(memory_id,model_id));
+            CREATE TABLE IF NOT EXISTS memory_file_operations(
+              operation_id TEXT PRIMARY KEY, team_id TEXT NOT NULL, agent_id TEXT NOT NULL, user_id TEXT NOT NULL,
+              asset_kind TEXT NOT NULL, target_path TEXT NOT NULL, expected_hash TEXT, desired_hash TEXT NOT NULL,
+              status TEXT NOT NULL, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL, error_class TEXT);
             INSERT OR IGNORE INTO schema_migrations VALUES(1);
             CREATE INDEX IF NOT EXISTS atomic_memories_scope_active ON atomic_memories(team_id,agent_id,user_id,status,updated_at);
             CREATE INDEX IF NOT EXISTS memory_jobs_due ON memory_jobs(status,not_before,lease_until);
             CREATE INDEX IF NOT EXISTS memory_audit_scope_time ON memory_audit(team_id,agent_id,user_id,created_at);
             INSERT OR IGNORE INTO schema_migrations VALUES(2);
+            INSERT OR IGNORE INTO schema_migrations VALUES(4);
             """
         )
+        self._migrate_legacy_l2_l3_assets()
+        self._recover_file_operations()
+
+    def _recover_file_operations(self) -> None:
+        """Settle a completed atomic rename, never overwrite an edited asset."""
+        for row in self._conn.execute("SELECT * FROM memory_file_operations WHERE status='prepared'").fetchall():
+            target = self._assets.root / str(row["target_path"])
+            parsed = None
+            try:
+                from agent_harness.storage.memory_assets import _parse  # noqa: PLC0415
+
+                parsed = _parse(target)
+            except OSError:
+                pass
+            if parsed is not None and parsed[0].get("content_hash") == row["desired_hash"]:
+                status, error = "settled", None
+            else:
+                # The candidate body intentionally is not in SQLite.  A missing
+                # file is retried by the durable promotion job; a differing one
+                # is preserved as a manual-edit conflict.
+                status, error = "dead_letter", "file_missing_or_modified"
+            self._conn.execute(
+                "UPDATE memory_file_operations SET status=?,error_class=?,updated_at=? WHERE operation_id=?",
+                (status, error, self._now(), row["operation_id"]),
+            )
+
+    def _prepare_file_operation(
+        self, scope: MemoryScope, asset_kind: str, target_path: Path, expected_hash: str | None, desired_hash: str
+    ) -> str:
+        operation_id = self._ids()
+        self._conn.execute(
+            "INSERT INTO memory_file_operations VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                operation_id,
+                *_scope(scope),
+                asset_kind,
+                str(target_path.relative_to(self._assets.root)),
+                expected_hash,
+                desired_hash,
+                "prepared",
+                self._now(),
+                self._now(),
+                None,
+            ),
+        )
+        return operation_id
+
+    def _settle_file_operation(self, operation_id: str) -> None:
+        self._conn.execute(
+            "UPDATE memory_file_operations SET status='settled',updated_at=? WHERE operation_id=? AND status='prepared'",
+            (self._now(), operation_id),
+        )
+
+    def _migrate_legacy_l2_l3_assets(self) -> None:
+        """Export pre-file-authority rows once, without replacing a user file.
+
+        Old databases retain their tables for an in-place upgrade and for old
+        audit rows, but new promotion output never writes them.  A differing
+        existing Markdown file is a manual-edit conflict: preserving it is
+        safer than trying to merge it without an explicit operator decision.
+        """
+        now = self._now()
+        conflicts: list[dict[str, object]] = []
+        for row in self._conn.execute("SELECT * FROM work_scene_memories").fetchall():
+            scope = MemoryScope(str(row["team_id"]))
+            legacy = WorkSceneMemory(
+                str(row["scene_id"]),
+                scope,
+                str(row["scenario_key"]),
+                int(row["version"]),
+                str(row["status"]),
+                str(row["content"]),
+                str(row["summary"]),
+                float(row["heat"]),
+                tuple(json.loads(row["l1_ids"])),
+                int(row["l1_high_watermark"]),
+                int(row["created_at"]),
+                int(row["updated_at"]),
+                str(row["content_hash"]),
+                bool(row["persona_update_request"]),
+            )
+            current = self._assets._read_scene(scope, legacy.scene_id)  # noqa: SLF001 - migration needs unindexed files
+            if current is None:
+                self._assets.write_scene(legacy)
+            elif current.content_hash != legacy.content_hash:
+                conflicts.append({"kind": "l2", "scene_id": legacy.scene_id, "repository_id": scope.repository_id})
+        rows = self._conn.execute("SELECT * FROM operating_doctrines ORDER BY updated_at DESC").fetchall()
+        if rows:
+            row = rows[0]
+            legacy = OperatingDoctrine(
+                str(row["doctrine_id"]),
+                GLOBAL_L3_SCOPE,
+                int(row["version"]),
+                str(row["content"]),
+                tuple(json.loads(row["l2_ids"])),
+                int(row["l2_high_watermark"]),
+                int(row["created_at"]),
+                int(row["updated_at"]),
+                str(row["content_hash"]),
+            )
+            current = self._assets.read_doctrine()
+            if current is None:
+                self._assets.write_doctrine(legacy)
+            elif current.content_hash != legacy.content_hash:
+                conflicts.append({"kind": "l3", "doctrine_id": legacy.doctrine_id})
+        for scope_file in (self._assets.root / "scopes").glob("*/scope.json"):
+            try:
+                self._assets.rebuild_index(
+                    MemoryScope(json.loads(scope_file.read_text(encoding="utf-8"))["repository_id"])
+                )
+            except (OSError, ValueError, json.JSONDecodeError, KeyError, TypeError):
+                continue
+        # A previous process may have crashed after recording the marker but
+        # before all files were visible.  Re-running this reconciliation is
+        # idempotent (hash matches are no-ops), so the marker is never a reason
+        # to skip a missing asset.
+        self._conn.execute("INSERT OR IGNORE INTO schema_migrations VALUES(5)")
+        for conflict in conflicts:
+            self._audit_in_transaction(GLOBAL_L3_SCOPE, "file_migration_conflict", conflict, now)
         columns = {row[1] for row in self._conn.execute("PRAGMA table_info(trace_archives)")}
         if "ancestor_item_ids" not in columns:
             self._conn.execute("ALTER TABLE trace_archives ADD COLUMN ancestor_item_ids TEXT NOT NULL DEFAULT '[]'")
@@ -738,6 +869,12 @@ class SQLiteMemoryStore:
         await self._refresh_embeddings(scope)
 
     async def search(self, scope: MemoryScope, query: RecallQuery, budget: RecallBudget) -> RecallBundle:
+        # A deployment may enable embeddings after L1 already exists.  Backfill
+        # that derived index lazily here, rather than requiring an unsafe
+        # rewrite of authoritative memory or making an operator remember a
+        # one-off rebuild command.  Failures are audited inside the helper and
+        # keyword recall below remains available.
+        await self._refresh_embeddings(scope)
         words, paths = _search_terms(query)
         rows = []
         fts_scores: dict[str, float] = {}
@@ -872,223 +1009,156 @@ class SQLiteMemoryStore:
         digest = content_hash("".join(f"{item.id}:{item.version}:{item.content}" for item in items))
         return RecallBundle(tuple(items), digest, total)
 
-    async def read_l2(self, scope: MemoryScope) -> tuple[WorkSceneMemory, ...]:
-        """Current scenes by heat, which is the order recall reads them in."""
+    async def search_conversation(self, scope: MemoryScope, query: RecallQuery, limit: int) -> RecallBundle:
+        """Bounded L0-only search used by the explicit conversation tool."""
+        if limit < 1:
+            raise ValueError("limit must be positive")
+        words, _ = _search_terms(query)
+        if not words:
+            return RecallBundle((), content_hash(""), 0)
+        clauses = " OR ".join("LOWER(i.content) LIKE ?" for _ in words)
         rows = self._conn.execute(
-            "SELECT * FROM work_scene_memories WHERE team_id=? AND agent_id=? AND user_id=? AND status='current' ORDER BY heat DESC",
-            _scope(scope),
+            f"""SELECT a.archive_id, i.source_entry_id, i.content FROM trace_items i
+            JOIN trace_archives a ON a.archive_id=i.archive_id
+            WHERE a.team_id=? AND a.agent_id=? AND a.user_id=? AND i.content IS NOT NULL AND ({clauses})
+            ORDER BY i.store_seq DESC LIMIT ?""",
+            (*_scope(scope), *(f"%{word}%" for word in words), limit),
         ).fetchall()
-        return tuple(self._scene(scope, row) for row in rows)
+        items = tuple(
+            RecallItem(
+                f"{row['archive_id']}:{row['source_entry_id']}",
+                1,
+                "l0",
+                str(row["content"]),
+                1.0,
+                (str(row["source_entry_id"]),),
+            )
+            for row in rows
+        )
+        return RecallBundle(
+            items,
+            content_hash("".join(f"{item.id}:{item.content}" for item in items)),
+            sum(len(item.content) for item in items),
+        )
+
+    async def read_l2(self, scope: MemoryScope) -> tuple[WorkSceneMemory, ...]:
+        return tuple(scene for scene in self._assets.read_scenes(scope) if scene.status == "current")
+
+    async def read_l2_index(self, scope: MemoryScope) -> str:
+        """The compact, scope-owned L2 catalogue used in the prompt."""
+        return self._assets.index_json(scope)
+
+    async def read_scene(self, scope: MemoryScope, scene_id: str) -> WorkSceneMemory | None:
+        """Read one L2 body after the caller has selected it from this scope's index."""
+        scene = self._assets.read_scene(scope, scene_id)
+        return scene if scene is not None and scene.status == "current" else None
 
     async def list_l2(
         self, scope: MemoryScope, status: str | None, after: tuple[int, str] | None, limit: int
     ) -> tuple[WorkSceneMemory, ...]:
-        """Scene memories for the browse view, newest first.
-
-        ``read_l2`` answers "what is current right now" for recall; browsing
-        also has to reach a scene the pipeline has since marked dormant.
-        """
-        sql = "SELECT * FROM work_scene_memories WHERE team_id=? AND agent_id=? AND user_id=?"
-        params: list[object] = list(_scope(scope))
-        if status is not None:
-            sql += " AND status=?"
-            params.append(status)
-        if after is not None:
-            sql += " AND (updated_at<? OR (updated_at=? AND scene_id<?))"
-            params += [after[0], after[0], after[1]]
-        sql += " ORDER BY updated_at DESC, scene_id DESC LIMIT ?"
-        params.append(limit)
-        return tuple(self._scene(scope, row) for row in self._conn.execute(sql, params).fetchall())
-
-    def _scene(self, scope: MemoryScope, row: sqlite3.Row) -> WorkSceneMemory:
-        return WorkSceneMemory(
-            row["scene_id"],
-            scope,
-            row["scenario_key"],
-            row["version"],
-            row["status"],
-            row["content"],
-            row["summary"],
-            row["heat"],
-            tuple(json.loads(row["l1_ids"])),
-            row["l1_high_watermark"],
-            row["created_at"],
-            row["updated_at"],
-            row["content_hash"],
-            bool(row["persona_update_request"]),
+        scenes = sorted(
+            self._assets.read_scenes(scope), key=lambda scene: (scene.updated_at, scene.scene_id), reverse=True
         )
+        if status is not None:
+            scenes = [scene for scene in scenes if scene.status == status]
+        if after is not None:
+            scenes = [scene for scene in scenes if (scene.updated_at, scene.scene_id) < after]
+        return tuple(scenes[:limit])
 
     async def read_all_l2(self):
-        """Current L2 scenes from every repository, for global L3 synthesis."""
-        rows = self._conn.execute(
-            "SELECT * FROM work_scene_memories WHERE status='current' ORDER BY updated_at DESC"
-        ).fetchall()
-        return tuple(
-            self._scene(MemoryScope(row["team_id"], row["agent_id"], row["user_id"] or None), row) for row in rows
-        )
+        result: list[WorkSceneMemory] = []
+        for raw in (self._assets.root / "scopes").glob("*/scope.json"):
+            try:
+                scope = MemoryScope(json.loads(raw.read_text())["repository_id"])
+                result.extend(await self.read_l2(scope))
+            except Exception:
+                pass
+        return tuple(result)
 
     async def read_l3(self, scope: MemoryScope):
-        row = self._conn.execute(
-            "SELECT * FROM operating_doctrines WHERE team_id=? AND agent_id=? AND user_id=? ORDER BY version DESC LIMIT 1",
-            _scope(GLOBAL_L3_SCOPE),
-        ).fetchone()
-        if row is None:
-            return None
-        from agent_harness.domain.memory import OperatingDoctrine
-
-        return OperatingDoctrine(
-            row["doctrine_id"],
-            GLOBAL_L3_SCOPE,
-            row["version"],
-            row["content"],
-            tuple(json.loads(row["l2_ids"])),
-            row["l2_high_watermark"],
-            row["created_at"],
-            row["updated_at"],
-            row["content_hash"],
-        )
+        return self._assets.read_doctrine()
 
     async def write_scene(self, scope: MemoryScope, candidate: SceneCandidate, max_scenes: int = 20) -> None:
         validate_scene_content(candidate.content)
-        now, sk = self._now(), _scope(scope)
-        conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            self._write_scene_in_transaction(scope, candidate, max_scenes, now, sk)
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
-
-    def _write_scene_in_transaction(
-        self, scope: MemoryScope, candidate: SceneCandidate, max_scenes: int, now: int, sk: tuple[str, str, str]
-    ) -> None:
-        """Apply all L2 visibility changes atomically; caller owns the transaction."""
-        if candidate.merge_scene_ids:
-            placeholders = ",".join("?" for _ in candidate.merge_scene_ids)
-            visible = self._conn.execute(
-                f"SELECT scene_id FROM work_scene_memories WHERE scene_id IN ({placeholders}) AND team_id=? AND agent_id=? AND user_id=? AND status='current'",
-                (*candidate.merge_scene_ids, *sk),
-            ).fetchall()
-            if {str(row[0]) for row in visible} != set(candidate.merge_scene_ids):
-                raise PromotionConflict("merged scene is unavailable in this scope")
-        current = self._conn.execute(
-            "SELECT * FROM work_scene_memories WHERE team_id=? AND agent_id=? AND user_id=? AND scenario_key=? AND status='current'",
-            (*sk, candidate.scenario_key),
-        ).fetchone()
-        if current is not None:
-            if candidate.expected_version is None or current["version"] != candidate.expected_version:
-                raise PromotionConflict("scene version changed")
-            self._conn.execute(
-                "UPDATE work_scene_memories SET version=?,content=?,summary=?,heat=heat+1,l1_ids=?,l1_high_watermark=?,updated_at=?,content_hash=?,persona_update_request=? WHERE scene_id=?",
-                (
-                    current["version"] + 1,
-                    candidate.content,
-                    candidate.summary,
-                    json.dumps(candidate.l1_ids),
-                    candidate.l1_high_watermark,
-                    now,
-                    content_hash(candidate.content),
-                    int(candidate.persona_update_request),
-                    current["scene_id"],
-                ),
-            )
-            event = "l2_update"
-        else:
-            count = self._conn.execute(
-                "SELECT COUNT(*) FROM work_scene_memories WHERE team_id=? AND agent_id=? AND user_id=? AND status='current'",
-                sk,
-            ).fetchone()[0]
-            if count + 1 >= (max_scenes * 4 + 4) // 5:
-                self._audit_in_transaction(
-                    scope,
-                    "l2_capacity_warning",
-                    {
-                        "count": count + 1,
-                        "max_scenes": max_scenes,
-                        "level": "full" if count + 1 >= max_scenes else "80_percent",
-                    },
-                    now,
-                )
-            if count >= max_scenes:
-                evict = self._conn.execute(
-                    "SELECT scene_id FROM work_scene_memories WHERE team_id=? AND agent_id=? AND user_id=? AND status='current' ORDER BY heat,updated_at LIMIT 1",
-                    sk,
-                ).fetchone()
-                self._conn.execute(
-                    "UPDATE work_scene_memories SET status='dormant',updated_at=? WHERE scene_id=?", (now, evict[0])
-                )
-                self._audit_in_transaction(
-                    scope, "l2_capacity_evicted", {"scene_id": evict[0], "max_scenes": max_scenes}, now
-                )
-            scene_id = self._ids()
-            self._conn.execute(
-                "INSERT INTO work_scene_memories VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    scene_id,
-                    *sk,
-                    candidate.scenario_key,
-                    1,
-                    "current",
-                    candidate.content,
-                    candidate.summary,
-                    1.0,
-                    json.dumps(candidate.l1_ids),
-                    candidate.l1_high_watermark,
-                    now,
-                    now,
-                    content_hash(candidate.content),
-                    int(candidate.persona_update_request),
-                ),
-            )
-            event = "l2_create"
-        for scene_id in candidate.merge_scene_ids:
-            changed = self._conn.execute(
-                "UPDATE work_scene_memories SET status='dormant',updated_at=? WHERE scene_id=? AND team_id=? AND agent_id=? AND user_id=? AND status='current'",
-                (now, scene_id, *sk),
-            ).rowcount
-            if not changed:
-                raise PromotionConflict("merged scene is unavailable in this scope")
-        self._audit_in_transaction(
-            scope, event, {"scenario_key": candidate.scenario_key, "merged": candidate.merge_scene_ids}, now
+        scenes = list(self._assets.read_scenes(scope))
+        now = self._now()
+        current = next(
+            (scene for scene in scenes if scene.scenario_key == candidate.scenario_key and scene.status == "current"),
+            None,
         )
+        if current is not None and (
+            candidate.expected_version is None or current.version != candidate.expected_version
+        ):
+            raise PromotionConflict("scene version changed")
+        if current is None and sum(scene.status == "current" for scene in scenes) >= max_scenes:
+            evict = min(
+                (scene for scene in scenes if scene.status == "current"),
+                key=lambda scene: (scene.heat, scene.updated_at),
+            )
+            self._assets.write_scene(replace(evict, status="dormant", updated_at=now), expected_hash=evict.content_hash)
+        scene = WorkSceneMemory(
+            current.scene_id if current else self._ids(),
+            scope,
+            candidate.scenario_key,
+            (current.version + 1) if current else 1,
+            "current",
+            candidate.content,
+            candidate.summary,
+            (current.heat + 1) if current else 1.0,
+            candidate.l1_ids,
+            candidate.l1_high_watermark,
+            current.created_at if current else now,
+            now,
+            content_hash(candidate.content),
+            candidate.persona_update_request,
+        )
+        operation_id = self._prepare_file_operation(
+            scope,
+            "l2_scene",
+            self._assets._scene_path(scope, scene.scene_id),  # noqa: SLF001 - durable intent names its exact asset
+            current.content_hash if current is not None else None,
+            scene.content_hash,
+        )
+        self._assets.write_scene(scene, expected_hash=current.content_hash if current is not None else None)
+        self._settle_file_operation(operation_id)
+        for scene_id in candidate.merge_scene_ids:
+            merged = next((item for item in scenes if item.scene_id == scene_id and item.status == "current"), None)
+            if merged is None:
+                raise PromotionConflict("merged scene is unavailable in this scope")
+            self._assets.write_scene(
+                replace(merged, status="dormant", updated_at=now), expected_hash=merged.content_hash
+            )
+        await self.audit(scope, "l2_file_written", {"scene_id": scene.scene_id, "version": scene.version})
 
     async def write_doctrine(self, scope: MemoryScope, candidate: DoctrineCandidate) -> None:
         validate_doctrine_content(candidate.content)
-        now, sk = self._now(), _scope(GLOBAL_L3_SCOPE)
-        conn = self._conn
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            current = conn.execute(
-                "SELECT version FROM operating_doctrines WHERE team_id=? AND agent_id=? AND user_id=? ORDER BY version DESC LIMIT 1",
-                sk,
-            ).fetchone()
-            if current is not None and (
-                candidate.expected_version is None or current["version"] != candidate.expected_version
-            ):
-                raise PromotionConflict("doctrine version changed")
-            version = 1 if current is None else int(current["version"]) + 1
-            conn.execute(
-                "INSERT INTO operating_doctrines VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-                (
-                    self._ids(),
-                    *sk,
-                    version,
-                    candidate.content,
-                    json.dumps(candidate.l2_ids),
-                    candidate.l2_high_watermark,
-                    now,
-                    now,
-                    content_hash(candidate.content),
-                ),
-            )
-            self._audit_in_transaction(
-                GLOBAL_L3_SCOPE, "l3_update", {"version": version, "l2_ids": candidate.l2_ids}, now
-            )
-            conn.execute("COMMIT")
-        except Exception:
-            conn.execute("ROLLBACK")
-            raise
+        current = self._assets.read_doctrine()
+        now = self._now()
+        if current is not None and (
+            candidate.expected_version is None or current.version != candidate.expected_version
+        ):
+            raise PromotionConflict("doctrine version changed")
+        doctrine = OperatingDoctrine(
+            self._ids(),
+            GLOBAL_L3_SCOPE,
+            1 if current is None else current.version + 1,
+            candidate.content,
+            candidate.l2_ids,
+            candidate.l2_high_watermark,
+            now if current is None else current.created_at,
+            now,
+            content_hash(candidate.content),
+        )
+        operation_id = self._prepare_file_operation(
+            GLOBAL_L3_SCOPE,
+            "l3_doctrine",
+            self._assets._doctrine_path(),  # noqa: SLF001 - durable intent names its exact asset
+            current.content_hash if current is not None else None,
+            doctrine.content_hash,
+        )
+        self._assets.write_doctrine(doctrine, expected_hash=current.content_hash if current is not None else None)
+        self._settle_file_operation(operation_id)
+        await self.audit(GLOBAL_L3_SCOPE, "l3_file_written", {"version": doctrine.version})
 
     async def replay_dead_letter(self, scope: MemoryScope, job_id: str) -> None:
         changed = self._conn.execute(
@@ -1142,6 +1212,7 @@ class SQLiteMemoryStore:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        self._assets.delete_scope(scope)
 
     async def rebuild_indexes(self, scope: MemoryScope) -> None:
         """Recreate derived search indexes from authoritative L1 rows only."""
@@ -1206,22 +1277,25 @@ class SQLiteMemoryStore:
                     (*sk, l1_before),
                 )
             ]
+            referenced_l1 = {
+                memory_id
+                for scene in self._assets.read_scenes(scope)
+                if scene.status == "current"
+                for memory_id in scene.l1_ids
+            }
+            l1_ids = [memory_id for memory_id in l1_ids if memory_id not in referenced_l1]
             for memory_id in l1_ids:
                 conn.execute("DELETE FROM atomic_memory_sources WHERE memory_id=?", (memory_id,))
                 conn.execute("DELETE FROM memory_fts WHERE memory_id=?", (memory_id,))
                 conn.execute("DELETE FROM memory_embeddings WHERE memory_id=?", (memory_id,))
                 conn.execute("DELETE FROM atomic_memories WHERE memory_id=?", (memory_id,))
+            doctrine = self._assets.read_doctrine()
+            protected_scenes = set(doctrine.l2_ids) if doctrine is not None else set()
             l2_ids = [
-                row[0]
-                for row in conn.execute(
-                    """SELECT scene_id FROM work_scene_memories AS s WHERE team_id=? AND agent_id=? AND user_id=?
-                    AND status='dormant' AND updated_at<? AND NOT EXISTS (
-                      SELECT 1 FROM operating_doctrines d WHERE instr(d.l2_ids, s.scene_id)>0)""",
-                    (*sk, l2_before),
-                )
+                scene.scene_id
+                for scene in self._assets.read_scenes(scope)
+                if scene.status == "dormant" and scene.updated_at < l2_before and scene.scene_id not in protected_scenes
             ]
-            for scene_id in l2_ids:
-                conn.execute("DELETE FROM work_scene_memories WHERE scene_id=?", (scene_id,))
             # Audit rows carry asset identifiers in their payload.  Until the scope has
             # no retained assets, preserve them conservatively rather than risk breaking
             # an audit chain by deleting a row whose referenced object still exists.
@@ -1244,6 +1318,8 @@ class SQLiteMemoryStore:
         except Exception:
             conn.execute("ROLLBACK")
             raise
+        for scene_id in l2_ids:
+            self._assets.delete_scene(scope, scene_id)
         l0, l1, l2 = len(l0_ids), len(l1_ids), len(l2_ids)
         counts: dict[str, object] = {"l0": l0, "l1": l1, "l2": l2, "audit": audit}
         await self.audit(scope, "gc", counts)

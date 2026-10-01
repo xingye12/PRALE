@@ -345,6 +345,14 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 
 **后果：** 每个 Operation 是一棵以 `prale.run` 为根、`prale.generate` 与 `prale.tool.<name>` 为子 observation 的 trace；根 observation 的 input/output 即离线评测的评分契约，`operation_id`、`lane`、`kind` 只作为 metadata（ADR-017 的耗时持久化让 observation 的起止时间等于效果本身的起止时间，而不是 worker 处理它的时间）。规格中的记忆与 Skill 不单独建 observation，而是以哈希、ID 与计数进入 generation metadata，避免把长期资产正文送上远端。脱敏与队列因此是 `integrations/` 内需要独立测试的一层，而不再只是薄 I/O 适配器；关闭遥测时逐字节行为与接入前一致。
 
+### ADR-023：L2/L3 正文以共享 Markdown 资产目录为权威
+
+**背景：** L2 场景与 L3 doctrine 是人类和模型都需要整体阅读、审阅与合并的长文；将正文锁在 SQLite 行中，不利于 Git diff/merge。L0/L1 的索引、watermark、job 与审计仍需要 SQLite 的事务和恢复能力。
+
+**决策：** 新增共享 `PRALE_MEMORY_ASSETS_DIR`。其下按 `repository_id` 的稳定哈希分隔 L2：`scopes/<hash>/l2/scenes/<scene-id>.md` 与 `index.json`；L3 位于 `l3/operating-doctrine.md`，同一资产目录仅一份。Markdown 正文是 L2/L3 的唯一内容权威；index 只保存场景定位与轻量元数据，损坏时从 Markdown 重建。SQLite 保留 L0/L1、jobs、watermark 与 audit，不再写入新的 L2/L3 正文。
+
+**后果：** 多仓库共享 memory DB 与 assets dir 时，L0--L2 仍按 repository 隔离，L3 保持全局共享；用户可对 L2/L3 文件做 diff、merge 和人工编辑。文件更新必须使用临时文件、fsync、rename，并以可恢复 intent/settlement 保护，不能将 Markdown 视为可随意丢弃的导出物。
+
 ## 10. 首个可执行里程碑
 
 第一个编码里程碑仅实现阶段 0–3：纯领域 DTO、storage/session 协议、内存后端、entry tree/branch projection、lane operation admission、snapshot 和结果查询。此里程碑不调用 DeepSeek、不执行工具，但必须已经具备“先持久化 operation、后由 Drive 领取”的恢复基础。

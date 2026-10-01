@@ -348,6 +348,11 @@ class Lane:
             RecallBudget(),
         )
 
+    async def prompt_memory(self):
+        if self._memory_runtime is None or self._memory_scope is None:
+            return None
+        return await self._memory_runtime.prompt_memory(self._memory_scope)
+
     async def available_skills(self, prompt: str):
         """Best-effort metadata-only Skill discovery; admission never depends on it."""
         if self._skill_runtime is None or self._skill_scope is None:

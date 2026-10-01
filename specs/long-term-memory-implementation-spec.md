@@ -53,7 +53,7 @@ src/agent_harness/
 tests/{conformance,integration,crash_recovery}/memory_*.py
 ```
 
-`domain/` 不得导入 SQLite、向量库、HTTP 或 provider SDK。`runtime/` 通过协议使用记忆；provider 请求由 `ContextAssembler` 生成。L2/L3 的人类可读 Markdown 只是一种投影/导出，SQLite 中的版本与来源引用才是权威记录，防止文件与数据库双写不一致。
+`domain/` 不得导入 SQLite、向量库、HTTP 或 provider SDK。`runtime/` 通过协议使用记忆；provider 请求由 `ContextAssembler` 生成。L0/L1、job、watermark 与 audit 仍由 SQLite 持久化；L2/L3 的正文改由共享资产目录中的 Markdown 文件权威保存。SQLite 不得再保存 L2/L3 正文副本；L2 的 `index.json` 是场景文件的可重建索引，L3 为单一 `operating-doctrine.md`。文件替换必须使用同目录临时文件 + fsync + rename，且写入 intent 与 settlement 必须可恢复。
 
 `MemoryRuntime` **必须**提供显式的生命周期：构造时不启动任何后台活动，`start()` 恢复未完成 job 与 outbox 扫描，`aclose()` 停止调度并等待在途 job 收敛。`Harness.close()` **必须**关闭已注入的 `MemoryRuntime`；未被显式 `close` 的 runtime 不得在事件循环结束后继续持有任务（见 ADR-014）。
 
@@ -197,7 +197,7 @@ GC **必须**是可中断的离线批处理，且**必须**遵守一条硬约束
 
 ### 3.6 索引
 
-SQLite 初版必须含 `memory_scopes`、`trace_archives`、`trace_items`、`atomic_memories`、`atomic_memory_sources`、`work_scene_memories`、`operating_doctrines`、`memory_jobs`、`memory_job_attempts`、`memory_audit`、FTS 表和 `schema_migrations`。L0/L1 索引使用 FTS5/BM25；embedding 是可选的旁路索引，必须带 `model_id` 与 `content_hash`。索引损坏可重建，权威正文和版本不可依赖索引恢复。
+SQLite 初版必须含 `memory_scopes`、`trace_archives`、`trace_items`、`atomic_memories`、`atomic_memory_sources`、`work_scene_memories`、`operating_doctrines`、`memory_jobs`、`memory_job_attempts`、`memory_audit`、FTS 表和 `schema_migrations`。L0/L1 索引使用 FTS5/BM25；embedding 是可选的旁路索引，必须带 `model_id` 与 `content_hash`。部署可通过 `PRALE_MEMORY_EMBEDDING_MODEL` 配置本地 BGE-M3 模型；启用后 L1 召回自动使用 embedding 与 BM25 的 RRF hybrid，未配置时保持 BM25-only。模型运行时依赖必须作为可选依赖安装，且模型加载、embedding 刷新或查询失败都不得影响权威写入或正常 Drive。索引损坏可重建，权威正文和版本不可依赖索引恢复。
 
 ## 4. Capture、晋升和恢复
 

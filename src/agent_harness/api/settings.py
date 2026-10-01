@@ -93,6 +93,8 @@ class Settings:
     sessions_dir: Path
     catalog_db: Path
     memory_db: Path | None
+    memory_assets_dir: Path | None
+    memory_embedding_model: Path | None
     skill_db: Path | None
     api_key: str
     model: str
@@ -124,6 +126,7 @@ class Settings:
             sessions_dir=self.sessions_dir,
             catalog_db=self.catalog_db,
             memory_db=self.memory_db,
+            memory_assets_dir=self.memory_assets_dir,
             skill_db=self.skill_db,
             project_id=self.project_id,
             default_lane=self.default_lane,
@@ -145,6 +148,7 @@ class Settings:
         """The deployment as text, with credentials reduced to their presence."""
 
         memory = "off" if self.memory_db is None else str(self.memory_db)
+        embedding = "off" if self.memory_embedding_model is None else str(self.memory_embedding_model)
         skills = "off" if self.skill_db is None else str(self.skill_db)
         prompt = "none" if self.memory_prompt_file is None else str(self.memory_prompt_file)
         tools = ", ".join(self.tools) or "none"
@@ -158,6 +162,7 @@ class Settings:
                 f"sessions_dir      {self.sessions_dir}",
                 f"catalog_db        {self.catalog_db}",
                 f"memory_db         {memory}",
+                f"memory_embedding  {embedding}",
                 f"skill_db          {skills}",
                 f"provider          deepseek {self.model} @ {self.base_url}",
                 f"api_key           {'<set>' if self.api_key else '<unset>'}",
@@ -217,6 +222,13 @@ class Settings:
         memory_db = (
             None if _off(environ, "PRALE_MEMORY") else _path(environ, "PRALE_MEMORY_DB", data_dir / "memory.sqlite")
         )
+        memory_assets_dir = (
+            None if memory_db is None else _path(environ, "PRALE_MEMORY_ASSETS_DIR", data_dir / "memory-assets")
+        )
+        raw_embedding_model = environ.get("PRALE_MEMORY_EMBEDDING_MODEL", "").strip()
+        memory_embedding_model = Path(raw_embedding_model).expanduser() if raw_embedding_model else None
+        if memory_embedding_model is not None and memory_db is None:
+            raise ProjectConfigError("PRALE_MEMORY_EMBEDDING_MODEL requires PRALE_MEMORY to be enabled")
         skill_db = (
             None if _off(environ, "PRALE_SKILLS") else _path(environ, "PRALE_SKILL_DB", data_dir / "skills.sqlite")
         )
@@ -257,6 +269,8 @@ class Settings:
             sessions_dir=_path(environ, "PRALE_SESSIONS_DIR", data_dir / "sessions"),
             catalog_db=_path(environ, "PRALE_CATALOG_DB", data_dir / "catalog.sqlite"),
             memory_db=memory_db,
+            memory_assets_dir=memory_assets_dir,
+            memory_embedding_model=memory_embedding_model,
             skill_db=skill_db,
             api_key=api_key,
             model=model,

@@ -12,6 +12,7 @@ from collections.abc import Callable
 from agent_harness.domain.memory import MemoryScope, SessionTraceArchive
 from agent_harness.domain.session import Session, SessionMutator
 from agent_harness.domain.skill import (
+    ArchiveReason,
     SkillArchive,
     SkillConfig,
     SkillListing,
@@ -20,6 +21,7 @@ from agent_harness.domain.skill import (
     SkillSearchMode,
     SkillScope,
     VersionConflict,
+    is_successful_tool_result,
     patch_markdown,
     validate_skill_proposal,
 )
@@ -228,12 +230,8 @@ class SkillEvolutionRuntime:
             return archived.archive_id
         return await self._archive(scope, (source,), self._reason(source))
 
-    def _reason(self, archive: SessionTraceArchive) -> str:
-        tools = sum(
-            1
-            for item in archive.items
-            if item.type == "message" and item.role == "tool" and bool(item.payload.get("success", True))
-        )
+    def _reason(self, archive: SessionTraceArchive) -> ArchiveReason:
+        tools = sum(1 for item in archive.items if item.type == "message" and is_successful_tool_result(item))
         raw = sum(len((item.content or "").encode()) for item in archive.items)
         if raw > self._config.archive_max_bytes:
             return "oversize"
@@ -243,7 +241,9 @@ class SkillEvolutionRuntime:
             return "bytes"
         return "forced"  # source archive boundaries are durable; a low-volume capture is retained, never discarded.
 
-    async def _archive(self, scope: SkillScope, archives: tuple[SessionTraceArchive, ...], reason: str) -> str:
+    async def _archive(
+        self, scope: SkillScope, archives: tuple[SessionTraceArchive, ...], reason: ArchiveReason
+    ) -> str:
         raw = json.dumps([a.content_hash for a in archives], sort_keys=True)
         payload_hash = hashlib.sha256(raw.encode()).hexdigest()
         items = tuple(item for archive in archives for item in archive.items)
@@ -257,7 +257,7 @@ class SkillEvolutionRuntime:
             archives[-1].trace_format_version,
             archives,
             sum(len((i.content or "").encode()) for i in items),
-            sum(1 for i in items if i.role == "tool" and bool(i.payload.get("success", True))),
+            sum(is_successful_tool_result(item) for item in items),
             sum(i.role == "user" for i in items),
             self._now(),
         )
@@ -356,7 +356,7 @@ def _skill_scope(scope: SkillScope | MemoryScope) -> SkillScope:
 
 
 def _keywords(archive: SkillArchive) -> tuple[str, ...]:
-    words = []
+    words: list[str] = []
     for item in archive.archives:
         for trace in item.items:
             words.extend((trace.content or "").lower().split())
@@ -365,9 +365,6 @@ def _keywords(archive: SkillArchive) -> tuple[str, ...]:
 
 def _has_successful_evidence(archive: SkillArchive, evidence_ids: tuple[str, ...]) -> bool:
     successful = {
-        item.source_entry_id
-        for source in archive.archives
-        for item in source.items
-        if item.role == "tool" and bool(item.payload.get("success", False))
+        item.source_entry_id for source in archive.archives for item in source.items if is_successful_tool_result(item)
     }
     return bool(successful.intersection(evidence_ids))

@@ -6,7 +6,7 @@ from hashlib import sha256
 import re
 from typing import Literal
 
-from agent_harness.domain.memory import MemoryScope, SessionTraceArchive
+from agent_harness.domain.memory import MemoryScope, SessionTraceArchive, TraceItem
 
 SkillState = Literal["active", "disabled", "archived"]
 SkillVisibility = Literal["private"]
@@ -14,6 +14,23 @@ SkillAction = Literal["no_op", "create", "update", "patch"]
 SkillJobStatus = Literal["scheduled", "queued", "running", "retry_wait", "dead_letter", "completed"]
 ArchiveReason = Literal["tool_calls", "bytes", "session_closed", "forced", "oversize"]
 SkillSearchMode = Literal["keyword", "embedding", "hybrid"]
+
+
+def is_successful_tool_result(item: TraceItem) -> bool:
+    """Return the canonical success status for an archived tool result.
+
+    Current tool entries record ``is_error``.  ``success`` is retained only for
+    compatibility with archives produced by the earlier skill format.  An
+    absent or malformed outcome is deliberately not treated as evidence.
+    """
+
+    if item.role != "tool":
+        return False
+    is_error = item.payload.get("is_error")
+    if isinstance(is_error, bool):
+        return not is_error
+    success = item.payload.get("success")
+    return isinstance(success, bool) and success
 
 
 class VersionConflict(Exception):

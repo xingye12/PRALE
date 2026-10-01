@@ -347,6 +347,7 @@ def test_settings_parse_the_environment_into_one_deployment(tmp_path: Path) -> N
     assert settings.catalog_db == tmp_path / "data" / "catalog.sqlite"
     assert settings.sessions_dir == tmp_path / "data" / "sessions"
     assert settings.memory_db == tmp_path / "data" / "memory.sqlite"
+    assert settings.memory_embedding_model is None
     assert settings.tools == ("read", "edit")
     assert settings.max_concurrent_drives == 3
     assert settings.graceful_shutdown_seconds == DEFAULT_GRACEFUL_SHUTDOWN_SECONDS
@@ -414,6 +415,24 @@ def test_settings_can_turn_a_store_off(tmp_path: Path) -> None:
     # materializes L0 archives through the memory store.
     with pytest.raises(ProjectConfigError, match="PRALE_SKILLS requires the memory store"):
         Settings.from_environment(_environment(tmp_path, PRALE_MEMORY="off"))
+    with pytest.raises(ProjectConfigError, match="PRALE_MEMORY_EMBEDDING_MODEL requires PRALE_MEMORY"):
+        Settings.from_environment(
+            _environment(
+                tmp_path,
+                PRALE_MEMORY="off",
+                PRALE_SKILLS="off",
+                PRALE_MEMORY_EMBEDDING_MODEL="/models/bge-m3",
+            )
+        )
+
+
+def test_settings_accept_an_opt_in_local_memory_embedding_model(tmp_path: Path) -> None:
+    settings = Settings.from_environment(
+        _environment(tmp_path, PRALE_MEMORY_EMBEDDING_MODEL="/root/vibe/AgenticRAG+RL/core/models/bge-m3")
+    )
+
+    assert settings.memory_embedding_model == Path("/root/vibe/AgenticRAG+RL/core/models/bge-m3")
+    assert "memory_embedding  /root/vibe/AgenticRAG+RL/core/models/bge-m3" in settings.describe()
 
 
 def test_print_config_shows_the_deployment_without_echoing_a_credential(

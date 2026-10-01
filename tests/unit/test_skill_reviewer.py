@@ -1,5 +1,6 @@
 import asyncio
 import json
+from dataclasses import replace
 
 import pytest
 
@@ -82,6 +83,26 @@ status: active
         assert "<<end-of-transcript>>" in user_prompt
         assert '"skill_id": "skl-old"' in user_prompt
         assert "not a participant" in provider.request.messages[0]["content"]
+
+    asyncio.run(scenario())
+
+
+def test_coding_reviewer_marks_current_tool_outcomes_as_successful_evidence() -> None:
+    async def scenario() -> None:
+        archive = _archive()
+        trace = archive.archives[0]
+        archive = replace(
+            archive,
+            archives=(
+                replace(
+                    trace, items=(TraceItem("tool-ok", 1, 1, "message", "tool", "pytest passed", {"is_error": False}),)
+                ),
+            ),
+        )
+        provider = Provider('{"action":"no_op","reason":"test"}')
+        await CodingSkillReviewer(provider).review(archive, ())
+        assert provider.request is not None
+        assert '"success": true' in provider.request.messages[1]["content"]
 
     asyncio.run(scenario())
 

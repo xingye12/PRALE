@@ -32,6 +32,7 @@ class ProjectRuntimeConfig:
     sessions_dir: Path
     catalog_db: Path
     memory_db: Path | None = None
+    memory_assets_dir: Path | None = None
     skill_db: Path | None = None
     project_id: str | None = None
     default_lane: str = "main"
@@ -58,6 +59,9 @@ class ProjectRuntimeConfig:
         object.__setattr__(self, "sessions_dir", Path(self.sessions_dir))
         object.__setattr__(self, "catalog_db", Path(self.catalog_db))
         object.__setattr__(self, "memory_db", None if self.memory_db is None else Path(self.memory_db))
+        object.__setattr__(
+            self, "memory_assets_dir", None if self.memory_assets_dir is None else Path(self.memory_assets_dir)
+        )
         object.__setattr__(self, "skill_db", None if self.skill_db is None else Path(self.skill_db))
 
     @property

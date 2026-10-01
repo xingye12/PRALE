@@ -8,7 +8,7 @@ already-redacted archive and a read-only candidate listing into one proposal;
 import json
 from dataclasses import dataclass
 
-from agent_harness.domain.skill import SkillArchive, SkillFile, SkillListing, SkillProposal
+from agent_harness.domain.skill import SkillArchive, SkillFile, SkillListing, SkillProposal, is_successful_tool_result
 from agent_harness.runtime.generation import ChatProvider, GenerationRequest
 
 _SYSTEM_PROMPT = """You are the Coding Skill Review Agent. You REVIEW a completed past coding conversation;
@@ -89,7 +89,7 @@ def _review_input(archive: SkillArchive, candidates: tuple[SkillListing, ...], h
             label = item.role or item.type
             metadata: dict[str, object] = {"source_entry_id": item.source_entry_id}
             if item.role == "tool":
-                metadata["success"] = bool(item.payload.get("success", False))
+                metadata["success"] = is_successful_tool_result(item)
             content = item.content or ""
             if item.payload and (not content or item.role == "tool"):
                 payload = json.dumps(item.payload, ensure_ascii=False, sort_keys=True, default=str)
