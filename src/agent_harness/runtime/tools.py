@@ -34,7 +34,13 @@ class ToolRegistry:
         return self._by_name.get(name)
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
-        return tuple(ToolDefinition(tool.name, tool.description, tool.input_schema) for tool in self._by_name.values())
+        definitions = []
+        for tool in self._by_name.values():
+            maximum = getattr(tool, "max_result_tokens", None)
+            if not isinstance(maximum, int) or isinstance(maximum, bool) or maximum < 1:
+                maximum = None
+            definitions.append(ToolDefinition(tool.name, tool.description, tool.input_schema, maximum))
+        return tuple(definitions)
 
     async def execute_parallel(self, calls: tuple[tuple[str, JsonValue], ...]) -> tuple[ToolExecutionResult, ...]:
         """Execute an already-durable batch concurrently; result order follows source call order."""

@@ -1,7 +1,5 @@
 // 技能视图：资产、版本历史、来源归档、提取任务与审计。
-//
-// 只读（ADR-WEB-004）：这里没有创建、编辑、启用/停用或审批入口——技能的写入
-// 属于自动演进管道，人工审批 API 不在本期范围。
+// 内容与版本只读；人工只能启用/停用已通过自动 Review 的 Skill。
 
 import { append, badge, card, clear, empty, h, kv, notice, sectionTitle, table, tabs, tag } from "./dom.js";
 import { DASH, bytes, clock, count, errorText, jsonText, listOrDash, shortId } from "./format.js";
@@ -32,7 +30,7 @@ export function createSkillsView(app) {
       h("h1", { class: "view-title" }, "技能"),
       h("p", {
         class: "view-sub",
-        text: "只读视图：状态（active/disabled/archived）、当前版本、SKILL.md 正文、资源文件与版本历史均按存储原样展示。",
+        text: "新提炼的 Skill 默认停用；在详情中启用后，Agent 才会发现和使用它。内容、版本与作用域仍为只读。",
       }),
     ];
   }
@@ -112,10 +110,17 @@ export function createSkillsView(app) {
   }
 
   function skillDetail(skill) {
+    const enableToggle = skill.state === "archived"
+      ? null
+      : h("button", {
+          type: "button",
+          text: skill.state === "active" ? "停用 Skill" : "启用 Skill",
+          onclick: () => setEnabled(skill, skill.state !== "active"),
+        });
     return h(
       "div",
       {},
-      h("h2", { class: "view-title" }, skill.name || skill.skill_id, badge(skill.state, skill.state === "active" ? "ok" : "warn")),
+      h("div", { class: "card-head" }, h("h2", { class: "view-title" }, skill.name || skill.skill_id, badge(skill.state, skill.state === "active" ? "ok" : "warn")), h("span", { class: "spacer" }), enableToggle),
       kv([
         ["skill_id", h("span", { class: "mono", text: skill.skill_id })],
         ["description", skill.description || DASH],
@@ -130,6 +135,20 @@ export function createSkillsView(app) {
       h("p", { class: "meta", text: "版本永不重写：每个版本的 content_hash 对应当次写入的正文与资源文件。" }),
       versions.length ? versions.map(versionCard) : empty("没有版本记录", "该资产尚无已写入的版本。"),
     );
+  }
+
+  async function setEnabled(skill, enabled) {
+    try {
+      detail = await app.api.request(`/skills/${encodeURIComponent(skill.skill_id)}/enabled`, {
+        method: "POST",
+        body: { enabled },
+      });
+      items = items.map((item) => (item.skill_id === detail.skill_id ? { ...item, state: detail.state, updated_at: detail.updated_at } : item));
+      error = null;
+    } catch (failure) {
+      error = failure;
+    }
+    render();
   }
 
   function archiveCard(archive) {

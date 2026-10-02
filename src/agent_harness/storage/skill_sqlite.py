@@ -84,6 +84,17 @@ class SQLiteSkillStore:
         CREATE INDEX IF NOT EXISTS skill_scope_active ON skills(repository_id,state,updated_at);
         INSERT OR IGNORE INTO schema_migrations VALUES(1);
         """)
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            if self._conn.execute("SELECT 1 FROM schema_migrations WHERE version=2").fetchone() is None:
+                # v2 makes human approval explicit.  All legacy auto-created
+                # Skills must be enabled deliberately before prompt injection.
+                self._conn.execute("UPDATE skills SET state='disabled' WHERE state='active'")
+                self._conn.execute("INSERT INTO schema_migrations VALUES(2)")
+            self._conn.execute("COMMIT")
+        except Exception:
+            self._conn.execute("ROLLBACK")
+            raise
 
     async def append_archive(self, archive: SkillArchive) -> tuple[SkillArchive, bool]:
         conn = self._conn
@@ -638,6 +649,34 @@ class SQLiteSkillStore:
             scope, proposal.skill_id, proposal.expected_version, proposal, name, description, triggers, now
         )
 
+    async def set_state(self, scope: SkillScope, skill_id: str, state: str) -> SkillAsset | None:
+        """Enable or disable an owned Skill without changing its content version."""
+        if state not in {"active", "disabled"}:
+            raise ValueError("skill state must be active or disabled")
+        conn = self._conn
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT * FROM skills WHERE skill_id=? AND repository_id=?", (skill_id, scope.storage_key)
+            ).fetchone()
+            if row is None:
+                conn.execute("COMMIT")
+                return None
+            if row["state"] == "archived":
+                raise ValueError("archived skills cannot be enabled or disabled")
+            previous, now = str(row["state"]), self._now()
+            conn.execute("UPDATE skills SET state=?,updated_at=? WHERE skill_id=?", (state, now, skill_id))
+            conn.execute(
+                "INSERT INTO skill_audit(repository_id,created_at,event,data) VALUES(?,?,?,?)",
+                (scope.storage_key, now, "skill_state_changed", json.dumps({"skill_id": skill_id, "from": previous, "to": state}, sort_keys=True)),
+            )
+            updated = conn.execute("SELECT * FROM skills WHERE skill_id=?", (skill_id,)).fetchone()
+            conn.execute("COMMIT")
+            return _asset(updated)
+        except Exception:
+            conn.execute("ROLLBACK")
+            raise
+
     async def _write(
         self,
         scope: SkillScope,
@@ -669,7 +708,7 @@ class SQLiteSkillStore:
                         json.dumps(triggers),
                         json.dumps(proposal.tags),
                         "private",
-                        "active",
+                        "disabled",
                         version,
                         now,
                         now,

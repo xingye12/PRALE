@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from agent_harness.api.errors import LaneBusy, NothingToCompact, OperationAlreadyExists
 from agent_harness.api.models import AbortResult, LaneSnapshot, OperationAdmission, OperationResult
+from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.entries import NewEntry
 from agent_harness.domain.operations import ActiveOperation, OperationMeta, OperationState
 from agent_harness.domain.session import Session, SessionMutator
@@ -83,6 +84,7 @@ class Lane:
         skill_runtime: "SkillEvolutionRuntime | None" = None,
         trace_recorder: bool = False,
         telemetry: TelemetrySink | None = None,
+        context_management: ContextManagementConfig = ContextManagementConfig(),
     ) -> None:
         self.name = name
         self._session = session
@@ -99,6 +101,7 @@ class Lane:
         self._skill_runtime = skill_runtime
         self._trace_recorder = trace_recorder
         self._telemetry = telemetry
+        self._context_management = context_management
 
     async def attach(self, at: str | None = None) -> None:
         """Durably create the lane's idle projection if this is its first attachment."""

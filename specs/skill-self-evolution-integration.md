@@ -8,16 +8,16 @@
 
 自动路径只允许新增或非破坏性更新。删除、撤销历史版本、变更可见性、跨 scope 发布 loadout、安装外部依赖，均须经独立的人工/资产管理流程。
 
-### 1.1 自动创建的默认状态是 active
+### 1.1 自动创建的默认状态是 disabled
 
-自动提炼创建的 Skill 默认状态为 **`active`**，不是 `draft`。这与参考实现一致：参考实现的 `skills` 表已移除 draft 状态并以 `DEFAULT 'active'` 建表，即自动沉淀的经验应当立即可用，而不是等待一个现实中不存在的审核队列。
+自动提炼创建的 Skill 默认状态为 **`disabled`**。只有本机 Web UI 上的显式人工启用，才会将其转为可被运行时发现的 `active`；`disabled` Skill 可浏览和审计，但绝不进入 listing、search 或 loadout。
 
-由此产生的安全边界**必须**由另外两个属性承担，且二者都是自动路径不能修改的：
+自动路径仍受以下边界约束，且二者都不能由 Review LLM 修改：
 
 - `visibility` 初始且始终为 `private`——自动路径**不提供** `set_visibility` 动作；
 - scope **必须**是提炼时的 `repository_id`（见 ADR-018），自动路径**不提供**跨 repository 写入。
 
-因此“默认 active”的准确含义是：**该 Skill 对创建它的 repository scope 立即可用，对其他 repository 不可见**。这也意味着不存在“先创建再激活”的两步流程，`activate`/`disable`/`archive` 只作为人工资产管理动作存在。
+因此“启用”的准确含义是：**该 Skill 只对创建它的 repository scope 可用，对其他 repository 不可见**。自动路径不提供 `activate`/`disable`/`archive`；Web UI 只能在 `active` 与 `disabled` 间切换，不能修改内容、版本、visibility 或 scope。
 
 ## 2. Skill 合约与存储模型
 
@@ -34,7 +34,7 @@ SkillAsset (skill_id: "skl-…")
 
 `SKILL.md` frontmatter 必须含 `name`、`description`、`triggers`、`version`、`status`。正文必须覆盖：适用范围与不适用范围、前置条件、步骤、验证、失败/回滚处理、资源使用说明。`description` 与 `triggers` 用于 listing/search；完整正文只有在实际选中 Skill 后才加载。
 
-`SkillScope` 与 `MemoryScope` 的归属字段一致且同源：只含一个稳定的 `repository_id`（由 `SkillScope.from_memory_scope()` 构造，`storage_key` 即 `repository_id`）。初版只允许在提炼时的 repository scope 内自动创建和修改私有 Skill，自动路径**不提供**跨 scope 写入。`visibility` 初始值为 `private`；`active | disabled | archived` 是 Skill 生命周期状态，自动提炼创建的默认状态为 `active`（见 §1.1）。`disabled`/`archived` 与任何 visibility 变更都是显式资产管理动作，而非 Review LLM 的权限。
+`SkillScope` 与 `MemoryScope` 的归属字段一致且同源：只含一个稳定的 `repository_id`（由 `SkillScope.from_memory_scope()` 构造，`storage_key` 即 `repository_id`）。初版只允许在提炼时的 repository scope 内自动创建和修改私有 Skill，自动路径**不提供**跨 scope 写入。`visibility` 初始值为 `private`；`active | disabled | archived` 是 Skill 生命周期状态，自动提炼创建的默认状态为 `disabled`（见 §1.1）。`active`/`disabled` 切换是 Web UI 的显式人工资产管理动作，`archived` 与任何 visibility 变更不属于自动 Review 权限。
 
 SQLite 后端至少包含 `skills`、`skill_versions`、`skill_files`、`skill_archives`、`skill_extraction_jobs`、`skill_candidates`、`skill_audit`、Skill FTS 表和 `schema_migrations`。Skill 各表直接以 `repository_id` 建列，不保留旧三元组 identity 列（与记忆库的兼容列策略不同，Skill 库没有历史 identity 数据需要承载）。文件正文可存 SQLite blob 或由 content-addressed blob store 持有；不论实现如何，`SkillVersion` 提交必须原子地绑定 Markdown、manifest、文件 hash 和版本号。禁止通过可变工作目录把“当前文件”当作权威版本。
 
@@ -97,14 +97,14 @@ Review LLM **不得**直接使用数据库、文件系统、shell、网络或删
 | 动作 | 约束 |
 | --- | --- |
 | `skill_list` / `skill_view` | 仅能读取调用 scope 已授权的元数据或版本 |
-| `skill_create` | 写入 `active` + `private`；名称、frontmatter、资源 manifest 校验通过才写入 |
+| `skill_create` | 写入 `disabled` + `private`；名称、frontmatter、资源 manifest 校验通过才写入 |
 | `skill_update` | 要求 `expected_version`，提交完整新版本 |
 | `skill_patch` | 必须唯一命中指定片段；无法唯一命中时拒绝 |
 | `skill_files_write` | 仅新增/替换相对资源路径；路径遍历、可执行外部下载和超限内容拒绝 |
 
 自动流程不提供 `delete`、`set_visibility`、`activate`、`deactivate`、`archive` 或跨 scope 修改动作。脚本资源即使被提炼出来，也只是未执行的版本化文本；后续执行仍必须通过 Harness 工具注册、权限和 effect intent 机制。
 
-`skill_create` 写入的是 `active` 而非 `draft`，因此“新建即生效”**必须**由质量门（§5）而非状态流转来保证。
+`skill_create` 写入的是 `disabled`，因此质量门负责筛掉无效候选，人工启用门负责决定哪些已通过候选可进入 Agent 上下文。
 
 ## 5. 版本、冲突和质量门
 
@@ -146,7 +146,7 @@ await skill_runtime.review_status(archive_or_job_id)
 
 `SkillEvolutionRuntime` **必须**提供与 `MemoryRuntime` 相同的生命周期：`start()` 恢复未完成 job 与 outbox 扫描，`aclose()` 停止调度并等待在途 job 收敛；`Harness.close()` 必须级联关闭二者（见 ADR-014）。
 
-人工审核/资产管理 API 另行定义，不能混入自动 Review 权限。配置至少包含：buffer 阈值（tool call 数与字节数）、archive 最大大小、Review provider/timeout/retry、最大候选数、listing/loadout 字符预算、允许的资源 MIME/大小、是否允许 embedding、以及 `auto_create` / `auto_update_active` 开关。生产默认**必须**启用 `auto_create`，**必须**关闭 `auto_update_active`——即可以自动沉淀新 Skill（`active` + `private`），但不得自动改写一个已存在且可能正被使用的 active Skill；对该类资产的更新只能由人工资产管理流程发起。
+人工审核/资产管理 API 另行定义，不能混入自动 Review 权限。配置至少包含：buffer 阈值（tool call 数与字节数）、archive 最大大小、Review provider/timeout/retry、最大候选数、listing/loadout 字符预算、允许的资源 MIME/大小、是否允许 embedding、以及 `auto_create` / `auto_update_active` 开关。生产默认**必须**启用 `auto_create`，**必须**关闭 `auto_update_active`——自动路径可沉淀新的 `disabled` + `private` Skill，但不得自动改写一个已存在且可能正被使用的 active Skill；对该类资产的更新只能由人工资产管理流程发起。
 
 必须记录 archive 原因与 hash、job 生命周期、Reviewer prompt/version、候选检索结果、每项 create/update/patch 的前后 version/hash、拒绝原因、冲突和被装配的 Skill versions。日志/审计不得保存原始密钥或受控资源明文。
 
@@ -160,7 +160,7 @@ await skill_runtime.review_status(archive_or_job_id)
 验收条件：
 
 - 同一 terminal operation 的重复 dispatcher 投递只增加一次 buffer 输入；archive 后崩溃不丢 archive、不重复创建 extraction job；Skill buffer 与 Memory L0 使用同一冻结 terminal snapshot；
-- 自动创建的 Skill 为 `active` + `private`，且仅对该 repository scope 可见；自动路径无法改变 visibility 或写入其他 scope；
+- 自动创建的 Skill 为 `disabled` + `private`，且仅对该 repository scope 可见；只有 Web UI 的显式启用才可使其进入 listing/search/loadout，自动路径无法改变 visibility 或写入其他 scope；
 - 默认配置下自动流程不能修改已存在的 active Skill（`auto_update_active=false`），尝试时必须留下拒绝审计；
 - 只配置 `skill_runtime` 而不配置 `memory_runtime` 时，`Harness.open` 抛出配置错误而不是静默停用；
 - 并发 update 不能静默覆盖，`expected_version` 不匹配必须返回当前版本；

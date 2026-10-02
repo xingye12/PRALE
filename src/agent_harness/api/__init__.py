@@ -1,5 +1,6 @@
 from agent_harness.api.catalog import SessionCatalog, SessionSummary
 from agent_harness.api.errors import (
+    ContextBudgetExceeded,
     InvalidCursor,
     MemoryNotFound,
     MemoryScopeDenied,
@@ -10,6 +11,7 @@ from agent_harness.api.errors import (
     UnknownTarget,
 )
 from agent_harness.api.harness import Harness
+from agent_harness.api.models import ContextManagementConfig, ContextReductionReport
 from agent_harness.api.pagination import Page, decode_cursor, encode_cursor
 from agent_harness.api.project import ProjectInfo, ProjectRuntimeConfig
 from agent_harness.api.rpc import HarnessRpc
@@ -27,6 +29,9 @@ __all__ = [
     "MemoryScope",
     "MemoryScopeDenied",
     "NothingToCompact",
+    "ContextBudgetExceeded",
+    "ContextManagementConfig",
+    "ContextReductionReport",
     "Page",
     "ProjectConfigError",
     "ProjectInfo",

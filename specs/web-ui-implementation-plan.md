@@ -11,9 +11,9 @@
 - 对话视图可向指定 lane 发送 prompt、流式显示消息和工具状态；
 - 轨迹视图可选择 session，按 operation（UI 中的 turn）展示输入/输出、token、总耗时、每次 LLM call 和工具 call 的耗时；
 - 记忆视图按服务端配置的 repository scope 展示 L0 归档、L1 atomic memories、L2 work-scene memories，以及全局唯一的 L3 operating doctrine；
-- 技能视图只读展示该 scope 下的 skill 资产、版本历史、来源归档与提取任务状态。
+- 技能视图展示该 scope 下的 skill 资产、版本历史、来源归档与提取任务状态，并允许人工启用/停用已提炼的 Skill。
 
-不在本期范围：把浏览器连接、HTTP 框架、前端状态或项目目录扫描逻辑放入 `domain/` / `runtime/`；以事件流替代 durable 历史；把工作目录权限扩大为任意文件浏览；**多用户 / 团队 ACL 与"认证主体到 scope"的映射**（ADR-018 明确 `repository_id` 不是授权维度，见 ADR-WEB-003）；**技能的创建、修改、评审与人工审批**（`skill-self-evolution-integration.md` 规定人工审核/资产管理 API 另行定义，不得混入自动 Review 权限）；修改 L0--L3 内容或执行记忆 GC。
+不在本期范围：把浏览器连接、HTTP 框架、前端状态或项目目录扫描逻辑放入 `domain/` / `runtime/`；以事件流替代 durable 历史；把工作目录权限扩大为任意文件浏览；**多用户 / 团队 ACL 与"认证主体到 scope"的映射**（ADR-018 明确 `repository_id` 不是授权维度，见 ADR-WEB-003）；**技能的创建、内容修改、评审与人工审批**（仅 `active`/`disabled` 的显式启用门例外）；修改 L0--L3 内容或执行记忆 GC。
 
 ## 2. 当前实现盘点与缺口
 
@@ -129,7 +129,8 @@ SQLite migration 只前进：为 operation/call usage、span 和查询索引加�
 | `GET /api/sessions/{id}/turns` | 分页轨迹列表和聚合指标 |
 | `GET /api/sessions/{id}/turns/{operation_id}` | 单 turn 的完整 entries、spans、usage |
 | `GET /api/memory/l0`、`/l1`、`/l2`、`/l3`、`/jobs`、`/audit`、`/l0/{archive_id}` | 只读记忆视图；L3 为全局 doctrine，`/jobs` 为晋升管道状态，单条归档含脱敏后的 items |
-| `GET /api/skills`、`/skills/{skill_id}`、`/skills/{skill_id}/versions` | 只读 skill 资产与版本历史（含 disabled/archived） |
+| `GET /api/skills`、`/skills/{skill_id}`、`/skills/{skill_id}/versions` | 读取 skill 资产与版本历史（含 disabled/archived） |
+| `POST /api/skills/{skill_id}/enabled` | 请求体 `{enabled: boolean}`；仅在 `active` / `disabled` 间切换并写入审计，不改写版本内容 |
 | `GET /api/skills/archives`、`/skills/archives/{id}`、`/skills/jobs`、`/skills/audit` | 来源归档（含 payload）、提取任务状态与技能审计 |
 
 前端布局：顶栏固定显示 `project_root` 与 `repository_id`；左侧导航为"对话 / 轨迹 / 记忆 / 技能"。对话页与轨迹页都有 session 与 lane 选择器；轨迹页内有 turn 列表，详情按时间线展示 message、LLM、tool、usage。工具调用参数和工具返回结果使用原生折叠块；尤其工具返回结果默认收起，用户点击后才读取完整输出与 details，避免命令日志或文件内容淹没对话和时间线。
@@ -141,7 +142,7 @@ SQLite migration 只前进：为 operation/call usage、span 和查询索引加�
 - 未结算/未知的 operation 显式标记为"结果未知"，不显示为 0 耗时或成功；
 - 缺少 span 的旧 Session 把 call 级耗时标为"不可用（未记录）"，不推断；
 - 记忆页按 L0 / L1 / L2 / L3 四个层级分栏（L3 标注为全局 doctrine），显示 version、status、更新时间、来源引用与脱敏状态；
-- 技能页展示资产状态（active/disabled/archived）、当前版本、triggers/tags、SKILL.md 正文、资源文件、版本历史（版本号与 content_hash，版本永不重写）、来源归档与提取任务状态；**只读**，不提供编辑、启用/停用或审批操作。
+- 技能页展示资产状态（active/disabled/archived）、当前版本、triggers/tags、SKILL.md 正文、资源文件、版本历史（版本号与 content_hash，版本永不重写）、来源归档与提取任务状态；可显式启用/停用非 archived Skill，但不提供内容编辑、版本修改或审批操作。
 
 ### 4.1 阶段 4 已交付的传输契约（`api/web.py`）
 
@@ -246,13 +247,13 @@ SQLite migration 只前进：为 operation/call usage、span 和查询索引加�
 
 **后果：** UI 能正确显示分层记忆与技能，同时不把 session 选择误解为 memory 权限边界。若未来需要多用户，必须按 ADR-018 新增独立的 owner/ACL 维度，而不是复用 `repository_id`。
 
-### ADR-WEB-004：技能视图只读
+### ADR-WEB-004：Web UI 是 Skill 的显式启用门
 
 **背景：** 技能资产有严格的质量与安全闸门（`validate_skill_proposal`）与乐观版本语义（写入必须携带 `expected_version`，版本永不重写）；`skill-self-evolution-integration.md` 明确人工审核/资产管理 API 需另行定义，且不得混入自动 Review 权限。
 
-**决策：** 本期技能视图只提供读取：资产与状态、版本历史、来源归档、提取任务与审计。不提供创建、修改、启用/停用、补丁或审批入口，也不暴露 review 权限。
+**决策：** 自动提炼的 Skill 一律以 `disabled` + `private` 写入。UI 可经 `POST /api/skills/{skill_id}/enabled` 在 `active` 与 `disabled` 间切换；转换按服务端 scope 定位、在同一 SQLite 事务内更新状态并追加审计，绝不改写 `SkillVersion`。`archived` 不可由此接口复活。UI 不提供创建、内容修改、补丁、visibility/scope 变更或 review 权限。
 
-**后果：** UI 可以观察技能沉淀结果，但不会绕过质量闸门或版本规则。人工审核能力留给后续独立设计。
+**后果：** 已通过自动质量门的候选仍需人工决定是否注入 Agent；禁用立即阻止后续 listing/search/loadout，已被冻结在进行中 intent 的版本仍按既有恢复语义完成。内容与版本门控不受 UI 影响。
 
 ### ADR-WEB-005：前端不引入构建工具链，Web 框架为可选依赖
 

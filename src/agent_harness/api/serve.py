@@ -213,6 +213,7 @@ def build_application(settings: Settings) -> Deployment:
         telemetry=telemetry,
         tokens=settings.tokens,
         max_concurrent_drives=settings.max_concurrent_drives,
+        context_management=settings.context_management,
     )
     return Deployment(web, tuple(stores))
 

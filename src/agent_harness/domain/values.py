@@ -49,3 +49,9 @@ def operation_result(operation_id: str) -> ValueAddress[object]:
 
 def operation_lease(operation_id: str) -> ValueAddress[dict[str, str]]:
     return ValueAddress(f"operation/{operation_id}/drive_lease")
+
+
+def operation_context_reductions(operation_id: str) -> ListAddress[dict[str, object]]:
+    """Append-only audit of request-only reductions frozen into an intent."""
+
+    return ListAddress(f"operation/{operation_id}/context_reductions")

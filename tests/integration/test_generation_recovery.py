@@ -2,7 +2,8 @@ import asyncio
 import contextlib
 
 from agent_harness.api.harness import Harness
-from agent_harness.domain.values import operation_state
+from agent_harness.domain.context_management import ContextManagementConfig
+from agent_harness.domain.values import operation_context_reductions, operation_state
 from agent_harness.runtime.generation import AssistantResult, GenerationDelta, GenerationRequest, ToolCall
 from agent_harness.runtime.retry import RetryPolicy
 from agent_harness.runtime.tools import ToolExecutionResult, ToolRegistry
@@ -16,6 +17,14 @@ class SuccessfulProvider:
     async def generate(self, request: GenerationRequest) -> AssistantResult:
         self.requests.append(request)
         return AssistantResult(content="hello", usage={"input_tokens": 3, "output_tokens": 1})
+
+
+class SummaryRetryProvider(SuccessfulProvider):
+    async def generate(self, request: GenerationRequest) -> AssistantResult:
+        self.requests.append(request)
+        if len(self.requests) == 1:
+            return AssistantResult(content="<analysis>not a summary</analysis>", usage={})
+        return AssistantResult(content="hello", usage={})
 
 
 class BlockingProvider:
@@ -131,6 +140,119 @@ class RecordingTool:
         self._started.append(self.name)
         await asyncio.sleep(0)
         return ToolExecutionResult(content={"tool": self.name, "value": arguments["value"]})
+
+
+def test_large_context_automatically_collapses_before_the_generation_effect() -> None:
+    async def scenario() -> None:
+        storage = MemoryStorage()
+        provider = SuccessfulProvider()
+        config = ContextManagementConfig(
+            context_window_tokens=300,
+            reserved_output_tokens=50,
+            soft_margin_tokens=100,
+            hard_margin_tokens=25,
+            protected_recent_messages=1,
+        )
+        lane = await (await Harness.open("session-1", storage, context_management=config)).acquire_lane("main")
+        original = "important prior context\n" * 80
+        await lane.prompt(original, operation_id="op-1")
+
+        result = await lane.drive(provider)
+
+        assert result.status == "completed"
+        assert len(provider.requests) == 2
+        assert provider.requests[0].tools == ()
+        assert provider.requests[0].messages[0]["role"] == "system"
+        assert provider.requests[1].messages[0]["content"].startswith("This session is being continued")
+        entries = await storage.scan_branch(result.tip_id)
+        assert entries[0].payload == {"role": "user", "content": original}
+        assert entries[1].type == "context_collapse"
+        assert entries[1].payload["summary"] == "hello"
+        [reduction] = await storage.read_list(operation_context_reductions("op-1"))
+        assert reduction["source_entry_ids"] == [entries[0].id, entries[1].id]
+
+    asyncio.run(scenario())
+
+
+def test_recovery_settles_an_interrupted_context_collapse_without_replaying_it() -> None:
+    async def scenario() -> None:
+        storage = MemoryStorage()
+        provider = BlockingProvider()
+        config = ContextManagementConfig(
+            context_window_tokens=300,
+            reserved_output_tokens=50,
+            soft_margin_tokens=100,
+            hard_margin_tokens=25,
+            protected_recent_messages=1,
+        )
+        lane = await (await Harness.open("session-1", storage, context_management=config)).acquire_lane("main")
+        await lane.prompt("old context\n" * 80, operation_id="op-1")
+
+        task = asyncio.create_task(lane.drive(provider))
+        await provider.started.wait()
+        state = await storage.get_value(operation_state("op-1"))
+        assert state.at == "context.collapse.effect_pending"
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+        recovered = await (await (await Harness.open("session-1", storage)).acquire_lane("main")).recover()
+
+        assert recovered is not None
+        assert recovered.status == "unknown"
+        assert provider.calls == 1
+        assert not provider.release.is_set()
+
+    asyncio.run(scenario())
+
+
+def test_global_auto_compact_is_used_only_when_collapse_mode_is_disabled() -> None:
+    async def scenario() -> None:
+        storage = MemoryStorage()
+        provider = SuccessfulProvider()
+        config = ContextManagementConfig(
+            context_window_tokens=300,
+            reserved_output_tokens=50,
+            soft_margin_tokens=100,
+            hard_margin_tokens=25,
+            protected_recent_messages=1,
+            collapse_enabled=False,
+        )
+        lane = await (await Harness.open("session-1", storage, context_management=config)).acquire_lane("main")
+        await lane.prompt("old context\n" * 80, operation_id="op-1")
+
+        result = await lane.drive(provider)
+        entries = await storage.scan_branch(result.tip_id)
+
+        assert len(provider.requests) == 2
+        assert entries[1].type == "compaction"
+        assert entries[1].payload["provenance"] == "auto_global_compact"
+
+    asyncio.run(scenario())
+
+
+def test_context_collapse_retries_invalid_summary_with_a_new_effect_attempt() -> None:
+    async def scenario() -> None:
+        storage = MemoryStorage()
+        provider = SummaryRetryProvider()
+        config = ContextManagementConfig(
+            context_window_tokens=300,
+            reserved_output_tokens=50,
+            soft_margin_tokens=100,
+            hard_margin_tokens=25,
+            protected_recent_messages=1,
+        )
+        lane = await (await Harness.open("session-1", storage, context_management=config)).acquire_lane("main")
+        await lane.prompt("old context\n" * 80, operation_id="op-1")
+
+        await lane.drive(provider)
+
+        assert len(provider.requests) == 3
+        assert provider.requests[1].messages[-1]["content"] == "[earlier conversation truncated for compaction retry]"
+        spans = await storage.list_spans("op-1")
+        assert [span.outcome for span in spans] == ["failed", "completed", "completed"]
+
+    asyncio.run(scenario())
 
 
 def test_generation_intent_is_settled_atomically_with_message_usage_tip_and_result() -> None:
@@ -451,7 +573,10 @@ def test_generation_after_compaction_uses_summary_projection_instead_of_full_his
         await lane.drive(provider)
 
         messages = provider.requests[-1].messages
-        assert messages[0] == {"role": "system", "content": "Conversation summary:\nhello"}
+        assert messages[0] == {
+            "role": "user",
+            "content": "This session is being continued from a compacted earlier conversation.\n\nhello",
+        }
         assert messages[-1] == {"role": "user", "content": "new"}
 
     asyncio.run(scenario())

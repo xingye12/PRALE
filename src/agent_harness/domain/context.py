@@ -1,5 +1,6 @@
 """Pure entry-tree projection for provider requests."""
 
+from agent_harness.domain.context_management import continuation_summary_message
 from agent_harness.domain.entries import Entry, JsonValue
 
 
@@ -11,7 +12,11 @@ def project_messages(entries: list[Entry]) -> list[JsonValue]:
     """
 
     latest_summary_index = max(
-        (index for index, entry in enumerate(entries) if entry.type in {"compaction", "branch_summary"}),
+        (
+            index
+            for index, entry in enumerate(entries)
+            if entry.type in {"compaction", "context_collapse", "branch_summary"}
+        ),
         default=-1,
     )
     if latest_summary_index < 0:
@@ -30,8 +35,15 @@ def project_messages(entries: list[Entry]) -> list[JsonValue]:
         if entry.type == "message" and entry.id in retained_ids
     ]
     following = [entry.payload for entry in entries[latest_summary_index + 1 :] if entry.type == "message"]
+    summary = summary_payload["summary"]
+    assert isinstance(summary, str)
+    summary_message: JsonValue = (
+        continuation_summary_message(summary)
+        if summary_payload.get("prompt_version") == 1
+        else {"role": "system", "content": f"Conversation summary:\n{summary}"}
+    )
     return [
-        {"role": "system", "content": f"Conversation summary:\n{summary_payload['summary']}"},
+        summary_message,
         *retained,
         *following,
     ]

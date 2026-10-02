@@ -50,6 +50,7 @@ from agent_harness.api.service import AuthenticationError, RemoteSubscription, S
 from agent_harness.api.settings import DEFAULT_MAX_CONCURRENT_DRIVES
 from agent_harness.api.skill import SkillQueryService
 from agent_harness.api.trace import TraceQueryService
+from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.skill import SkillScope
 from agent_harness.memory.protocol import MemoryStore
@@ -230,6 +231,7 @@ class SessionSupervisor:
         trace_recorder: bool = False,
         max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
         telemetry: TelemetrySink | None = None,
+        context_management: ContextManagementConfig = ContextManagementConfig(),
     ) -> None:
         if skill_store is not None and memory_store is None:
             raise ValueError("skill_store requires memory_store for L0 archive materialization")
@@ -241,6 +243,7 @@ class SessionSupervisor:
         self._trace_recorder = trace_recorder
         self._max_drives = max_concurrent_drives
         self._telemetry = telemetry
+        self._context_management = context_management
         self._sessions: dict[str, _OpenSession] = {}
         self._open_lock = asyncio.Lock()
         self._drives: dict[tuple[str, str], asyncio.Task[None]] = {}
@@ -471,6 +474,7 @@ class SessionSupervisor:
             skill_runtime=self._skill_runtime,
             trace_recorder=self._trace_recorder,
             telemetry=self._telemetry,
+            context_management=self._context_management,
         )
         return _OpenSession(harness, storage)
 
@@ -521,6 +525,7 @@ class WebApplication:
         tokens: dict[str, str] | None = None,
         max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
         telemetry: TelemetrySink | None = None,
+        context_management: ContextManagementConfig = ContextManagementConfig(),
     ) -> None:
         self._config = config
         # The deployment's optional observer.  It is closed last, after the
@@ -556,6 +561,7 @@ class WebApplication:
             trace_recorder=trace_recorder,
             max_concurrent_drives=max_concurrent_drives,
             telemetry=telemetry,
+            context_management=context_management,
         )
         self.app = self._build_app(tokens or {})
 
@@ -617,6 +623,7 @@ class WebApplication:
             Route(f"{prefix}/skills/archives/{{archive_id}}", self.get_skill_archive),
             Route(f"{prefix}/skills/jobs", self.list_skill_jobs),
             Route(f"{prefix}/skills/audit", self.list_skill_audit),
+            Route(f"{prefix}/skills/{{skill_id}}/enabled", self.set_skill_enabled, methods=["POST"]),
             Route(f"{prefix}/skills/{{skill_id}}", self.get_skill),
             Route(f"{prefix}/skills/{{skill_id}}/versions", self.list_skill_versions),
             Route("/", self.index),
@@ -780,6 +787,18 @@ class WebApplication:
             raise SessionNotFound("no such skill in this repository")
         return JSONResponse(_jsonable(asset))
 
+    async def set_skill_enabled(self, request: Request) -> JSONResponse:
+        try:
+            body = await request.json()
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            raise ValueError("request body must be JSON") from None
+        if not isinstance(body, dict) or not isinstance(body.get("enabled"), bool):
+            raise ValueError("enabled must be a boolean")
+        asset = await self._skill_service().set_enabled(request.path_params["skill_id"], body["enabled"])
+        if asset is None:
+            raise SessionNotFound("no such skill in this repository")
+        return JSONResponse(_jsonable(asset))
+
     async def list_skill_versions(self, request: Request) -> JSONResponse:
         page = await self._skill_service().list_versions(
             request.path_params["skill_id"], _cursor(request), _limit(request)
@@ -893,6 +912,7 @@ def create_app(
     tokens: dict[str, str] | None = None,
     max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
     telemetry: TelemetrySink | None = None,
+    context_management: ContextManagementConfig = ContextManagementConfig(),
 ) -> WebApplication:
     """Build the web application for one deployment.
 
@@ -913,6 +933,7 @@ def create_app(
         tokens=tokens,
         max_concurrent_drives=max_concurrent_drives,
         telemetry=telemetry,
+        context_management=context_management,
     )
 
 

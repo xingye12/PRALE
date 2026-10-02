@@ -34,6 +34,15 @@ class NothingToCompact(HarnessError):
     """The selected branch has no prior history eligible for compaction."""
 
 
+class ContextBudgetExceeded(HarnessError):
+    """The final provider request cannot fit the configured context window."""
+
+    def __init__(self, estimated_tokens: int, hard_limit_tokens: int) -> None:
+        super().__init__(f"context requires {estimated_tokens} tokens; hard limit is {hard_limit_tokens}")
+        self.estimated_tokens = estimated_tokens
+        self.hard_limit_tokens = hard_limit_tokens
+
+
 class UnknownTarget(HarnessError):
     """A navigation request refers to an entry outside the session tree."""
 

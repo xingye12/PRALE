@@ -47,7 +47,10 @@ def test_skill_versions_are_atomic_private_and_owner_scoped(factory) -> None:
         store = factory()
         owner, other = SkillScope("repo-a"), SkillScope("repo-b")
         asset = await store.create(owner, _proposal(files=(SkillFile("template.txt", b"ok"),)), 1)
-        assert asset.state == "active" and asset.visibility == "private" and asset.current_version == 1
+        assert asset.state == "disabled" and asset.visibility == "private" and asset.current_version == 1
+        assert await store.load(owner, asset.skill_id) is None
+        enabled = await store.set_state(owner, asset.skill_id, "active")
+        assert enabled is not None and enabled.state == "active" and enabled.current_version == 1
         loaded = await store.load(owner, asset.skill_id)
         assert loaded and loaded.files[0].content == b"ok"
         assert await store.load(other, asset.skill_id) is None
@@ -67,6 +70,14 @@ def test_skill_versions_are_atomic_private_and_owner_scoped(factory) -> None:
                 _proposal(action="update", skill_id=asset.skill_id, expected_version=2),
                 4,
             )
+
+        disabled = await store.set_state(owner, asset.skill_id, "disabled")
+        assert disabled is not None and disabled.state == "disabled" and disabled.current_version == 2
+        assert await store.search(owner, "deploy", 10) == ()
+        assert [record.event for record in await store.list_audit(owner, None, 10)] == [
+            "skill_state_changed",
+            "skill_state_changed",
+        ]
 
     asyncio.run(scenario())
 
@@ -99,6 +110,26 @@ def test_skill_patch_requires_one_unambiguous_target() -> None:
         patch_markdown("target target", "target", "replacement")
     with pytest.raises(ValueError):
         patch_markdown("nothing", "target", "replacement")
+
+
+def test_skill_state_migration_disables_legacy_active_assets(tmp_path) -> None:
+    async def scenario() -> None:
+        path = tmp_path / "skills.db"
+        store = SQLiteSkillStore(path)
+        asset = await store.create(SkillScope("repo"), _proposal(), 1)
+        # Recreate the v1 state: before the human enable gate, automatically
+        # extracted Skills were written active.
+        store._conn.execute("UPDATE skills SET state='active' WHERE skill_id=?", (asset.skill_id,))
+        store._conn.execute("DELETE FROM schema_migrations WHERE version=2")
+        store.close()
+
+        reopened = SQLiteSkillStore(path)
+        migrated = await reopened.get_skill(SkillScope("repo"), asset.skill_id)
+        assert migrated is not None and migrated.state == "disabled"
+        assert await reopened.listing(SkillScope("repo"), "deploy", 2_000) == ()
+        reopened.close()
+
+    asyncio.run(scenario())
 
 
 def test_durable_buffer_seals_once_at_threshold_and_job_respects_not_before() -> None:

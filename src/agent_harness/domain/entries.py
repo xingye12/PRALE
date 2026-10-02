@@ -3,7 +3,7 @@ from typing import Literal
 
 type JsonScalar = str | int | float | bool | None
 type JsonValue = JsonScalar | list[JsonValue] | dict[str, JsonValue]
-EntryType = Literal["message", "compaction", "branch_summary", "custom"]
+EntryType = Literal["message", "compaction", "context_collapse", "branch_summary", "custom"]
 
 
 @dataclass(frozen=True, slots=True)

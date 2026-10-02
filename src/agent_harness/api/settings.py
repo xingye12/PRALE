@@ -18,6 +18,7 @@ from pathlib import Path
 
 from agent_harness.api.errors import ProjectConfigError
 from agent_harness.api.project import ProjectRuntimeConfig
+from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.integrations.langfuse import LangfuseConfig
 from agent_harness.integrations.repository_explorer import RepositoryScanLimits
 
@@ -98,6 +99,7 @@ class Settings:
     skill_db: Path | None
     api_key: str
     model: str
+    context_management: ContextManagementConfig
     base_url: str
     timeout_seconds: float
     tokens: dict[str, str]
@@ -205,6 +207,22 @@ class Settings:
         if not api_key:
             raise ProjectConfigError("PRALE_API_KEY is required: this deployment needs a provider credential")
         model = environ.get("PRALE_MODEL", "").strip() or DEFAULT_MODEL
+        try:
+            context_management = ContextManagementConfig(
+                enabled=not _off(environ, "PRALE_CONTEXT_MANAGEMENT"),
+                context_window_tokens=_int(environ, "PRALE_CONTEXT_WINDOW_TOKENS", 128_000),
+                reserved_output_tokens=_int(environ, "PRALE_CONTEXT_RESERVED_OUTPUT_TOKENS", 20_000),
+                soft_margin_tokens=_int(environ, "PRALE_CONTEXT_SOFT_MARGIN_TOKENS", 13_000),
+                hard_margin_tokens=_int(environ, "PRALE_CONTEXT_HARD_MARGIN_TOKENS", 3_000),
+                per_tool_result_chars=_int(environ, "PRALE_CONTEXT_PER_TOOL_RESULT_CHARS", 50_000),
+                per_tool_message_chars=_int(environ, "PRALE_CONTEXT_PER_TOOL_MESSAGE_CHARS", 200_000),
+                protected_recent_messages=_int(environ, "PRALE_CONTEXT_PROTECTED_RECENT_MESSAGES", 6),
+                microcompact_keep_recent=_int(environ, "PRALE_CONTEXT_MICROCOMPACT_KEEP_RECENT", 5),
+                collapse_enabled=not _off(environ, "PRALE_CONTEXT_COLLAPSE"),
+                auto_compact_enabled=not _off(environ, "PRALE_CONTEXT_AUTO_COMPACT"),
+            )
+        except ValueError as error:
+            raise ProjectConfigError(str(error)) from error
         tools = _tools(environ.get("PRALE_TOOLS", ""))
         unknown = sorted(set(tools) - set(BUILTIN_TOOLS))
         if unknown:
@@ -274,6 +292,7 @@ class Settings:
             skill_db=skill_db,
             api_key=api_key,
             model=model,
+            context_management=context_management,
             base_url=environ.get("PRALE_BASE_URL", "").strip() or DEFAULT_BASE_URL,
             timeout_seconds=_float(environ, "PRALE_TIMEOUT_SECONDS", 60.0),
             tokens=tokens,

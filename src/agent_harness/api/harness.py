@@ -1,4 +1,5 @@
 from agent_harness.api.errors import InvalidLane
+from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.session import Session
 from agent_harness.domain.skill import SkillScope
@@ -28,6 +29,7 @@ class Harness:
         skill_runtime: SkillEvolutionRuntime | None = None,
         trace_recorder: bool = False,
         telemetry: TelemetrySink | None = None,
+        context_management: ContextManagementConfig = ContextManagementConfig(),
     ) -> None:
         self._session = session
         self._tools = tools
@@ -41,6 +43,7 @@ class Harness:
         self._skill_runtime = skill_runtime
         self._trace_recorder = trace_recorder
         self._telemetry = telemetry
+        self._context_management = context_management
         if (memory_scope is None) != (memory_runtime is None):
             raise ValueError("memory_scope and memory_runtime must be configured together")
         if skill_runtime is not None and memory_runtime is None:
@@ -68,6 +71,7 @@ class Harness:
         skill_runtime: SkillEvolutionRuntime | None = None,
         trace_recorder: bool = False,
         telemetry: TelemetrySink | None = None,
+        context_management: ContextManagementConfig = ContextManagementConfig(),
     ) -> "Harness":
         bind_session = getattr(storage, "bind_session", None)
         if callable(bind_session):
@@ -82,6 +86,7 @@ class Harness:
             skill_runtime=skill_runtime,
             trace_recorder=trace_recorder,
             telemetry=telemetry,
+            context_management=context_management,
         )
 
     async def acquire_lane(self, name: str) -> Lane:
@@ -102,6 +107,7 @@ class Harness:
                 skill_runtime=self._skill_runtime,
                 trace_recorder=self._trace_recorder,
                 telemetry=self._telemetry,
+                context_management=self._context_management,
             )
             await lane.attach()
             self._lanes[name] = lane
@@ -129,6 +135,7 @@ class Harness:
             skill_scope=self._skill_scope,
             skill_runtime=self._skill_runtime,
             trace_recorder=self._trace_recorder,
+            context_management=self._context_management,
         )
         await target.attach(tip_id)
         self._lanes[target_name] = target

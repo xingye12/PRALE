@@ -164,6 +164,12 @@ status: active
 
         await SkillEvolutionRuntime(store, CodingSkillReviewer(provider))._run_job(claimed)  # noqa: SLF001
 
+        # Auto-review writes a disabled asset. It is deliberately absent from
+        # runtime discovery until an operator enables it.
+        assert await store.search(SkillScope("repo"), "pytest", 10) == ()
+        assets = await store.list_skills(SkillScope("repo"), "disabled", None, 10)
+        assert len(assets) == 1 and assets[0].name == "pytest-check"
+        await store.set_state(SkillScope("repo"), assets[0].skill_id, "active")
         skills = await store.search(SkillScope("repo"), "pytest", 10)
         assert len(skills) == 1 and skills[0].name == "pytest-check"
         status = await store.get_job(job.job_id)

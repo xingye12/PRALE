@@ -12,6 +12,7 @@ class GenerationRequest:
     operation_id: str
     messages: tuple[JsonValue, ...]
     tools: tuple["ToolDefinition", ...] = ()
+    context_management: JsonValue | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -19,6 +20,7 @@ class ToolDefinition:
     name: str
     description: str
     input_schema: JsonValue
+    max_result_tokens: int | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -52,6 +54,17 @@ class ChatProvider(Protocol):
     """Provider-neutral boundary; DeepSeek is an adapter added later."""
 
     async def generate(self, request: GenerationRequest) -> AssistantResult: ...
+
+
+class ContextManagementProvider(ChatProvider, Protocol):
+    """Optional provider capability; adapters expose only supported features.
+
+    The core runtime never assumes server-side cache editing exists.  A future
+    adapter may advertise a context window and encode cache edits at its wire
+    boundary without leaking provider payloads into durable domain state.
+    """
+
+    context_window_tokens: int
 
 
 class StreamingChatProvider(ChatProvider, Protocol):

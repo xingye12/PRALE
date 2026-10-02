@@ -18,6 +18,7 @@ import httpx
 
 from agent_harness.api.project import ProjectRuntimeConfig
 from agent_harness.api.web import WebApplication, create_app
+from agent_harness.domain.skill import SkillProposal, SkillScope
 from agent_harness.runtime.generation import AssistantResult, GenerationRequest
 from agent_harness.storage.memory_sqlite import SQLiteMemoryStore
 from agent_harness.storage.skill_sqlite import SQLiteSkillStore
@@ -204,6 +205,58 @@ def test_a_submitted_turn_is_driven_in_the_background_and_read_over_http(tmp_pat
                 lanes = (await client.get("/api/sessions/s-1/lanes")).json()
                 assert [lane["name"] for lane in lanes["items"]] == ["main"]
                 assert lanes["items"][0]["operation_id"] is None
+        finally:
+            await web.aclose()
+
+    asyncio.run(scenario())
+
+
+def test_skill_must_be_enabled_in_the_web_ui_before_the_runtime_can_discover_it(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        config = _config(tmp_path)
+        web = await _open(config, Provider())
+        try:
+            assert config.skill_db is not None
+            store = SQLiteSkillStore(config.skill_db)
+            proposal = SkillProposal(
+                "create",
+                evidence_entry_ids=("tool-result",),
+                markdown="""---
+name: Deploy
+description: Reusable deployment verification procedure
+triggers: deploy, release
+version: 1
+status: active
+---
+适用范围与不适用范围：已验证的服务发布。
+前置条件：有已批准的发布包。
+步骤：执行部署并记录结果。
+验证：检查健康端点和回滚指标。
+失败/回滚处理：停止发布并回滚到上一版本。
+资源使用说明：无附加资源。
+""",
+            )
+            asset = await store.create(SkillScope(REPOSITORY_ID), proposal, 1)
+            assert asset.state == "disabled"
+            assert await store.listing(SkillScope(REPOSITORY_ID), "deploy", 2_000) == ()
+
+            async with _client(web) as client:
+                response = await client.post(f"/api/skills/{asset.skill_id}/enabled", json={"enabled": True})
+                assert response.status_code == 200
+                assert response.json()["state"] == "active"
+                assert [item.skill_id for item in await store.listing(SkillScope(REPOSITORY_ID), "deploy", 2_000)] == [
+                    asset.skill_id
+                ]
+                disabled = await client.post(f"/api/skills/{asset.skill_id}/enabled", json={"enabled": False})
+                assert disabled.status_code == 200
+                assert disabled.json()["state"] == "disabled"
+
+            assert await store.listing(SkillScope(REPOSITORY_ID), "deploy", 2_000) == ()
+            assert [row.event for row in await store.list_audit(SkillScope(REPOSITORY_ID), None, 10)] == [
+                "skill_state_changed",
+                "skill_state_changed",
+            ]
+            store.close()
         finally:
             await web.aclose()
 

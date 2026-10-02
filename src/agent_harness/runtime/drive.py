@@ -3,13 +3,21 @@
 import asyncio
 import time
 from collections.abc import Mapping, Sequence
+from typing import Literal, cast
 
-from agent_harness.api.errors import ProviderNotConfigured, UnknownTarget
+from agent_harness.api.errors import ContextBudgetExceeded, ProviderNotConfigured, UnknownTarget
 from agent_harness.api.models import OperationResult
 from agent_harness.domain.compaction import select_compaction_window
 from agent_harness.domain.context import project_messages
+from agent_harness.domain.context_management import (
+    build_compaction_prompt,
+    estimate_messages,
+    format_compact_summary,
+    needs_summary,
+    reduce_request_messages,
+)
 from agent_harness.domain.effects import EffectKind, EffectOutcome, EffectSpan, ErrorClass
-from agent_harness.domain.entries import JsonValue, NewEntry
+from agent_harness.domain.entries import Entry, JsonValue, NewEntry
 from agent_harness.domain.operations import ActiveOperation, OperationState
 from agent_harness.domain.session import SessionMutator
 from agent_harness.domain.types import OperationStatus
@@ -17,6 +25,7 @@ from agent_harness.domain.values import (
     lane_inbox,
     lane_state,
     lane_tip,
+    operation_context_reductions,
     operation_lease,
     operation_result,
     operation_state,
@@ -32,6 +41,7 @@ from agent_harness.runtime.telemetry import (
     publish,
 )
 from agent_harness.storage.protocol import (
+    AppendList,
     ClearList,
     DeleteValue,
     InsertEntry,
@@ -309,6 +319,10 @@ class Drive:
                     await self._transition(operation, OperationState(at="assistant.ready", control="running", data={}))
                 case "assistant.ready":
                     await self._persist_generation_intent(operation)
+                case "context.collapse.effect_pending" | "context.global_compaction.effect_pending":
+                    result = await self._execute_context_summary(operation)
+                    if result is not None:
+                        return result
                 case "assistant.effect_pending":
                     if self._provider is None:
                         raise ProviderNotConfigured("a chat provider is required to execute a generation intent")
@@ -335,6 +349,13 @@ class Drive:
             return None
         if operation.state.at == "summary.effect_pending":
             return await self._settle_interrupted_compaction(operation)
+        if operation.state.at in {"context.collapse.effect_pending", "context.global_compaction.effect_pending"}:
+            await self._settle_interrupted_context_summary(operation)
+            # The summary provider outcome is unknowable.  Do not silently
+            # issue the original user generation from recovery: callers may
+            # resume deliberately with a provider, but this recovery call
+            # must make the interrupted effect visible and terminal.
+            return await self._settle_terminal_at_tip(await self._required_operation(), "unknown")
         if operation.state.at != "assistant.effect_pending":
             if operation.state.at == "tools":
                 data = operation.state.data
@@ -454,7 +475,7 @@ class Drive:
                 "entry_id": entry_id,
                 "usage_id": self._lane.new_id(),
                 "span_id": span.span_id,
-                "messages": hook_context["messages"],
+                "messages": build_compaction_prompt(hook_context["messages"]),
                 "retained_message_ids": retained_message_ids,
             }
             await self._transition(operation, OperationState("summary.effect_pending", "running", intent), [span_write])
@@ -477,7 +498,10 @@ class Drive:
         usage_id = data["usage_id"]
         assert isinstance(entry_id, str) and isinstance(usage_id, str)
 
-        return await self._settle_compaction_summary(operation, response.content, response.usage)
+        summary = format_compact_summary(response.content)
+        if summary is None:
+            raise RuntimeError("compaction provider returned an empty summary")
+        return await self._settle_compaction_summary(operation, summary, response.usage)
 
     async def _settle_compaction_summary(
         self,
@@ -517,7 +541,11 @@ class Drive:
                             entry_id,
                             parent,
                             "compaction",
-                            {"summary": summary, "retained_message_ids": retained_ids},
+                            {
+                                "summary": summary,
+                                "retained_message_ids": cast(JsonValue, retained_ids),
+                                "prompt_version": 1,
+                            },
                         )
                     ),
                     InsertUsage(
@@ -648,6 +676,14 @@ class Drive:
         transformed = await self._lane.hooks.run("transform_context", {"messages": project_messages(context)})
         if not isinstance(transformed, dict) or not isinstance(transformed.get("messages"), list):
             raise RuntimeError("transform_context must return a request object with messages")
+        # This deliberately follows transform_context: existing hooks continue
+        # to see the full base projection, while the durable request intent
+        # freezes the subsequently reduced view.
+        reduced = reduce_request_messages(transformed["messages"], self._lane._context_management)  # noqa: SLF001
+        transformed = {**transformed, "messages": list(reduced.messages)}
+        if needs_summary(transformed["messages"], self._lane._context_management):  # noqa: SLF001
+            await self._start_context_summary(operation, context, list(reduced.messages), reduced.report)
+            return
         prompt = operation.meta.request.get("prompt", "") if isinstance(operation.meta.request, dict) else ""
         bundle = await self._lane.prompt_memory()
         skills = await self._lane.available_skills(prompt if isinstance(prompt, str) else "")
@@ -715,6 +751,10 @@ class Drive:
                     ),
                 ],
             }
+        final_estimate = estimate_messages(payload["messages"])
+        hard_limit = self._lane._context_management.hard_limit_tokens  # noqa: SLF001
+        if hard_limit is not None and final_estimate > hard_limit:
+            raise ContextBudgetExceeded(final_estimate, hard_limit)
         assistant_entry_id = self._lane.new_id()
         usage_id = self._lane.new_id()
         span, span_write = self._open_span(operation, assistant_entry_id, "llm", attempt=1)
@@ -752,12 +792,250 @@ class Drive:
                 }
                 for loadout in loadouts
             ],
+            "context_management": {
+                "estimated_tokens_before": reduced.report.estimated_tokens_before,
+                "estimated_tokens_after": final_estimate,
+                "trimmed_tool_results": reduced.report.trimmed_tool_results,
+                "micro_cleared_tool_results": reduced.report.micro_cleared_tool_results,
+                "snipped_messages": reduced.report.snipped_messages,
+                "source_hashes": list(reduced.report.source_hashes),
+            },
         }
         await self._transition(
             operation,
             OperationState(at="assistant.effect_pending", control="running", data=intent),
-            [span_write],
+            [
+                span_write,
+                AppendList(
+                    operation_context_reductions(operation.meta.operation_id),
+                    {
+                        "kind": "request_projection",
+                        "trimmed_tool_results": reduced.report.trimmed_tool_results,
+                        "micro_cleared_tool_results": reduced.report.micro_cleared_tool_results,
+                        "snipped_messages": reduced.report.snipped_messages,
+                        "source_hashes": list(reduced.report.source_hashes),
+                        "source_entry_ids": [entry.id for entry in context],
+                        "source_tip_id": operation.meta.source_tip_id,
+                    },
+                ),
+            ],
         )
+
+    async def _start_context_summary(
+        self,
+        operation: ActiveOperation,
+        context: list[Entry],
+        messages: list[JsonValue],
+        report: object,
+    ) -> None:
+        """Persist the internal collapse/global-summary effect before calling it."""
+
+        config = self._lane._context_management  # noqa: SLF001
+        kind = "collapse" if config.collapse_enabled else "global"
+        if kind == "global" and not config.auto_compact_enabled:
+            hard = config.hard_limit_tokens
+            raise ContextBudgetExceeded(estimate_messages(messages), hard if hard is not None else 0)
+        state_name = (
+            "context.collapse.effect_pending" if kind == "collapse" else "context.global_compaction.effect_pending"
+        )
+        entry_id = self._lane.new_id()
+        span, span_write = self._open_span(operation, entry_id, "llm", attempt=1)
+        source_ids = [entry.id for entry in context]
+        # Keep only a tail which itself is small enough to fit alongside the
+        # summary.  Retaining one giant message would otherwise trigger a
+        # second collapse of the exact same source range.
+        retained_ids: list[str] = []
+        retained_messages: list[JsonValue] = []
+        tail_budget = max(1, (config.soft_limit_tokens or 0) // 2)
+        for entry in reversed(context):
+            if entry.type != "message":
+                continue
+            candidate = [entry.payload, *retained_messages]
+            if len(retained_ids) >= config.protected_recent_messages or estimate_messages(candidate) > tail_budget:
+                break
+            retained_ids.insert(0, entry.id)
+            retained_messages.insert(0, entry.payload)
+        data = {
+            "entry_id": entry_id,
+            "usage_id": self._lane.new_id(),
+            "span_id": span.span_id,
+            "messages": build_compaction_prompt(messages),
+            "summary_kind": kind,
+            "source_entry_ids": source_ids,
+            "retained_message_ids": retained_ids,
+            "prompt_version": 1,
+            "retry": 0,
+            "context_report": {
+                "estimated_tokens_before": getattr(report, "estimated_tokens_before", 0),
+                "estimated_tokens_after": getattr(report, "estimated_tokens_after", 0),
+            },
+        }
+        await self._transition(operation, OperationState(state_name, "running", data), [span_write])
+
+    async def _execute_context_summary(self, operation: ActiveOperation) -> OperationResult | None:
+        if self._provider is None:
+            raise ProviderNotConfigured("a chat provider is required to compact a session")
+        data = operation.state.data
+        if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
+            raise RuntimeError("context summary intent is invalid")
+        try:
+            response = await self._provider.generate(
+                GenerationRequest(
+                    self._lane._session.id,  # noqa: SLF001
+                    self._lane.name,
+                    operation.meta.operation_id,
+                    tuple(data["messages"]),
+                )
+            )
+        except Exception:
+            return await self._retry_or_fail_context_summary(operation)
+        summary = format_compact_summary(response.content)
+        if summary is None:
+            return await self._retry_or_fail_context_summary(operation)
+        await self._settle_context_summary(operation, summary, response.usage)
+        return None
+
+    async def _retry_or_fail_context_summary(self, operation: ActiveOperation) -> OperationResult | None:
+        data = operation.state.data
+        if not isinstance(data, dict):
+            raise RuntimeError("context summary intent is invalid")
+        retry = data.get("retry", 0)
+        if not isinstance(retry, int):
+            raise RuntimeError("context summary retry is invalid")
+        if retry >= self._lane._context_management.max_summary_retries:  # noqa: SLF001
+            return await self._settle_failed_context_summary(operation)
+        entry_id = data.get("entry_id")
+        if not isinstance(entry_id, str):
+            raise RuntimeError("context summary intent is invalid")
+        messages = data.get("messages")
+        if not isinstance(messages, list):
+            raise RuntimeError("context summary intent is invalid")
+        span, span_write = self._open_span(operation, entry_id, "llm", attempt=retry + 2)
+        next_data = {
+            **data,
+            "span_id": span.span_id,
+            "retry": retry + 1,
+            "messages": [
+                *messages,
+                {"role": "user", "content": "[earlier conversation truncated for compaction retry]"},
+            ],
+        }
+        await self._transition(
+            operation,
+            OperationState(operation.state.at, "running", next_data),
+            [*self._settle_span(data.get("span_id"), "failed", "provider_error"), span_write],
+        )
+        return None
+
+    async def _settle_failed_context_summary(self, operation: ActiveOperation) -> OperationResult:
+        data = operation.state.data
+        if not isinstance(data, dict):
+            raise RuntimeError("context summary intent is invalid")
+        span_id = data.get("span_id")
+
+        async def settle(mutator: SessionMutator) -> OperationResult:
+            if await mutator.get_value(operation_state(operation.meta.operation_id)) != operation.state:
+                raise RuntimeError("context summary intent was already settled")
+            tip_id = await mutator.get_value(lane_tip(self._lane.name))
+            if tip_id is not None and not isinstance(tip_id, str):
+                raise RuntimeError("invalid lane tip")
+            result = self._terminal_result(
+                operation,
+                tip_id,
+                "unknown",
+                error_code="summary_invalid",
+                error_message="context summary could not be validated",
+            )
+            writes = [
+                *self._settle_span(span_id, "failed", "provider_error"),
+                *await self._lane.memory_capture_writes(mutator, result),
+                *self._terminal_writes(operation, result, "unknown"),
+            ]
+            await mutator.commit(writes)
+            return result
+
+        result = await self._lane._session.mutate(settle)  # noqa: SLF001
+        self._publish(self._operation_terminal(result, {"context_summary_failed": True}))
+        return result
+
+    async def _settle_context_summary(
+        self, operation: ActiveOperation, summary: str, usage: dict[str, int | float]
+    ) -> None:
+        data = operation.state.data
+        if not isinstance(data, dict):
+            raise RuntimeError("context summary intent is invalid")
+        entry_id, usage_id, span_id = data.get("entry_id"), data.get("usage_id"), data.get("span_id")
+        kind = data.get("summary_kind")
+        retained = data.get("retained_message_ids", [])
+        source_ids = data.get("source_entry_ids", [])
+        if (
+            not isinstance(entry_id, str)
+            or not isinstance(usage_id, str)
+            or kind not in {"collapse", "global"}
+            or not isinstance(retained, list)
+            or not all(isinstance(item, str) for item in retained)
+            or not isinstance(source_ids, list)
+            or not all(isinstance(item, str) for item in source_ids)
+        ):
+            raise RuntimeError("context summary intent is invalid")
+
+        async def settle(mutator: SessionMutator) -> None:
+            if await mutator.get_value(operation_state(operation.meta.operation_id)) != operation.state:
+                raise RuntimeError("context summary intent was already settled")
+            parent = await mutator.get_value(lane_tip(self._lane.name))
+            entry_type: Literal["context_collapse", "compaction"] = (
+                "context_collapse" if kind == "collapse" else "compaction"
+            )
+            payload: dict[str, JsonValue] = {
+                "summary": summary,
+                "retained_message_ids": cast(JsonValue, retained),
+                "covered_entry_ids": cast(JsonValue, source_ids),
+                "prompt_version": 1,
+                "provenance": "auto_context_collapse" if kind == "collapse" else "auto_global_compact",
+            }
+            await mutator.commit(
+                [
+                    InsertEntry(NewEntry(entry_id, parent, entry_type, payload)),
+                    InsertUsage(
+                        UsageRow(
+                            usage_id,
+                            usage,
+                            entry_id=entry_id,
+                            operation_id=operation.meta.operation_id,
+                            span_id=span_id if isinstance(span_id, str) else None,
+                        )
+                    ),
+                    *self._settle_span(span_id, "completed"),
+                    SetValue(lane_tip(self._lane.name), entry_id),
+                    SetValue(
+                        operation_state(operation.meta.operation_id), OperationState("assistant.ready", "running", {})
+                    ),
+                ]
+            )
+
+        await self._lane._session.mutate(settle)  # noqa: SLF001
+
+    async def _settle_interrupted_context_summary(
+        self, operation: ActiveOperation, *, error_class: ErrorClass = "interrupted"
+    ) -> None:
+        data = operation.state.data
+        if not isinstance(data, dict):
+            raise RuntimeError("context summary intent is invalid")
+        span_id = data.get("span_id")
+
+        async def settle(mutator: SessionMutator) -> None:
+            if await mutator.get_value(operation_state(operation.meta.operation_id)) != operation.state:
+                raise RuntimeError("context summary intent was already settled")
+            await mutator.commit(
+                [
+                    *self._settle_span(span_id, "unknown", error_class),
+                    SetValue(
+                        operation_state(operation.meta.operation_id), OperationState("assistant.ready", "running", {})
+                    ),
+                ]
+            )
+
+        await self._lane._session.mutate(settle)  # noqa: SLF001
 
     async def _execute_and_settle(self, operation: ActiveOperation) -> OperationResult | None:
         intent = operation.state.data
@@ -775,6 +1053,9 @@ class Drive:
                 operation_id=operation.meta.operation_id,
                 messages=tuple(messages),
                 tools=self._lane.tools.definitions(),
+                context_management=intent.get("context_management")
+                if isinstance(intent.get("context_management"), dict)
+                else None,
             )
             stream = getattr(self._provider, "stream", None)
             if callable(stream):

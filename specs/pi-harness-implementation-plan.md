@@ -353,6 +353,14 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 
 **后果：** 多仓库共享 memory DB 与 assets dir 时，L0--L2 仍按 repository 隔离，L3 保持全局共享；用户可对 L2/L3 文件做 diff、merge 和人工编辑。文件更新必须使用临时文件、fsync、rename，并以可恢复 intent/settlement 保护，不能将 Markdown 视为可随意丢弃的导出物。
 
+### ADR-024：Skill 必须由人工显式启用后才能注入 Agent
+
+**背景：** 自动 Review 的结构、证据与安全门只能筛选候选，不能替代使用者对具体仓库和工作流的判断。此前自动创建的 Skill 直接处于 `active`，会在后续 run 的 listing/search/loadout 中被发现和注入。
+
+**决策：** 自动创建的 Skill 一律以 `disabled` + `private` 持久化；SQLite skill store v2 将已有的 legacy `active` 自动资产迁移为 `disabled`。仅 Web UI 的 repository-scoped `POST /api/skills/{skill_id}/enabled` 可以在 `active` 与 `disabled` 间切换。状态切换在一个 SQLite transaction 内更新资产并追加 audit，不改写 immutable `SkillVersion`、资源、scope 或 visibility；`archived` 不可由该接口复活。
+
+**后果：** `disabled` Skill 仍可浏览、审计和保留历史，但不出现在 runtime 的 listing/search/loadout；启用只影响未来的装配，已冻结在 effect intent 中的版本继续用于恢复，保持既有可复现性。Web UI 因此是人工启用门，而不是绕过 Review 的内容写入通道。
+
 ## 10. 首个可执行里程碑
 
 第一个编码里程碑仅实现阶段 0–3：纯领域 DTO、storage/session 协议、内存后端、entry tree/branch projection、lane operation admission、snapshot 和结果查询。此里程碑不调用 DeepSeek、不执行工具，但必须已经具备“先持久化 operation、后由 Drive 领取”的恢复基础。

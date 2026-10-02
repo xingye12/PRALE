@@ -1,10 +1,8 @@
-"""Read-only skill views for one repository.
+"""Repository-scoped Skill queries and explicit activation.
 
-The skill view is deliberately read-only (ADR-WEB-004): creating, updating and
-disabling a skill are decisions of the evolution runtime and its reviewer, and
-a UI that could edit them would be a second writer with a different quality
-gate.  Every read here is scoped to the deployment's repository, which the
-caller cannot choose.
+The UI cannot alter Skill content, versions, scope, or visibility. It may only
+activate/deactivate an already-reviewed private asset; that lifecycle change is
+durable and audited by the store.
 
 Unlike the injection views (`search`, `listing`), these reads keep disabled and
 archived assets.  A UI that could only see what is currently injected could not
@@ -29,7 +27,7 @@ _JOB_STATUSES: frozenset[str] = frozenset({"scheduled", "queued", "running", "re
 
 
 class SkillQueryService:
-    """One repository's skill assets, read-only."""
+    """One repository's Skill assets and their activation state."""
 
     def __init__(self, store: SkillStore, scope: SkillScope) -> None:
         self._store = store
@@ -51,6 +49,10 @@ class SkillQueryService:
         """One asset, in whatever state it is in."""
 
         return await self._store.get_skill(self._scope, skill_id)
+
+    async def set_enabled(self, skill_id: str, enabled: bool) -> SkillAsset | None:
+        """Make one owned Skill discoverable (or hide it) without editing it."""
+        return await self._store.set_state(self._scope, skill_id, "active" if enabled else "disabled")
 
     async def list_versions(self, skill_id: str, cursor: str | None = None, limit: int = 50) -> Page[SkillVersion]:
         """One skill's version history, newest first."""

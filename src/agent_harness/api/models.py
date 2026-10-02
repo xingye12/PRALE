@@ -1,6 +1,16 @@
 from dataclasses import dataclass
 
+from agent_harness.domain.context_management import ContextManagementConfig, ContextReductionReport
 from agent_harness.domain.types import OperationKind, OperationStatus
+
+__all__ = [
+    "AbortResult",
+    "ContextManagementConfig",
+    "ContextReductionReport",
+    "LaneSnapshot",
+    "OperationAdmission",
+    "OperationResult",
+]
 
 
 @dataclass(frozen=True, slots=True)
