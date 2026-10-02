@@ -59,6 +59,14 @@ def _episode(
                 "avoidable_actions": avoidable_actions,
                 "fixture": stage("correction"),
             },
+            {
+                "id": "retransfer",
+                "purpose": "In another new session, apply the corrected evidence to a fresh ambiguous task.",
+                "task": "Apply the corrected rule to a new related task. Cite the corrected evidence if available.",
+                "required_evidence_ids": [f"{evidence_id}-corrected"],
+                "avoidable_actions": avoidable_actions,
+                "fixture": stage("retransfer"),
+            },
         ],
     }
 

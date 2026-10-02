@@ -84,7 +84,7 @@ Buffer 按 `(scope, session_id)` 维护消息字节数、成功 tool call 数和
 Review 顺序如下：
 
 1. 读取 archive，并按角色重建输入；工具调用和结果必须成对呈现，明确成功、失败和验证证据。没有 `execution-v1` trace 时，Review 不得声称知道实际重试次数、hook 决策或 provider payload。
-2. 从归档生成少量高信号关键词，用 scope 过滤后的 FTS（可选 hybrid）检索候选 Skills。
+2. 从归档生成少量高信号关键词，用 scope 过滤后的 BM25 检索候选 Skills。
 3. 向 provider 中立的 `SkillReviewer` 提交 archive、候选摘要和严格输出 schema。
 4. Reviewer 返回 `no_op`、`create`、`update` 或 `patch` 建议，以及可验证的完整内容/唯一补丁、预期版本和引用证据。
 5. `SkillEvolutionRuntime` 本地校验 schema、frontmatter、资源路径、大小、敏感内容和版本，然后以乐观锁调用 `SkillStore`。
@@ -125,11 +125,13 @@ write(expected_version=3) → 成功 version 4 / VersionConflict(current=4)
 
 ## 6. 运行时检索和装配
 
-Skill 可用 `keyword | embedding | hybrid` 搜索，但必须先按 scope、visibility、绑定与 `status=active` 过滤。**SQLite v1 只提供 FTS/BM25**：`embedding` 与 `hybrid` 是接口允许的取值，但未接入向量索引时**必须**降级为 BM25 并记录 telemetry，而不是让 `embedding` 生效却返回空结果。
+Skill 可用 `keyword | embedding | hybrid` 搜索，但必须先按 scope、visibility、绑定与 `status=active` 过滤。SQLite 的 keyword 路径对 active Skill 元数据在进程内执行 BM25，避免将原始自然语言 prompt 解释为 FTS 查询；中英混合文本按标识符与汉字分词。在线 listing 暂固定 top-k 为 **10**。`embedding` 与 `hybrid` 是接口允许的取值，但未接入向量索引时**必须**降级为 BM25 并记录 telemetry，而不是让 `embedding` 生效却返回空结果。
 
 每次 run 在构造 provider request 前取得预算受限的 `SkillListing`：仅含 `skill_id`、name、description、triggers、version 和简短状态，建议总预算 2,000 字符。listing 应置于独立 `<available_skills>` prompt 区块，不能把所有 `SKILL.md` 注入。
 
-模型/运行时选中某项后，通过稳定 ID + version 请求 `SkillLoadout`，其中包含完整 Markdown 与 manifest 指定的必要资源。完整 loadout 进入该 operation 的 effect intent，至少记录 `skill_id`、version、content hash、resource hashes 和装配预算。崩溃恢复必须重用该冻结 version，不能在重试时偷偷换成最新 Skill。
+模型/运行时选中某项后，通过稳定 ID + version 请求 `SkillLoadout`，其中包含完整 Markdown 与 manifest 指定的必要资源。自动装配时，完整 loadout 进入该 operation 的 effect intent，至少记录 `skill_id`、version、content hash、resource hashes 和装配预算。崩溃恢复必须重用该冻结 version，不能在重试时偷偷换成最新 Skill。
+
+部署也可显式注册只读 `skill_load` AgentTool。模型先从 `<available_skills>` 目录取得 `skill_id` 与 version，再调用该工具；工具只接受该精确版本、只读取当前 scope 的 `active` + `private` asset，并将 `SKILL.md`、manifest 与受预算约束的版本化资源作为普通 tool result 返回。工具调用的 ID/version 在 durable tool intent 中，结果与 operation state 原子结算；它标记为 `safe`，因此崩溃恢复只会重放同一 immutable version，绝不将省略 version 的“当前版本”解析为新版本。未启用、跨 scope、缺失或超预算的 Skill 统一返回不可用，不泄露资产状态。
 
 装配优先级建议为：显式调用方绑定 > 任务/场景匹配 > FTS/hybrid 分数。若 SkillStore 超时、索引失败或未启用，运行时记录 telemetry 并以空 listing 继续；不得阻塞 operation admission。已 `disabled` 或 `archived` 的版本不得新装配，但已冻结在进行中 intent 的版本可继续用于恢复，以保证可复现性。
 

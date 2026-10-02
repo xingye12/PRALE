@@ -36,7 +36,8 @@ DEFAULT_LANE = "main"
 DATA_DIR_NAME = ".prale"
 """Where the stores live when ``PRALE_DATA_DIR`` does not say otherwise."""
 
-BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore")
+MEMORY_TOOLS = ("memory_search", "conversation_search", "memory_read_scene")
+BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore", "skill_load", *MEMORY_TOOLS)
 """The local tool set, named individually because enabling ``bash`` is a decision."""
 
 DEFAULT_MAX_CONCURRENT_DRIVES = 8
@@ -58,6 +59,7 @@ __all__ = [
     "DEFAULT_MAX_CONCURRENT_DRIVES",
     "DEFAULT_MODEL",
     "DEFAULT_PORT",
+    "MEMORY_TOOLS",
     "Settings",
 ]
 
@@ -74,7 +76,8 @@ DEFAULT_GRACEFUL_SHUTDOWN_SECONDS = 10.0
 DEFAULT_LANE = "main"
 DATA_DIR_NAME = ".prale"
 """Where the stores live when ``PRALE_DATA_DIR`` does not say otherwise."""
-BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore")
+MEMORY_TOOLS = ("memory_search", "conversation_search", "memory_read_scene")
+BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore", "skill_load", *MEMORY_TOOLS)
 """The local tool set, named individually because enabling ``bash`` is a decision."""
 
 
@@ -255,6 +258,10 @@ class Settings:
             # L0 archives through the memory store, and the runtime's own error
             # for that mismatch arrives much further from the configuration.
             raise ProjectConfigError("PRALE_SKILLS requires the memory store: extraction reads L0 archives from it")
+        if set(tools).intersection(MEMORY_TOOLS) and memory_db is None:
+            raise ProjectConfigError("memory tools require PRALE_MEMORY to be enabled")
+        if "skill_load" in tools and skill_db is None:
+            raise ProjectConfigError("skill_load requires PRALE_SKILLS to be enabled")
         repository_index_dir = None
         if "repository_explore" in tools:
             raw_index_dir = environ.get("PRALE_REPOSITORY_INDEX_DIR", "").strip()

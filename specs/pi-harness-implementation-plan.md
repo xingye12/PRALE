@@ -361,6 +361,30 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 
 **后果：** `disabled` Skill 仍可浏览、审计和保留历史，但不出现在 runtime 的 listing/search/loadout；启用只影响未来的装配，已冻结在 effect intent 中的版本继续用于恢复，保持既有可复现性。Web UI 因此是人工启用门，而不是绕过 Review 的内容写入通道。
 
+### ADR-025：Skill 按需读取是受 scope 约束的安全工具
+
+**背景：** metadata-only 的 `<available_skills>` 目录避免每轮都注入全部 `SKILL.md`，但仅有目录时模型不能在一次工具循环中取得某项完整方法。由 hook 预选可实现自动装配，却不满足模型基于当前任务自行决定读取的需求。
+
+**决策：** 提供可选、只读的 `skill_load` AgentTool。调用必须携带目录中给出的 `skill_id` 与正整数 version；工具按部署配置的 `SkillScope` 调用 loadout 读取，只返回 `active` + `private` asset 的该 immutable version，并受既有 loadout 字节预算与 tool-result token 上限约束。工具调用遵循普通工具的 durable intent → effect → atomic settlement，且 replay policy 为 `safe`；重放只使用已持久化的精确 version。部署仅在 `PRALE_TOOLS` 显式包含 `skill_load` 且 Skill store 已启用时注册该工具。
+
+**后果：** 模型可先检索小目录、再仅读取必要的完整 Skill，且完整内容作为已结算 tool result 留在对话上下文。禁用、跨 scope 或不存在的 Skill 不会暴露不同错误；用户仍可通过不注册该工具维持“只注入目录”的部署。此工具不赋予写入、启用、归档或跨 scope 读取能力。
+
+### ADR-026：配置显式决定所有 AgentTool
+
+**背景：** memory retrieval 工具曾在 memory store 启用时自动注册，绕过了 `PRALE_TOOLS`。因此空工具配置仍可调用记忆，运营者也无法从环境文件看出或选择完整的工具权限集合。
+
+**决策：** `PRALE_TOOLS` 是所有 AgentTool 的唯一 allow-list，包含本地工具、`repository_explore`、`skill_load` 以及 `memory_search`、`conversation_search`、`memory_read_scene`。默认空集合意味着没有 AgentTool。配置 memory retrieval 工具时必须启用 memory store；配置 `skill_load` 时必须启用 Skill store。store 启用本身不再隐式扩大模型可调用工具集。
+
+**后果：** `/root/web.env` 或其他部署环境可完整、可审计地表达工具权限；现有部署若需要 memory retrieval，须将对应名称加入 `PRALE_TOOLS`。memory/Skill 的后台 capture、promotion、UI 查询不受 AgentTool allow-list 影响。
+
+### ADR-027：Skill metadata 使用进程内 BM25 检索
+
+**背景：** 将原始用户 prompt 直接作为 SQLite FTS `MATCH` 表达式会把普通自然语言按 FTS 的 AND 和 tokenizer 规则解释。中英连续文本（例如 `PRALE如果L3`）及“应该怎么办”等未出现在 Skill 元数据中的词，会让明明相关的 Skill 返回空目录。
+
+**决策：** Skill keyword retrieval 不再执行 FTS `MATCH`。它先按 scope、visibility 和 active 状态读取元数据，在进程内把 ASCII 标识符与单个汉字规范化为词元，再对 name、description、triggers 做 BM25 排序。在线 `<available_skills>` listing 最多返回 10 项；`embedding`/`hybrid` 未接入向量后端时仍显式降级到此 BM25 路径。
+
+**后果：** 自然语言 prompt 不再是数据库查询语言，混合中英文提问可稳定发现相关 Skill。小规模 repository-scoped Skill 集合须在每次检索时读取并计分；若将来规模使其不适用，必须引入同样不接受原始 FTS 语法的受控索引查询，而不是恢复直接 `MATCH`。
+
 ## 10. 首个可执行里程碑
 
 第一个编码里程碑仅实现阶段 0–3：纯领域 DTO、storage/session 协议、内存后端、entry tree/branch projection、lane operation admission、snapshot 和结果查询。此里程碑不调用 DeepSeek、不执行工具，但必须已经具备“先持久化 operation、后由 Drive 领取”的恢复基础。

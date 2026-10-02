@@ -365,6 +365,12 @@ def test_settings_refuse_a_deployment_without_an_identity_or_a_credential(tmp_pa
         Settings.from_environment({"PRALE_REPOSITORY_ID": REPOSITORY_ID})
     with pytest.raises(ProjectConfigError, match="unknown tools"):
         Settings.from_environment(_environment(tmp_path, PRALE_TOOLS="read,deploy"))
+    with pytest.raises(ProjectConfigError, match="skill_load requires PRALE_SKILLS"):
+        Settings.from_environment(_environment(tmp_path, PRALE_TOOLS="skill_load", PRALE_SKILLS="off"))
+    with pytest.raises(ProjectConfigError, match="memory tools require PRALE_MEMORY"):
+        Settings.from_environment(
+            _environment(tmp_path, PRALE_TOOLS="memory_search", PRALE_MEMORY="off", PRALE_SKILLS="off")
+        )
     with pytest.raises(ProjectConfigError, match="must be an integer"):
         Settings.from_environment(_environment(tmp_path, PRALE_PORT="eighty"))
     with pytest.raises(ProjectConfigError, match="must be greater than 0"):
@@ -404,6 +410,28 @@ def test_a_first_run_creates_the_layout_it_was_given(tmp_path: Path) -> None:
         assert settings.skill_db is not None and settings.skill_db.is_file()
     finally:
         deployment.close()
+
+
+def test_skill_load_is_registered_only_when_explicitly_enabled(tmp_path: Path) -> None:
+    deployment = build_application(
+        Settings.from_environment(
+            _environment(tmp_path, PRALE_TOOLS="skill_load,memory_search,conversation_search,memory_read_scene")
+        )
+    )
+    try:
+        assert [tool.name for tool in deployment.web.supervisor._tools] == [  # noqa: SLF001
+            "memory_search",
+            "conversation_search",
+            "memory_read_scene",
+            "skill_load",
+        ]
+    finally:
+        deployment.close()
+    without_tool = build_application(Settings.from_environment(_environment(tmp_path)))
+    try:
+        assert "skill_load" not in [tool.name for tool in without_tool.web.supervisor._tools]  # noqa: SLF001
+    finally:
+        without_tool.close()
 
 
 def test_settings_can_turn_a_store_off(tmp_path: Path) -> None:

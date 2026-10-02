@@ -1,4 +1,4 @@
-"""Score one warm or cold experience-compounding benchmark run.
+"""Score one memory-on or memory-off experience-compounding benchmark run.
 
 The runner is deliberately model-agnostic.  It scores observable task
 acceptance plus evidence IDs and action counts emitted by the operator's
@@ -50,8 +50,8 @@ def build_report(benchmark: dict[str, Any], results: dict[str, Any]) -> dict[str
     if benchmark.get("benchmark_id") != "prale-experience-v1":
         raise ValueError("unsupported experience benchmark")
     metadata = results.get("metadata")
-    if not isinstance(metadata, Mapping) or metadata.get("memory_mode") not in {"warm", "cold"}:
-        raise ValueError("results.metadata.memory_mode must be warm or cold")
+    if not isinstance(metadata, Mapping) or metadata.get("memory_mode") not in {"memory-on", "memory-off"}:
+        raise ValueError("results.metadata.memory_mode must be memory-on or memory-off")
     raw_episodes = results.get("episodes")
     if not isinstance(raw_episodes, list):
         raise ValueError("results.episodes must be an array")
@@ -88,7 +88,8 @@ def build_report(benchmark: dict[str, Any], results: dict[str, Any]) -> dict[str
 
     transfer = [stage for episode in episodes for stage in episode["stages"] if stage["id"] == "transfer"]
     correction = [stage for episode in episodes for stage in episode["stages"] if stage["id"] == "correction"]
-    reusable = [stage for stage in [*transfer, *correction] if stage["evidence_reused"] is not None]
+    retransfer = [stage for episode in episodes for stage in episode["stages"] if stage["id"] == "retransfer"]
+    reusable = [stage for stage in [*transfer, *correction, *retransfer] if stage["evidence_reused"] is not None]
     all_scored = [stage for episode in episodes for stage in episode["stages"] if stage["id"] != "learn"]
     return {
         "benchmark_id": benchmark["benchmark_id"],
@@ -96,12 +97,14 @@ def build_report(benchmark: dict[str, Any], results: dict[str, Any]) -> dict[str
         "summary": {
             "transfer_acceptance_rate": _mean(float(stage["accepted"]) for stage in transfer),
             "correction_acceptance_rate": _mean(float(stage["accepted"]) for stage in correction),
+            "corrected_transfer_acceptance_rate": _mean(float(stage["accepted"]) for stage in retransfer),
             "evidence_reuse_rate": _mean(float(bool(stage["evidence_reused"])) for stage in reusable),
             "avoidable_rediscovery_rate": _mean(
                 float(bool(stage["repeated_avoidable_actions"])) for stage in all_scored
             ),
             "transfer_mean_tool_calls": _mean_known_tool_calls(transfer),
             "correction_mean_tool_calls": _mean_known_tool_calls(correction),
+            "corrected_transfer_mean_tool_calls": _mean_known_tool_calls(retransfer),
         },
         "episodes": episodes,
     }

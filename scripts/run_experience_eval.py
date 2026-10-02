@@ -1,4 +1,4 @@
-"""Run PRALE warm/cold trials over the executable experience fixtures.
+"""Run PRALE memory-on/off trials over the executable experience fixtures.
 
 This runner intentionally keeps fixture oracles outside the agent workspace.
 It is a small experiment runner, not a deployment entry point: credentials are
@@ -118,8 +118,6 @@ async def _run_stage(
             "Read TASK.md and input.json once, then use write to create a raw JSON decision.json with the named keys. "
             "Do not put Markdown around the JSON and do not merely explain the answer."
         )
-        if mode == "warm" and stage["id"] != "learn":
-            prompt += " If historical experience is useful, use memory_search before making the decision."
         await lane.prompt(prompt, operation_id=f"{stage['id']}-{uuid.uuid4()}")
         try:
             result = await asyncio.wait_for(lane.drive(provider), timeout=timeout_seconds)
@@ -151,8 +149,8 @@ async def run(
     benchmark: dict[str, Any], *, provider: DeepSeekProvider, mode: str, prompt_path: Path, stage_timeout: float
 ) -> dict[str, Any]:
     with tempfile.TemporaryDirectory(prefix="prale-experience-assets-") as directory:
-        store = SQLiteMemoryStore(Path(directory) / "memory.sqlite") if mode == "warm" else None
-        scope = MemoryScope("experience-eval") if mode == "warm" else None
+        store = SQLiteMemoryStore(Path(directory) / "memory.sqlite") if mode == "memory-on" else None
+        scope = MemoryScope("experience-eval") if mode == "memory-on" else None
         runtime = (
             MemoryRuntime(store, _extractor(provider, prompt_path), l1_turn_threshold=1) if store is not None else None
         )
@@ -187,7 +185,7 @@ async def run(
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--mode", choices=("warm", "cold"), required=True)
+    parser.add_argument("--mode", choices=("memory-on", "memory-off"), required=True)
     parser.add_argument("--benchmark", type=Path, default=Path("evals/memory/experience-v1.json"))
     parser.add_argument("--memory-prompt", type=Path, default=Path("deploy/memory-code-prompt.md"))
     parser.add_argument("--output", type=Path, required=True)

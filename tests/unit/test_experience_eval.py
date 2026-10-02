@@ -29,7 +29,7 @@ def test_experience_benchmark_has_fresh_session_transfer_and_correction_stages()
     assert len(benchmark["episodes"]) == 4
     assert benchmark["protocol"]["session_boundary"].startswith("Each transfer")
     assert all(
-        [stage["id"] for stage in episode["stages"]] == ["learn", "transfer", "correction"]
+        [stage["id"] for stage in episode["stages"]] == ["learn", "transfer", "correction", "retransfer"]
         for episode in benchmark["episodes"]
     )
     assert all(
@@ -40,7 +40,7 @@ def test_experience_benchmark_has_fresh_session_transfer_and_correction_stages()
 
 
 def test_report_scores_transfer_reuse_and_rediscovery_separately() -> None:
-    results = _results("warm")
+    results = _results("memory-on")
     first_transfer = results["episodes"][0]["stages"][1]  # type: ignore[index]
     first_transfer["evidence_ids"] = []
     first_transfer["actions"] = ["sqlite3"]
@@ -48,17 +48,17 @@ def test_report_scores_transfer_reuse_and_rediscovery_separately() -> None:
     report = build_report(build_benchmark(), results)
 
     assert report["summary"]["transfer_acceptance_rate"] == 1.0
-    assert report["summary"]["evidence_reuse_rate"] == 7 / 8
-    assert report["summary"]["avoidable_rediscovery_rate"] == 1 / 8
+    assert report["summary"]["evidence_reuse_rate"] == 11 / 12
+    assert report["summary"]["avoidable_rediscovery_rate"] == 1 / 12
     assert report["summary"]["transfer_mean_tool_calls"] == 2.0
 
 
 def test_comparison_reports_the_warm_advantage_not_just_absolute_scores() -> None:
-    warm = build_report(build_benchmark(), _results("warm", tool_calls=1))
-    cold = build_report(build_benchmark(), _results("cold", tool_calls=4))
+    warm = build_report(build_benchmark(), _results("memory-on", tool_calls=1))
+    cold = build_report(build_benchmark(), _results("memory-off", tool_calls=4))
 
     comparison = compare([warm, cold])
 
-    delta = comparison["comparisons"][0]["warm_minus_cold"]
+    delta = comparison["comparisons"][0]["memory_on_minus_off"]
     assert delta["transfer_tool_call_saving"] == 3.0
     assert delta["transfer_mean_tool_calls"] == -3.0

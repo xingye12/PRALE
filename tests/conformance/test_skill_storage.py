@@ -82,6 +82,21 @@ def test_skill_versions_are_atomic_private_and_owner_scoped(factory) -> None:
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("factory", [lambda: InMemorySkillStore(), lambda: SQLiteSkillStore(":memory:")])
+def test_skill_search_uses_bm25_for_mixed_language_prompts_and_caps_results_at_ten(factory) -> None:
+    async def scenario() -> None:
+        store = factory()
+        scope = SkillScope("repo")
+        for index in range(11):
+            asset = await store.create(scope, _proposal(markdown=_markdown(f"PRALE L3 triage {index}")), index + 1)
+            assert await store.set_state(scope, asset.skill_id, "active")
+        matches = await store.search(scope, "PRALE如果L3 记忆不见了应该怎么办", 50)
+        assert len(matches) == 10
+        assert all("PRALE L3 triage" in item.name for item in matches)
+
+    asyncio.run(scenario())
+
+
 @pytest.mark.parametrize(
     ("proposal", "valid"),
     [

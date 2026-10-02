@@ -38,6 +38,7 @@ from agent_harness.api.errors import ProjectConfigError
 from agent_harness.api.settings import Settings
 from agent_harness.api.web import WebApplication, create_app
 from agent_harness.domain.memory import MemoryScope
+from agent_harness.domain.skill import SkillScope
 from agent_harness.integrations.bge_m3 import LocalBgeM3EmbeddingProvider
 from agent_harness.integrations.deepseek import DeepSeekProvider
 from agent_harness.integrations.langfuse import LangfuseTelemetry
@@ -51,6 +52,7 @@ from agent_harness.integrations.repository_explorer import (
     TreeSitterRepositoryIndexer,
 )
 from agent_harness.integrations.skill_reviewer import CodingSkillReviewer
+from agent_harness.integrations.skill_tools import create_skill_tools
 from agent_harness.runtime.generation import GenerationRequest
 from agent_harness.storage.memory_sqlite import SQLiteMemoryStore
 from agent_harness.storage.skill_sqlite import SQLiteSkillStore
@@ -197,10 +199,13 @@ def build_application(settings: Settings) -> Deployment:
             settings.memory_db, embedding_provider=embeddings, assets_dir=settings.memory_assets_dir
         )
         stores.append(memory_store)
-        tools = (*tools, *create_memory_tools(memory_store, MemoryScope(settings.repository_id)))
+        memory_tools = create_memory_tools(memory_store, MemoryScope(settings.repository_id))
+        tools = (*tools, *(tool for tool in memory_tools if tool.name in settings.tools))
     if settings.skill_db is not None:
         skill_store = SQLiteSkillStore(settings.skill_db)
         stores.append(skill_store)
+        if "skill_load" in settings.tools:
+            tools = (*tools, *create_skill_tools(skill_store, SkillScope(settings.repository_id)))
     web = create_app(
         settings.config,
         provider,

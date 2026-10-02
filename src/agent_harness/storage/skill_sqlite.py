@@ -2,10 +2,12 @@
 # ruff: noqa
 
 import json
+import math
 import re
 import sqlite3
 import time
 import uuid
+from collections import Counter
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, cast
@@ -29,6 +31,14 @@ from agent_harness.domain.skill import (
 )
 
 _FRONTMATTER_VERSION = re.compile(r"(?m)^version:\s*(\d+)\s*$")
+_BM25_TOKEN = re.compile(r"[A-Za-z0-9_]+|[\u4e00-\u9fff]")
+_BM25_TOP_K = 10
+
+
+def _bm25_tokens(value: str) -> tuple[str, ...]:
+    """Tokenize mixed identifier/Chinese text without requiring an FTS parser."""
+
+    return tuple(token.group(0).lower() for token in _BM25_TOKEN.finditer(value))
 
 
 def _now() -> int:
@@ -450,24 +460,38 @@ class SQLiteSkillStore:
         return _job(row) if row else None
 
     async def search(self, scope: SkillScope, query: str, limit: int) -> tuple[SkillListing, ...]:
-        try:
-            rows = self._conn.execute(
-                """SELECT s.* FROM skill_fts f JOIN skills s ON s.skill_id=f.skill_id
-              WHERE f.repository_id=? AND skill_fts MATCH ? AND s.visibility='private' AND s.state='active'
-              ORDER BY bm25(skill_fts) LIMIT ?""",
-                (scope.storage_key, query or "*", limit),
-            ).fetchall()
-        except sqlite3.OperationalError:
-            rows = self._conn.execute(
-                "SELECT * FROM skills WHERE repository_id=? AND visibility='private' AND state='active' ORDER BY updated_at DESC LIMIT ?",
-                (scope.storage_key, limit),
-            ).fetchall()
-        return tuple(_listing(row) for row in rows)
+        if limit < 1:
+            return ()
+        rows = self._conn.execute(
+            "SELECT * FROM skills WHERE repository_id=? AND visibility='private' AND state='active' ORDER BY updated_at DESC",
+            (scope.storage_key,),
+        ).fetchall()
+        query_terms = set(_bm25_tokens(query))
+        if not rows or not query_terms:
+            return tuple(_listing(row) for row in rows[: min(limit, _BM25_TOP_K)])
+        documents = [Counter(_bm25_tokens(f"{row['name']} {row['description']} {row['triggers']}")) for row in rows]
+        lengths = [sum(document.values()) for document in documents]
+        average_length = sum(lengths) / len(lengths)
+        document_frequency = Counter(term for document in documents for term in document if term in query_terms)
+        scored: list[tuple[float, sqlite3.Row]] = []
+        for row, document, length in zip(rows, documents, lengths, strict=True):
+            score = 0.0
+            for term in query_terms:
+                frequency = document[term]
+                if not frequency:
+                    continue
+                inverse_frequency = math.log(1 + (len(documents) - document_frequency[term] + 0.5) / (document_frequency[term] + 0.5))
+                normalization = 1.2 * (1 - 0.75 + 0.75 * length / average_length)
+                score += inverse_frequency * frequency * 2.2 / (frequency + normalization)
+            if score:
+                scored.append((score, row))
+        scored.sort(key=lambda item: (-item[0], -item[1]["updated_at"], item[1]["skill_id"]))
+        return tuple(_listing(row) for _, row in scored[: min(limit, _BM25_TOP_K)])
 
     async def listing(self, scope: SkillScope, query: str, budget: int) -> tuple[SkillListing, ...]:
         chosen: list[SkillListing] = []
         used = 0
-        for item in await self.search(scope, query, 50):
+        for item in await self.search(scope, query, _BM25_TOP_K):
             cost = len(item.skill_id) + len(item.name) + len(item.description) + sum(map(len, item.triggers)) + 40
             if chosen and used + cost > budget:
                 break
