@@ -1,0 +1,65 @@
+{
+  "task_id": "T20",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.enqueue",
+      "start_line": 15,
+      "end_line": 24,
+      "observation": "enqueue(key, job) keys work by asset id: it looks up this.queues (a Map<string, SerialQueue>) and lazily constructs one SerialQueue the first time a key is seen, then adds the job to that key's queue and returns immediately (fire-and-forget, with the rejection swallowed). Two submissions of the same source therefore share one FIFO SerialQueue and can never build concurrently; the second submission cannot start until the first job settles."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.onIdle",
+      "start_line": 26,
+      "end_line": 33,
+      "observation": "onIdle(key?) awaits the SerialQueue for a key (or Promise.all over every queue when no key is given). It is the deterministic observation point the fixture uses after submitting the same source twice: when it resolves, the single queued build has finished and the metadata row can be read in its terminal state."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.create",
+      "start_line": 132,
+      "end_line": 139,
+      "observation": "create() delegates to store.createCodeGraph, which is idempotent on (service_id, team_id, repo_url, branch). When existed is true it returns the existing row without auditing or calling enqueueBuild, so a duplicate submission of the same source produces no second job on the BuildQueue. This is the gate that turns two submissions into one effective build."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.runBuild",
+      "start_line": 275,
+      "end_line": 343,
+      "observation": "runBuild is the queued job. It flips the row to processing/cloning, invokes the injected worker, then writes the terminal status: ready with commit_hash/stats/last_sync_at on success, or failed with sync_error on error. The fixture observes this single execution settling the row at status=ready."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "BuildQueue serializes per asset key by lazily creating exactly one SerialQueue per key. Submitting the same source (same key) twice reuses that single queue, executes the two jobs FIFO with concurrency 1, and never overlaps them — verified in the fixture by maxInFlight === 1 and the ordered start/end trace.",
+      "evidence_paths": ["MemoryKnowledge/src/store/build-queue.ts"]
+    },
+    {
+      "claim": "BuildQueue.onIdle provides the completion barrier for the queue: after the duplicate submission, awaiting onIdle() deterministically yields a quiesced queue, letting the fixture assert the one effective build's terminal metadata state.",
+      "evidence_paths": ["MemoryKnowledge/src/store/build-queue.ts"]
+    },
+    {
+      "claim": "CodeGraphService.create() is idempotent on (service_id, team_id, repo_url, branch): the second submission of the same source returns existed=true and, because enqueueBuild is only called when existed is false, no second job reaches the BuildQueue. The injected worker therefore runs exactly once (workerRuns === 1) and exactly one metadata row exists.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    },
+    {
+      "claim": "The single effective build records the expected terminal state: the row ends at status=ready with commit_hash populated, internal_status and sync_error cleared, stats_json and last_sync_at set, and the audit log holding exactly one `create` and one `ready` action.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    }
+  ],
+  "conclusion": "The contract holds. A standalone, dependency-free fixture (MemoryKnowledge/fixtures/build-queue-double-submit.mts) submits the same source twice and demonstrates, against the real production code, that (1) BuildQueue maps both submissions to one per-key SerialQueue so serial execution never overlaps, and (2) CodeGraphService.create's idempotency gate coalesces the duplicate so the worker runs exactly once and the single metadata row settles in the terminal `ready` state. The fixture executes with a bare Node runtime (no vitest, SQLite, or network) and passes 17/17 checks with exit code 0.",
+  "validation": {
+    "command": "node MemoryKnowledge/fixtures/build-queue-double-submit.mts",
+    "status": "passed",
+    "notes": "Runs the fixture from the repository root with Node v24.14.0, which strips TypeScript types natively; MemoryKnowledge/fixtures/ts-js-resolve-hook.mjs is a tiny ESM resolve hook that maps the repo's NodeNext `.js` specifiers onto the `.ts` sources they actually live in. Result: Part A (BuildQueue same-key double submit) 4/4 and Part B (CodeGraphService duplicate source) 13/13 — 17/17 checks PASS, 'CONTRACT OK', exit 0. Limitation: the repo's declared test runner is vitest (`pnpm test`) and tsx is the dev runner, but neither is installed (no node_modules, and this task forbids installing dependencies), so the fixture was executed directly with `node` instead of through vitest; the optional vitest-based harness is therefore not exercised."
+  }
+}

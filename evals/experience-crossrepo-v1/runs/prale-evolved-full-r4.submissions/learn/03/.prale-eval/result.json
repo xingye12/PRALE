@@ -1,0 +1,76 @@
+{
+  "task_id": "03",
+  "repository": "pi",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "packages/agent/src/harness/agent-harness.ts",
+      "symbol": "LaneSnapshotTool",
+      "start_line": 194,
+      "end_line": 209,
+      "observation": "The public harness snapshot surface separates an unresolvable running tool from an observable settled one. The `status: \"running\"` arm intentionally makes `result` optional (line 200), while only the `status: \"settled\"` arm guarantees a `result` (line 203-208). A caller therefore cannot read an operation's effect out of the public snapshot before the operation has settled; the running view is explicitly not an observed effect."
+    },
+    {
+      "path": "packages/agent/test/harness/execution-tools.test.ts",
+      "symbol": "clearPrepared",
+      "start_line": 50,
+      "end_line": 55,
+      "observation": "The existing primitive suite models the harness pipeline as effect-free preparation. `clearPrepared` runs `applyBeforeToolDecision(prepared, undefined)` and returns a `ClearedToolCall`, i.e. a call that is only *cleared for durable intent publication and execution*; no tool effect is entered. The suite's abort-first case (`lets abort-first gate refusal escape without invoking the tool`, lines 173-183) then pins the complementary boundary: an admission refused by the gate throws `AbortRequested` and leaves the tool untouched. Together they localise the effect boundary at `gate.admit`, which the new contract test wraps with an explicit durable-intent settlement step."
+    },
+    {
+      "path": "packages/agent/src/harness/execution/tools.ts",
+      "symbol": "executeToolCall",
+      "start_line": 125,
+      "end_line": 158,
+      "observation": "`executeToolCall` is the single place where a cleared call crosses the external effect boundary: the whole body is wrapped in `gate.admit(async () => { ... })` (line 134) and only then calls `call.tool.execute(...)` (line 138). Until the owning gate admits the call, the tool body is unreachable, which is the primitive the durable-intent contract relies on."
+    },
+    {
+      "path": "packages/agent/src/harness/runtime/drive/tools.ts",
+      "symbol": "startToolInvocation",
+      "start_line": 475,
+      "end_line": 512,
+      "observation": "This harness procedure fixes the ordering of durable intent and effect. It resolves and clears the call, then `await publishToolIntent(...)` (line 489) commits the cleared arguments plus the `effect_pending` state to the session, and only afterwards returns a completion that runs `performToolInvocation` (line 503) / `executeToolCall`. When settlement answers `cancel_requested` the effect is skipped in favour of `abortedOutcome` (line 502)."
+    },
+    {
+      "path": "packages/agent/test/harness/durable-intent-settlement.test.ts",
+      "symbol": "clearedCall",
+      "start_line": 59,
+      "end_line": 65,
+      "observation": "New minimal contract test. `clearedCall` mirrors the harness's pre-effect step (prepare + before-tool decision, no effect). The `describe(\"durable tool-intent settlement\")` block (line 75) then proves ordering: with settlement outstanding, `observation` is empty and the mocked `execute` has not been called; after settlement resolves, the effect is observed exactly once strictly after the `settled:effect_pending` marker; if settlement fails (`control.close`), admission is refused and the effect is never entered."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "In the pi harness an external tool effect is admitted only after the durable intent is settled: `packages/agent/src/harness/runtime/drive/tools.ts` (`startToolInvocation`) awaits `publishToolIntent`, which commits the cleared arguments plus the `effect_pending` state, and only then invokes the effect; `packages/agent/src/harness/execution/tools.ts` (`executeToolCall`) routes the tool body exclusively through `gate.admit`.",
+      "evidence_paths": [
+        "packages/agent/src/harness/runtime/drive/tools.ts",
+        "packages/agent/src/harness/execution/tools.ts"
+      ]
+    },
+    {
+      "claim": "The public harness API in `packages/agent/src/harness/agent-harness.ts` exposes an operation's tool effect only once it is settled: `LaneSnapshotTool` makes a `result` optional while the tool is `running` and guarantees it only in the `settled` arm, so an unsettled operation's effect is not observable through the public snapshot.",
+      "evidence_paths": [
+        "packages/agent/src/harness/agent-harness.ts"
+      ]
+    },
+    {
+      "claim": "The harness primitive suite in `packages/agent/test/harness/execution-tools.test.ts` already treats preparation/clearing as effect-free (`clearPrepared`) and pins that a refused admission never invokes the tool, providing the boundary the new contract test extends with an explicit durable-intent settlement step.",
+      "evidence_paths": [
+        "packages/agent/test/harness/execution-tools.test.ts"
+      ]
+    },
+    {
+      "claim": "The added minimal test `packages/agent/test/harness/durable-intent-settlement.test.ts` demonstrates the contract executably against the gate from `packages/agent/src/harness/execution/effect-gate.ts`: no effect is observed while settlement is outstanding, exactly one effect is observed strictly after settlement resolves, and a failed settlement leaves the effect unexecuted.",
+      "evidence_paths": [
+        "packages/agent/test/harness/durable-intent-settlement.test.ts",
+        "packages/agent/src/harness/execution/effect-gate.ts"
+      ]
+    }
+  ],
+  "conclusion": "The contract is that an operation's effect is unobservable before its durable intent settles. The pi harness enforces this by writing the effect_pending intent (cleared call + args) via publishToolIntent before startToolInvocation reaches performToolInvocation/executeToolCall, whose effect body is reachable only through gate.admit; the public snapshot only guarantees a result for settled tools. The minimal test packages/agent/test/harness/durable-intent-settlement.test.ts encodes that ordering at the exported primitive boundary and additionally shows that a failed settlement never enters the effect.",
+  "validation": {
+    "command": "node --experimental-strip-types --check packages/agent/test/harness/durable-intent-settlement.test.ts",
+    "status": "partial",
+    "notes": "The focused vitest run (npm --prefix packages/agent run test:harness -- --run test/harness/durable-intent-settlement.test.ts) is blocked because the workspace has no installed dependencies (no node_modules; `vitest: not found`, exit 127) and installing dependencies is out of scope. The available fallback validation passed: Node 24.14.0 with --experimental-strip-types --check parsed the new test file as valid TypeScript (exit 0). Import targets were verified statically against the checkout (prepareToolCall/applyBeforeToolDecision/executeToolCall/ClearedToolCall exported from src/harness/execution/tools.ts; createGate/Gate from src/harness/execution/effect-gate.ts; BACKGROUND_CONTEXT from src/harness/context.ts). The test therefore still needs to be executed under vitest once dependencies are installed."
+  }
+}

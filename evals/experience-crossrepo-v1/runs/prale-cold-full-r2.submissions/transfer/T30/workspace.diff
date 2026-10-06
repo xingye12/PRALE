@@ -1,0 +1,364 @@
+diff --git a/packages/coding-agent/test/settings-manager.test.ts b/packages/coding-agent/test/settings-manager.test.ts
+index 8e1bb83..92a1c51 100644
+--- a/packages/coding-agent/test/settings-manager.test.ts
++++ b/packages/coding-agent/test/settings-manager.test.ts
+@@ -610,6 +610,59 @@ describe("SettingsManager", () => {
+ 		});
+ 	});
+ 
++	describe("settings precedence", () => {
++		type PrecedenceFixture = {
++			/** Setting key under test, used in the test title. */
++			name: string;
++			/** Value the resolver falls back to when nothing is configured. */
++			defaultValue: string | undefined;
++			/** User (global) settings file content. */
++			userSettings: Settings;
++			/** Project settings file content: must win over user/default. */
++			projectSettings: Settings;
++			/** Explicit CLI override: must win over the project value. */
++			cliOverrides: Settings;
++			/** Reads the effective value through the public resolver API. */
++			read: (manager: SettingsManager) => string | undefined;
++		};
++
++		// Table-driven precedence contract: default -> user (global) -> project -> explicit CLI
++		// override, where each layer uses a distinct value. The CLI layer is applied exactly like
++		// main.ts applies an explicit flag (e.g. `--use-theme` -> applyOverrides).
++		const precedenceFixtures: PrecedenceFixture[] = [
++			{
++				name: "theme",
++				defaultValue: undefined,
++				userSettings: { theme: "light" },
++				projectSettings: { theme: "solarized-light" },
++				cliOverrides: { theme: "tokyo-night" },
++				read: (manager) => manager.getThemeSetting(),
++			},
++		];
++
++		it.each(precedenceFixtures)(
++			"$name: project value wins over user/default but loses to an explicit CLI value",
++			(fixture) => {
++				// Default layer: nothing configured anywhere.
++				expect(fixture.read(SettingsManager.inMemory())).toBe(fixture.defaultValue);
++
++				// User (global) layer applies while the project has not set the value.
++				writeFileSync(join(agentDir, "settings.json"), JSON.stringify(fixture.userSettings));
++				const userManager = SettingsManager.create(projectDir, agentDir);
++				expect(fixture.read(userManager)).toBe(fixture.userSettings.theme);
++
++				// Project value wins over user/default.
++				writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify(fixture.projectSettings));
++				const projectManager = SettingsManager.create(projectDir, agentDir);
++				expect(fixture.read(projectManager)).toBe(fixture.projectSettings.theme);
++
++				// Explicit CLI value wins over the project value.
++				projectManager.applyOverrides(fixture.cliOverrides);
++				expect(fixture.read(projectManager)).toBe(fixture.cliOverrides.theme);
++			},
++		);
++	});
++
+ 	describe("getSessionDir", () => {
+ 		it("should return undefined when not set", () => {
+ 			writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: "dark" }));
+diff --git a/.prale-eval/validation/hooks.mjs b/.prale-eval/validation/hooks.mjs
+new file mode 100644
+index 0000000..1e04890
+--- /dev/null
++++ b/.prale-eval/validation/hooks.mjs
+@@ -0,0 +1,18 @@
++// Node module hooks that redirect the third-party runtime dependencies of
++// packages/coding-agent/src/core/settings-manager.ts to local stubs. This lets the precedence
++// demo load the real SettingsManager source without installing dependencies.
++const STUBS = new Map([
++	["proper-lockfile", new URL("./stubs/proper-lockfile.mjs", import.meta.url).href],
++	["cross-spawn", new URL("./stubs/cross-spawn.mjs", import.meta.url).href],
++	["undici", new URL("./stubs/undici.mjs", import.meta.url).href],
++	["@earendil-works/pi-ai", new URL("./stubs/pi-ai.mjs", import.meta.url).href],
++	["vitest", new URL("./vitest-shim.mjs", import.meta.url).href],
++]);
++
++export async function resolve(specifier, context, nextResolve) {
++	const stub = STUBS.get(specifier);
++	if (stub) {
++		return { url: stub, shortCircuit: true };
++	}
++	return nextResolve(specifier, context);
++}
+diff --git a/.prale-eval/validation/precedence-harness.mjs b/.prale-eval/validation/precedence-harness.mjs
+new file mode 100644
+index 0000000..a959221
+--- /dev/null
++++ b/.prale-eval/validation/precedence-harness.mjs
+@@ -0,0 +1,63 @@
++// Focused executable validation for the new table-driven "settings precedence" test in
++// packages/coding-agent/test/settings-manager.test.ts.
++//
++// Vitest is not installed in this workspace (no node_modules, and dependencies must not be
++// installed), so this harness loads the real SettingsManager source through Node's type stripping
++// plus the module stubs/hooks in this directory, and replays exactly the assertions of the new
++// table-driven fixture.
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
++import { join } from "node:path";
++import { SettingsManager } from "../../packages/coding-agent/src/core/settings-manager.ts";
++
++const root = join(import.meta.dirname, "tmp");
++const agentDir = join(root, "agent");
++const projectDir = join(root, "project");
++
++function reset() {
++	if (existsSync(root)) rmSync(root, { recursive: true, force: true });
++	mkdirSync(agentDir, { recursive: true });
++	mkdirSync(join(projectDir, ".pi"), { recursive: true });
++}
++
++// Same fixture row as the test table.
++const fixture = {
++	name: "theme",
++	defaultValue: undefined,
++	userSettings: { theme: "light" },
++	projectSettings: { theme: "solarized-light" },
++	cliOverrides: { theme: "tokyo-night" },
++	read: (manager) => manager.getThemeSetting(),
++};
++
++const results = [];
++function check(layer, actual, expected) {
++	assert.deepStrictEqual(actual, expected, `${layer}: expected ${JSON.stringify(expected)}, got ${JSON.stringify(actual)}`);
++	results.push(`${fixture.name} / ${layer}: ${JSON.stringify(actual)}`);
++}
++
++reset();
++try {
++	// Default layer: nothing configured anywhere.
++	check("default (inMemory, unset)", fixture.read(SettingsManager.inMemory()), fixture.defaultValue);
++
++	// User (global) layer applies while the project has not set the value.
++	writeFileSync(join(agentDir, "settings.json"), JSON.stringify(fixture.userSettings));
++	const userManager = SettingsManager.create(projectDir, agentDir);
++	check("user/global", fixture.read(userManager), fixture.userSettings.theme);
++
++	// Project value wins over user/default.
++	writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify(fixture.projectSettings));
++	const projectManager = SettingsManager.create(projectDir, agentDir);
++	check("project over user/default", fixture.read(projectManager), fixture.projectSettings.theme);
++
++	// Explicit CLI value wins over the project value.
++	projectManager.applyOverrides(fixture.cliOverrides);
++	check("explicit CLI over project", fixture.read(projectManager), fixture.cliOverrides.theme);
++} finally {
++	reset();
++	rmSync(root, { recursive: true, force: true });
++}
++
++console.log(`PASS: ${results.length} precedence assertions`);
++for (const line of results) console.log(`  ${line}`);
+diff --git a/.prale-eval/validation/register.mjs b/.prale-eval/validation/register.mjs
+new file mode 100644
+index 0000000..aa94883
+--- /dev/null
++++ b/.prale-eval/validation/register.mjs
+@@ -0,0 +1,3 @@
++import { register } from "node:module";
++
++register("./hooks.mjs", import.meta.url);
+diff --git a/.prale-eval/validation/run-precedence-test.mjs b/.prale-eval/validation/run-precedence-test.mjs
+new file mode 100644
+index 0000000..bd18239
+--- /dev/null
++++ b/.prale-eval/validation/run-precedence-test.mjs
+@@ -0,0 +1,6 @@
++// Executes the new table-driven "settings precedence" test from the real
++// packages/coding-agent/test/settings-manager.test.ts source through the vitest-compatible shim.
++import { runRegistered } from "./vitest-shim.mjs";
++
++await import("../../packages/coding-agent/test/settings-manager.test.ts");
++await runRegistered("project value wins over user/default");
+diff --git a/.prale-eval/validation/stubs/cross-spawn.mjs b/.prale-eval/validation/stubs/cross-spawn.mjs
+new file mode 100644
+index 0000000..13b4102
+--- /dev/null
++++ b/.prale-eval/validation/stubs/cross-spawn.mjs
+@@ -0,0 +1,8 @@
++// Minimal stand-in for the `cross-spawn` runtime dependency (not installed in this workspace).
++// Only reached through utils/child-process.ts, which the precedence demo never calls.
++import { spawn, spawnSync } from "node:child_process";
++
++const crossSpawn = (command, args, options) => spawn(command, args, options);
++crossSpawn.sync = (command, args, options) => spawnSync(command, args, options);
++
++export default crossSpawn;
+diff --git a/.prale-eval/validation/stubs/pi-ai.mjs b/.prale-eval/validation/stubs/pi-ai.mjs
+new file mode 100644
+index 0000000..15fdf70
+--- /dev/null
++++ b/.prale-eval/validation/stubs/pi-ai.mjs
+@@ -0,0 +1,3 @@
++// Minimal stand-in for `@earendil-works/pi-ai`. settings-manager.ts imports the retry delay
++// constant from it; the type-only imports are erased by Node's type stripping.
++export const DEFAULT_MAX_AGENT_RETRY_DELAY_MS = 60000;
+diff --git a/.prale-eval/validation/stubs/proper-lockfile.mjs b/.prale-eval/validation/stubs/proper-lockfile.mjs
+new file mode 100644
+index 0000000..ced6013
+--- /dev/null
++++ b/.prale-eval/validation/stubs/proper-lockfile.mjs
+@@ -0,0 +1,9 @@
++// Minimal stand-in for the `proper-lockfile` runtime dependency (not installed in this workspace).
++// The settings precedence demo only needs the lock calls to be no-ops.
++export default {
++	lockSync: () => () => {},
++	unlockSync: () => {},
++	lock: async () => () => {},
++	unlock: async () => {},
++	check: async () => false,
++};
+diff --git a/.prale-eval/validation/stubs/undici.mjs b/.prale-eval/validation/stubs/undici.mjs
+new file mode 100644
+index 0000000..1635e3b
+--- /dev/null
++++ b/.prale-eval/validation/stubs/undici.mjs
+@@ -0,0 +1,12 @@
++// Minimal stand-in for the `undici` runtime dependency (not installed in this workspace).
++// http-dispatcher.ts only references undici inside functions the precedence demo never calls.
++export class Dispatcher {}
++export class Client extends Dispatcher {}
++export class Pool extends Dispatcher {}
++export class Agent extends Dispatcher {}
++export class EnvHttpProxyAgent extends Dispatcher {}
++export const setGlobalDispatcher = () => {};
++export const getGlobalDispatcher = () => undefined;
++export const install = () => {};
++export const request = () => Promise.reject(new Error("undici stub: request not implemented"));
++export const fetch = () => Promise.reject(new Error("undici stub: fetch not implemented"));
+diff --git a/.prale-eval/validation/vitest-shim.mjs b/.prale-eval/validation/vitest-shim.mjs
+new file mode 100644
+index 0000000..4dd75e9
+--- /dev/null
++++ b/.prale-eval/validation/vitest-shim.mjs
+@@ -0,0 +1,114 @@
++// Minimal vitest-compatible surface used to execute the real test source when vitest itself is not
++// installed in this workspace. Only the matchers needed by the executed test are implemented; the
++// runner intentionally reports how many tests it did not execute.
++import assert from "node:assert/strict";
++
++const hookStack = [{ before: [], after: [] }];
++const tests = [];
++
++export function describe(_name, fn) {
++	hookStack.push({ before: [], after: [] });
++	try {
++		fn();
++	} finally {
++		hookStack.pop();
++	}
++}
++
++export function beforeEach(fn) {
++	hookStack[hookStack.length - 1].before.push(fn);
++}
++
++export function afterEach(fn) {
++	hookStack[hookStack.length - 1].after.push(fn);
++}
++
++function register(title, fn) {
++	tests.push({
++		title,
++		fn,
++		before: hookStack.flatMap((scope) => scope.before),
++		after: hookStack.flatMap((scope) => scope.after),
++	});
++}
++
++function interpolate(title, row) {
++	if (row === null || typeof row !== "object") return title.replace(/\$[\w.]+/g, String(row));
++	return title.replace(/\$(\w+)/g, (_match, key) => String(row[key]));
++}
++
++export function it(title, fn) {
++	register(title, fn);
++}
++
++it.each = (cases) => (title, fn) => {
++	for (const row of cases) register(interpolate(title, row), () => fn(row));
++};
++it.skip = () => {};
++
++export const test = it;
++
++export function expect(actual) {
++	const matchers = {
++		toBe: (expected) => assert.ok(Object.is(actual, expected), `expected ${String(actual)} to be ${String(expected)}`),
++		toEqual: (expected) => assert.deepStrictEqual(actual, expected),
++		toBeUndefined: () => assert.strictEqual(actual, undefined),
++		toBeDefined: () => assert.notStrictEqual(actual, undefined),
++		toBeTruthy: () => assert.ok(actual),
++		toBeFalsy: () => assert.ok(!actual),
++		toHaveLength: (expected) => assert.strictEqual(actual.length, expected),
++		toContain: (expected) => assert.ok(actual.includes(expected)),
++		toThrow: (expected) => {
++			assert.strictEqual(typeof actual, "function", "toThrow requires a function");
++			assert.throws(actual, expected === undefined ? undefined : undefined);
++		},
++		toMatchObject: (expected) => assert.deepStrictEqual(pick(actual, Object.keys(expected)), expected),
++	};
++	matchers.not = { toThrow: () => assert.doesNotThrow(actual) };
++	return matchers;
++}
++
++function pick(value, keys) {
++	const out = {};
++	for (const key of keys) {
++		if (value != null && key in value) out[key] = value[key];
++	}
++	return out;
++}
++
++export function expectTypeOf() {
++	return new Proxy(() => {}, { get: () => () => {} });
++}
++
++export async function runRegistered(filter) {
++	let passed = 0;
++	let failed = 0;
++	let notExecuted = 0;
++	const failures = [];
++	for (const entry of tests) {
++		if (!entry.title.includes(filter)) {
++			notExecuted++;
++			continue;
++		}
++		try {
++			for (const hook of entry.before) await hook();
++			await entry.fn();
++			for (const hook of entry.after) await hook();
++			passed++;
++			console.log(`PASS: ${entry.title}`);
++		} catch (error) {
++			failed++;
++			failures.push(`${entry.title}\n${error?.stack ?? error}`);
++			try {
++				for (const hook of entry.after) await hook();
++			} catch {
++				// ignore cleanup failures
++			}
++		}
++	}
++	if (failed > 0) {
++		console.error(`FAIL:\n${failures.join("\n\n")}`);
++		process.exitCode = 1;
++	}
++	console.log(`\n${passed} passed, ${failed} failed, ${notExecuted} not executed by this shim`);
++}
+snapshot .prale-eval/validation/hooks.mjs - ba5098be0df3bd5ddb7b7766ee8e3c277fb4e09827ef27790db1e2e3f912ec0b
+snapshot .prale-eval/validation/precedence-harness.mjs - 1b59351f2da60637dd007ff34dff4962271d236cf43e0221c03b7fe659c24ced
+snapshot .prale-eval/validation/register.mjs - 286b813c5cf21c66a921566a518b8e9ee5ab58edd84bd8e16faea3c2bfa80a17
+snapshot .prale-eval/validation/run-precedence-test.mjs - 9934b0e1f3c6054a42d9ed3087fe7e63971787bd7ebd1cc4ef66671d1706dece
+snapshot .prale-eval/validation/stubs/cross-spawn.mjs - 4de1d50a94c035eef90f25c2423e11bce071ff1df3c3ce212bdacd3bff20dae2
+snapshot .prale-eval/validation/stubs/pi-ai.mjs - c03a521382600285928500ac5d1431200dd4e6bf8449926ad62c9aa20c95e050
+snapshot .prale-eval/validation/stubs/proper-lockfile.mjs - d67513124052cffe49f4ef90ea9aadf7c63f483d8879632a9e7b69757edffca6
+snapshot .prale-eval/validation/stubs/undici.mjs - 6375b9c750baa30ee11dd579cb59ad6e7c7c69c61fda6b19208cd3e6cadb4f1a
+snapshot .prale-eval/validation/vitest-shim.mjs - c330b92f40edb49cc9be41f0b30879d9baeaa0df0b2bd4dc22384032917ed53f
+snapshot packages/coding-agent/test/settings-manager.test.ts 9174509b95e92feaf18cb5adf77e601c5c631c5b875eca5906c949653f3edbe3 62ba682982cdf483ad38888824efae427cc70ca2b729619b7fa6fe7b8ddbef4f

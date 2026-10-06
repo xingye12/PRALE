@@ -1,0 +1,87 @@
+{
+  "task_id": "T28",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/sendchat.py",
+      "symbol": "sanity_check_messages",
+      "start_line": 5,
+      "end_line": 26,
+      "observation": "sanity_check_messages() validates the `messages` field of an outgoing model request: it walks the non-system turns, raises ValueError (via aider.utils.format_messages) as soon as two consecutive turns share a role, and returns True only when the last non-system turn comes from the user. aider/models.py:987 calls it at the top of Model.send_completion when AIDER_SANITY_CHECK_TURNS is set, so an invalid request is rejected before litellm.completion is ever reached. The fake-transport demo asserts exactly that: with AIDER_SANITY_CHECK_TURNS=1 two consecutive user turns raise 'Messages don't properly alternate' for both gpt-4 and deepseek/deepseek-r1 while the transport call counter stays at 1."
+    },
+    {
+      "path": "aider/sendchat.py",
+      "symbol": "ensure_alternating_roles",
+      "start_line": 29,
+      "end_line": 61,
+      "observation": "ensure_alternating_roles() repairs the `messages` request field by inserting an empty turn of the opposite role whenever two consecutive turns share a role (empty assistant after user, empty user after assistant). Model.send_completion applies it for deepseek-r1 style models (aider/models.py:990) and Model.simple_send_with_retries for deepseek-reasoner (aider/models.py:1044). In the fake-transport demo the transport records messages [user 'a', assistant '', user 'b'] for an input of two consecutive user turns, proving the request field was normalised before dispatch and without any network access."
+    },
+    {
+      "path": "aider/llm.py",
+      "symbol": "LazyLiteLLM",
+      "start_line": 21,
+      "end_line": 42,
+      "observation": "LazyLiteLLM is the deferred-import proxy for the external model SDK: __getattr__ triggers _load_litellm(), which calls importlib.import_module('litellm') on first use and then configures the loaded module (suppress_debug_info=True, set_verbose=False, drop_params=True, _logging._disable_debugging()). Because the module is fetched through importlib at call time, a fake 'litellm' module placed in sys.modules is imported and configured by this real code path, which is how the demo substitutes a fake transport for the absent SDK while still exercising aider's production wiring. The demo asserts importlib.import_module was asked only for 'litellm' and that the loading happens lazily (once, on the first attribute access)."
+    },
+    {
+      "path": "aider/llm.py",
+      "symbol": "litellm",
+      "start_line": 45,
+      "end_line": 45,
+      "observation": "The module-level singleton `litellm = LazyLiteLLM()` is the single object every caller (aider/models.py:21 imports it) uses to reach the external provider, e.g. litellm.completion(**kwargs) at aider/models.py:1036 and litellm.get_model_info/validate_environment/token_counter. The demo points litellm._lazy_module at the fake transport module, so all of those calls resolve to in-process recording stubs: this is what allows assertions on the exact request fields (model, messages, stream, temperature, tools, tool_choice, timeout) while guaranteeing that the real SDK - and therefore the network - is never involved."
+    },
+    {
+      "path": "aider/models.py",
+      "symbol": "Model.send_completion",
+      "start_line": 985,
+      "end_line": 1037,
+      "observation": "Model.send_completion is aider's external/model helper: it optionally runs sendchat.sanity_check_messages, repairs roles with ensure_alternating_roles, assembles the request kwargs (model, stream, temperature, tools/tool_choice from `functions`, extra_params, timeout, messages), hashes the canonical JSON of the non-message kwargs with sha1, and finally calls litellm.completion(**kwargs). The demo drives this helper with the fake transport and asserts every one of those request fields plus the sha1 hash and a single transport call, i.e. that the helper performs no I/O of its own beyond the injected transport."
+    },
+    {
+      "path": "tests/basic/test_llm_fake_transport.py",
+      "symbol": "FakeLitellmTransport",
+      "start_line": 131,
+      "end_line": 176,
+      "observation": "FakeLitellmTransport is the fake transport used by the new contract test: a types.ModuleType named 'litellm' that records every completion(**kwargs) request, returns a canned response with choices[0].message.content, and exposes the attributes the real code touches (suppress_debug_info, set_verbose, drop_params, _logging._disable_debugging, model_cost, get_model_info, validate_environment, token_counter, encode). It answers entirely in-process, so the six tests can assert request fields without any dependency on litellm being installed."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "aider/llm.py exposes the external model client as a lazily imported proxy, so injecting a fake 'litellm' module into sys.modules makes the real production wiring - importlib.import_module('litellm') followed by suppress_debug_info/set_verbose/drop_params/_logging._disable_debugging configuration - run against the fake transport instead of the SDK; the demo asserts importlib was asked only for 'litellm', that litellm._lazy_module is the fake module, and that the loader configured it once.",
+      "evidence_paths": [
+        "aider/llm.py",
+        "tests/basic/test_llm_fake_transport.py"
+      ]
+    },
+    {
+      "claim": "aider/sendchat.py owns the request's `messages` field: sanity_check_messages() raises ValueError for non-alternating turns before any transport call (aider/models.py:987), while ensure_alternating_roles() inserts empty opposite-role turns so that consecutive same-role turns become a valid alternating list; the demo verifies both the ValueError rejection and the repaired [user, assistant '', user] request that the fake transport records for a deepseek-r1 model.",
+      "evidence_paths": [
+        "aider/sendchat.py",
+        "aider/models.py"
+      ]
+    },
+    {
+      "claim": "The external/model helper's request fields are exactly as contracted: for send_completion the fake transport receives model, messages, stream, temperature and timeout=600 (plus tools and tool_choice when a function schema is supplied), the returned sha1 equals the hash of the canonicalised non-message kwargs, and every request goes through the single injected transport object.",
+      "evidence_paths": [
+        "aider/models.py",
+        "aider/llm.py",
+        "tests/basic/test_llm_fake_transport.py"
+      ]
+    },
+    {
+      "claim": "No hidden network access occurs while the helper runs: socket.socket.connect, socket.connect_ex and socket.create_connection are replaced by a guard that records and fails on any attempt, the model-info download path (ModelInfoManager._update_cache -> MODEL_INFO_URL) is recorded and stays unused because a warm cache is seeded, and all six tests assert that both recorders are empty (with a negative-control test proving the guard would fire on a real connect).",
+      "evidence_paths": [
+        "aider/llm.py",
+        "aider/models.py",
+        "tests/basic/test_llm_fake_transport.py"
+      ]
+    }
+  ],
+  "conclusion": "Aider's external/model call path is testable end-to-end with a fake transport and no network. The added contract test (tests/basic/test_llm_fake_transport.py, 6 tests, all passing) installs a fake 'litellm' module so that aider/llm.py's LazyLiteLLM performs its real deferred import and configuration, drives Model.send_completion and Model.simple_send_with_retries, and asserts the outgoing request fields (model, messages, stream, temperature, tools/tool_choice, timeout), the sha1 request hash, the message-alternation contract implemented in aider/sendchat.py (ensure_alternating_roles repairs, sanity_check_messages rejects before dispatch), and the total absence of network access (guarded sockets plus an unused model-info HTTP download). Because litellm/json5/oslex are not installed in this checkout, minimal stand-ins are used for those import-time dependencies only; the asserted behaviour comes from the real repository modules.",
+  "validation": {
+    "command": "python -m pytest tests/basic/test_llm_fake_transport.py -q",
+    "status": "passed",
+    "notes": "Result: 6 passed in ~0.3s, run offline from the repository root. Limitation: the optional runtime dependencies litellm, json5 and oslex are NOT installed in this environment, so the new test provides minimal, documented stand-ins for those import-time dependencies and uses the fake litellm transport as the delivery channel; all asserted behaviour comes from the real aider/llm.py, aider/sendchat.py and aider/models.py sources. The wider tests/basic suite cannot be collected here (pre-existing ModuleNotFoundError: mixpanel/json5/...), so validation is scoped to the new focused test module, which was also re-run from a clean state (scratch HOME and seeded model-info cache removed) and repeated to confirm idempotency. flake8 is not installed, so the [flake8] config could not be executed; the new file's lines were checked to be <= 100 characters manually."
+  }
+}

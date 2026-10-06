@@ -1,0 +1,90 @@
+{
+  "task_id": "T09",
+  "repository": "tdam",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "MemoryClientConfig",
+      "start_line": 8,
+      "end_line": 19,
+      "observation": "Shared config contract for the SDK clients: endpoint (base URL, here the fake backend's 127.0.0.1 URL), apiKey (sent as `Authorization: Bearer`), serviceId (sent as `x-tdai-service-id`), plus optional timeout/rejectUnauthorized. The demo passes this object into the real v3 MemoryClient, which is why the observed HTTP requests carry those auth headers. It intentionally holds only transport-level fields: team/agent/user/session scope lives in the isolation context, not here."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "Transport",
+      "start_line": 24,
+      "end_line": 28,
+      "observation": "Explicitly documented as the testing seam ('inject a mock that satisfies this'): `post<T>(path, body)` returns the already-unwrapped data type, with an optional `get`. The v3 MemoryClient consumes exactly this interface, so the demo can drive the real client against the local fake HTTP backend and assert on the wire traffic (path, body, order) while the client owns scope assembly and payload shaping."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "IsolationContext.baseBody",
+      "start_line": 67,
+      "end_line": 74,
+      "observation": "Builds the scope metadata merged into every request body: team_id + agent_id + user_id (and optional task_id), passed through `stripUndefined` so absent optional keys are omitted rather than sent as null. The demo asserts that all observed write/read bodies carry exactly team_id/agent_id/user_id matching the constructor scope."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "writeScenario",
+      "start_line": 336,
+      "end_line": 343,
+      "observation": "The write half of the demo: POSTs `/v3/scenario/write` with the isolation scope body plus `path`, `content` and optional `summary`. It returns `V3ScenarioWriteData` (`{ path, updated_at }`) — i.e. the client resolves to the normalized data payload, not the envelope. The demo verifies the exact key set on the wire and that the returned object has no envelope fields."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "readScenario",
+      "start_line": 332,
+      "end_line": 334,
+      "observation": "The scoped read half: POSTs `/v3/scenario/read` with the same isolation scope body plus only `path`. Because it spreads `baseBody()` and never adds session_id, the read is scoped by team+agent+user and stays sessionless (L2/L3 do not consume session scope). The demo asserts the read body has exactly the four keys team_id/agent_id/user_id/path and no write fields."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "V3HttpTransport.request",
+      "start_line": 58,
+      "end_line": 121,
+      "observation": "Normalization layer used by the demo: for `code === 0` it returns `envelope.data` (empty object fallback) and, when present, attaches `trace_id` from the `x-trace-id` response header; for a non-OK HTTP status or non-zero business code it throws `TDAMError` using the header request id (`x-qcloud-transaction-id` ?? `x-trace-id`) over the envelope's `request_id`. The demo verifies both branches (unwrapped data with trace_id; TDAMError code 5001 with header-derived request id)."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The demo drives the repository's real v3 MemoryClient (constructed through the public MemoryClientConfig contract) instead of a hand-rolled client, so every request observed by the fake backend is produced by SDK code.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts"
+      ]
+    },
+    {
+      "claim": "The MemoryClient reaches the network only through the injectable Transport.post seam, which is why a local fake HTTP backend can capture the full request path, body and ordering for assertion.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/src/v3/client.ts"
+      ]
+    },
+    {
+      "claim": "Scope metadata is assembled by IsolationContext.baseBody and merged into every data-plane request, so the observed write and read bodies both carry team_id/agent_id/user_id matching the constructed isolation scope while omitting undefined/optional keys.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/client.ts",
+        "sdk/memory-core/typescript/src/client.ts"
+      ]
+    },
+    {
+      "claim": "The ordered write then scoped read maps to POST /v3/scenario/write (scope + path + content + summary) followed by POST /v3/scenario/read (scope + path only); the read never carries session_id or the write fields, and the read is only issued after the write response completes.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/client.ts"
+      ]
+    },
+    {
+      "claim": "Results are normalized by V3HttpTransport: successful calls resolve to the unwrapped `data` object (write -> {path, updated_at}; read -> normalized ScenarioFile with nulls for a missing document) with trace_id copied from the response header, and non-zero business codes throw TDAMError carrying the header-derived request id.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts",
+        "sdk/memory-core/typescript/src/v3/client.ts"
+      ]
+    }
+  ],
+  "conclusion": "A dependency-free, executable demo at `.prale-eval/demo/run-demo.mjs` exercises the real tdam TypeScript v3 SDK end to end against a local fake HTTP backend bound to 127.0.0.1. It performs exactly one write (`MemoryClient.writeScenario` -> POST /v3/scenario/write) then one scoped read (`MemoryClient.readScenario` -> POST /v3/scenario/read) and verifies all three required properties from live wire captures: (1) request order - the write arrives and its response completes before the read is sent; (2) scope metadata - both bodies carry team_id/agent_id/user_id from the isolation context, the write body adds path/content/summary, the read body is scope + path only and never leaks session_id; (3) normalized result - responses are unwrapped from the `{code,message,request_id,data}` envelope, `x-trace-id` is surfaced as `trace_id`, a missing document normalizes to nulls, and a non-zero code throws TDAMError with the header-derived request id. All 13 assertions pass.",
+  "validation": {
+    "command": "node --experimental-transform-types .prale-eval/demo/run-demo.mjs",
+    "status": "passed",
+    "notes": "Ran from the repository root; exit code 0, '13/13 checks passed'. Observed order: 1) POST /v3/scenario/write body={\"team_id\":\"team-demo\",\"agent_id\":\"agt-demo\",\"user_id\":\"usr-demo\",\"path\":\"notes/demo.md\",\"content\":\"hello from the write\",\"summary\":\"demo note\"}; 2) POST /v3/scenario/read body={\"team_id\":\"team-demo\",\"agent_id\":\"agt-demo\",\"user_id\":\"usr-demo\",\"path\":\"notes/demo.md\"}; 3) POST /v3/scenario/read (missing path -> nulls); 4) POST /v3/scenario/read (__error__ -> TDAMError code 5001). Normalized results: write={\"path\":\"notes/demo.md\",\"updated_at\":...,\"trace_id\":\"trace-1\"}, read={\"path\":\"notes/demo.md\",\"content\":\"hello from the write\",\"created_at\":...,\"updated_at\":...,\"trace_id\":\"trace-2\"}. Dependency limitation: the workspace has no installed node_modules (no vitest/typescript/undici), and installing was not permitted, so the SDK's own `npm test` (vitest) suite could not be run. Instead the demo imports the TS sources directly via Node's `--experimental-transform-types` plus a two-line, self-contained module-resolution hook (`.prale-eval/demo/loader.mjs`) that maps internal `./x.js` specifiers to `./x.ts` and stubs the unused `undici` import; no external dependencies were added and no repository source files were modified. The experimental-flag requirement is the only harness caveat. Citation ranges in `evidence` were programmatically re-checked to contain their named symbols."
+  }
+}

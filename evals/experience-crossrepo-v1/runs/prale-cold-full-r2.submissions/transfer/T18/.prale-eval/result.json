@@ -1,0 +1,109 @@
+{
+  "task_id": "T18",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue",
+      "start_line": 11,
+      "end_line": 34,
+      "observation": "BuildQueue holds a Map<string, SerialQueue> keyed by an asset id. Every build submission for one asset (code_graph_id for CodeGraphService, wiki_id for WikiService) is routed to the SAME queue instance, and SerialQueue runs with concurrency 1, so a duplicated submission for the same asset can never produce two overlapping build executions (no concurrent git clone / SQLite / file writes). The class is the repository's single choke point where 'effective work' (a build actually running) is serialized per asset; the header comment states the invariant 'same asset never rebuilds concurrently'."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.enqueue",
+      "start_line": 14,
+      "end_line": 24,
+      "observation": "enqueue(key, job) looks up (or lazily creates) the single SerialQueue for that key and appends the job to it with fire-and-forget semantics (rejections swallowed). Consequences for the duplicate-submission question: (1) a second identical submission for the same asset joins the one existing queue for that key instead of starting a parallel job, so duplicate submissions are never executed concurrently; (2) the enqueue path never re-enters the caller (no retry loop, no recursive re-submission), so a swallowed failure cannot fan out into extra effective builds; (3) queue instances are per key, so distinct assets still build in parallel - the guard is dedup/serialization per asset, not a global lock."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.onIdle",
+      "start_line": 26,
+      "end_line": 33,
+      "observation": "onIdle(key?) is the deterministic settlement point for the queue: with a key it awaits that key's SerialQueue.onIdle(), without a key it awaits all queues. This is what makes the duplicate-submission property observable and testable - after the caller replays duplicate submissions, the demo waits here and counts worker (build) invocations, proving that N duplicate submissions produced fewer than N effective builds (1 build for 2 identical create calls; 1 build for 2 back-to-back sync calls)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue.drain",
+      "start_line": 81,
+      "end_line": 102,
+      "observation": "drain() is the execution engine behind BuildQueue: it returns early while this.running is true, shifts exactly one entry, sets running = true, and only re-enters (or releases idle resolvers) in the finally block. This is the literal 'at most one in-flight job per queue' mutex, i.e. the mechanism that turns duplicate submissions for one asset into strictly FIFO, non-overlapping executions (verified in the demo: maxInflight for a key that received 3 duplicate submissions was 1)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.create",
+      "start_line": 132,
+      "end_line": 139,
+      "observation": "create() is the duplicate *source* submission entry point. It delegates to store.createCodeGraph() and only when the store reports existed === false does it write an audit row and call enqueueBuild(). A duplicate submission of the same memory + team + repo_url + branch therefore returns the already-existing row with existed = true and enqueues nothing at all - the duplicate never becomes a queued build, let alone an executed one."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.sync",
+      "start_line": 154,
+      "end_line": 171,
+      "observation": "sync() is the duplicate *build* (rebuild) submission entry point. If the row is already pending or processing it returns { kind: 'busy' } and - per the inline comment - deliberately does not overwrite status, does not re-enqueue, and does not write an audit row. So while the first submission's build is queued or running, every repeated submission is rejected instead of stacking another effective build. Only the first accepted sync flips the row to pending and enqueues exactly one job."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/sqlite-store.ts",
+      "symbol": "createCodeGraph",
+      "start_line": 69,
+      "end_line": 83,
+      "observation": "The production store implements the idempotent half of the contract: it first SELECTs for a live row matching (service_id, team_id, repo_url, branch) and returns { row, existed: true } on a hit, before ever generating an id or inserting. This is what makes duplicated source submissions collapse onto one asset row / one asset id, which in turn is what makes the BuildQueue key collision-and-dedup path apply."
+    },
+    {
+      "path": "MemoryKnowledge/src/db/schema.ts",
+      "symbol": "idx_kcg_team_repo_branch",
+      "start_line": 46,
+      "end_line": 48,
+      "observation": "The partial unique index on (service_id, team_id, repo_url, branch) WHERE deleted_at IS NULL is the database-level guarantee that a duplicated source submission cannot create a second live asset row: even in a race, at most one live row exists per source identity, so both submissions resolve to the same code_graph_id and thus the same per-key BuildQueue. This is the schema fact the demo's emulated store reproduces."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/wiki-service.ts",
+      "symbol": "WikiService.ingest",
+      "start_line": 272,
+      "end_line": 290,
+      "observation": "The wiki engine mirrors the code-graph engine exactly: ingest() (= sync() = 'rebuild' submission) returns { kind: 'busy' } with the same 'do not overwrite status / do not re-enqueue / do not audit' comment when the wiki is pending or processing, and enqueues at most one job on the single accepted transition. Both engines share the same BuildQueue, so the duplicate-submission property is uniform across the two asset types in MemoryKnowledge."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Duplicate build submissions for the same asset key are never executed concurrently: BuildQueue gives each asset id one SerialQueue with concurrency 1, so a replayed submission joins that asset's queue and runs strictly FIFO after the in-flight build. Measured in the executable demo: 3 duplicate submissions under key cg_A produced maxInflight = 1 and completion order [A#1, A#2, A#3], while a distinct key (cg_B) still ran with maxInflight = 1 in parallel with cg_A - the guarantee is per-asset serialization, not a global lock.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    },
+    {
+      "claim": "A duplicate source submission (same memory/service + team + repo_url + branch) creates no duplicate effective work at all: the store returns existed = true for the second submission and CodeGraphService.create only audits and enqueues when existed === false. Measured in the executable demo with the real CodeGraphService: two identical create() calls returned existed = [false, true] on the same code_graph_id and after BuildQueue.onIdle() the injected worker had run exactly once, with exactly one 'create' audit row; a duplicate create issued while a build was in flight likewise returned existed = true and added no job.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/sqlite-store.ts",
+        "MemoryKnowledge/src/db/schema.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    },
+    {
+      "claim": "A duplicate build/rebuild submission made while the first submission is still pending or processing is rejected as busy and is not re-enqueued: CodeGraphService.sync returns { kind: 'busy' } before touching status/audit/queue. Measured in the executable demo: two back-to-back sync() calls returned kinds ['ok', 'busy'] (busy step reported as 'processing'), only one 'ingest' audit row was written, and the worker invocation count rose by exactly one (1 -> 2), i.e. the duplicate submission produced zero additional effective builds. The wiki engine implements the same guard in WikiService.ingest, so the property holds for both asset types.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/wiki-service.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    },
+    {
+      "claim": "The enqueue path itself cannot amplify duplicates: BuildQueue.enqueue is fire-and-forget with swallowed rejections, so a failing duplicated job neither retries nor re-enters its caller, and the only observable effect of N duplicate submissions is at most N serialized FIFO executions throttled by the busy/create guards upstream; BuildQueue.onIdle makes the resulting effective work (worker invocations) deterministically measurable, which is the settlement point used by the demo's assertions.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    }
+  ],
+  "conclusion": "Proven in MemoryKnowledge: duplicate source/build submission does not create duplicate effective work. Defense is layered and both layers are exercised by real repository code. (1) Submission-time dedup: an identical source submission (service + team + repo_url + branch) is collapsed to the existing row by sqlite-store.createCodeGraph / the partial unique index idx_kcg_team_repo_branch, and CodeGraphService.create enqueues only when existed === false (so the second create enqueues nothing); a repeated rebuild submission while the asset is pending/processing is rejected busy by CodeGraphService.sync (and identically by WikiService.ingest) with no status change, no audit row and no enqueue. (2) Execution-time serialization as defense in depth: even if two jobs for one asset reached the queue, BuildQueue maps every asset id to a single SerialQueue with concurrency 1, so they run strictly FIFO, never overlapping (no concurrent git clone / SQLite / file writes). Executable demo (node .prale-eval/demo/dedup-demo.mjs, all 11 assertions pass, exit 0): 3 duplicate submissions on one key gave maxInflight = 1 and FIFO order while another key stayed parallel; 2 identical create() calls gave existed = [false, true] on one code_graph_id with exactly 1 worker invocation and 1 'create' audit; 2 back-to-back sync() calls gave ['ok', 'busy'] with exactly 1 additional worker invocation and 1 'ingest' audit; max concurrent worker invocations across the whole scenario was 1. Residual limitation stated honestly: BuildQueue by itself serializes duplicate jobs rather than skipping them, so the 'no duplicate effective work' guarantee for a *submitted duplicate* comes from the create/sync busy guards plus the DB unique index; the queue guarantees no duplicated work runs concurrently and bounds effective work to one in-flight build per asset. The production SQLite store (drizzle-orm + better-sqlite3) and the vitest suite are not installed in this workspace, so the store was emulated to exactly the semantics of sqlite-store.ts:69-83 and schema.ts:44-49; that emulation is the only non-repository component in the demo.",
+  "validation": {
+    "command": "node .prale-eval/demo/dedup-demo.mjs",
+    "status": "pass",
+    "notes": "Focused executable validation, run from the workspace root, exit code 0. It imports and runs the unmodified repository sources MemoryKnowledge/src/store/build-queue.ts, MemoryKnowledge/src/store/serial-queue.ts and MemoryKnowledge/src/store/code-graph-service.ts via Node 24's built-in TypeScript type stripping (a 20-line resolver hook maps the repo's .js import specifiers to the sibling .ts files; nothing is installed and no repository file is modified). 11/11 assertions passed, covering: per-key maxInflight = 1 with FIFO order under 3 duplicate submissions, parallel execution across distinct keys, idempotent create (existed [false,true], 1 worker call, 1 create audit), busy rejection of a back-to-back duplicate sync (['ok','busy'], 1 extra worker call, 1 ingest audit), duplicate create while a build is in flight (no extra job), and global max concurrent worker invocations = 1. Limitation: the optional project validation dependencies are unavailable in this offline workspace - there is no node_modules, no tsx/vitest/tsc binary, and pnpm/npm install is disallowed, so `pnpm -C MemoryKnowledge test` (vitest), `pnpm -C MemoryKnowledge typecheck` (tsc --noEmit) and a real drizzle+better-sqlite3 store run could not be executed. `tsc --noEmit` could therefore not be used as a static check either; the successful import and execution of the three .ts modules is the strongest available check that the cited sources parse and behave as claimed, and the production-store behaviour relied on by the demo is reproduced from sqlite-store.ts:69-83 and schema.ts:44-49 rather than executed."
+  }
+}

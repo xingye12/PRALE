@@ -1,0 +1,103 @@
+{
+  "task_id": "T05",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "env",
+      "start_line": 6,
+      "end_line": 8,
+      "observation": "`env(key, fallback)` is the lowest-level precedence primitive for every string setting in PanelConfig: it returns `process.env[key] ?? fallback`, so an explicit value wins over the built-in default and only `undefined` counts as \"absent\". Consequence for the conflict case: an explicit empty string (`KNOWLEDGE_SERVICE_URL=''`) DOES shadow the default `http://127.0.0.1:8421`, because `??` is used instead of `||`."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "envInt",
+      "start_line": 10,
+      "end_line": 15,
+      "observation": "`envInt(key, fallback)` implements the same precedence for numeric settings but treats BOTH `undefined` and `''` as absent (`if (raw === undefined || raw === '') return fallback;`) and rejects non-finite values, so blank or non-numeric explicit input degrades to the built-in default instead of leaking `NaN`. This is the deliberate asymmetry with `env()` that the precedence test pins down (PORT='' -> 8123, PORT='not-a-number' -> 8123)."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "PanelConfig",
+      "start_line": 17,
+      "end_line": 35,
+      "observation": "`PanelConfig` is the full normalized shape of panel/instance configuration: server bind, `metadataInstancesConfig` (the registry file that carries the per-instance config layer), `metadataRemoteTimeoutMs`, UI dist dir, log level/format, knowledge-service endpoint + token + timeout, the knowledge LLM-binding sync switch, and the agent-template directory. It documents the resolution downstream layers depend on (`serviceId 按请求 instanceId 注入`), i.e. request-scoped identity on top of these configured values."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "envBool",
+      "start_line": 37,
+      "end_line": 41,
+      "observation": "`envBool(key, fallback)` applies the type-specific precedence for booleans: blank/unset explicit input falls back to the default `true` for `KNOWLEDGE_LLM_BINDING_SYNC`, while any explicit value other than exactly `'true'`/`'1'` (including `'TRUE'` and `'false'`) overrides the default with `false`."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "loadPanelConfig",
+      "start_line": 43,
+      "end_line": 69,
+      "observation": "`loadPanelConfig()` is the single normalizing entry point where the precedence is actually applied field by field: each property is `env(KEY, <built-in default>)` / `envInt(KEY, <default>)` / `envBool(KEY, <default>)`, and the two enum-ish fields are validated afterwards (`log.level` whitelist falls back to `info`, `log.format` falls back to `json`). It is therefore the exact function a precedence test must exercise with conflicting layers: METADATA_INSTANCES_CONFIG (config file location) defaults to `./config/metadata-instances.json`, KNOWLEDGE_SERVICE_URL to `http://127.0.0.1:8421`, KNOWLEDGE_LLM_PROXY_BASE_URL to `http://127.0.0.1:8096`, TDAI_AGENT_TEMPLATE_DIR to `./data/agent-templates`."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+      "symbol": "resolve",
+      "start_line": 96,
+      "end_line": 102,
+      "observation": "`InstanceRegistry.resolve(instanceId)` is the instance-level precedence gate: the explicit request value must match an entry of the config layer, otherwise it throws `InstanceRegistryError(400, 'INVALID_INSTANCE')`. There is no built-in default instance, so an explicit id that conflicts with config fails closed instead of silently borrowing the configured `default` entry."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+      "symbol": "listPublic",
+      "start_line": 104,
+      "end_line": 112,
+      "observation": "`listPublic()` exposes the only field that intentionally has a config > default fallback: when `proxy_endpoint` is absent the key is omitted entirely (`...(proxy_endpoint ? { proxy_endpoint } : {})`), which is what lets clients apply their `proxy_endpoint ?? gateway_endpoint` default; when present, the configured value wins. It also drops `api_key`, so the credential of the config layer can never be reached through a client-side fallback."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 62,
+      "observation": "`validatePanelMetaHeaders(deps)` implements the request-input layer: it reads `x-tdai-service-id`, trims it, rejects missing/blank input with 400 MISSING_INSTANCE_ID, resolves the id through the config registry (400 INVALID_INSTANCE on conflict) and then constructs `panelMeta` with `instanceId`, `gatewayEndpoint` and `gatewayApiKey` taken from that config entry. So the request decides WHO, the config decides WHAT endpoints/credentials are used, and the default layer never substitutes for a conflicting explicit id."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "MemoryPanel resolves instance/panel configuration with a strict three-layer precedence: explicit request input > config (env values and registry entries) > built-in default. `loadPanelConfig()` applies the explicit-over-default half by evaluating every PanelConfig field as `env(KEY, <literal default>)`, `envInt(KEY, <default>)` or `envBool(KEY, <default>)`, and validating the enum-ish log fields against a whitelist that falls back to `info`/`json`.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/config/panel-config.ts"
+      ]
+    },
+    {
+      "claim": "The precedence rule is type-sensitive, which is the real conflict surface: `env()` uses `??`, so an explicit empty string beats the built-in default for string settings (KNOWLEDGE_SERVICE_URL='' yields baseUrl ''), whereas `envInt()`/`envBool()` treat `''` as absent and fall back to the default (PORT='' -> 8123). Invalid explicit numeric input also degrades to the default (PORT='not-a-number' -> 8123, never NaN), and only exactly 'true'/'1' overrides the boolean default true.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/config/panel-config.ts"
+      ]
+    },
+    {
+      "claim": "`loadPanelConfig()` is the single normalization point for panel configuration, and it also fixes the config-file layer for instance routing: `metadataInstancesConfig` is `METADATA_INSTANCES_CONFIG` when set and otherwise the built-in `./config/metadata-instances.json`, which is the file `InstanceRegistry.load()` parses into the config layer used at request time.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/config/panel-config.ts",
+        "MemoryPanel/src/panel/config/instance-registry.ts"
+      ]
+    },
+    {
+      "claim": "At the request layer the explicit `x-tdai-service-id` header is authoritative: the middleware trims it and rejects missing/blank input with 400 MISSING_INSTANCE_ID, and rejects an id absent from the registry config with 400 INVALID_INSTANCE even though a `default` entry exists in config — no default instance is ever borrowed. For a configured id, `InstanceRegistry.resolve()` supplies gatewayEndpoint/api_key from the config entry, so request input selects identity while config supplies values.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/config/instance-registry.ts"
+      ]
+    },
+    {
+      "claim": "`proxy_endpoint` is the one instance field with an explicit two-layer fallback: the configured value wins and is published by `InstanceRegistry.listPublic()`, while an omitted value causes the key to be dropped so the client-side `proxy_endpoint ?? gateway_endpoint` default applies; `api_key` never appears in the public projection, so the default layer cannot resurrect a credential from config.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/config/instance-registry.ts"
+      ]
+    }
+  ],
+  "conclusion": "The precedence contract for MemoryPanel instance/panel configuration is: (1) explicit request input wins — per-process env overrides consumed by `loadPanelConfig()`, and the `x-tdai-service-id` header consumed by `validatePanelMetaHeaders`; (2) config is the second layer — values present in the environment and the per-instance registry entries parsed from `METADATA_INSTANCES_CONFIG` (default `./config/metadata-instances.json`); (3) built-in defaults are the last resort — the literals in `env()/envInt()/envBool()`, the `info`/`json` log whitelist, and the client-side `proxy_endpoint ?? gateway_endpoint` fallback. Conflicts resolve per field without cross-layer bleeding: valid explicit values always win; blank or invalid explicit input degrades to the default for int/bool/enum fields but NOT for plain string fields (`??` semantics, e.g. KNOWLEDGE_SERVICE_URL=''); and an explicit instance id that the config does not contain fails closed with 400 INVALID_INSTANCE rather than falling back to the configured `default` instance. The executable demo (`.prale-eval/precedence-demo.mjs`) drives the real `loadPanelConfig`, `InstanceRegistry` and `validatePanelMetaHeaders` sources and confirms all 24 precedence assertions, including citation-integrity checks for the line ranges listed above; the vitest port of the same contract lives at `MemoryPanel/tests/panel/panel-config-precedence.test.ts`.",
+  "validation": {
+    "command": "node .prale-eval/precedence-demo.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root; output: 24/24 precedence checks passed, status=pass, normalized result written to .prale-eval/precedence-demo-output.json (checks A0-A7 panel env/config/default conflicts, B1-B5 instance routing and proxy_endpoint fallback, C1-C5 request-header middleware behaviour, D:* citation integrity for the cited symbol/line ranges). LIMITATION: MemoryPanel has no node_modules in this workspace and installing dependencies is out of scope, so `pnpm --dir MemoryPanel test` (vitest) and `pnpm --dir MemoryPanel typecheck` (tsc) could not be executed; the dependency-free runner therefore compiles the repository TypeScript with the built-in `node:module.stripTypeScriptTypes` (mode 'transform') and substitutes inert shims for the three third-party imports it touches (`dotenv` -> no-op loadDotenv, `zod` -> unused chainable proxy for the schema declarations, `hono/factory` -> `createMiddleware = (handler) => handler`, plus a three-method fake Hono context), so the precedence logic executed is the repository's own while the Hono router itself is not exercised. `MemoryPanel/tests/panel/panel-config-precedence.test.ts` (the idiomatic vitest home of this contract) was additionally syntax-verified by parsing it with `stripTypeScriptTypes`; it is expected to run under `pnpm --dir MemoryPanel test` once dependencies are installed."
+  }
+}

@@ -1,0 +1,832 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/demo-deliverable.md b/.prale-eval/demo-deliverable.md
+new file mode 100644
+index 0000000..d37b57c
+--- /dev/null
++++ b/.prale-eval/demo-deliverable.md
+@@ -0,0 +1,103 @@
++# T24 demo — fake gateway/config tenant dispatch
++
++## What this demonstrates
++
++Using **local fake gateway/config fixtures** (no Docker, no real OpenClaw image), the
++demo shows the multi-tenant routing boundary of `server/core/multi-tenant-gateway.js`:
++
++- an **allowed tenant request reaches the fake backend**, and
++- a **mismatched tenant is rejected before dispatch** (the fake backend records zero
++  extra hits).
++
++## How to run
++
++```bash
++node .prale-eval/demo/run-demo.mjs
++```
++
++Exit code is `0` when every check passes, `1` otherwise. The most focused validation is
++that single command; it prints and writes the normalized result to
++`.prale-eval/demo-output.json`.
++
++## Artifacts
++
++| Path | Role |
++| --- | --- |
++| `.prale-eval/demo/fixtures/fake-config.json` | Fake config fixture: the tenant registry (`tenant-a`, `tenant-b` with per-tenant tokens) and the gateway block (`rpc_path`). `port: null` is a placeholder the runner replaces with the ephemeral port the fake backend binds. |
++| `.prale-eval/demo/fake-gateway.mjs` | Fake backend: an HTTP server that stands in for a per-tenant OpenClaw gateway endpoint. It appends one JSON line per accepted request to a hits file (with method, path, `Authorization`, attributed tenant, body) and replies `200 {ok:true, receivedBy:"fake-backend", tenantId}`. It binds `127.0.0.1:0` and prints `FAKE_GATEWAY_READY <port>`. |
++| `.prale-eval/demo/run-demo.mjs` | Executable demo: starts the fake gateway, resolves the tenant target from the request context, gates dispatch, runs the scenarios, and emits the normalized result. |
++| `.prale-eval/demo-output.json` | Normalized machine-readable operation result of the last run. |
++
++## Contract exercised (grounded in the repository)
++
++The demo replays the tenant-target contract of
++`server/core/multi-tenant-gateway.js`:
++
++- `getHttpTargetForCurrentRequest()` (lines 448–466) reads the request tenant from
++  `getRequestTenant()` (`server/core/request-context.js`) and returns
++  `{ baseUrl: "http://<tenant.host>:<tenant.port>",
++     headers: { Authorization: "Bearer <tenant.token>" }, tenant }`.
++  The demo's `resolveTenantTarget()` builds the same base URL and bearer header from the
++  fixture registry, and `run-demo.mjs` imports the **real** `runWithRequestContext` /
++  `getRequestTenant` symbols so the context binding is not re-implemented.
++- `getHttpTargetForTenantId()` (lines 468–485) and `callGatewayForTenant()` (lines
++  417–426) reject an unknown tenant with `Tenant <id> not found` **before**
++  `ensureGatewayClient` / `ensureConnected` runs, so no request is dispatched.
++- `getTenantForUser()` (lines 501–509) resolves a user's owning tenant, and
++  `ensureConnected()` (lines 704–780) is the connection gate that runs only after a
++  tenant target has been resolved.
++
++The demo's dispatch gate (`authorizeAndDispatch`) applies the same boundary to the
++credentials a request presents:
++
++1. missing request-context tenant → `401 missing_tenant_context`, no dispatch;
++2. context tenant not in the registry → `403 unknown_tenant` (mirrors
++   `Tenant <id> not found`), no dispatch;
++3. credential tenant ≠ context tenant → `403 tenant_mismatch`, no dispatch;
++4. credential tenant == context tenant → `fetch` to that tenant's `baseUrl` with
++   `Authorization: Bearer <token>`.
++
++## Normalized operation result
++
++`.prale-eval/demo-output.json` records:
++
++- `allowed_tenant_reaches_backend: true`
++- `mismatched_tenant_rejected_before_dispatch: true`
++- `backend_hit_count: 1` (only the allowed request was ever sent)
++- per-scenario `{status, reason, contextTenantId, credentialTenantId, dispatched, backend}`
++- `checks` + `passed`
++
++Sample run (port varies per run):
++
++```json
++{
++  "allowed_tenant_reaches_backend": true,
++  "mismatched_tenant_rejected_before_dispatch": true,
++  "backend_hit_count": 1,
++  "scenarios": {
++    "allowed":        { "status": 200, "reason": "dispatched",      "contextTenantId": "tenant-a", "credentialTenantId": "tenant-a", "dispatched": true,  "backend": { "ok": true, "receivedBy": "fake-backend", "tenantId": "tenant-a" } },
++    "mismatch":       { "status": 403, "reason": "tenant_mismatch", "contextTenantId": "tenant-a", "credentialTenantId": "tenant-b", "dispatched": false },
++    "unknown_tenant": { "status": 403, "reason": "unknown_tenant",  "error": "Tenant tenant-ghost not found", "dispatched": false }
++  },
++  "passed": true
++}
++```
++
++## Empirical result
++
++`node .prale-eval/demo/run-demo.mjs` → exit `0`; the fake backend log contained exactly
++one line, from the allowed `tenant-a` request (`Bearer fake-token-tenant-a`). The
++mismatch (`tenant-a` context + `tenant-b` credential) and unknown-tenant
++(`tenant-ghost`) scenarios were rejected in-process and produced **no** additional
++backend hits, proving rejection happened before dispatch.
++
++## Limitations
++
++- The demo targets a local fake HTTP backend; it does not start Docker, tenant
++  containers, or the real OpenClaw gateway. `server/core/multi-tenant-gateway.js`
++  cannot be imported in this checkout because its transitive `../database.js` →
++  `better-sqlite3` dependency and `node_modules` are absent, so the demo imports only
++  the dependency-free `server/core/request-context.js` and replays the documented
++  target contract. This is limited-strength substitute evidence, not the full suite.
++- No dependency was installed and no repository source, task metadata, lockfile, or git
++  configuration was modified.
+diff --git a/.prale-eval/demo-output.json b/.prale-eval/demo-output.json
+new file mode 100644
+index 0000000..6bcda07
+--- /dev/null
++++ b/.prale-eval/demo-output.json
+@@ -0,0 +1,59 @@
++{
++  "demo": "wattclaw-t24-fake-gateway-tenant-dispatch",
++  "fixture": ".prale-eval/demo/fixtures/fake-config.json",
++  "fakeBackendPort": 45822,
++  "allowed_tenant_reaches_backend": true,
++  "mismatched_tenant_rejected_before_dispatch": true,
++  "backend_hit_count": 1,
++  "scenarios": {
++    "allowed": {
++      "status": 200,
++      "reason": "dispatched",
++      "contextTenantId": "tenant-a",
++      "credentialTenantId": "tenant-a",
++      "baseUrl": "http://127.0.0.1:45822",
++      "backend": {
++        "ok": true,
++        "receivedBy": "fake-backend",
++        "tenantId": "tenant-a"
++      },
++      "dispatched": true
++    },
++    "mismatch": {
++      "status": 403,
++      "reason": "tenant_mismatch",
++      "contextTenantId": "tenant-a",
++      "credentialTenantId": "tenant-b",
++      "dispatched": false
++    },
++    "unknown_tenant": {
++      "status": 403,
++      "reason": "unknown_tenant",
++      "error": "Tenant tenant-ghost not found",
++      "dispatched": false
++    }
++  },
++  "backend_hits": [
++    {
++      "ts": 1791080291684,
++      "method": "POST",
++      "path": "/api/v1/admin/rpc",
++      "authorization": "Bearer fake-token-tenant-a",
++      "tenantId": "tenant-a",
++      "body": {
++        "id": "rpc-demo-1",
++        "method": "system.ping",
++        "params": {}
++      }
++    }
++  ],
++  "checks": {
++    "allowed_reached_backend": true,
++    "allowed_backend_saw_tenant_a": true,
++    "mismatch_rejected": true,
++    "mismatch_not_dispatched": true,
++    "unknown_tenant_rejected": true,
++    "unknown_tenant_not_dispatched": true
++  },
++  "passed": true
++}
+diff --git a/.prale-eval/demo/.runtime/backend-hits.jsonl b/.prale-eval/demo/.runtime/backend-hits.jsonl
+new file mode 100644
+index 0000000..33ec1ce
+--- /dev/null
++++ b/.prale-eval/demo/.runtime/backend-hits.jsonl
+@@ -0,0 +1 @@
++{"ts":1791080291684,"method":"POST","path":"/api/v1/admin/rpc","authorization":"Bearer fake-token-tenant-a","tenantId":"tenant-a","body":{"id":"rpc-demo-1","method":"system.ping","params":{}}}
+diff --git a/.prale-eval/demo/fake-gateway.mjs b/.prale-eval/demo/fake-gateway.mjs
+new file mode 100644
+index 0000000..0899997
+--- /dev/null
++++ b/.prale-eval/demo/fake-gateway.mjs
+@@ -0,0 +1,67 @@
++// Fake OpenClaw gateway backend used by the T24 demo.
++//
++// It stands in for the per-tenant gateway HTTP endpoint that
++// server/core/multi-tenant-gateway.js targets via getHttpTargetForCurrentRequest()
++// (`baseUrl = http://<tenant.host>:<tenant.port>`, `Authorization: Bearer <tenant.token>`).
++//
++// Each accepted request is appended as one JSON line to the --hits file so the demo
++// can prove a request actually reached the backend (and, for the rejected case, that
++// no line was written).
++//
++// Usage: node fake-gateway.mjs --hits <path> [--config <path>]
++// On ready it prints: FAKE_GATEWAY_READY <port>
++import http from 'http'
++import { appendFileSync, readFileSync } from 'fs'
++
++function argValue(name, fallback = '') {
++  const index = process.argv.indexOf(name)
++  return index >= 0 && process.argv[index + 1] ? process.argv[index + 1] : fallback
++}
++
++const hitsPath = argValue('--hits')
++const configPath = argValue('--config')
++if (!hitsPath) {
++  console.error('fake-gateway: --hits <path> is required')
++  process.exit(2)
++}
++
++// Token -> tenant id map so the fake backend can attribute a hit to a tenant,
++// exactly like a real per-tenant gateway would resolve its own credential.
++const tokenToTenant = new Map()
++if (configPath) {
++  const config = JSON.parse(readFileSync(configPath, 'utf8'))
++  for (const tenant of config.tenants || []) tokenToTenant.set(tenant.token, tenant.id)
++}
++
++function tenantFromAuthorization(header = '') {
++  const match = /^Bearer\s+(.+)$/i.exec(String(header))
++  if (!match) return null
++  return tokenToTenant.get(match[1]) || null
++}
++
++const server = http.createServer((req, res) => {
++  const auth = req.headers.authorization || ''
++  const tenantId = tenantFromAuthorization(auth)
++  let body = ''
++  req.on('data', chunk => { body += chunk })
++  req.on('end', () => {
++    appendFileSync(hitsPath, `${JSON.stringify({
++      ts: Date.now(),
++      method: req.method,
++      path: req.url,
++      authorization: auth,
++      tenantId,
++      body: body ? JSON.parse(body) : null,
++    })}\n`)
++    res.writeHead(200, { 'Content-Type': 'application/json' })
++    res.end(JSON.stringify({ ok: true, receivedBy: 'fake-backend', tenantId }))
++  })
++})
++
++server.listen(0, '127.0.0.1', () => {
++  console.log(`FAKE_GATEWAY_READY ${server.address().port}`)
++})
++
++for (const signal of ['SIGTERM', 'SIGINT']) {
++  process.on(signal, () => server.close(() => process.exit(0)))
++}
+diff --git a/.prale-eval/demo/fixtures/fake-config.json b/.prale-eval/demo/fixtures/fake-config.json
+new file mode 100644
+index 0000000..1a6b450
+--- /dev/null
++++ b/.prale-eval/demo/fixtures/fake-config.json
+@@ -0,0 +1,34 @@
++{
++  "fixture": "wattclaw-multi-tenant-fake-gateway",
++  "schema_version": 1,
++  "description": "Local fake gateway/config fixture for the T24 demo. The gateway block and tenant records mirror the tenant target contract of server/core/multi-tenant-gateway.js (getHttpTargetForCurrentRequest / getHttpTargetForTenantId build baseUrl from tenant.host:tenant.port and send Authorization: Bearer <tenant.token>). 'port: null' is a placeholder the demo runner replaces with the ephemeral port the fake backend actually binds.",
++  "gateway": {
++    "protocol": "http",
++    "host": "127.0.0.1",
++    "port": null,
++    "rpc_path": "/api/v1/admin/rpc"
++  },
++  "policy": {
++    "require_context_tenant_match": true,
++    "reject_unknown_tenant": true,
++    "reject_before_dispatch": true
++  },
++  "tenants": [
++    {
++      "id": "tenant-a",
++      "token": "fake-token-tenant-a",
++      "host": "127.0.0.1",
++      "port": null,
++      "containerName": "openclaw-tenant-a",
++      "status": "active"
++    },
++    {
++      "id": "tenant-b",
++      "token": "fake-token-tenant-b",
++      "host": "127.0.0.1",
++      "port": null,
++      "containerName": "openclaw-tenant-b",
++      "status": "active"
++    }
++  ]
++}
+diff --git a/.prale-eval/demo/run-demo.mjs b/.prale-eval/demo/run-demo.mjs
+new file mode 100644
+index 0000000..166bdbf
+--- /dev/null
++++ b/.prale-eval/demo/run-demo.mjs
+@@ -0,0 +1,202 @@
++// T24 demo: fake gateway/config fixtures show an allowed tenant request reaches the
++// fake backend while a mismatched tenant is rejected before dispatch.
++//
++// Grounding: the routing contract exercised here is the one implemented by
++// server/core/multi-tenant-gateway.js:
++//   - getHttpTargetForCurrentRequest() binds the tenant from the request context
++//     (`getRequestTenant()`, server/core/request-context.js) and returns
++//     { baseUrl: `http://${tenant.host}:${tenant.port}`,
++//       headers: { Authorization: `Bearer ${tenant.token}` }, tenant }.
++//   - getHttpTargetForTenantId()/callGatewayForTenant() reject an unknown tenant
++//     with `Tenant <id> not found` before any gateway client is created.
++// This demo imports the real, dependency-free request-context module and replays
++// that contract against a local fake backend so the allow/deny boundary is provable
++// without Docker, better-sqlite3, or the real OpenClaw image.
++//
++// Usage: node .prale-eval/demo/run-demo.mjs
++import { spawn } from 'child_process'
++import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'fs'
++import path from 'path'
++import { fileURLToPath } from 'url'
++import { runWithRequestContext, getRequestTenant } from '../../server/core/request-context.js'
++
++const here = path.dirname(fileURLToPath(import.meta.url))
++const repoRoot = path.resolve(here, '..', '..')
++const configPath = path.join(here, 'fixtures', 'fake-config.json')
++const fakeGatewayPath = path.join(here, 'fake-gateway.mjs')
++const runtimeDir = path.join(here, '.runtime')
++const hitsPath = path.join(runtimeDir, 'backend-hits.jsonl')
++const outputPath = path.join(repoRoot, '.prale-eval', 'demo-output.json')
++
++mkdirSync(runtimeDir, { recursive: true })
++if (existsSync(hitsPath)) rmSync(hitsPath)
++writeFileSync(hitsPath, '')
++
++function readConfig() {
++  const config = JSON.parse(readFileSync(configPath, 'utf8'))
++  return config
++}
++
++function delay(ms) {
++  return new Promise(resolve => setTimeout(resolve, ms))
++}
++
++function readHits() {
++  const raw = readFileSync(hitsPath, 'utf8').trim()
++  return raw ? raw.split('\n').map(line => JSON.parse(line)) : []
++}
++
++// Start the fake backend and wait for its ephemeral port.
++async function startFakeGateway(config) {
++  const child = spawn(process.execPath, [fakeGatewayPath, '--hits', hitsPath, '--config', configPath], {
++    stdio: ['ignore', 'pipe', 'pipe'],
++  })
++  const port = await new Promise((resolve, reject) => {
++    let out = ''
++    const timer = setTimeout(() => reject(new Error('fake gateway did not become ready')), 10_000)
++    child.stdout.on('data', chunk => {
++      out += chunk
++      const match = /FAKE_GATEWAY_READY (\d+)/.exec(out)
++      if (match) {
++        clearTimeout(timer)
++        resolve(Number(match[1]))
++      }
++    })
++    child.stderr.on('data', chunk => process.stderr.write(`[fake-gateway] ${chunk}`))
++    child.on('exit', code => { clearTimeout(timer); reject(new Error(`fake gateway exited early (${code})`)) })
++  })
++  return { child, port }
++}
++
++// Mirror getHttpTargetForCurrentRequest(): pick the context tenant, look it up in the
++// tenant registry, and build the per-tenant base URL + bearer credential.
++function resolveTenantTarget(registry, contextTenantId) {
++  const tenant = registry.find(entry => entry.id === contextTenantId)
++  if (!tenant) throw new Error(`Tenant ${contextTenantId} not found`)
++  return {
++    baseUrl: `http://${tenant.host}:${tenant.port}`,
++    headers: { Authorization: `Bearer ${tenant.token || ''}` },
++    tenant,
++  }
++}
++
++// Dispatch gate: authorize the credential against the request context tenant BEFORE
++// any network call. A mismatch or unknown context tenant is rejected in-process.
++async function authorizeAndDispatch({ registry, rpcPath, credentialToken, body }) {
++  const contextTenant = getRequestTenant()
++  if (!contextTenant?.id) {
++    return { status: 401, reason: 'missing_tenant_context', dispatched: false }
++  }
++  let target
++  try {
++    target = resolveTenantTarget(registry, contextTenant.id) // rejects unknown context tenant
++  } catch (err) {
++    return { status: 403, reason: 'unknown_tenant', error: err.message, dispatched: false }
++  }
++  const credential = registry.find(entry => entry.token === credentialToken)
++  if (!credential || credential.id !== target.tenant.id) {
++    return {
++      status: 403,
++      reason: 'tenant_mismatch',
++      contextTenantId: target.tenant.id,
++      credentialTenantId: credential?.id || null,
++      dispatched: false,
++    }
++  }
++  const res = await fetch(new URL(rpcPath, target.baseUrl), {
++    method: 'POST',
++    headers: { ...target.headers, 'Content-Type': 'application/json' },
++    body: JSON.stringify(body),
++  })
++  const payload = await res.json()
++  return {
++    status: res.status,
++    reason: 'dispatched',
++    contextTenantId: target.tenant.id,
++    credentialTenantId: credential.id,
++    baseUrl: target.baseUrl,
++    backend: payload,
++    dispatched: true,
++  }
++}
++
++async function main() {
++  const config = readConfig()
++  const { child, port } = await startFakeGateway(config)
++  try {
++    // Inject the ephemeral port into the fixture's tenant records and gateway block
++    // (the fixture declares `port: null` as a placeholder).
++    const registry = config.tenants.map(tenant => ({ ...tenant, port }))
++    config.gateway.port = port
++    const rpcPath = config.gateway.rpc_path
++
++    const scenarioAllowed = await runWithRequestContext({ tenant: registry.find(t => t.id === 'tenant-a') }, () =>
++      authorizeAndDispatch({
++        registry,
++        rpcPath,
++        credentialToken: 'fake-token-tenant-a',
++        body: { id: 'rpc-demo-1', method: 'system.ping', params: {} },
++      }))
++
++    const hitsAfterAllowed = readHits()
++
++    const scenarioMismatch = await runWithRequestContext({ tenant: registry.find(t => t.id === 'tenant-a') }, () =>
++      authorizeAndDispatch({
++        registry,
++        rpcPath,
++        credentialToken: 'fake-token-tenant-b',
++        body: { id: 'rpc-demo-2', method: 'system.ping', params: {} },
++      }))
++
++    const hitsAfterMismatch = readHits()
++
++    const scenarioUnknown = await runWithRequestContext({ tenant: { id: 'tenant-ghost' } }, () =>
++      authorizeAndDispatch({
++        registry,
++        rpcPath,
++        credentialToken: 'fake-token-tenant-a',
++        body: { id: 'rpc-demo-3', method: 'system.ping', params: {} },
++      }))
++
++    const hitsAfterUnknown = readHits()
++
++    const checks = {
++      allowed_reached_backend: scenarioAllowed.dispatched === true && scenarioAllowed.status === 200 && hitsAfterAllowed.length === 1,
++      allowed_backend_saw_tenant_a: scenarioAllowed.backend?.tenantId === 'tenant-a',
++      mismatch_rejected: scenarioMismatch.status === 403 && scenarioMismatch.reason === 'tenant_mismatch' && scenarioMismatch.dispatched === false,
++      mismatch_not_dispatched: hitsAfterMismatch.length === hitsAfterAllowed.length,
++      unknown_tenant_rejected: scenarioUnknown.status === 403 && scenarioUnknown.reason === 'unknown_tenant' && scenarioUnknown.dispatched === false,
++      unknown_tenant_not_dispatched: hitsAfterUnknown.length === hitsAfterMismatch.length,
++    }
++
++    const result = {
++      demo: 'wattclaw-t24-fake-gateway-tenant-dispatch',
++      fixture: path.relative(repoRoot, configPath),
++      fakeBackendPort: port,
++      allowed_tenant_reaches_backend: checks.allowed_reached_backend && checks.allowed_backend_saw_tenant_a,
++      mismatched_tenant_rejected_before_dispatch: checks.mismatch_rejected && checks.mismatch_not_dispatched,
++      backend_hit_count: hitsAfterAllowed.length,
++      scenarios: {
++        allowed: scenarioAllowed,
++        mismatch: scenarioMismatch,
++        unknown_tenant: scenarioUnknown,
++      },
++      backend_hits: hitsAfterAllowed,
++      checks,
++      passed: Object.values(checks).every(Boolean),
++    }
++
++    writeFileSync(outputPath, `${JSON.stringify(result, null, 2)}\n`)
++    console.log(JSON.stringify(result, null, 2))
++    if (!result.passed) process.exitCode = 1
++  } finally {
++    child.kill('SIGTERM')
++    await delay(150)
++    if (!child.killed) child.kill('SIGKILL')
++  }
++}
++
++main().catch(err => {
++  console.error('demo failed:', err)
++  process.exit(1)
++})
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..e032d25
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,113 @@
++{
++  "task_id": "T24",
++  "repository": "wattclaw",
++  "mode": "demo",
++  "evidence": [
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "getHttpTargetForCurrentRequest",
++      "start_line": 448,
++      "end_line": 466,
++      "observation": "The per-request tenant router. It reads the request tenant from getRequestTenant() (or falls back to the requesting user's tenant / the default tenant), and returns { baseUrl: `http://${tenant.host}:${tenant.port}`, headers: { Authorization: `Bearer ${tenant.token || ''}` }, tenant }. It only ever builds a target for the request's own context tenant and attaches that tenant's own token, which is exactly the allow path the demo replays: resolve the backend from the context tenant, then dispatch with its bearer credential."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "getHttpTargetForTenantId",
++      "start_line": 468,
++      "end_line": 485,
++      "observation": "Explicit-tenant target resolver. It looks the tenant up by id and throws `Tenant ${tenantId} not found` when the tenant does not exist, before ensureGatewayClient()/ensureConnected() are reached, so an unknown tenant produces no downstream dispatch. This is the deny boundary the demo mirrors for the unknown-tenant scenario (403 unknown_tenant, zero fake-backend hits)."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "callGatewayForTenant",
++      "start_line": 417,
++      "end_line": 426,
++      "observation": "Cross-tenant RPC entry point that resolves the tenant by id and throws `Tenant ${tenantId} not found` before ensureGatewayClient()/ensureConnected() and gateway.call(). It confirms rejection happens in-process before any dispatch when the requested tenant identity is not a known tenant."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "getTenantForUser",
++      "start_line": 501,
++      "end_line": 509,
++      "observation": "Resolves a user's owning tenant through user_tenant_assignments joined to openclaw_tenants and normalizes the row. This is the ownership lookup that binds a request to exactly one tenant (host/port/token), so the request context tenant used by getHttpTargetForCurrentRequest() is tenant-scoped rather than global."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "ensureConnected",
++      "start_line": 704,
++      "end_line": 780,
++      "observation": "The connection gate that runs only after a tenant target/client has been resolved (creates/reuses the tenant client, approves a pending device on pairing/scope errors, and times out otherwise). It has no path for an unknown or mismatched tenant, which shows the tenant lookup/rejection happens upstream of dispatch."
++    },
++    {
++      "path": "server/core/request-context.js",
++      "symbol": "getRequestTenant",
++      "start_line": 17,
++      "end_line": 19,
++      "observation": "Returns the tenant stored in the AsyncLocalStorage request context (null when unset). Paired with runWithRequestContext (lines 5-7), it is the dependency-free mechanism multi-tenant-gateway.js uses to scope routing to a tenant. The demo imports these real symbols so the request-context binding is not a re-implementation."
++    },
++    {
++      "path": ".prale-eval/demo/run-demo.mjs",
++      "symbol": "authorizeAndDispatch",
++      "start_line": 85,
++      "end_line": 121,
++      "observation": "The demo's dispatch gate. It reads the context tenant via the real getRequestTenant(), rejects missing context (401), unknown tenant (403 unknown_tenant, via resolveTenantTarget), and credential/context tenant mismatch (403 tenant_mismatch) without any network call, and only fetches the tenant baseUrl with `Authorization: Bearer <token>` when the credential tenant equals the context tenant."
++    },
++    {
++      "path": ".prale-eval/demo/run-demo.mjs",
++      "symbol": "resolveTenantTarget",
++      "start_line": 73,
++      "end_line": 83,
++      "observation": "Replays the getHttpTargetForCurrentRequest contract against the fake fixture registry: it looks up the context tenant and builds { baseUrl: `http://${tenant.host}:${tenant.port}`, headers: { Authorization: `Bearer ${tenant.token}` }, tenant }, throwing `Tenant <id> not found` for an unknown tenant."
++    },
++    {
++      "path": ".prale-eval/demo/fixtures/fake-config.json",
++      "symbol": "tenants",
++      "start_line": 16,
++      "end_line": 33,
++      "observation": "Fake config fixture: the tenant registry with tenant-a/tenant-b ids, hosts, per-tenant bearer tokens, container names, and `port: null` placeholders; plus a policy block requiring context/tenant match and reject-before-dispatch. It is the local stand-in for the DB-backed tenant records the gateway module reads."
++    },
++    {
++      "path": ".prale-eval/demo/fake-gateway.mjs",
++      "symbol": "server",
++      "start_line": 42,
++      "end_line": 61,
++      "observation": "Local fake backend gateway. It binds 127.0.0.1:0, attributes the Authorization bearer token to a tenant via tenantFromAuthorization(), appends one JSON hit line per accepted request (method, path, authorization, tenantId, body) and returns 200 {ok:true, receivedBy:'fake-backend', tenantId}. Counting hit lines is how the demo proves a request was dispatched or rejected before dispatch."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "The gateway module routes a request strictly through its own tenant context: getHttpTargetForCurrentRequest() takes the tenant from getRequestTenant() (server/core/request-context.js) and returns that tenant's baseUrl with an Authorization: Bearer of that same tenant's token, so an allowed request is bound to one tenant and one credential.",
++      "evidence_paths": [
++        "server/core/multi-tenant-gateway.js",
++        "server/core/request-context.js"
++      ]
++    },
++    {
++      "claim": "Tenant identity is the rejection boundary that runs before dispatch: getHttpTargetForTenantId() and callGatewayForTenant() throw `Tenant <id> not found` for an unknown tenant before ensureGatewayClient()/ensureConnected() and before any RPC, and getTenantForUser() binds a user/request to exactly one tenant row.",
++      "evidence_paths": [
++        "server/core/multi-tenant-gateway.js"
++      ]
++    },
++    {
++      "claim": "The demo's authorizeAndDispatch gate rejects a mismatched tenant in-process: with a tenant-a request context and a tenant-b credential it returns 403 tenant_mismatch with dispatched=false, and an unknown context tenant (tenant-ghost) returns 403 unknown_tenant via resolveTenantTarget's `Tenant tenant-ghost not found`.",
++      "evidence_paths": [
++        ".prale-eval/demo/run-demo.mjs"
++      ]
++    },
++    {
++      "claim": "The allowed path is end-to-end against the fake backend: the allowed scenario (tenant-a context + tenant-a credential) returns HTTP 200 from the fake gateway and the backend's hit log contains exactly one entry with `Bearer fake-token-tenant-a` and tenantId tenant-a, while the mismatch and unknown-tenant scenarios add no hits, proving they were rejected before dispatch.",
++      "evidence_paths": [
++        ".prale-eval/demo/run-demo.mjs",
++        ".prale-eval/demo/fake-gateway.mjs",
++        ".prale-eval/demo/fixtures/fake-config.json",
++        "server/core/multi-tenant-gateway.js"
++      ]
++    }
++  ],
++  "conclusion": "The demo proves the multi-tenant routing boundary described by server/core/multi-tenant-gateway.js using only local fake gateway/config fixtures. The allowed tenant request (context tenant-a + credential tenant-a) is dispatched to the fake backend, which returns 200 and records exactly one hit carrying `Bearer fake-token-tenant-a`; the mismatched request (context tenant-a + credential tenant-b) and the unknown-tenant request (tenant-ghost) are both rejected with 403 before any network call and produce zero additional backend hits. The exercised contract is grounded in the repository: getHttpTargetForCurrentRequest() derives the target from the request-context tenant with that tenant's host/port/token, getHttpTargetForTenantId()/callGatewayForTenant() reject unknown tenants before connecting, and request-context.js's runWithRequestContext/getRequestTenant are imported directly. The demo is executable via `node .prale-eval/demo/run-demo.mjs`, exits 0, and writes the normalized result to .prale-eval/demo-output.json. Limitation: the real module cannot be imported here because node_modules/better-sqlite3 is absent, so the gateway target contract is replayed against the fixtures rather than executing the Docker-backed module; no dependencies were installed and no task metadata, lockfile, hidden-oracle file, or git configuration was modified.",
++  "validation": {
++    "command": "node .prale-eval/demo/run-demo.mjs",
++    "status": "passed",
++    "notes": "Ran the demo end-to-end: exit 0, all checks true (allowed_reached_backend, allowed_backend_saw_tenant_a, mismatch_rejected, mismatch_not_dispatched, unknown_tenant_rejected, unknown_tenant_not_dispatched), backend_hit_count = 1. Also ran `node --check server/core/multi-tenant-gateway.js` and confirmed `node -e import('./server/core/request-context.js')` succeeds. Limitation: the official suite could not run and server/core/multi-tenant-gateway.js cannot be imported directly because its transitive ../database.js -> better-sqlite3 dependency and node_modules are absent (import fails with ERR_MODULE_NOT_FOUND); no dependency was installed, so this dynamic demo plus the static citation checks are limited-strength substitute evidence, not equivalent to the full test suite. Every cited symbol/range was re-verified against the working tree; only .prale-eval/ is new."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/demo-deliverable.md - fe4ffc802c6f15f5d7620db4406d8489b01d2f9fa778663e7d9b7015f70ed6e8
+snapshot .prale-eval/demo-output.json - 976fd34d0771cccf0c3a43c6e7027f4efee25b11d9e794c40b0b0b83aa3ee7a9
+snapshot .prale-eval/demo/.runtime/backend-hits.jsonl - 9f8ce6bb0a4e04fb128491a55ce0c51b821567004dd7fa7fd7cd1729aac76875
+snapshot .prale-eval/demo/fake-gateway.mjs - f1f3907740fa366d9d82d4acfd599601c89ccf21eadb6e542ba171ee311f1793
+snapshot .prale-eval/demo/fixtures/fake-config.json - baaecbf38c43a6b27c297853a77f3520a3089da1368107c5d1808117ac1e0dee
+snapshot .prale-eval/demo/run-demo.mjs - c331dfa4f7332412fa6542e0c223b6e6f61f4a5644ce26675d3aa480f3dd68f9
+snapshot .prale-eval/result.json - aa1b378fdfd0d3d7b6ad955dc7cf4adde8ba08f8c7b5c864434baa4a390543e4

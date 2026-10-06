@@ -1,0 +1,1257 @@
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..588abc9
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,121 @@
++# T14 contract deliverable — distinct newline/whitespace edit fixture (repository `aider`)
++
++## 1. Deliverable
++
++An executable, self-contained contract demo plus its fixture:
++
++| Artifact | Role |
++| --- | --- |
++| `.prale-eval/demo_search_replace_contract.py` | Executable demo; runs the contract checks against the unmodified repository code and exits 0 iff the contract holds. |
++| `.prale-eval/fixtures/*.txt` | The distinct newline/whitespace edit fixture (original, unique search/replace, whitespace-blind search, non-unique search/replace). |
++| `.prale-eval/validation-log.txt` | Captured output of both demo runs (human-readable and `--json`). |
++| `.prale-eval/result.json` | Machine-readable contract result (evidence, claims, conclusion, validation). |
++
++Run from the repository root:
++
++```
++python .prale-eval/demo_search_replace_contract.py        # human readable
++python .prale-eval/demo_search_replace_contract.py --json # machine readable
++```
++
++## 2. Contract
++
++**Subject of the edit.** `original.txt` holds two near-twin blocks:
++
++```
++def first():
++    paint()   <- trailing spaces
++    return 1
++
++
++def second():
++    paint()
++    return 1
++```
++
++The two blocks are textually identical except for (a) the trailing spaces after
++`paint()` in the first block and (b) the blank-line/newline layout that separates
++them. The block boundaries themselves are whitespace: the same logical edit
++differs in uniqueness purely because of newline/space detail.
++
++**C1 — an exact edit succeeds exactly once.**
++
++* The unique search text `def first():\n    paint()   \n    return 1\n` occurs
++  exactly once in `original.txt`; `search_and_replace` is expected to return the
++  text with that single substitution applied and the sibling block untouched
++  (verified by equality with `original.replace(search, replace, 1)`).
++* The same edit routed through the coder's real caller entry point
++  `udiff_coder.directly_apply_hunk(content, hunk)` must produce the identical
++  result — matching what `udiff_coder.Coder.apply_edits` would write.
++* Whitespace distinctness is load-bearing: the whitespace-blind search text
++  (identical but without the trailing spaces) occurs **0** times, so the edit is
++  refused (`search_and_replace` returns `None`) instead of being silently applied
++  to the twin.
++
++**C2 — a non-unique edit fails without partial mutation.**
++
++* The search text `    return 1\n` occurs **2** times. Its non-whitespace context
++  is 8 characters (`return 1`), which is under the guard's 10-character
++  threshold.
++* `udiff_coder.directly_apply_hunk` must refuse the hunk: it returns `None`
++  (falsy), and it also maps `SearchTextNotUnique` to `None`.
++* No partial mutation: `udiff_coder.Coder.apply_edits` writes the file only on
++  the SUCCESS branch (`self.io.write_text(...)`), so a refused hunk leaves the
++  target byte-for-byte unchanged. The demo simulates this write rule on a
++  temporary copy and asserts the bytes are unchanged.
++
++**Failure signal.** `aider.coders.search_replace.SearchTextNotUnique` is a
++`ValueError` subclass and remains the module's designated ambiguity signal; the
++demo asserts that invariant so `udiff_coder` can keep translating it into the
++`UnifiedDiffNotUnique` message.
++
++## 3. Where the behaviour lives (evidence)
++
++Checked against the repository sources:
++
++| Location | Behaviour used by the contract |
++| --- | --- |
++| `aider/coders/search_replace.py:434-445` — `search_and_replace` | Counts occurrences (l. 437) and returns `original.replace(search, replace)`; returns `None` on 0 matches. The `if num > 1: raise SearchTextNotUnique()` guard is commented out (l. 438-439), so uniqueness is the caller's responsibility. |
++| `aider/coders/search_replace.py:524-525` — `SearchTextNotUnique` | The `ValueError` subclass used as the ambiguity failure signal (imported by `udiff_coder`). |
++| `aider/coders/search_replace.py:565-577` — `flexible_search_and_replace` | Returns the first truthy strategy result; the exact-match strategy runs first (via `all_preprocs`, l. 528-538 and `try_strategy`, l. 586-608). |
++| `aider/coders/search_replace.py:611-614` — `strip_blank_lines` | Normalises only outer blank lines, so interior trailing whitespace stays significant — the fixture's distinguisher survives the flexible path. |
++| `aider/coders/udiff_coder.py:261-279` — `directly_apply_hunk` | The refusal guard: `< 10` non-whitespace characters **and** `content.count(before) > 1` → return `None` (l. 270); `SearchTextNotUnique` → `None` (l. 275-278). |
++| `aider/coders/udiff_coder.py:69-118` — `apply_edits` | Writes only truthy content (`self.io.write_text`, l. 112); errors/`continue` on not-unique (l. 95) or no-match (l. 103) → no partial mutation. |
++
++## 4. Normalized operation result
++
++`python .prale-eval/demo_search_replace_contract.py` → exit code **0**,
++`contract_satisfied: true`, 7/7 checks PASS:
++
++| Check | Result |
++| --- | --- |
++| `fixture_unique_search_occurs_once` (1 unique / 2 non-unique occurrences) | PASS |
++| `C1_search_and_replace_unique_applied_once` | PASS |
++| `C1_directly_apply_hunk_unique_succeeds_once` | PASS |
++| `exact_match_is_whitespace_sensitive` (whitespace-blind search → `None`) | PASS |
++| `C2_nonunique_edit_refused_without_partial_mutation` (returns `None`, file bytes unchanged) | PASS |
++| `observed_hazard_raw_nonunique_call_replaces_all_occurrences` (documented limitation) | PASS |
++| `failure_signal_type_is_documented_exception` | PASS |
++
++## 5. Limitations (recorded, not hidden)
++
++1. **Missing optional dependencies.** `diff_match_patch` and `GitPython` are not
++   installed and `import oslex` fails, so `aider/coders/search_replace.py` and
++   `aider/coders/udiff_coder.py` cannot be imported as-is. The demo installs
++   in-memory stand-in modules for those imports (plus the heavy `aider` /
++   `aider.coders` package `__init__` files) and then imports the **unmodified**
++   repository sources, asserting `sr.__file__` / `uc.__file__` point at the real
++   files. The exact-match path and the refusal guard — the entire subject of this
++   contract — use none of the missing packages. No dependency was installed.
++2. **Rate of application for a raw non-unique call.** Because the raise inside
++   `search_and_replace` is commented out, a raw non-unique
++   `search_and_replace` call rewrites *all* occurrences (the demo records this as
++   `observed_hazard_raw_nonunique_call_replaces_all_occurrences`). The contract's
++   "fail without mutation" guarantee therefore comes from the caller-level guard
++   `udiff_coder.directly_apply_hunk`, which is the path exercised by the demo.
++   For non-unique hunks with a **long** non-whitespace context the `< 10` guard
++   does not trigger; that case is outside this fixture (its context is 8
++   characters) and is not claimed.
++3. **Fuzzy strategies not exercised.** `dmp_apply` / `dmp_lines_apply` and the
++   git-cherry-pick strategies require the missing packages and are out of scope
++   for the exact/non-unique contract.
+diff --git a/.prale-eval/demo_search_replace_contract.py b/.prale-eval/demo_search_replace_contract.py
+new file mode 100644
+index 0000000..194a0a5
+--- /dev/null
++++ b/.prale-eval/demo_search_replace_contract.py
+@@ -0,0 +1,295 @@
++#!/usr/bin/env python
++"""Executable contract demo for task T14 (repository: aider).
++
++Contract under test -- a *distinct newline/whitespace edit fixture*:
++
++  C1  An exact edit whose search text is unique -- here unique only because the
++      fixture distinguishes the two near-twin blocks with trailing whitespace and
++      a blank-line/newline layout -- succeeds and is applied exactly once.
++
++  C2  A non-unique edit (the same search text occurring twice) fails and leaves
++      the target file byte-for-byte unchanged (no partial mutation).
++
++Both properties are verified against the repository's own code:
++
++  * aider/coders/search_replace.py :: search_and_replace  -> exact substring
++    search/replace engine used by every non-fuzzy strategy.
++  * aider/coders/udiff_coder.py   :: directly_apply_hunk   -> caller-level
++    uniqueness guard that refuses a repeated search/replace on a tiny bit of
++    non-whitespace context (and swallows SearchTextNotUnique).
++  * aider/coders/udiff_coder.py   :: apply_edits           -> writes the file
++    only when the hunk produced content, i.e. a refused hunk is never written.
++
++Import shims: this sandbox lacks the optional third-party packages
++``diff_match_patch`` and ``GitPython``, and ``aider.utils`` imports ``oslex``.
++The demo therefore installs in-memory stand-ins for those modules (and for the
++heavy ``aider``/``aider.coders`` package inits) so that the *unmodified* source
++files ``aider/coders/search_replace.py`` and ``aider/coders/udiff_coder.py`` can
++be imported and executed.  No dependency is installed and no repository file is
++modified.
++
++Usage:
++    python .prale-eval/demo_search_replace_contract.py [--json]
++Exit status 0 means the contract is satisfied (C1 and C2 both hold).
++"""
++
++from __future__ import annotations
++
++import json
++import sys
++import tempfile
++import types
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++ROOT = HERE.parent
++FIXTURES = HERE / "fixtures"
++
++
++# --------------------------------------------------------------------------- #
++# import shims
++# --------------------------------------------------------------------------- #
++def _module(name: str) -> types.ModuleType:
++    mod = types.ModuleType(name)
++    sys.modules[name] = mod
++    return mod
++
++
++def install_import_shims() -> None:
++    """Make the repo importable without installing optional dependencies."""
++    if str(ROOT) not in sys.path:
++        sys.path.insert(0, str(ROOT))
++
++    # 1. diff_match_patch (third-party, not installed in this sandbox).
++    dmp_mod = _module("diff_match_patch")
++
++    class diff_match_patch:  # noqa: N801 - mirrors the upstream class name
++        Diff_Timeout = 0
++        Match_Threshold = 0
++        Match_Distance = 0
++        Match_MaxBits = 0
++        Patch_Margin = 0
++
++    dmp_mod.diff_match_patch = diff_match_patch
++
++    # 2. Stub the `aider` / `aider.coders` package __init__ files (they pull in
++    #    the whole coder stack) but keep the real on-disk submodules importable.
++    aider_pkg = _module("aider")
++    aider_pkg.__path__ = [str(ROOT / "aider")]
++    coders_pkg = _module("aider.coders")
++    coders_pkg.__path__ = [str(ROOT / "aider" / "coders")]
++
++    dump_mod = _module("aider.dump")
++    dump_mod.dump = lambda *a, **k: None
++
++    utils_mod = _module("aider.utils")
++
++    class GitTemporaryDirectory:  # only reachable via the cherry-pick paths
++        def __enter__(self):
++            raise RuntimeError("git-cherry-pick strategies are not exercised by this demo")
++
++        def __exit__(self, *exc):
++            return False
++
++    utils_mod.GitTemporaryDirectory = GitTemporaryDirectory
++
++    base_coder_mod = _module("aider.coders.base_coder")
++    base_coder_mod.Coder = object
++
++    udiff_prompts_mod = _module("aider.coders.udiff_prompts")
++    udiff_prompts_mod.UnifiedDiffPrompts = object
++
++
++def load_repo_modules():
++    import importlib
++
++    sr = importlib.import_module("aider.coders.search_replace")
++    uc = importlib.import_module("aider.coders.udiff_coder")
++
++    # Sanity: we really loaded the repository sources, not the stubs.
++    assert Path(sr.__file__).resolve() == (ROOT / "aider" / "coders" / "search_replace.py")
++    assert Path(uc.__file__).resolve() == (ROOT / "aider" / "coders" / "udiff_coder.py")
++    return sr, uc
++
++
++def fixture(name: str) -> str:
++    return (FIXTURES / name).read_text()
++
++
++# --------------------------------------------------------------------------- #
++# checks
++# --------------------------------------------------------------------------- #
++def main(emit_json: bool = False) -> int:
++    install_import_shims()
++    sr, uc = load_repo_modules()
++
++    original = fixture("original.txt")
++    search_unique = fixture("search_unique.txt")
++    replace_unique = fixture("replace_unique.txt")
++    search_ws_blind = fixture("search_whitespace_blind.txt")
++    search_nonunique = fixture("search_nonunique.txt")
++    replace_nonunique = fixture("replace_nonunique.txt")
++
++    checks = []
++
++    def check(name, ok, detail):
++        checks.append({"check": name, "ok": bool(ok), "detail": detail})
++        return bool(ok)
++
++    # --- fixture shape -----------------------------------------------------
++    check(
++        "fixture_unique_search_occurs_once",
++        original.count(search_unique) == 1
++        and original.count(search_nonunique) == 2,
++        {
++            "unique_search_occurrences": original.count(search_unique),
++            "nonunique_search_occurrences": original.count(search_nonunique),
++            "distinguisher": "trailing 3 spaces after paint() in the first block",
++        },
++    )
++
++    # --- C1: exact/unique edit succeeds exactly once -----------------------
++    sr_result = sr.search_and_replace([search_unique, replace_unique, original])
++    expected_unique = original.replace(search_unique, replace_unique, 1)
++    check(
++        "C1_search_and_replace_unique_applied_once",
++        sr_result == expected_unique
++        and sr_result.count(replace_unique) == 1
++        and sr_result.count(search_unique) == 0
++        and sr_result.count("def second():") == 1,
++        {
++            "returned_text_is_none": sr_result is None,
++            "replace_occurrences": None if sr_result is None else sr_result.count(replace_unique),
++            "sibling_block_preserved": None
++            if sr_result is None
++            else sr_result.count("def second():\n    paint()\n    return 1\n") == 1,
++        },
++    )
++
++    # Same edit routed through the caller path used by the udiff coder.
++    hunk_unique = [
++        "-def first():\n",
++        "-    paint()   \n",
++        "-    return 1\n",
++        "+def first():\n",
++        "+    paint()\n",
++        "+    return 1\n",
++    ]
++    caller_unique = uc.directly_apply_hunk(original, hunk_unique)
++    check(
++        "C1_directly_apply_hunk_unique_succeeds_once",
++        caller_unique == expected_unique
++        and caller_unique.count("paint()   ") == 0
++        and caller_unique.count(replace_unique) == 1,
++        {"applied": caller_unique is not None},
++    )
++
++    # --- whitespace-distinctness is load bearing ---------------------------
++    # A whitespace-normalised guess (same lines, no trailing spaces) matches
++    # nothing, so the exact edit is refused rather than applied to the twin.
++    ws_blind = sr.search_and_replace([search_ws_blind, replace_unique, original])
++    check(
++        "exact_match_is_whitespace_sensitive",
++        original.count(search_ws_blind) == 0 and ws_blind is None,
++        {
++            "whitespace_blind_search_occurrences": original.count(search_ws_blind),
++            "search_and_replace_result": ws_blind,
++        },
++    )
++
++    # --- C2: non-unique edit fails without partial mutation ----------------
++    direct_nonunique = sr.search_and_replace([search_nonunique, replace_nonunique, original])
++    hunk_nonunique = ["-    return 1\n", "+    RETURN 1\n"]
++    caller_nonunique = uc.directly_apply_hunk(original, hunk_nonunique)
++
++    # Simulate the apply_edits contract: write only a truthy hunk result.
++    tmpdir = Path(tempfile.mkdtemp(prefix="t14-", dir=HERE))
++    target = tmpdir / "target.txt"
++    target.write_text(original)
++    if caller_nonunique:
++        target.write_text(caller_nonunique)
++    on_disk = target.read_text()
++    target.unlink()
++    tmpdir.rmdir()
++
++    check(
++        "C2_nonunique_edit_refused_without_partial_mutation",
++        caller_nonunique is None and on_disk == original,
++        {
++            "guard_reason": (
++                "directly_apply_hunk refuses when the non-whitespace context is "
++                "<10 chars and content.count(before) > 1 (aider/coders/udiff_coder.py:270)"
++            ),
++            "unique_call_result_is_none": caller_nonunique is None,
++            "file_bytes_unchanged": on_disk == original,
++            "file_changed_after_refusal": on_disk != original,
++        },
++    )
++
++    # Documented hazard / limitation: the uniqueness check inside
++    # search_and_replace is commented out (search_replace.py:437-438), so a raw
++    # non-unique call rewrites every occurrence instead of raising.  Refusal is
++    # therefore the caller's responsibility (udiff_coder.directly_apply_hunk).
++    check(
++        "observed_hazard_raw_nonunique_call_replaces_all_occurrences",
++        direct_nonunique is not None and direct_nonunique.count(replace_nonunique) == 2,
++        {
++            "search_and_replace_result": direct_nonunique,
++            "substitutions": None if direct_nonunique is None else direct_nonunique.count(replace_nonunique),
++            "note": "refusal is enforced one level up, not inside search_and_replace",
++        },
++    )
++
++    check(
++        "failure_signal_type_is_documented_exception",
++        issubclass(sr.SearchTextNotUnique, ValueError),
++        {"exception": "aider.coders.search_replace.SearchTextNotUnique (ValueError subclass)"},
++    )
++
++    contract_ok = all(c["ok"] for c in checks if c["check"].startswith(("C1_", "C2_", "fixture_")))
++
++    summary = {
++        "task_id": "T14",
++        "repository": "aider",
++        "mode": "contract",
++        "demo": ".prale-eval/demo_search_replace_contract.py",
++        "fixtures": ".prale-eval/fixtures/",
++        "modules_under_test": [
++            "aider/coders/search_replace.py",
++            "aider/coders/udiff_coder.py",
++        ],
++        "contract_satisfied": contract_ok,
++        "checks": checks,
++        "limitations": [
++            "diff_match_patch and GitPython are not installed in this sandbox, so the "
++            "fuzzy dmp_* and git-cherry-pick strategies are covered only by import shims; "
++            "the checks exercise the exact-match search_and_replace path and the "
++            "directly_apply_hunk refusal guard, which is the path the contract is about.",
++            "The unique/non-unique guard lives in the *caller* "
++            "(udiff_coder.directly_apply_hunk), not in search_and_replace: the "
++            "SearchTextNotUnique raise inside search_and_replace is commented out, so a raw "
++            "non-unique search_and_replace call rewrites all occurrences "
++            "(recorded as observed_hazard_raw_nonunique_call_replaces_all_occurrences).",
++        ],
++    }
++
++    if emit_json:
++        out = json.dumps(summary, indent=2)
++    else:
++        lines = [
++            "T14 contract demo -- distinct newline/whitespace edit fixture",
++            "=" * 62,
++        ]
++        for c in checks:
++            lines.append(f"[{'PASS' if c['ok'] else 'FAIL'}] {c['check']}")
++            lines.append(f"        {json.dumps(c['detail'])}")
++        lines.append("=" * 62)
++        lines.append(f"contract_satisfied: {contract_ok}")
++        out = "\n".join(lines)
++
++    print(out)
++    return 0 if contract_ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main(emit_json="--json" in sys.argv[1:]))
+diff --git a/.prale-eval/fixtures/original.txt b/.prale-eval/fixtures/original.txt
+new file mode 100644
+index 0000000..369f6ed
+--- /dev/null
++++ b/.prale-eval/fixtures/original.txt
+@@ -0,0 +1,8 @@
++def first():
++    paint()   
++    return 1
++
++
++def second():
++    paint()
++    return 1
+diff --git a/.prale-eval/fixtures/replace_nonunique.txt b/.prale-eval/fixtures/replace_nonunique.txt
+new file mode 100644
+index 0000000..a3c0b38
+--- /dev/null
++++ b/.prale-eval/fixtures/replace_nonunique.txt
+@@ -0,0 +1 @@
++    RETURN 1
+diff --git a/.prale-eval/fixtures/replace_unique.txt b/.prale-eval/fixtures/replace_unique.txt
+new file mode 100644
+index 0000000..fb12906
+--- /dev/null
++++ b/.prale-eval/fixtures/replace_unique.txt
+@@ -0,0 +1,3 @@
++def first():
++    paint()
++    return 1
+diff --git a/.prale-eval/fixtures/search_nonunique.txt b/.prale-eval/fixtures/search_nonunique.txt
+new file mode 100644
+index 0000000..a830c86
+--- /dev/null
++++ b/.prale-eval/fixtures/search_nonunique.txt
+@@ -0,0 +1 @@
++    return 1
+diff --git a/.prale-eval/fixtures/search_unique.txt b/.prale-eval/fixtures/search_unique.txt
+new file mode 100644
+index 0000000..4747bf6
+--- /dev/null
++++ b/.prale-eval/fixtures/search_unique.txt
+@@ -0,0 +1,3 @@
++def first():
++    paint()   
++    return 1
+diff --git a/.prale-eval/fixtures/search_whitespace_blind.txt b/.prale-eval/fixtures/search_whitespace_blind.txt
+new file mode 100644
+index 0000000..fb12906
+--- /dev/null
++++ b/.prale-eval/fixtures/search_whitespace_blind.txt
+@@ -0,0 +1,3 @@
++def first():
++    paint()
++    return 1
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..32df456
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,96 @@
++{
++  "task_id": "T14",
++  "repository": "aider",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "aider/coders/search_replace.py",
++      "symbol": "search_and_replace",
++      "start_line": 434,
++      "end_line": 445,
++      "observation": "The exact-match edit engine: it counts occurrences of search_text in original_text (line 437) and, when the count is non-zero, returns original_text.replace(search_text, replace_text). Because the guard `# if num > 1: raise SearchTextNotUnique()` is commented out at lines 438-439, a unique search text is applied exactly once, a search text that appears twice would be rewritten at every occurrence, and a search text that appears zero times makes the function return None so nothing is mutated. This is the primitive the T14 contract pins down: exact (byte-for-byte, whitespace/newline-significant) matching, and the fact that uniqueness must be enforced by the caller."
++    },
++    {
++      "path": "aider/coders/search_replace.py",
++      "symbol": "SearchTextNotUnique",
++      "start_line": 524,
++      "end_line": 525,
++      "observation": "The designated failure signal for an ambiguous edit: a ValueError subclass exported from this module and imported by aider/coders/udiff_coder.py (line 8). It is the contract's distinction between 'edit failed cleanly' (raise / falsy result, file untouched) and 'edit silently applied to several places' (multi-occurrence str.replace). The demo asserts it stays a ValueError subclass so callers can keep translating it into the UnifiedDiffNotUnique error message."
++    },
++    {
++      "path": "aider/coders/search_replace.py",
++      "symbol": "flexible_search_and_replace",
++      "start_line": 565,
++      "end_line": 577,
++      "observation": "Dispatcher over (strategy, preproc) pairs that returns the first truthy result, i.e. the exact-match search_and_replace strategy is always attempted first (see editblock_strategies/udiff_strategies at lines 547-563 and the caller udiff_coder.flexi_just_search_and_replace at lines 201-206, which uses only (search_and_replace, all_preprocs)). Consequently a unique, byte-exact match is resolved once by search_and_replace without ever reaching the fuzzy diff-match-patch strategies, and a non-matching attempt returns None so the caller's refusal path stays clean."
++    },
++    {
++      "path": "aider/coders/search_replace.py",
++      "symbol": "strip_blank_lines",
++      "start_line": 611,
++      "end_line": 614,
++      "observation": "Whitespace/newline normalisation used by the preproc tuples in all_preprocs (lines 528-538) and applied by try_strategy (lines 586-608). It only trims leading/trailing blank lines of the three texts, so interior whitespace - such as the trailing spaces that make the T14 fixture's two blocks distinct - remains significant, and a whitespace-blind search text still fails to match. This is why the fixture's exact edit succeeds exactly once instead of being normalised onto the near-twin block."
++    },
++    {
++      "path": "aider/coders/udiff_coder.py",
++      "symbol": "directly_apply_hunk",
++      "start_line": 261,
++      "end_line": 279,
++      "observation": "The caller-level uniqueness guard: after building before/after from the hunk it computes the non-whitespace context length (lines 267-268) and returns None, i.e. refuses the edit, when `len(before_lines) < 10 and content.count(before) > 1` (line 270) - the exact situation of the T14 non-unique edit, whose search text `    return 1\\n` occurs twice with only 8 non-whitespace characters. It also catches SearchTextNotUnique (lines 275-278) and turns it into None, so ambiguity always yields a clean failure rather than a partial rewrite."
++    },
++    {
++      "path": "aider/coders/udiff_coder.py",
++      "symbol": "apply_edits",
++      "start_line": 69,
++      "end_line": 118,
++      "observation": "The write path that makes 'fails without partial mutation' concrete: `content = do_replace(...)` (line 94), and on SearchTextNotUnique (line 95) or a falsy result (line 103) it appends an error and `continue`s, reaching `self.io.write_text(full_path, content)` (line 112) only on SUCCESS. A hunk refused by directly_apply_hunk therefore never reaches the filesystem, which the demo checks by simulating this contract on a temporary file and comparing bytes."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "An exact edit whose search text occurs exactly once is applied exactly once and does not touch the near-twin block: search_and_replace([search, replace, original]) returns original with a single substitution (the demo compares against original.replace(search, replace, 1) and confirms the second block `def second():` survives verbatim).",
++      "evidence_paths": [
++        "aider/coders/search_replace.py"
++      ]
++    },
++    {
++      "claim": "Matching is byte-exact with respect to whitespace and newlines: the fixture's two blocks differ only by trailing spaces after `paint()` plus the surrounding blank lines, and a whitespace-blind search text (`paint()` without the trailing spaces) occurs 0 times, so search_and_replace returns None and leaves the text unchanged.",
++      "evidence_paths": [
++        "aider/coders/search_replace.py"
++      ]
++    },
++    {
++      "claim": "A non-unique edit fails instead of being applied: for the ambiguous search text `    return 1\\n` (2 occurrences, 8 non-whitespace characters) directly_apply_hunk returns None via its `len(before_lines) < 10 and content.count(before) > 1` refusal, and SearchTextNotUnique remains the module-level exception used when the ambiguity is detected by the search/replace strategy itself.",
++      "evidence_paths": [
++        "aider/coders/search_replace.py",
++        "aider/coders/udiff_coder.py"
++      ]
++    },
++    {
++      "claim": "The failure is free of partial mutation: apply_edits writes the file only on the SUCCESS branch, so a refused hunk leaves the target file byte-for-byte identical (verified by the demo, which applies the contract on a temporary copy and asserts the bytes are unchanged).",
++      "evidence_paths": [
++        "aider/coders/udiff_coder.py",
++        "aider/coders/search_replace.py"
++      ]
++    },
++    {
++      "claim": "Uniqueness is decided on the exact text first, before any whitespace-normalising or fuzzy retry: flexible_search_and_replace returns the first truthy strategy result and the udiff path tries (search_and_replace, all_preprocs) before any diff-match-patch strategy, while strip_blank_lines only trims outer blank lines so the fixture's interior whitespace distinction is preserved.",
++      "evidence_paths": [
++        "aider/coders/search_replace.py"
++      ]
++    },
++    {
++      "claim": "Documented limitation recorded by the demo: the SearchTextNotUnique raise inside search_and_replace is commented out (lines 438-439), so a raw non-unique call rewrites all occurrences; the contract's refusal is therefore enforced one level up by udiff_coder.directly_apply_hunk, which the demo observes as `observed_hazard_raw_nonunique_call_replaces_all_occurrences`.",
++      "evidence_paths": [
++        "aider/coders/search_replace.py",
++        "aider/coders/udiff_coder.py"
++      ]
++    }
++  ],
++  "conclusion": "Contract satisfied for the distinct newline/whitespace edit fixture. Using the repository's own code (aider/coders/search_replace.py search_and_replace plus the uniqueness guard in aider/coders/udiff_coder.py directly_apply_hunk/apply_edits): (C1) the fixture's exact edit is unique only because of whitespace/newline detail (trailing spaces after `paint()`, blank-line layout); it matches once and is applied exactly once, leaving the sibling block byte-identical, and a whitespace-blind variant matches zero times and is refused; (C2) the non-unique edit (`    return 1` occurring twice with an 8-character non-whitespace context) is refused - directly_apply_hunk returns None - and applying the apply_edits write rule on a temporary copy leaves the file byte-for-byte unchanged, so no partial mutation occurs. The demo runs green (exit 0, 7/7 checks PASS) with the repository sources imported via in-memory shims because diff_match_patch, GitPython and oslex are absent from this sandbox; the fuzzy dmp_* and git-cherry-pick strategies are outside the scope of this contract and were not exercised.",
++  "validation": {
++    "command": "python .prale-eval/demo_search_replace_contract.py",
++    "status": "pass",
++    "notes": "Run from the repository root (/tmp/prale-real-eval-jl54twwo/workspace); exit code 0, all 7 checks PASS and contract_satisfied=true (both `python .prale-eval/demo_search_replace_contract.py` and `... --json` runs are captured in .prale-eval/validation-log.txt). The demo reads fixtures from .prale-eval/fixtures/ and never modifies a repository file; its write-path check uses a temporary directory created under .prale-eval/ and removes it again. LIMITATION: the optional dependencies diff_match_patch and GitPython are not installed and `import oslex` fails, so aider/coders/search_replace.py and aider/coders/udiff_coder.py cannot be imported directly; the demo installs in-memory stand-in modules for them (and for the heavy aider/aider.coders package __init__ files) and then imports the unmodified repository sources, which it asserts via sr.__file__/uc.__file__. The exact-match search_and_replace path and the directly_apply_hunk refusal guard - the behaviour this contract is about - need none of the missing packages; the fuzzy dmp_* and git-cherry-pick strategies were not exercised. No dependencies were installed."
++  }
++}
+diff --git a/.prale-eval/validation-log.txt b/.prale-eval/validation-log.txt
+new file mode 100644
+index 0000000..828cd6f
+--- /dev/null
++++ b/.prale-eval/validation-log.txt
+@@ -0,0 +1,95 @@
++T14 contract demo -- distinct newline/whitespace edit fixture
++==============================================================
++[PASS] fixture_unique_search_occurs_once
++        {"unique_search_occurrences": 1, "nonunique_search_occurrences": 2, "distinguisher": "trailing 3 spaces after paint() in the first block"}
++[PASS] C1_search_and_replace_unique_applied_once
++        {"returned_text_is_none": false, "replace_occurrences": 1, "sibling_block_preserved": true}
++[PASS] C1_directly_apply_hunk_unique_succeeds_once
++        {"applied": true}
++[PASS] exact_match_is_whitespace_sensitive
++        {"whitespace_blind_search_occurrences": 0, "search_and_replace_result": null}
++[PASS] C2_nonunique_edit_refused_without_partial_mutation
++        {"guard_reason": "directly_apply_hunk refuses when the non-whitespace context is <10 chars and content.count(before) > 1 (aider/coders/udiff_coder.py:270)", "unique_call_result_is_none": true, "file_bytes_unchanged": true, "file_changed_after_refusal": false}
++[PASS] observed_hazard_raw_nonunique_call_replaces_all_occurrences
++        {"search_and_replace_result": "def first():\n    paint()   \n    RETURN 1\n\n\ndef second():\n    paint()\n    RETURN 1\n", "substitutions": 2, "note": "refusal is enforced one level up, not inside search_and_replace"}
++[PASS] failure_signal_type_is_documented_exception
++        {"exception": "aider.coders.search_replace.SearchTextNotUnique (ValueError subclass)"}
++==============================================================
++contract_satisfied: True
++{
++  "task_id": "T14",
++  "repository": "aider",
++  "mode": "contract",
++  "demo": ".prale-eval/demo_search_replace_contract.py",
++  "fixtures": ".prale-eval/fixtures/",
++  "modules_under_test": [
++    "aider/coders/search_replace.py",
++    "aider/coders/udiff_coder.py"
++  ],
++  "contract_satisfied": true,
++  "checks": [
++    {
++      "check": "fixture_unique_search_occurs_once",
++      "ok": true,
++      "detail": {
++        "unique_search_occurrences": 1,
++        "nonunique_search_occurrences": 2,
++        "distinguisher": "trailing 3 spaces after paint() in the first block"
++      }
++    },
++    {
++      "check": "C1_search_and_replace_unique_applied_once",
++      "ok": true,
++      "detail": {
++        "returned_text_is_none": false,
++        "replace_occurrences": 1,
++        "sibling_block_preserved": true
++      }
++    },
++    {
++      "check": "C1_directly_apply_hunk_unique_succeeds_once",
++      "ok": true,
++      "detail": {
++        "applied": true
++      }
++    },
++    {
++      "check": "exact_match_is_whitespace_sensitive",
++      "ok": true,
++      "detail": {
++        "whitespace_blind_search_occurrences": 0,
++        "search_and_replace_result": null
++      }
++    },
++    {
++      "check": "C2_nonunique_edit_refused_without_partial_mutation",
++      "ok": true,
++      "detail": {
++        "guard_reason": "directly_apply_hunk refuses when the non-whitespace context is <10 chars and content.count(before) > 1 (aider/coders/udiff_coder.py:270)",
++        "unique_call_result_is_none": true,
++        "file_bytes_unchanged": true,
++        "file_changed_after_refusal": false
++      }
++    },
++    {
++      "check": "observed_hazard_raw_nonunique_call_replaces_all_occurrences",
++      "ok": true,
++      "detail": {
++        "search_and_replace_result": "def first():\n    paint()   \n    RETURN 1\n\n\ndef second():\n    paint()\n    RETURN 1\n",
++        "substitutions": 2,
++        "note": "refusal is enforced one level up, not inside search_and_replace"
++      }
++    },
++    {
++      "check": "failure_signal_type_is_documented_exception",
++      "ok": true,
++      "detail": {
++        "exception": "aider.coders.search_replace.SearchTextNotUnique (ValueError subclass)"
++      }
++    }
++  ],
++  "limitations": [
++    "diff_match_patch and GitPython are not installed in this sandbox, so the fuzzy dmp_* and git-cherry-pick strategies are covered only by import shims; the checks exercise the exact-match search_and_replace path and the directly_apply_hunk refusal guard, which is the path the contract is about.",
++    "The unique/non-unique guard lives in the *caller* (udiff_coder.directly_apply_hunk), not in search_and_replace: the SearchTextNotUnique raise inside search_and_replace is commented out, so a raw non-unique search_and_replace call rewrites all occurrences (recorded as observed_hazard_raw_nonunique_call_replaces_all_occurrences)."
++  ]
++}
+diff --git a/aider/__pycache__/__init__.cpython-312.pyc b/aider/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..bd68a305dd746c35c47805502d02f36c5d0409c6
+GIT binary patch
+literal 751
+zcmZ`$&ubb%82!ds-Cb8xD^?pzf2FoWMGYkV1x-PuCn4v?%d%vrqOQ8kZZvwbJsAk}
+z*c@{zhC<ta!E;a6i!1~JJrzpXHkV>AoiW;yL%+k@`M&q&eUF__!Jr>lebYi!7Xf_X
+z&7y?);p{s*ya63_WI!F25CYv(@(@o6%Y2Frq0V{)9w0vAdB=Qs5pfq$nPA=9WgXX-
+zQAzGdGS{JMXePP<|L*=*ffw#I4*>Ntci%<#J3zb%pb`Sc3Fq849Bj2=4{t*o&3R?U
+ziwk~{ZJ|oaUwN`5a>N#)R;AhK`q#3L9%R?EI%%=7qN;O3Rl8!kQa78_?t0U9$0Y1y
+z5X<WN(xyf&vX%5ZvZ?LVv~s0UrkMFs{%f6prM(~v8)r$Y=!9nf_VTm69b(#SwIgs>
+z2U|9EyfaHjR8`F|RP`9nc+TnLoLx6_Ce;j*p+qw>q{X0W+~2U<?Pjjsq&160Ai3F+
+zoT^qD6<bxaW@jorsW<gqgFL1DMflrU?-{rlA#?)QPnY67WpXLr3%CMC=@TLKLjpnS
+zD`OlvER68YN%+Q5Y!qJY72Oa7V*SiZ(G3dT>_oZRfB1THfAjF#Sh+h04#W?^<KRbQ
+zyju9I6ejU|gV-p()-Sr!{MIjb8KlcU0iiVaTpoo}uZlcI`nMZ~z!k<Y*XYX8^HDUj
+qube8;*)EYyr`8IKeBjGR;B6|OfMLX+zm12t5XXc+zk!GAh~XbA<iErK
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/utils.cpython-312.pyc b/aider/__pycache__/utils.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..494d2241c9e6ade9d3518da585aaafae49edc4af
+GIT binary patch
+literal 14768
+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
+N<JL2*iwzmG{{O(6TI>J-
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/coders/__pycache__/search_replace.cpython-312.pyc b/aider/coders/__pycache__/search_replace.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..4f3af08c4d5854e0fbb2e84b65ad7c1f9438b757
+GIT binary patch
+literal 23462
+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
+WUdp*59F(~4Nv4BU`tP}Uxc?X4+VBDZ
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/coders/__pycache__/udiff_coder.cpython-312.pyc b/aider/coders/__pycache__/udiff_coder.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b69d62376ce074f0aa67283ea9ae879ed01bb071
+GIT binary patch
+literal 12916
+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
+
+literal 0
+HcmV?d00001
+
+snapshot .prale-eval/contract-deliverable.md - c811fba5d7d98bf9a5fc8cf8677b17e4c0204ce9d8599f2ace957fc7678a965d
+snapshot .prale-eval/demo_search_replace_contract.py - 0c7d4c583c156aec9a5afdcb488f4af4e3f2e7a60c74ec3708c00968a8324460
+snapshot .prale-eval/fixtures/original.txt - 4a975add655c5124e31089a4a14f6017543128387ce8cdc5f29d599029baee49
+snapshot .prale-eval/fixtures/replace_nonunique.txt - 858b4ff4dbafa33325191fb02f52cb710fe14e3008ccd57848bb4f66561d9116
+snapshot .prale-eval/fixtures/replace_unique.txt - 846c94915d697fa8f317c2828f7d18251a731df14773e43fe35ae8bf335eba35
+snapshot .prale-eval/fixtures/search_nonunique.txt - c75efa0f041a772c118bec449e5e37111795300cdffa507955c18a3e298d55b0
+snapshot .prale-eval/fixtures/search_unique.txt - 9a8be9708a9d336893391d914797ee0d9f2f69591486dd6df1f844a36364f819
+snapshot .prale-eval/fixtures/search_whitespace_blind.txt - 846c94915d697fa8f317c2828f7d18251a731df14773e43fe35ae8bf335eba35
+snapshot .prale-eval/result.json - c98e0679028120d901558d62d478f1e7ace43286ffdcac6f6d3a57f8d33d2f2d
+snapshot .prale-eval/validation-log.txt - bd9799918f563108fbbe5414035edae74fa016b1e1393afefa84bd8085796cac
+snapshot aider/__pycache__/__init__.cpython-312.pyc - da3af12bcd554a1b9d614cc06ef07eb3f5361a4ee10d1e9c5bf3a43cfeaf28df
+snapshot aider/__pycache__/utils.cpython-312.pyc - 61ec35ad75a22ff7c90131c67da4fe730fb2aeb5c664351643040222a4b3b7f4
+snapshot aider/coders/__pycache__/search_replace.cpython-312.pyc - ec56db7458033a2efb8443feb4b7f65eb0fd1d113f001a0e64cd601c51ca9198
+snapshot aider/coders/__pycache__/udiff_coder.cpython-312.pyc - 617a1fa6cb116d2deef0ac3556ef212dfd88b85e902ac5a38b099068416d158e

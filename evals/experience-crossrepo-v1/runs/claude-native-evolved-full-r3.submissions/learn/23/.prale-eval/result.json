@@ -1,0 +1,134 @@
+{
+  "task_id": 23,
+  "repository": "tdam",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/kernel/headers.ts",
+      "symbol": "META_HEADER_SERVICE_ID",
+      "start_line": 1,
+      "end_line": 8,
+      "observation": "Single source of truth for the three kernel v3 meta headers used on both the inbound path and outbound forwarding: x-tdai-service-id (carries the panel instance id, i.e. serviceId), x-tdai-user-key (caller identity), and x-request-id (correlation id). Because the same constants are imported by the validator and by transport-fetch, the panel can never drift between the header it validates and the header it forwards."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/request-logger.ts",
+      "symbol": "requestLogger",
+      "start_line": 36,
+      "end_line": 72,
+      "observation": "First stage of the trace. The middleware reads x-request-id from the inbound request and falls back to randomUUID() (line 38), stores it as ctx.var.reqId and a child logger on ctx.var.log (41-42), and echoes it back on the response header (43). The finally block maps status to log level (5xx=error, 4xx=warn, 2xx=info) and suppresses info noise for static assets and successful /health checks. Because reqId is set here before routing, every later envelope — success, validation error, or the app.onError INTERNAL envelope — can stamp the same request_id."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/app.ts",
+      "symbol": "buildPanelApp",
+      "start_line": 17,
+      "end_line": 59,
+      "observation": "Composition root of the panel HTTP surface. Line 20 installs requestLogger on '*' so every request gets (or inherits) an x-request-id and a ctx.var.reqId before routing. Lines 24-37 register the /api/v1 sub-app, including registerMetaProxyRoutes(api, deps) at line 26, then mount it at API_PREFIX='/api/v1' (line 15, line 37). Lines 39-48 are the terminal error handler: any unhandled throw is logged and converted into the same 4-field control envelope {code:500, message:'INTERNAL', request_id, data:null} with HTTP 500. Lines 50-56 add the static/SPA fallback, deliberately letting /api/* and /health fall through so API responses are never swallowed by index.html."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "mapHttpStatusFromEnvelopeCode",
+      "start_line": 3,
+      "end_line": 15,
+      "observation": "Defines the kernel response envelope contract MetaEnvelope<T> = {code, message, request_id, data} (lines 3-8) and the single mapping used to turn an envelope code into an HTTP status (lines 11-15): 400-599 map through unchanged, code 0 maps to 200, and everything else (1xx/2xx/3xx or 6xx+, e.g. not-in-scope/unknown codes) collapses to 502. This is what makes the panel a transparent meta-proxy: business codes from the kernel survive to the client, while protocol-level oddities are reported as Bad Gateway rather than leaking a bogus status."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondEnvelope",
+      "start_line": 5,
+      "end_line": 25,
+      "observation": "Panel-side envelope helpers. controlEnvelope (5-16) builds a MetaEnvelope<null> with data:null; respondEnvelope (18-20) serializes an envelope with c.json using mapHttpStatusFromEnvelopeCode(envelope.code) so the HTTP status always agrees with the body code; respondControlError (22-25) reads c.get('reqId') and stamps it into request_id, so locally generated errors still carry the same correlation id as proxied kernel responses."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 63,
+      "observation": "The header-validation stage of the trace. It derives the action from the path suffix after '/meta/' (readAction, 24-29), requires x-tdai-service-id (MISSING_INSTANCE_ID -> 400), resolves the instance through deps.instanceRegistry.resolve (INVALID_INSTANCE -> 400 on registry code 400; other errors rethrow to the app onError handler), then requires x-tdai-user-key unless the action is exactly 'auth/verify' (MISSING_USER_KEY -> 400). On success it publishes a PanelMetaContext {instanceId, gatewayEndpoint, gatewayApiKey, userKey} into c.set('panelMeta') for the route and adapter to consume."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+      "symbol": "registerMetaProxyRoutes",
+      "start_line": 148,
+      "end_line": 219,
+      "observation": "The route stage. It registers POST /meta/* guarded by validatePanelMetaHeaders (line 149), rejects empty action (404 UNKNOWN_META_ACTION), out-of-scope actions (501 NOT_IN_SCOPE) and non-allow-listed actions (404). It parses the JSON body defensively, assembles the MetaCallContext from c.get('panelMeta') plus c.get('reqId') (170-177), runs the pre-write duplicate check for create actions, and finally calls deps.metaKernel.invoke(action, body, ctx) (204) and returns the kernel envelope through respondEnvelope (218). Local-only branches (agent/get-default-template) still emit a synthesized code:0 envelope, so every exit path is an envelope."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+      "symbol": "FetchMetaKernelAdapter",
+      "start_line": 6,
+      "end_line": 25,
+      "observation": "The adapter stage boundary. invoke() sanitizes the body (sanitizeBody strips limit/offset for non-list actions so stray pagination params cannot leak into single-entity calls), recomputes omitUserKey for 'auth/verify' independently of the middleware (defense in depth: auth/verify must never forward a user key), converts the MetaCallContext into KernelCredentials via toKernelCredentials, and posts to the fixed kernel path `/v3/meta/${action}` through the KernelHttpPort. Note both FetchMetaKernelAdapter and FetchKernelHttpAdapter are injected as deps.metaKernel / the http port, so the route depends on ports, not on fetch."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+      "symbol": "FetchKernelHttpAdapter",
+      "start_line": 10,
+      "end_line": 47,
+      "observation": "Concrete transport adapter used in envelope mode. postEnvelope delegates to executeMetaFetch(..., 'envelope'), so a non-zero kernel business code is returned to the caller rather than thrown. When the transport itself fails it catches KernelFetchError and manufactures a well-formed MetaEnvelope with the same shape: code 504 -> 'KERNEL_TIMEOUT', 502 -> 'KERNEL_UNAVAILABLE', otherwise the error message; request_id is taken from cred.requestId and data is null. This is why downstream route code can treat transport failure and kernel failure uniformly."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/transport-fetch.ts",
+      "symbol": "executeMetaFetch",
+      "start_line": 125,
+      "end_line": 232,
+      "observation": "The outbound hop. It normalizes the endpoint, applies a 15s default timeout via AbortController (142-143), writes the outbound headers from the shared constants at 145-151: Content-Type, x-tdai-service-id = serviceId, x-request-id = reqId (reused from the panel request id when provided, else a fresh UUID at line 135), optional Authorization: Bearer apiKey, and x-tdai-user-key only when a userKey is present. It validates the raw JSON is actually an envelope (missing/non-numeric code -> KernelFetchError 502), normalizes defaults (message 'ok', request_id falls back to reqId, data to {}), and in 'envelope' mode logs non-zero codes as errors but still returns the envelope. Timeout becomes 504, any other transport error 502."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "A panel request enters through buildPanelApp, where the requestLogger middleware is mounted on '*' before any route, minting or inheriting x-request-id and storing it as ctx.var.reqId that later becomes the envelope request_id.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/app.ts",
+        "MemoryPanel/src/panel/http/middleware/request-logger.ts"
+      ]
+    },
+    {
+      "claim": "buildPanelApp only mounts the HTTP surface (request logger, /api/v1 sub-app including the meta proxy, error handler, static fallback); it holds no header-validation, adapter or envelope logic itself, keeping routing composition separate from request processing.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/app.ts"
+      ]
+    },
+    {
+      "claim": "The meta envelope contract is MetaEnvelope<T>={code,message,request_id,data} and mapHttpStatusFromEnvelopeCode is the single code->HTTP-status rule: 400-599 pass through, 0 becomes 200, and any other code becomes 502, so kernel business codes survive to the client while unknown codes surface as Bad Gateway.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/envelope.ts"
+      ]
+    },
+    {
+      "claim": "Header validation for POST /api/v1/meta/* is enforced by validatePanelMetaHeaders: x-tdai-service-id must resolve via the instance registry, x-tdai-user-key is required unless the action is exactly 'auth/verify', and failures short-circuit as 400 control envelopes built by respondControlError with data:null.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/http/envelope.ts"
+      ]
+    },
+    {
+      "claim": "The route stage (registerMetaProxyRoutes) validates the action against the allow-list, builds a MetaCallContext from the validated panelMeta plus reqId, and always answers with an envelope: either the kernel envelope passed straight through respondEnvelope, or a locally synthesized envelope for panel-only actions such as agent/get-default-template.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+        "MemoryPanel/src/panel/http/envelope.ts"
+      ]
+    },
+    {
+      "claim": "The adapter hop converts MetaCallContext into KernelCredentials (toKernelCredentials) and posts /v3/meta/${action}; userKey is intentionally dropped for 'auth/verify' at both the middleware and the adapter, and limit/offset are stripped for non-list actions before forwarding.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+        "MemoryPanel/src/panel/kernel/types.ts",
+        "MemoryPanel/src/panel/http/routes/meta/proxy.ts"
+      ]
+    },
+    {
+      "claim": "Outbound forwarding re-emits the same header names that were validated inbound (x-tdai-service-id, x-tdai-user-key) plus x-request-id and Bearer apiKey, and transport failures are normalized back into envelope shape (504 timeout / 502 unavailable) so callers never have to handle raw fetch errors.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/transport-fetch.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts"
+      ]
+    }
+  ],
+  "conclusion": "A request through the TencentDB Agent Memory panel flows through four decoupled stages. (1) Header/correlation: buildPanelApp installs requestLogger on '*' (app.ts:20), which reuses or generates x-request-id and stores it as ctx.var.reqId. (2) Route + header validation: POST /api/v1/meta/* is registered at app.ts:26 and mounted under '/api/v1' (app.ts:37); validatePanelMetaHeaders resolves x-tdai-service-id to a gateway endpoint/api key via the instance registry and requires x-tdai-user-key unless the action is 'auth/verify', publishing a PanelMetaContext; failures return 400 control envelopes. The route then allow-lists the action, assembles a MetaCallContext from panelMeta + reqId, and invokes the kernel port. (3) Adapter: FetchMetaKernelAdapter sanitizes the body, re-drops userKey for auth/verify, converts the context to KernelCredentials and posts /v3/meta/${action}; FetchKernelHttpAdapter runs it in 'envelope' mode via executeMetaFetch, which forwards x-tdai-service-id/x-request-id/Bearer/x-tdai-user-key and maps transport failures to code 504/502 synthetic envelopes. (4) Response envelope: every exit path returns MetaEnvelope{code,message,request_id,data}; http/envelope.ts respondEnvelope sets the HTTP status via mapHttpStatusFromEnvelopeCode (0->200, 400-599->code, else 502), so kernel business codes pass through unchanged, and unhandled errors fall to app.onError which emits {code:500,message:'INTERNAL',request_id,data:null}. The design keeps composition (app.ts), validation (middleware), routing (proxy.ts), transport (adapters) and the envelope contract (kernel/envelope.ts) each in one place, with the shared header constants guaranteeing inbound validation and outbound forwarding cannot drift.",
+  "validation": {
+    "command": "cd /tmp/prale-real-eval-4_tmth15/workspace && node -e \"const fs=require('fs');const r=JSON.parse(fs.readFileSync('.prale-eval/result.json','utf8'));if(r.task_id!==23||r.repository!=='tdam'||r.mode!=='explore')throw new Error('metadata mismatch');const paths=new Set(r.evidence.map(e=>e.path));for(const p of ['MemoryPanel/src/panel/http/app.ts','MemoryPanel/src/panel/kernel/envelope.ts']){if(!paths.has(p))throw new Error('missing evidence '+p);if(!r.claims.some(c=>c.evidence_paths.includes(p)))throw new Error('missing claim '+p);}for(const e of r.evidence){const lines=fs.readFileSync(e.path,'utf8').split('\\\\n');const body=lines.slice(e.start_line-1,e.end_line).join('\\\\n');if(!body.includes(e.symbol))throw new Error('symbol not in range: '+e.path+' '+e.symbol);}console.log('result.json OK: metadata, evidence paths, claims, and symbol/line ranges verified');\"",
+    "status": "passed",
+    "notes": "Run from the workspace root with the system Node (v24.14.0). Verification is pure JSON/structure plus line-range containment against the cited source files; no network or dependency install is involved. Because MemoryPanel has no node_modules and ships no test files (package.json declares vitest, but src contains no *.test.ts and no tests/ directory exists), the declared `npm test` / `tsc --noEmit` validation could not be executed and was replaced by this self-contained script — this limitation is recorded here as required."
+  }
+}

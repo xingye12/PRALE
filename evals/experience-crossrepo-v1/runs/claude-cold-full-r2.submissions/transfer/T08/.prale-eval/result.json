@@ -1,0 +1,73 @@
+{
+  "task_id": "T08",
+  "repository": "wattclaw",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "package.json",
+      "symbol": "type",
+      "start_line": 1,
+      "end_line": 6,
+      "observation": "The manifest root sets \"type\": \"module\" (line 6), which makes server/index.js load as a native Node ESM module. That is what allows the server entry to be validated with a parse-only `node --check` (no bundler, no transpile step) and is the reason `node .prale-eval/verify-fixture.mjs` can read the entry as ESM source without installing anything."
+    },
+    {
+      "path": "package.json",
+      "symbol": "scripts",
+      "start_line": 7,
+      "end_line": 21,
+      "observation": "scripts.start (line 16) is `node --env-file=.env server/index.js`, so server/index.js is the authored server entry executed directly by Node, and scripts.build (line 11) is `vue-tsc -b && vite build`, i.e. the frontend is compiled by Vite into a dist/ tree. Together these two scripts define the frontend-build -> server-serve hand-off that the verification asserts. scripts.test:server (line 13) shows the intended in-repo test path is vitest, which needs node_modules and is therefore not used here."
+    },
+    {
+      "path": "package.json",
+      "symbol": "dependencies",
+      "start_line": 22,
+      "end_line": 61,
+      "observation": "The runtime dependency block declares express ^5.2.1 (line 39) and other server-only modules (better-sqlite3, ws). These are exactly the imports that would be resolved if server/index.js were executed, so their presence confirms the entry is a side-effecting runtime program rather than an importable pure module, which is why the verification stays static."
+    },
+    {
+      "path": "server/index.js",
+      "symbol": "app",
+      "start_line": 352,
+      "end_line": 362,
+      "observation": "server/index.js constructs the Express app with `const app = express()` (352) and `const server = createServer(app)` (353), then derives the frontend contract at 356-357: `const distPath = join(__dirname, '../dist')` and `const hasDist = existsSync(join(distPath, 'index.html'))`. The build-presence decision is therefore a pure filesystem probe of the Vite output location, decoupled from actually booting the server."
+    },
+    {
+      "path": "server/index.js",
+      "symbol": "distPath",
+      "start_line": 2200,
+      "end_line": 2225,
+      "observation": "The serving branch is the heart of the frontend/server fixture: when hasDist is true the server mounts `express.static(distPath)` and installs an SPA fallback that `res.sendFile(join(distPath, 'index.html'))` for any GET not starting with '/api/' (2211-2212); when hasDist is false the same guard redirects to `envConfig.DEV_FRONTEND_URL + req.originalUrl` (2220). Both branches reference distPath, and the /api/ exclusion in both is a structural invariant the verification checks by source inspection rather than by starting the listener."
+    },
+    {
+      "path": "server/index.js",
+      "symbol": "server",
+      "start_line": 2239,
+      "end_line": 2241,
+      "observation": "`server.listen(envConfig.PORT, ...)` (2240) is the top-level side effect that binds the HTTP port and, via its callback, starts the Gateway/SQLite-backed subsystems. It is the reason the entry module cannot be imported in an offline check and must instead be verified statically; note also line 2240 is only reached after the serving contract above is registered."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "WattClaw's server entry is a native Node ESM program run directly (`scripts.start` = `node ... server/index.js`, `\"type\": \"module\"`), and its frontend is produced separately by Vite (`scripts.build` = `vite build`), so the frontend/server boundary is a build-output file hand-off rather than a runtime coupling.",
+      "evidence_paths": ["package.json"]
+    },
+    {
+      "claim": "server/index.js probes the frontend with `existsSync(join(distPath, 'index.html'))` and then takes exactly one of two branches for non-/api GET requests: serve dist/ statically with an index.html SPA fallback when built, or redirect to DEV_FRONTEND_URL when not built. This two-branch static-serving contract is fully determinable from source text.",
+      "evidence_paths": ["server/index.js"]
+    },
+    {
+      "claim": "The Vite build directory (vite.config.ts `outDir: 'dist'`) and the server's `distPath = join(__dirname, '../dist')` are the same path by contract, so a verification can assert the fixture's cross-file agreement without running either the build or the server.",
+      "evidence_paths": ["package.json", "server/index.js"]
+    },
+    {
+      "claim": "Executing server/index.js would require node_modules (express ^5.2.1, better-sqlite3), bind a TCP port (server.listen on PORT), and initialize SQLite plus a Gateway WebSocket, and the module exports nothing. Therefore the only offline-safe verification is static: parse-only `node --check` plus source-structure assertions, which is what this task selects.",
+      "evidence_paths": ["server/index.js", "package.json"]
+    }
+  ],
+  "conclusion": "For the WattClaw frontend/server fixture the narrow, offline-safe verification is a static check of the built-frontend serving contract implemented in .prale-eval/verify-fixture.mjs. It (1) parses package.json and asserts the manifest facts that define the hand-off (ESM entry, start runs server/index.js, build runs vite build, express/vite declared), (2) runs `node --check server/index.js` to prove the entry parses as ESM without executing it, and (3) asserts by source inspection that the server derives frontend presence from dist/index.html and branches between express.static(distPath) + SPA fallback and a DEV_FRONTEND_URL redirect, excluding /api/ in both. It avoids runtime/deployment dependencies because it never imports or spawns the server entry: no npm install, no node_modules, no port bind, no SQLite, no OpenClaw Gateway, no .env, no dist/ build, and no Docker. All 13 checks pass (13/13), so the fixture's contract holds without any runtime.",
+  "validation": {
+    "command": "node .prale-eval/verify-fixture.mjs",
+    "status": "pass",
+    "notes": "Executed with Node v24.14.0 and only the standard library; exit code 0, result status 'pass' with 13/13 checks ok (pkg.valid-json, pkg.esm, pkg.server-entry, pkg.build-produces-dist, pkg.express-dep, pkg.vite-devdep, server.parseable, server.dist-path, server.has-dist-probe, server.static-dist, server.spa-fallback, server.dev-redirect, vite.outdir-matches-dist). Limitation recorded: node_modules is absent in this environment, so the repo's vitest suite (`npm run test:server`) was not run and could not be installed (no dependency installs permitted); `node --check` plus source-structure assertions were used instead as the dependency-free equivalent. No network access, port binding, SQLite, Gateway connection, or dist/ build was used or required."
+  }
+}

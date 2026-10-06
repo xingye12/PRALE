@@ -3,10 +3,10 @@
 import asyncio
 import time
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
 from typing import Literal, cast
 
 from agent_harness.api.errors import ContextBudgetExceeded, ProviderNotConfigured, UnknownTarget
-from agent_harness.api.models import OperationResult
 from agent_harness.domain.compaction import select_compaction_window
 from agent_harness.domain.context import project_messages
 from agent_harness.domain.context_management import (
@@ -18,16 +18,14 @@ from agent_harness.domain.context_management import (
 )
 from agent_harness.domain.effects import EffectKind, EffectOutcome, EffectSpan, ErrorClass
 from agent_harness.domain.entries import Entry, JsonValue, NewEntry
-from agent_harness.domain.operations import ActiveOperation, OperationState
+from agent_harness.domain.operations import ActiveOperation, OperationResult, OperationState
 from agent_harness.domain.session import SessionMutator
+from agent_harness.domain.subagents import SubagentError
 from agent_harness.domain.types import OperationStatus
 from agent_harness.domain.values import (
     lane_inbox,
-    lane_state,
     lane_tip,
     operation_context_reductions,
-    operation_lease,
-    operation_result,
     operation_state,
 )
 from agent_harness.runtime.generation import AssistantResult, ChatProvider, GenerationDelta, GenerationRequest, ToolCall
@@ -40,10 +38,10 @@ from agent_harness.runtime.telemetry import (
     ToolTelemetry,
     publish,
 )
+from agent_harness.runtime.tools import is_control_tool
 from agent_harness.storage.protocol import (
     AppendList,
     ClearList,
-    DeleteValue,
     InsertEntry,
     InsertSpan,
     InsertUsage,
@@ -138,6 +136,9 @@ class Drive:
     # before the Session can prove it, and an observer can never change a turn.
 
     def _publish(self, event: TelemetryEvent) -> None:
+        if self._lane.subagent_context:
+            existing = getattr(event, "metadata", {})
+            event = replace(event, metadata={**existing, **self._lane.subagent_context})
         publish(self._lane.telemetry, event)
 
     def _operation_started(self, operation: ActiveOperation) -> OperationTelemetry:
@@ -294,11 +295,16 @@ class Drive:
 
     async def run(self) -> OperationResult:
         initial = await self._required_operation()
-        await self._lane.hooks.run(
-            "before_drive",
-            {"lane": self._lane.name, "operation_id": initial.meta.operation_id, "kind": initial.meta.kind},
-            fail_closed=True,
-        )
+        try:
+            await self._lane.hooks.run(
+                "before_drive",
+                {"lane": self._lane.name, "operation_id": initial.meta.operation_id, "kind": initial.meta.kind},
+                fail_closed=True,
+            )
+        except Exception:
+            if self._lane.subagent_run_id:
+                return await self._settle_terminal_at_tip(initial, "declined", error_code="before_drive_failed")
+            raise
         await self._lane.emit("operation_started", initial.meta.operation_id, {"kind": initial.meta.kind})
         self._publish(self._operation_started(initial))
         while True:
@@ -318,6 +324,12 @@ class Drive:
                     await self._consume_inbox()
                     await self._transition(operation, OperationState(at="assistant.ready", control="running", data={}))
                 case "assistant.ready":
+                    if (
+                        self._lane.subagents
+                        and self._lane.subagent_run_id
+                        and await self._lane.subagents.exhausted(self._lane.subagent_run_id)
+                    ):
+                        return await self._settle_terminal_at_tip(operation, "failed", error_code="turn_limit_exceeded")
                     await self._persist_generation_intent(operation)
                 case "context.collapse.effect_pending" | "context.global_compaction.effect_pending":
                     result = await self._execute_context_summary(operation)
@@ -368,9 +380,14 @@ class Drive:
                         ),
                         None,
                     )
+                    if pending is not None and pending.get("control"):
+                        return await self.run()
                     if pending is not None:
                         tool = self._lane.tools.get(pending["tool_name"])
-                        if tool is not None and tool.replay_policy == "safe":
+                        if (
+                            tool is not None
+                            and pending.get("replay_policy", getattr(tool, "replay_policy", "never")) == "safe"
+                        ):
                             return await self.run()
                         await self._settle_tool(
                             operation,
@@ -439,7 +456,7 @@ class Drive:
             writes.extend(
                 await self._lane.memory_capture_writes(mutator, result, terminal_ids, branch_tip_id=target_id)
             )
-            writes.extend(self._terminal_writes(operation, result, "completed"))
+            writes.extend(await self._terminal_writes(mutator, operation, result, "completed"))
             await mutator.commit(writes)
             return result
 
@@ -560,7 +577,7 @@ class Drive:
                     *self._settle_span(span_id, "completed"),
                     SetValue(lane_tip(self._lane.name), entry_id),
                     *await self._lane.memory_capture_writes(mutator, result, (entry_id,)),
-                    *self._terminal_writes(operation, result, "completed"),
+                    *await self._terminal_writes(mutator, operation, result, "completed"),
                 ]
             )
             return result
@@ -607,7 +624,7 @@ class Drive:
                     *self._settle_span(span_id, "unknown", "interrupted"),
                     SetValue(lane_tip(self._lane.name), entry_id),
                     *await self._lane.memory_capture_writes(mutator, result, (entry_id,)),
-                    *self._terminal_writes(operation, result, "unknown"),
+                    *await self._terminal_writes(mutator, operation, result, "unknown"),
                 ]
             )
             return result
@@ -631,7 +648,27 @@ class Drive:
                 ):
                     raise RuntimeError("invalid lane inbox item")
                 writes.append(
-                    InsertEntry(NewEntry(item["id"], tip, "message", {"role": "user", "content": item["prompt"]}))
+                    InsertEntry(
+                        NewEntry(
+                            item["id"],
+                            tip,
+                            "message",
+                            {
+                                "role": "user",
+                                "content": item["prompt"],
+                                **(
+                                    {
+                                        "subagent_notification": {
+                                            key: item[key]
+                                            for key in ("notification_id", "agent_id", "run_id", "source_operation_id")
+                                        }
+                                    }
+                                    if item.get("kind") == "subagent_notification"
+                                    else {}
+                                ),
+                            },
+                        )
+                    )
                 )
                 tip = item["id"]
             writes.extend([SetValue(lane_tip(self._lane.name), tip), ClearList(lane_inbox(self._lane.name))])
@@ -666,6 +703,13 @@ class Drive:
                         },
                     )
                 )
+            if (
+                next_state.at == "assistant.effect_pending"
+                and operation.state.at == "assistant.ready"
+                and self._lane.subagents
+                and self._lane.subagent_run_id
+            ):
+                writes.extend(await self._lane.subagents.generation_writes(mutator, self._lane.subagent_run_id))
             writes.append(SetValue(operation_state(operation.meta.operation_id), next_state))
             await mutator.commit(writes)
 
@@ -750,6 +794,11 @@ class Drive:
                         for loadout in loadouts
                     ),
                 ],
+            }
+        if self._lane.system_prompt:
+            payload = {
+                **payload,
+                "messages": [{"role": "system", "content": self._lane.system_prompt}, *payload["messages"]],
             }
         final_estimate = estimate_messages(payload["messages"])
         hard_limit = self._lane._context_management.hard_limit_tokens  # noqa: SLF001
@@ -949,7 +998,7 @@ class Drive:
             writes = [
                 *self._settle_span(span_id, "failed", "provider_error"),
                 *await self._lane.memory_capture_writes(mutator, result),
-                *self._terminal_writes(operation, result, "unknown"),
+                *await self._terminal_writes(mutator, operation, result, "unknown"),
             ]
             await mutator.commit(writes)
             return result
@@ -1057,6 +1106,8 @@ class Drive:
                 if isinstance(intent.get("context_management"), dict)
                 else None,
             )
+            if self._lane.effect_closed:
+                raise asyncio.CancelledError
             stream = getattr(self._provider, "stream", None)
             if callable(stream):
                 response = await self._stream_response(operation, request, stream)
@@ -1303,7 +1354,11 @@ class Drive:
                 return None
             result = self._terminal_result(operation, assistant_entry_id, "completed", ended_at=ended_at)
             writes.extend(await self._lane.memory_capture_writes(mutator, result, (assistant_entry_id,)))
-            writes.extend(self._terminal_writes(operation, result, "completed"))
+            writes.extend(
+                await self._terminal_writes(
+                    mutator, operation, result, "completed", (assistant_entry_id, response.content)
+                )
+            )
             await mutator.commit(writes)
             return result
 
@@ -1341,14 +1396,26 @@ class Drive:
         if any(
             isinstance(call, dict) and call.get("status") == "completed" and call.get("terminate") for call in calls
         ):
-            return await self._settle_terminal_at_tip(operation, "completed")
+            status = (
+                "unknown"
+                if self._lane.subagent_run_id
+                and any(isinstance(call, dict) and call.get("outcome") == "unknown" for call in calls)
+                else "completed"
+            )
+            error_code = None
+            if self._lane.subagent_run_id and any(call.get("error_code") == "capability_unavailable" for call in calls):
+                status, error_code = "failed", "capability_unavailable"
+            return await self._settle_terminal_at_tip(operation, status, error_code)
         pending = next(
             (call for call in calls if isinstance(call, dict) and call.get("status") == "effect_pending"),
             None,
         )
+        if pending is not None and pending.get("control"):
+            await self._finish_control(operation, pending)
+            return
         if pending is not None:
             tool = self._lane.tools.get(pending["tool_name"])
-            if tool is not None and tool.replay_policy == "safe":
+            if tool is not None and pending.get("replay_policy", getattr(tool, "replay_policy", "never")) == "safe":
                 # The replay is a new attempt.  Close the lost one as unknown in
                 # the same transaction that authorizes the retry, so a span is
                 # never left pending for an effect that nothing is waiting on.
@@ -1384,6 +1451,10 @@ class Drive:
         if planned is None:
             await self._transition(operation, OperationState("checkpoint", "running", {}))
             return
+        control_tool = self._lane.tools.get(planned["tool_name"])
+        if is_control_tool(control_tool):
+            await self._start_control(operation, planned)
+            return
         if planned.get("parallel"):
             await self._run_parallel_tools(operation, calls)
             return
@@ -1393,6 +1464,9 @@ class Drive:
                 "tool_call_id": planned["tool_call_id"],
                 "tool_name": planned["tool_name"],
                 "arguments": planned["arguments"],
+                "lane": self._lane.name,
+                "operation_id": operation.meta.operation_id,
+                **self._lane.subagent_context,
             },
             block_on_error=True,
         )
@@ -1404,7 +1478,13 @@ class Drive:
         span, span_write = self._open_span(operation, planned["tool_call_id"], "tool", attempt)
         await self._transition_tool(
             operation,
-            {**planned, "attempt": attempt, "span_id": span.span_id, "span_started_at": span.started_at},
+            {
+                **planned,
+                "attempt": attempt,
+                "span_id": span.span_id,
+                "span_started_at": span.started_at,
+                "replay_policy": getattr(control_tool, "replay_policy", "never"),
+            },
             "effect_pending",
             extra=[span_write],
         )
@@ -1424,7 +1504,12 @@ class Drive:
             await self._settle_tool(
                 latest,
                 active,
-                {"content": f"unknown tool: {active['tool_name']}", "is_error": True},
+                {
+                    "content": f"unknown tool: {active['tool_name']}",
+                    "is_error": True,
+                    "terminate": bool(self._lane.subagent_run_id),
+                    **({"error_code": "capability_unavailable"} if self._lane.subagent_run_id else {}),
+                },
                 outcome="aborted",
                 error_class="unknown_tool",
             )
@@ -1435,6 +1520,8 @@ class Drive:
                 operation.meta.operation_id,
                 {"tool_call_id": active["tool_call_id"], "tool_name": active["tool_name"]},
             )
+            if self._lane.effect_closed:
+                raise asyncio.CancelledError
             tool_result = await tool.execute(active["arguments"])
             result = {
                 "content": tool_result.content,
@@ -1456,6 +1543,114 @@ class Drive:
             {"tool_call_id": active["tool_call_id"], "is_error": result.get("is_error", False)},
         )
 
+    async def _start_control(self, operation: ActiveOperation, planned: dict) -> None:
+        event = await self._lane.hooks.run(
+            "before_tool",
+            {
+                "tool_call_id": planned["tool_call_id"],
+                "tool_name": planned["tool_name"],
+                "arguments": planned["arguments"],
+                "lane": self._lane.name,
+                "operation_id": operation.meta.operation_id,
+                **self._lane.subagent_context,
+            },
+            block_on_error=True,
+        )
+        if not isinstance(event, dict):
+            raise RuntimeError("before_tool must return a tool request object")
+        span, span_write = self._open_span(operation, planned["tool_call_id"], "tool", 1)
+        runtime = self._lane.subagents
+
+        async def prepare(mutator: SessionMutator) -> dict:
+            if await mutator.get_value(operation_state(operation.meta.operation_id)) != operation.state:
+                raise RuntimeError("control intent changed during preparation")
+            extra: list[Write] = []
+            arguments = event.get("arguments", planned["arguments"])
+            if event.get("block"):
+                control = {
+                    "format_version": 1,
+                    "kind": "blocked",
+                    "receipt": {"content": "tool call blocked by hook", "is_error": True, "terminate": True},
+                }
+            else:
+                try:
+                    if runtime is None:
+                        raise RuntimeError("subagent dispatcher is not configured")
+                    if not isinstance(arguments, dict):
+                        raise ValueError("control arguments must be an object")
+                    control, extra = await runtime.prepare_control(
+                        mutator, self._lane, operation, planned["tool_name"], arguments, planned["tool_call_id"]
+                    )
+                except (SubagentError, ValueError, TypeError) as error:
+                    control = {
+                        "format_version": 1,
+                        "kind": "error",
+                        "receipt": {
+                            "content": {"error_code": type(error).__name__, "message": str(error)},
+                            "is_error": True,
+                            "terminate": False,
+                        },
+                    }
+            active = {
+                **planned,
+                "arguments": arguments,
+                "status": "effect_pending",
+                "attempt": 1,
+                "span_id": span.span_id,
+                "span_started_at": span.started_at,
+                "control": control,
+            }
+            calls = [
+                active if call["tool_call_id"] == planned["tool_call_id"] else call
+                for call in operation.state.data["calls"]
+            ]
+            await mutator.commit(
+                [
+                    span_write,
+                    *extra,
+                    SetValue(
+                        operation_state(operation.meta.operation_id),
+                        OperationState("tools", "running", {"calls": calls}),
+                    ),
+                ]
+            )
+            return active
+
+        active = await self._lane._session.mutate(prepare)
+        await self._lane.emit(
+            "tool_start",
+            operation.meta.operation_id,
+            {"tool_call_id": active["tool_call_id"], "tool_name": active["tool_name"]},
+        )
+        if active["control"].get("run_id") and active["tool_name"] in ("subagent", "subagent_continue"):
+            await self._lane.emit("subagent_admitted", operation.meta.operation_id, active["control"])
+        await self._finish_control(await self._required_operation(), active)
+
+    async def _finish_control(self, operation: ActiveOperation, active: dict) -> None:
+        control = active["control"]
+        if control.get("format_version") != 1:
+            raise RuntimeError("unknown control state version")
+        if control["kind"] in ("blocked", "error"):
+            result = control["receipt"]
+        else:
+            assert self._lane.subagents is not None
+            try:
+                result = await self._lane.subagents.execute_control(self._lane, control)
+            except SubagentError as error:
+                result = {"content": {"error_code": type(error).__name__, "message": str(error)}, "is_error": True}
+        after = await self._lane.hooks.run("after_tool", result)
+        if not isinstance(after, dict):
+            raise RuntimeError("after_tool must return a tool result object")
+        outcome, error = _tool_outcome(after)
+        if control["kind"] == "blocked":
+            outcome, error = "aborted", "hook_blocked"
+        await self._settle_tool(operation, active, after, outcome, error)
+        await self._lane.emit(
+            "tool_end",
+            operation.meta.operation_id,
+            {"tool_call_id": active["tool_call_id"], "is_error": after.get("is_error", False)},
+        )
+
     async def _run_parallel_tools(self, operation: ActiveOperation, calls: list[object]) -> None:
         """Run one contiguous opt-in batch; durable writes retain source order."""
 
@@ -1463,7 +1658,7 @@ class Drive:
         for call in calls:
             if not isinstance(call, dict) or call.get("status") != "planned":
                 continue
-            if not call.get("parallel"):
+            if not call.get("parallel") or is_control_tool(self._lane.tools.get(call["tool_name"])):
                 break
             batch.append(call)
         if not batch:
@@ -1472,7 +1667,14 @@ class Drive:
         for call in batch:
             event = await self._lane.hooks.run(
                 "before_tool",
-                {"tool_call_id": call["tool_call_id"], "tool_name": call["tool_name"], "arguments": call["arguments"]},
+                {
+                    "tool_call_id": call["tool_call_id"],
+                    "tool_name": call["tool_name"],
+                    "arguments": call["arguments"],
+                    "lane": self._lane.name,
+                    "operation_id": operation.meta.operation_id,
+                    **self._lane.subagent_context,
+                },
                 block_on_error=True,
             )
             if not isinstance(event, dict):
@@ -1483,7 +1685,15 @@ class Drive:
         for call, _ in prepared:
             attempt = call.get("attempt", 0) + 1 if isinstance(call.get("attempt"), int) else 1
             span, span_write = self._open_span(operation, call["tool_call_id"], "tool", attempt)
-            targets.append({**call, "attempt": attempt, "span_id": span.span_id, "span_started_at": span.started_at})
+            targets.append(
+                {
+                    **call,
+                    "attempt": attempt,
+                    "span_id": span.span_id,
+                    "span_started_at": span.started_at,
+                    "replay_policy": getattr(self._lane.tools.get(call["tool_name"]), "replay_policy", "never"),
+                }
+            )
             span_writes.append(span_write)
         await self._transition_tools(operation, targets, "effect_pending", extra=span_writes)
         latest = await self._required_operation()
@@ -1502,13 +1712,24 @@ class Drive:
                 )
             tool = self._lane.tools.get(call["tool_name"])
             if tool is None:
-                return {"content": f"unknown tool: {call['tool_name']}", "is_error": True}, "aborted", "unknown_tool"
+                return (
+                    {
+                        "content": f"unknown tool: {call['tool_name']}",
+                        "is_error": True,
+                        "terminate": bool(self._lane.subagent_run_id),
+                        **({"error_code": "capability_unavailable"} if self._lane.subagent_run_id else {}),
+                    },
+                    "aborted",
+                    "unknown_tool",
+                )
             try:
                 await self._lane.emit(
                     "tool_start",
                     operation.meta.operation_id,
                     {"tool_call_id": call["tool_call_id"], "tool_name": call["tool_name"]},
                 )
+                if self._lane.effect_closed:
+                    raise asyncio.CancelledError
                 value = await tool.execute(call["arguments"])
                 result = {"content": value.content, "is_error": value.is_error, "terminate": value.terminate}
                 if value.details is not None:
@@ -1571,7 +1792,15 @@ class Drive:
             assert isinstance(data, dict) and isinstance(data.get("calls"), list)
             parent_id = await mutator.get_value(lane_tip(self._lane.name))
             calls = [
-                {**call, "status": "completed", "terminate": result.get("terminate", False)} if call == active else call
+                {
+                    **call,
+                    "status": "completed",
+                    "outcome": outcome,
+                    "error_code": result.get("error_code"),
+                    "terminate": result.get("terminate", False),
+                }
+                if call == active
+                else call
                 for call in data["calls"]
             ]
             await mutator.commit(
@@ -1619,8 +1848,15 @@ class Drive:
             assert isinstance(data, dict) and isinstance(data.get("calls"), list)
             active_ids = {call["tool_call_id"] for call in active}
             by_id = {call["tool_call_id"]: result for call, result in zip(active, results)}
+            outcomes_by_id = {call["tool_call_id"]: outcome for call, (outcome, _) in zip(active, outcomes)}
             calls = [
-                {**call, "status": "completed", "terminate": by_id[call["tool_call_id"]].get("terminate", False)}
+                {
+                    **call,
+                    "status": "completed",
+                    "terminate": by_id[call["tool_call_id"]].get("terminate", False),
+                    "outcome": outcomes_by_id[call["tool_call_id"]],
+                    "error_code": by_id[call["tool_call_id"]].get("error_code"),
+                }
                 if call.get("tool_call_id") in active_ids
                 else call
                 for call in data["calls"]
@@ -1693,7 +1929,9 @@ class Drive:
             span_error_class=span_error_class,
         )
 
-    async def _settle_terminal_at_tip(self, operation: ActiveOperation, status: OperationStatus) -> OperationResult:
+    async def _settle_terminal_at_tip(
+        self, operation: ActiveOperation, status: OperationStatus, error_code: str | None = None
+    ) -> OperationResult:
         async def settle(mutator: SessionMutator) -> OperationResult:
             current = await mutator.get_value(operation_state(operation.meta.operation_id))
             if current != operation.state:
@@ -1701,9 +1939,9 @@ class Drive:
             tip_id = await mutator.get_value(lane_tip(self._lane.name))
             if tip_id is not None and not isinstance(tip_id, str):
                 raise RuntimeError("invalid lane tip")
-            result = self._terminal_result(operation, tip_id, status)
+            result = self._terminal_result(operation, tip_id, status, error_code=error_code)
             writes = await self._lane.memory_capture_writes(mutator, result)
-            await mutator.commit([*writes, *self._terminal_writes(operation, result, status)])
+            await mutator.commit([*writes, *await self._terminal_writes(mutator, operation, result, status)])
             return result
 
         result = await self._lane._session.mutate(settle)  # noqa: SLF001
@@ -1723,15 +1961,75 @@ class Drive:
             tip_id = await mutator.get_value(lane_tip(self._lane.name))
             if tip_id is not None and not isinstance(tip_id, str):
                 raise RuntimeError("invalid lane tip")
+            branch_tip_id = tip_id
+            writes: list[Write] = []
+            terminal_ids: list[str] = []
+            unknown_effect = False
+            if operation.state.at == "tools" and isinstance(operation.state.data, dict):
+                for call in cast(list[dict[str, object]], operation.state.data.get("calls", [])):
+                    if call.get("status") == "completed":
+                        continue
+                    pending = call.get("status") == "effect_pending"
+                    unknown = pending and not call.get("control")
+                    unknown_effect |= bool(unknown)
+                    if pending:
+                        writes.extend(
+                            self._settle_span(call.get("span_id"), "unknown" if unknown else "aborted", "interrupted")
+                        )
+                    entry_id = cast(str, call["result_entry_id"])
+                    writes.append(
+                        InsertEntry(
+                            NewEntry(
+                                entry_id,
+                                tip_id,
+                                "message",
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": call["tool_call_id"],
+                                    "is_error": True,
+                                    "content": "tool execution interrupted; outcome is unknown"
+                                    if unknown
+                                    else "tool call cancelled",
+                                    "terminate": True,
+                                },
+                            )
+                        )
+                    )
+                    tip_id = entry_id
+                    terminal_ids.append(entry_id)
             result = self._terminal_result(
                 operation,
                 tip_id,
-                "aborted",
-                error_code="cancelled",
+                "unknown" if self._lane.subagent_run_id and unknown_effect else "aborted",
+                error_code="interrupted" if unknown_effect else "cancelled",
                 error_message="operation cancelled before the next external effect",
             )
-            writes = await self._lane.memory_capture_writes(mutator, result)
-            await mutator.commit([*writes, *self._terminal_writes(operation, result, "aborted")])
+            writes.extend(
+                await self._lane.memory_capture_writes(
+                    mutator,
+                    result,
+                    tuple(terminal_ids),
+                    branch_tip_id=branch_tip_id,
+                )
+            )
+            writes.append(SetValue(lane_tip(self._lane.name), tip_id))
+            answer = None
+            if self._lane.subagent_run_id and terminal_ids:
+                branch = await mutator.scan_branch(branch_tip_id)
+                base_ids = {e.id for e in await mutator.scan_branch(result.from_tip_id)}
+                answer = next(
+                    (
+                        (e.id, cast(str, e.payload["content"]))
+                        for e in reversed(branch)
+                        if e.id not in base_ids
+                        and isinstance(e.payload, dict)
+                        and e.payload.get("role") == "assistant"
+                        and isinstance(e.payload.get("content"), str)
+                    ),
+                    None,
+                )
+            writes.extend(await self._terminal_writes(mutator, operation, result, result.status, answer))
+            await mutator.commit(writes)
             return result
 
         result = await self._lane._session.mutate(settle)  # noqa: SLF001
@@ -1801,14 +2099,8 @@ class Drive:
                     ),
                     SetValue(lane_tip(self._lane.name), assistant_entry_id),
                     *await self._lane.memory_capture_writes(mutator, result, (assistant_entry_id,)),
-                    SetValue(
-                        operation_state(operation.meta.operation_id),
-                        OperationState("terminal", "settled", {"status": status}),
-                    ),
-                    SetValue(operation_result(operation.meta.operation_id), result),
-                    SetValue(
-                        lane_state(self._lane.name),
-                        {"current_operation_id": None, "last_operation_id": operation.meta.operation_id},
+                    *await self._terminal_writes(
+                        mutator, operation, result, status, (assistant_entry_id, assistant_payload["content"])
                     ),
                 ]
             )
@@ -1855,18 +2147,12 @@ class Drive:
             error_message=error_message,
         )
 
-    def _terminal_writes(
-        self, operation: ActiveOperation, result: OperationResult, status: OperationStatus
+    async def _terminal_writes(
+        self,
+        mutator: SessionMutator,
+        operation: ActiveOperation,
+        result: OperationResult,
+        status: OperationStatus,
+        answer: tuple[str, str] | None = None,
     ) -> list[Write]:
-        return [
-            SetValue(
-                operation_state(operation.meta.operation_id),
-                OperationState("terminal", "settled", {"status": status}),
-            ),
-            SetValue(operation_result(operation.meta.operation_id), result),
-            SetValue(
-                lane_state(self._lane.name),
-                {"current_operation_id": None, "last_operation_id": operation.meta.operation_id},
-            ),
-            DeleteValue(operation_lease(operation.meta.operation_id)),
-        ]
+        return await self._lane.terminal_writes(mutator, result, answer)

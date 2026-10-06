@@ -53,13 +53,15 @@ from agent_harness.api.trace import TraceQueryService
 from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.skill import SkillScope
+from agent_harness.domain.subagents import SubagentConfig, SubagentDefinition
 from agent_harness.memory.protocol import MemoryStore
 from agent_harness.memory.runtime import MemoryExtractor, MemoryRuntime
 from agent_harness.runtime.events import HarnessEvent
 from agent_harness.runtime.generation import ChatProvider
 from agent_harness.runtime.lane import ActiveOperation, Lane
+from agent_harness.runtime.subagents import ProviderResolver, validate_subagent_definitions
 from agent_harness.runtime.telemetry import TelemetrySink, close_telemetry
-from agent_harness.runtime.tools import AgentTool
+from agent_harness.runtime.tools import AgentTool, RuntimeControlTool
 from agent_harness.skill.protocol import SkillReviewer, SkillStore
 from agent_harness.skill.runtime import SkillEvolutionRuntime
 from agent_harness.storage.catalog import SQLiteCatalogStore
@@ -223,7 +225,7 @@ class SessionSupervisor:
         config: ProjectRuntimeConfig,
         provider: ChatProvider,
         *,
-        tools: tuple[AgentTool, ...] = (),
+        tools: tuple[AgentTool | RuntimeControlTool, ...] = (),
         memory_store: MemoryStore | None = None,
         skill_store: SkillStore | None = None,
         memory_extractor: MemoryExtractor | None = None,
@@ -232,6 +234,9 @@ class SessionSupervisor:
         max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
         telemetry: TelemetrySink | None = None,
         context_management: ContextManagementConfig = ContextManagementConfig(),
+        definitions: tuple[SubagentDefinition, ...] = (),
+        subagent_config: SubagentConfig = SubagentConfig(),
+        provider_resolver: ProviderResolver | None = None,
     ) -> None:
         if skill_store is not None and memory_store is None:
             raise ValueError("skill_store requires memory_store for L0 archive materialization")
@@ -244,6 +249,9 @@ class SessionSupervisor:
         self._max_drives = max_concurrent_drives
         self._telemetry = telemetry
         self._context_management = context_management
+        self._definitions = definitions
+        self._subagent_config = subagent_config
+        self._provider_resolver = provider_resolver
         self._sessions: dict[str, _OpenSession] = {}
         self._open_lock = asyncio.Lock()
         self._drives: dict[tuple[str, str], asyncio.Task[None]] = {}
@@ -275,6 +283,11 @@ class SessionSupervisor:
     @property
     def max_concurrent_drives(self) -> int:
         return self._max_drives
+
+    async def subagent_counts(self) -> dict[str, int]:
+        active = sum(opened.harness.active_subagent_drives for opened in self._sessions.values())
+        queued = sum([await opened.harness.queued_subagent_runs() for opened in self._sessions.values()])
+        return {"active": active, "queued": queued, "limit_per_session": self._subagent_config.max_running}
 
     @property
     def open_sessions(self) -> int:
@@ -328,6 +341,7 @@ class SessionSupervisor:
                 pass
         self._drives.clear()
         for session_id, opened in self._sessions.items():
+            await opened.harness.close_subagents()
             if self._skill_runtime is not None and self._skill_scope is not None:
                 await self._skill_runtime.archive_session_closed(self._skill_scope, session_id)
             opened.storage.close()
@@ -475,6 +489,9 @@ class SessionSupervisor:
             trace_recorder=self._trace_recorder,
             telemetry=self._telemetry,
             context_management=self._context_management,
+            definitions=self._definitions,
+            subagent_config=self._subagent_config,
+            provider_resolver=self._provider_resolver,
         )
         return _OpenSession(harness, storage)
 
@@ -516,7 +533,7 @@ class WebApplication:
         config: ProjectRuntimeConfig,
         provider: ChatProvider,
         *,
-        tools: tuple[AgentTool, ...] = (),
+        tools: tuple[AgentTool | RuntimeControlTool, ...] = (),
         memory_store: MemoryStore | None = None,
         skill_store: SkillStore | None = None,
         memory_extractor: MemoryExtractor | None = None,
@@ -526,7 +543,11 @@ class WebApplication:
         max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
         telemetry: TelemetrySink | None = None,
         context_management: ContextManagementConfig = ContextManagementConfig(),
+        definitions: tuple[SubagentDefinition, ...] = (),
+        subagent_config: SubagentConfig = SubagentConfig(),
+        provider_resolver: ProviderResolver | None = None,
     ) -> None:
+        validate_subagent_definitions(definitions, provider_resolver, tools)
         self._config = config
         # The deployment's optional observer.  It is closed last, after the
         # drives it reports on have stopped settling.
@@ -562,6 +583,9 @@ class WebApplication:
             max_concurrent_drives=max_concurrent_drives,
             telemetry=telemetry,
             context_management=context_management,
+            definitions=definitions,
+            subagent_config=subagent_config,
+            provider_resolver=provider_resolver,
         )
         self.app = self._build_app(tokens or {})
 
@@ -665,6 +689,7 @@ class WebApplication:
                 },
                 "stores": dict(self._stores),
                 "sessions": {"open": self.supervisor.open_sessions},
+                "subagents": await self.supervisor.subagent_counts(),
                 "drives": {
                     "active": self.supervisor.active_drives,
                     "limit": self.supervisor.max_concurrent_drives,
@@ -903,7 +928,7 @@ def create_app(
     config: ProjectRuntimeConfig,
     provider: ChatProvider,
     *,
-    tools: tuple[AgentTool, ...] = (),
+    tools: tuple[AgentTool | RuntimeControlTool, ...] = (),
     memory_store: MemoryStore | None = None,
     skill_store: SkillStore | None = None,
     memory_extractor: MemoryExtractor | None = None,
@@ -913,6 +938,9 @@ def create_app(
     max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
     telemetry: TelemetrySink | None = None,
     context_management: ContextManagementConfig = ContextManagementConfig(),
+    definitions: tuple[SubagentDefinition, ...] = (),
+    subagent_config: SubagentConfig = SubagentConfig(),
+    provider_resolver: ProviderResolver | None = None,
 ) -> WebApplication:
     """Build the web application for one deployment.
 
@@ -934,6 +962,9 @@ def create_app(
         max_concurrent_drives=max_concurrent_drives,
         telemetry=telemetry,
         context_management=context_management,
+        definitions=definitions,
+        subagent_config=subagent_config,
+        provider_resolver=provider_resolver,
     )
 
 

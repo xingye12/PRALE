@@ -1,0 +1,147 @@
+{
+  "task_id": 24,
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "scheduleUserSessionSync",
+      "start_line": 179,
+      "end_line": 216,
+      "observation": "Scheduling entry point that makes repeated delivery of the same sync trigger safe at the trigger level. It reads lastSyncAtByUserId (line 189) and returns { changed: 0, skipped: true, reason: 'cooldown' } when the replay arrives inside cooldownMs (default 60_000, line 8), then checks inFlightByUserId (line 195) and returns the already-running promise for a concurrent duplicate instead of starting a second scan; only a genuinely new trigger builds a promise, records the cooldown timestamp after success (line 203) and clears the in-flight slot in .finally (line 211)."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "inFlightByUserId",
+      "start_line": 14,
+      "end_line": 15,
+      "observation": "Module-level coalescing state: inFlightByUserId is the per-user promise registry that turns a duplicate concurrent delivery into a no-op (line 195 read, 214 set, 219 clear) and lastSyncAtByUserId is the per-user cooldown clock. Because the key is userId, two identical deliveries for one user can never overlap, so at most one gateway scan and one persistence pass run per window."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "syncUserSessionsFromGateway",
+      "start_line": 118,
+      "end_line": 177,
+      "observation": "The sync body: lists sessions per owned agent through sessions.list only, normalizes every raw row, and applies three drop guards per normalized session (unparseable row, agent outside the ownership set line 160, session in recentlyDeletedSessionKeys line 161) before calling upsertSyncedUserSession (line 163). Counters only move when the persistence layer reports changed: true (lines 164-168), so a replayed delivery of an identical payload yields changed=0 without touching the stored row."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "upsertSyncedUserSession",
+      "start_line": 156,
+      "end_line": 169,
+      "observation": "The per-session write loop that makes duplicate delivery harmless inside a single scan or across replays: every candidate session is routed through the idempotent upsert keyed by the normalized sessionKey, and the changed/inserted/updated counters are incremented only on a real database change. Two identical rows in one gateway payload therefore scan twice but persist once."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "normalizeGatewaySessionForSync",
+      "start_line": 59,
+      "end_line": 77,
+      "observation": "Pure, deterministic normalization of a Gateway session row into { sessionKey, agentId, channel, peer, label, lastActivity } (lines 69-76). Because it is a pure function of the payload, a redelivered payload produces the exact same idempotency key and the exact same field set, which is the precondition for the downstream comparison guard to see 'no change'."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "resetSessionSyncStateForTests",
+      "start_line": 218,
+      "end_line": 221,
+      "observation": "Test seam that clears both coalescing maps (inFlightByUserId, lastSyncAtByUserId), confirming that the duplicate-delivery protections are module-level process state keyed by userId and that the exported surface allows the demo to isolate each duplicate-delivery scenario deterministically."
+    },
+    {
+      "path": "server/core/session-sync.test.js",
+      "symbol": "coalesces scheduled syncs for the same user",
+      "start_line": 122,
+      "end_line": 138,
+      "observation": "In-repo acceptance test for duplicate triggers: it fires two scheduleUserSessionSync calls for userId 'user-1' with cooldownMs 0 inside Promise.all and asserts the gateway RPC ran exactly once (expect(calls).toBe(1)), i.e. the second duplicate delivery is absorbed by the in-flight coalescing rather than producing a second synchronization."
+    },
+    {
+      "path": "server/core/session-sync.test.js",
+      "symbol": "does not reinsert recently deleted sessions",
+      "start_line": 103,
+      "end_line": 120,
+      "observation": "In-repo acceptance test that a replayed delivery of a just-deleted session never reaches the persistence layer: with recentlyDeletedSessionKeys containing 'agent:agent-a:deleted' and the Gateway still reporting that key, the sync returns changed 0 and upsertSyncedUserSession is not called (line 119), so duplicate delivery cannot resurrect deleted state."
+    },
+    {
+      "path": "server/user-manager.js",
+      "symbol": "upsertSyncedUserSession",
+      "start_line": 614,
+      "end_line": 688,
+      "observation": "Persistence guard that closes the duplicate-delivery loop. The row is looked up by session_key (line 621); a missing row inserts once (line 647), otherwise all next-state fields are derived (agent_id, channel, peer_id, label, display_title, tenant_id, and last_message_at as a monotonic max, lines 657-672) and compared to the stored values; when nothing differs the function returns { changed: false, action: 'unchanged' } at line 673 without issuing any UPDATE, so replaying the same delivery is a true no-op."
+    },
+    {
+      "path": "server/user-manager.js",
+      "symbol": "normalizeSessionUpdatedAt",
+      "start_line": 549,
+      "end_line": 562,
+      "observation": "Activity-timestamp normalization used by the upsert: numeric epoch (seconds vs milliseconds) and ISO strings are converted deterministically, and an unparseable value falls back to the existing value (fallback null in upsertSyncedUserSession). Combined with the Math.max merge in upsertSyncedUserSession, a duplicate delivery - including a stale replay - can never move last_message_at backwards."
+    },
+    {
+      "path": "server/handlers/sessions.js",
+      "symbol": "scheduleUserSessionSync",
+      "start_line": 390,
+      "end_line": 396,
+      "observation": "The production call site: /api/sessions schedules the sync asynchronously via setImmediate after responding, passing the module-level recentlyDeletedSessions set as recentlyDeletedSessionKeys. Because polling this endpoint is the normal duplicate-delivery source, every repeat funnels through the coalescing/cooldown logic instead of forcing a fresh gateway scan."
+    },
+    {
+      "path": "server/handlers/sessions.js",
+      "symbol": "recentlyDeletedSessions",
+      "start_line": 27,
+      "end_line": 27,
+      "observation": "Module-level tombstone set of session keys deleted by the user; the delete path consults it (line 66, if (recentlyDeletedSessions.has(sessionKey)) return false) and the sync call site forwards it (line 394), which is what makes a duplicate delivery of a deleted session harmless."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Duplicate delivery of the same gateway session payload is harmless at the persistence layer: the write path is an upsert keyed by session_key that compares every stored field and returns { changed: false, action: 'unchanged' } without issuing an UPDATE, so a replayed delivery leaves the stored row byte-identical and produces zero inserted/updated counters.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/user-manager.js"
+      ]
+    },
+    {
+      "claim": "Duplicate concurrent triggers for the same user collapse onto a single in-flight synchronization: scheduleUserSessionSync returns the existing promise from inFlightByUserId instead of starting a new run, so the second delivery performs no gateway call and both callers observe the identical result object.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/core/session-sync.test.js"
+      ]
+    },
+    {
+      "claim": "A duplicate trigger that lands inside the cooldown window (lastSyncAtByUserId, default cooldownMs 60000) is rejected with { changed: 0, skipped: true, reason: 'cooldown' } and never touches the Gateway, so bursty duplicate delivery cannot amplify gateway load or writes.",
+      "evidence_paths": [
+        "server/core/session-sync.js"
+      ]
+    },
+    {
+      "claim": "Duplicate delivery cannot resurrect deleted state: both the handler-side tombstone set recentlyDeletedSessions and the per-row guard in the sync loop (recentlyDeletedSessionKeys) drop the session before any upsert, and the in-repo test asserts upsertSyncedUserSession is not called for a replayed deleted session key.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/handlers/sessions.js",
+        "server/core/session-sync.test.js"
+      ]
+    },
+    {
+      "claim": "The idempotency key is derived deterministically from the delivery itself: normalizeGatewaySessionForSync is a pure function producing the same sessionKey and field set for the same payload, so redeliveries always address the same user_sessions row (keyed by session_key) rather than creating a second one.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/user-manager.js"
+      ]
+    },
+    {
+      "claim": "A duplicate delivery - even one carrying an older snapshot - cannot regress session activity: lastActivity is normalized by normalizeSessionUpdatedAt and merged with Math.max against the stored last_message_at, so the merged value is monotonic and the replay is reported as unchanged.",
+      "evidence_paths": [
+        "server/user-manager.js",
+        "server/core/session-sync.js"
+      ]
+    },
+    {
+      "claim": "Duplicate delivery is harmless even when duplicated rows arrive inside one delivery: the per-session loop counts changed/inserted/updated only when the idempotent upsert reports a real change, so a payload repeating the same session scans twice but persists exactly one row.",
+      "evidence_paths": [
+        "server/core/session-sync.js"
+      ]
+    }
+  ],
+  "conclusion": "Duplicate delivery is harmless for WattClaw session synchronization, proven end to end on the real sync module by an executable demo (18/18 checks passing). The three delivery paths are all idempotent or coalescing: (1) concurrent duplicate triggers collapse onto one in-flight promise keyed by userId (inFlightByUserId) and repeated triggers inside cooldown are skipped by lastSyncAtByUserId, so at most one gateway scan and one persistence pass per user per window; (2) within a scan, each normalized session is persisted through upsertSyncedUserSession, which is keyed by session_key and compares every field before writing - a replayed identical payload returns { changed: false, action: 'unchanged' } with zero writes, so the row is bit-identical and counters stay at inserted=1, updated=0; (3) sessions the user just deleted stay dropped for replays via recentlyDeletedSessionKeys/recentlyDeletedSessions, and last_message_at is a monotonic max so even a stale duplicate cannot regress activity. The in-repo vitest suite encodes the same contract (coalescing and deleted-session tests); that suite could not be executed here because node_modules (vitest, better-sqlite3) is absent, so the demo ran the real server/core/session-sync.js with only its user-manager import wired to an in-memory stand-in transcribed from server/user-manager.js:614-688 - a documented reduction in evidence strength for the SQL layer only.",
+  "validation": {
+    "command": "node --check server/core/session-sync.js && node .prale-eval/duplicate-delivery-demo.mjs && node .prale-eval/verify-citations.mjs",
+    "status": "passed",
+    "notes": "All three steps exit 0. (a) node --check parses the cited module. (b) .prale-eval/duplicate-delivery-demo.mjs exercises the real server/core/session-sync.js (only the '../user-manager.js' import specifier is rewritten so the module loads without node_modules) across 7 duplicate-delivery scenarios / 18 assertions, all PASS: replay writes nothing, concurrent duplicates share one promise and one gateway call, cooldown absorbs replays, repeated rows in one payload persist once, deleted sessions are never reinserted, normalization is deterministic, stale replays cannot regress last_message_at. (c) .prale-eval/verify-citations.mjs re-opens .prale-eval/result.json and checks task_id/repository/mode against the current TASK.md, that every evidence range is inclusive, in-bounds and actually contains the named symbol, that server/core/session-sync.js is covered by evidence and by at least one claim, and that every claim's evidence_paths resolve to real workspace files with evidence entries. LIMITATION: the repository's own test runner is unavailable in this sandbox - node_modules is absent (no vitest, no better-sqlite3), and dependencies must not be installed - so `npm run test:server` (which includes server/core/session-sync.test.js) could not be run; the in-repo tests are cited as contract text rather than as executed results. The SQL persistence layer of upsertSyncedUserSession was therefore stood in by an in-memory keyed store transcribed from server/user-manager.js:614-688, which weakens the demo's evidence for the database layer specifically; the persistence-guard claim is additionally grounded by direct citation of that source range."
+  }
+}

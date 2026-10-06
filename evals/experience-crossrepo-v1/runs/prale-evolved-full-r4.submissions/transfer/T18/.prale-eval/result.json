@@ -1,0 +1,84 @@
+{
+  "task_id": "T18",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "env",
+      "start_line": 6,
+      "end_line": 8,
+      "observation": "The `env(key, fallback)` helper is the lowest-level resolver for string keys: it returns `process.env[key] ?? fallback`. Precedence is therefore nullish-based — an explicitly supplied value (already present in process.env, including the empty string) wins over the default; only an absent key (undefined/null) falls through to the built-in default. Because dotenv loads the .env 'config' layer into process.env without overriding pre-existing keys, the effective chain is explicit input > .env config > default."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "envInt",
+      "start_line": 10,
+      "end_line": 15,
+      "observation": "`envInt(key, fallback)` resolves numeric keys: an absent or empty raw value returns the fallback, and any non-finite `Number(raw)` also returns the fallback. This is the key conflict case in which an explicit-but-illegal value does NOT win — it degrades to the built-in default and never falls through to a conflicting .env value, which the precedence test asserts for PORT and KNOWLEDGE_TIMEOUT_MS."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "PanelConfig",
+      "start_line": 17,
+      "end_line": 35,
+      "observation": "`PanelConfig` is the resolved instance/panel configuration shape: server host/port, the instance-registry file path (`metadataInstancesConfig`), the remote metadata timeout, UI dist dir, log level/format, the Knowledge Service connection block, the startup LLM-binding toggle, and the local agent-template directory. Every field is produced exclusively by `loadPanelConfig()` from the three conflicting sources, so this interface is the public surface the precedence contract governs."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "envBool",
+      "start_line": 37,
+      "end_line": 41,
+      "observation": "`envBool(key, fallback)` resolves boolean keys: absent/empty returns the fallback, but any non-empty non-canonical raw value returns strict `false` (`raw === 'true' || raw === '1'`) rather than the fallback. This diverges from `envInt`'s illegal-value policy: KNOWLEDGE_LLM_BINDING_SYNC='false' or even 'yes' resolves to false (overriding the `true` default), which the precedence test asserts separately rather than extrapolating envInt's behavior."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "loadPanelConfig",
+      "start_line": 43,
+      "end_line": 69,
+      "observation": "`loadPanelConfig()` is the single resolution point for instance/panel configuration: it instantiates each key via `env`/`envInt`/`envBool` with hard-coded default literals, normalizes LOG_LEVEL/LOG_FORMAT to a closed set, and derives `knowledge` and `knowledgeLlmBinding` sub-objects. `metadataInstancesConfig` (default './config/metadata-instances.json') is the path that `buildPanelDeps` later hands to `InstanceRegistry.load`, tying the panel-config precedence chain to per-instance resolution."
+    },
+    {
+      "path": "MemoryPanel/tests/panel/panel-config.precedence.test.ts",
+      "symbol": "loadResolvedConfig",
+      "start_line": 66,
+      "end_line": 92,
+      "observation": "`loadResolvedConfig({ explicit, envFile })` is the test fixture that materializes the two input layers (explicit process.env values and a mocked dotenv 'config' layer that never overrides existing keys) and then imports the real panel-config module fresh, returning the actual `loadPanelConfig()` result. The suite forces explicit/config/default to disagree per key and asserts the winner, including the envInt vs envBool illegal-value divergence."
+    },
+    {
+      "path": ".prale-eval/harness/precedence-runner.mjs",
+      "symbol": "scenarios",
+      "start_line": 76,
+      "end_line": 186,
+      "observation": "The executable precedence suite: 12 conflict scenarios (explicit > config > default, config > default, defaults-only, illegal numeric explicit, empty numeric explicit, invalid/valid enum, empty-string string key, envBool canonical/false/non-canonical, and the instance-registry path) driven against the real panel-config.ts imported via Node type-stripping with only `dotenv` redirected to a faithful `override:false` stub."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "For MemoryPanel instance/panel configuration, loadPanelConfig() resolves each key with the precedence explicit request input > .env config > built-in default: an already-present process.env value wins (env() uses `??`, so even an explicit empty string is honored), a value present only in the dotenv-loaded .env file wins over the hard-coded fallback, and the fallback applies only when neither is present.",
+      "evidence_paths": ["MemoryPanel/src/panel/config/panel-config.ts"]
+    },
+    {
+      "claim": "Illegal-value policy is not uniform across the config resolvers: envInt() discards empty/non-finite input and returns its fallback default (so a malformed explicit PORT cannot override the default, nor leak to the .env value), while envBool() returns strict false for any non-empty non-canonical token instead of the fallback, so KNOWLEDGE_LLM_BINDING_SYNC='false' or 'yes' resolves to false even though the default is true.",
+      "evidence_paths": ["MemoryPanel/src/panel/config/panel-config.ts"]
+    },
+    {
+      "claim": "The per-instance configuration entry point is itself resolved through the same panel-config precedence chain: `metadataInstancesConfig` (default './config/metadata-instances.json') selects the registry file that buildPanelDeps passes to InstanceRegistry.load, so the explicit/.env/default conflict determines which instance registry a Panel instance reads.",
+      "evidence_paths": ["MemoryPanel/src/panel/config/panel-config.ts"]
+    },
+    {
+      "claim": "The precedence contract is executable and observed, not merely asserted: the dependency-free harness runs the real panel-config.ts (imported live via Node type-stripping, only `dotenv` redirected to an override:false stub) under 12 conflict scenarios and reports 12/12 passed, and the vitest suite encodes the same conflicts plus the envInt/envBool illegal-value divergence.",
+      "evidence_paths": [
+        ".prale-eval/harness/precedence-runner.mjs",
+        "MemoryPanel/tests/panel/panel-config.precedence.test.ts",
+        "MemoryPanel/src/panel/config/panel-config.ts"
+      ]
+    }
+  ],
+  "conclusion": "In MemoryPanel, instance/panel configuration is resolved in a single place (loadPanelConfig() in MemoryPanel/src/panel/config/panel-config.ts) with the precedence explicit request input > dotenv .env config > built-in default. The conflict semantics are enforced by the three helpers: env() is nullish-coalescing (explicit value, even empty string, beats the default), envInt() returns its fallback for empty/non-finite input (an illegal explicit value degrades to the default rather than the .env value), and envBool() returns strict false for non-canonical input rather than its fallback. The same chain decides `metadataInstancesConfig`, which selects the instance registry consumed by InstanceRegistry.load. I constructed an executable precedence test: a dependency-free harness that drives the real panel-config.ts through 12 explicit/config/default conflict scenarios (12/12 passed, exit 0), plus a vitest suite (MemoryPanel/tests/panel/panel-config.precedence.test.ts) encoding the same cases. No repository source, task metadata, locks, or git configuration were modified; the only repo-tree addition is the new test file under the configured vitest include path.",
+  "validation": {
+    "command": "node --import ./.prale-eval/harness/register.mjs ./.prale-eval/harness/precedence-runner.mjs && node .prale-eval/verify-citations.mjs",
+    "status": "passed",
+    "notes": "The precedence harness executes the REAL MemoryPanel/src/panel/config/panel-config.ts (sha256 ab8536456b9d1aeb, path recorded in the run output) via Node's TypeScript type-stripping; only the bare specifier `dotenv` is redirected by a module-resolution hook to a faithful override:false stub, because this checkout has no node_modules and installing dependencies is out of scope. Result: 12/12 conflict scenarios passed, exit 0 (explicit beats config and default; config beats default; defaults-only; illegal/empty numeric explicit falls back to default; invalid enum normalizes to default; explicit empty string honored for string keys; envBool canonical/false/non-canonical; instance-registry path precedence). LIMITATION: the vitest suite at MemoryPanel/tests/panel/panel-config.precedence.test.ts (the canonical in-repo form of this test, matching the configured include `tests/**/*.test.ts`) could not be executed here because vitest/typescript/dotenv are not installed; no dependency was installed and no lockfile was touched. The dependency-free harness reproduces every assertion of that suite against the same source file. `.prale-eval/verify-citations.mjs` independently re-derives task_id/repository/mode from the current TASK.md and verifies that each cited symbol really occurs inside its inclusive line range."
+  }
+}

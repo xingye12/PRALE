@@ -1,0 +1,100 @@
+{
+  "task_id": "T11",
+  "repository": "tdam",
+  "mode": "contract",
+  "contracted_route": {
+    "route": "POST /api/v1/skill/*",
+    "registrar": "registerSkillProxyRoutes",
+    "file": "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+    "why_different": "Unlike the /api/v1/meta/* proxy, whose '/meta/' action marker the shared middleware special-cases for auth/verify, the skill data-plane proxy path yields action '' from readAction, so x-tdai-user-key is unconditionally required."
+  },
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 62,
+      "observation": "The header guard itself. It reads x-tdai-service-id via META_HEADER_SERVICE_ID and trims; a falsy id returns respondControlError(c, 400, 'MISSING_INSTANCE_ID') before any downstream access. It then resolves the id through deps.instanceRegistry.resolve, mapping an InstanceRegistryError with code 400 to respondControlError(c, 400, 'INVALID_INSTANCE') and rethrowing anything else. It computes omitUserKey from action === 'auth/verify', requires x-tdai-user-key otherwise (400 'MISSING_USER_KEY'), and only then sets c.set('panelMeta', ...) and calls await next(). Every rejection path returns early, so the guarded route handler - and therefore the downstream kernel client - is never reached."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "readAction",
+      "start_line": 24,
+      "end_line": 29,
+      "observation": "Derives the meta action by slicing after the hardcoded '/meta/' marker and returns '' when the marker is absent. Because a /skill/* request contains no '/meta/', action is '' there, omitUserKey is false, and the user-key requirement applies - this is what makes the skill proxy a distinct contract case from /meta/auth/verify."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+      "symbol": "registerSkillProxyRoutes",
+      "start_line": 26,
+      "end_line": 51,
+      "observation": "Registers `api.post('/skill/*', validatePanelMetaHeaders(deps), handler)`. The middleware runs before the handler; the handler is the only place that reads c.get('panelMeta') and calls deps.skillKernel.invoke(action, body, ctx). Since the middleware returns on any header failure, a rejected request can never reach deps.skillKernel.invoke."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondControlError",
+      "start_line": 22,
+      "end_line": 25,
+      "observation": "Builds the standard control envelope via controlEnvelope(code, message, requestId) with request_id defaulting to '' when c.get('reqId') is unset, and emits it through respondEnvelope, which returns c.json(envelope, mapHttpStatusFromEnvelopeCode(envelope.code)). This is the single envelope shape all guard rejections use."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "mapHttpStatusFromEnvelopeCode",
+      "start_line": 11,
+      "end_line": 15,
+      "observation": "Maps the envelope code to the HTTP status: 400-599 to the code itself, 0 to 200, otherwise 502. A guard rejection with code 400 therefore surfaces as HTTP 400 while the JSON body still carries the envelope fields."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+      "symbol": "InstanceRegistryError",
+      "start_line": 50,
+      "end_line": 58,
+      "observation": "Error type carrying the numeric `code` the middleware inspects. InstanceRegistry.resolve throws InstanceRegistryError(400, 'INVALID_INSTANCE') for an unknown instance id, which is exactly the (err instanceof InstanceRegistryError && err.code === 400) branch that yields the 400 INVALID_INSTANCE envelope."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/headers.ts",
+      "symbol": "META_HEADER_SERVICE_ID",
+      "start_line": 5,
+      "end_line": 7,
+      "observation": "Canonical inbound header names: META_HEADER_SERVICE_ID = 'x-tdai-service-id' and META_HEADER_USER_KEY = 'x-tdai-user-key'. These are the required headers whose absence/invalidity the contract exercises."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "A panel route guarded by validatePanelMetaHeaders returns the standard control envelope and never invokes the downstream kernel client when a required header is missing or invalid: a missing x-tdai-service-id yields {code:400, message:'MISSING_INSTANCE_ID', request_id:<string>, data:null} at HTTP 400; an unknown x-tdai-service-id yields {code:400, message:'INVALID_INSTANCE', ...}; and a missing x-tdai-user-key (on non-auth/verify paths) yields {code:400, message:'MISSING_USER_KEY', ...}. Each of these returns early, so the guarded handler that calls deps.skillKernel.invoke/deps.metaKernel.invoke is never reached.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/http/envelope.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts"
+      ]
+    },
+    {
+      "claim": "The standard envelope is fixed and four-fielded: {code, message, request_id, data}. respondControlError always sets data to null and defaults request_id to '' when no reqId variable is set, and respondEnvelope derives the HTTP status from the code (400 -> 400) rather than hardcoding it.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/envelope.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts"
+      ]
+    },
+    {
+      "claim": "The /api/v1/skill/* data-plane proxy is a different panel route from /api/v1/meta/*: readAction only recognises the hardcoded '/meta/' marker, so on /skill/* the action is '' and the user-key is required (no auth/verify exemption), and only after validation does the handler call deps.skillKernel.invoke. This makes it a clean subject for the never-calls-the-downstream-client contract.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/http/routes/skill/proxy.ts"
+      ]
+    },
+    {
+      "claim": "Invalid-instance rejection is driven by InstanceRegistry.resolve throwing InstanceRegistryError(400), which the middleware maps to the 400 INVALID_INSTANCE envelope; any other thrown error is deliberately rethrown (surfaced as a 500 by the app-level error handler) rather than being converted into a control envelope.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/config/instance-registry.ts"
+      ]
+    }
+  ],
+  "conclusion": "The header guard on the contracted panel route (POST /api/v1/skill/*) is verified contract-first: requests with a missing or invalid required header (x-tdai-service-id missing/unknown, or x-tdai-user-key missing) are rejected with the standard control envelope {code, message, request_id, data} at the HTTP status derived from the code, and the downstream kernel client is never invoked because validatePanelMetaHeaders returns before next(). The same guard and envelope behavior is asserted for the /api/v1/meta/* proxy for contrast. Supporting dependencies (node_modules: hono, zod, vitest, tsx) are absent in this environment, so the canonical vitest contract could not be executed; an equivalent dependency-free runner that executes the real middleware and envelope modules via Node's module-stub loader passes all 58 checks.",
+  "validation": {
+    "command": "cd MemoryPanel && node --import ./tests/panel/stubs/register.mjs tests/panel/contract-panel-header-guard.run.mjs",
+    "status": "passed",
+    "notes": "58/58 checks passed on Node v24.14.0. The runner imports and executes the real src/panel/http/middleware/validate-panel-headers.ts and src/panel/http/envelope.ts (type-stripped by Node), stubbing only two unavailable collaborators: 'hono/factory' (identity createMiddleware) and the panel instance registry (which needs zod and uses a TS parameter property). The canonical vitest file tests/panel/contract-panel-header-guard.test.ts (route-level, real Hono) could NOT be executed because node_modules is absent and dependency installation is out of scope; it was syntax-verified with node:module stripTypeScriptTypes instead. Contracted route: POST /api/v1/skill/get."
+  }
+}

@@ -1,0 +1,91 @@
+{
+  "task_id": "T18",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.enqueue",
+      "start_line": 15,
+      "end_line": 24,
+      "observation": "enqueue() looks up a SerialQueue by asset key in the `queues` map and lazily creates exactly one per key, then adds the job to that key's lane (fire-and-forget). Because the lane is keyed by asset id, two submissions for the same asset id are placed on the same concurrency=1 lane and can never run their bodies concurrently, while different asset ids get independent lanes. This is the mechanism that prevents duplicate concurrent effective build work on git/SQLite/files."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.onIdle",
+      "start_line": 27,
+      "end_line": 33,
+      "observation": "onIdle(key?) awaits that key's SerialQueue.onIdle(), or Promise.all over every lane when no key is given. It is the barrier the executable validation uses to deterministically observe that only one effective job was drained for a duplicated key."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue.drain",
+      "start_line": 81,
+      "end_line": 101,
+      "observation": "drain() refuses to start when `this.running` is already true, shifts one entry, and only re-drains from the `.finally()` of the running task. This is what makes each per-key lane strictly serial (FIFO, concurrency 1), which is the guarantee BuildQueue relies on so that duplicate same-key submissions serialize instead of overlapping."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.create",
+      "start_line": 132,
+      "end_line": 139,
+      "observation": "create() delegates identity resolution to store.createCodeGraph() and calls enqueueBuild(row) only when `existed` is false. A duplicate submission (same service+team+repo_url+branch) therefore returns the existing row and enqueues nothing, so it produces zero additional effective build work."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.sync",
+      "start_line": 153,
+      "end_line": 171,
+      "observation": "sync() short-circuits with `{ kind: \"busy\" }` when the row is pending or processing, explicitly without overwriting status and without enqueueing a second build. Only a settled (ready/failed) asset is versioned (+1) and enqueued, so repeated in-flight submissions add no duplicate work while a deliberate post-ready sync remains a legitimate new build."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/sqlite-store.ts",
+      "symbol": "SqliteKnowledgeStore.createCodeGraph",
+      "start_line": 69,
+      "end_line": 136,
+      "observation": "The identity store implements idempotent create: it selects on (service_id, team_id, repo_url, branch, deleted_at IS NULL) and returns `existed: true` when a live row already exists; on a concurrent insert it re-selects the raced row and also returns `existed: true`. This is the dedupe layer that turns a duplicate submission into the same asset id rather than a second row."
+    },
+    {
+      "path": "MemoryKnowledge/src/routes/code-graph.ts",
+      "symbol": "createCodeGraphRoutes (POST /sync handler)",
+      "start_line": 265,
+      "end_line": 283,
+      "observation": "The HTTP layer surfaces the service contract: create returns 200 for an existing asset and 201 for a new one, and a busy sync is answered with a minimal HTTP 409 body `{ code: 409, message: \"busy\", data: { status, step } }` instead of queueing duplicate work. This makes the no-duplicate-work guarantee observable at the API boundary."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Duplicate build submissions for the same asset key cannot create duplicate *concurrent* effective work: BuildQueue gives each asset id exactly one SerialQueue lane, and SerialQueue.drain runs strictly one task at a time, so same-key submissions are serialized rather than overlapped. The executable demo measures max observed concurrency = 1 for a duplicated key while distinct keys reach concurrency 2, confirming the lane is per-key and shared by duplicates.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    },
+    {
+      "claim": "A duplicate *create* submission produces exactly one effective build: the store dedupes on (service_id, team_id, repo_url, branch) and returns existed=true, and CodeGraphService.create enqueues a build only when existed is false. The demo asserts the second create returns the same code_graph_id and that the injected worker runs exactly once for the duplicated pair.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/sqlite-store.ts"
+      ]
+    },
+    {
+      "claim": "A duplicate *sync* submitted while the asset is pending/processing is rejected as busy (HTTP 409) with no status overwrite and no second enqueue, so it adds no effective work; only a sync on a settled asset is versioned and rebuilt. The demo asserts kind === \"busy\" with the worker still at one run, then a post-ready sync legitimately becomes version 2 and a second run.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/routes/code-graph.ts"
+      ]
+    },
+    {
+      "claim": "BuildQueue.onIdle(key?) is the deterministic barrier used to observe queue drain in tests and shutdown, letting the demo prove that after duplicate submissions the single lane is fully drained (both same-key jobs complete) rather than one being lost.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    }
+  ],
+  "conclusion": "Duplicate source/build submission does not create duplicate effective work in MemoryKnowledge. Two independent layers enforce this. (1) BuildQueue is a per-asset-key lane registry: every asset id maps to exactly one SerialQueue with concurrency 1, so duplicate submissions for the same key are serialized and their bodies never overlap (git clone / SQLite writes / index files cannot conflict), while distinct assets retain independent lanes. (2) Effective-work dedupe happens upstream of the queue: identity is (service_id, team_id, repo_url, branch); the store returns existed=true for a duplicate create and CodeGraphService.create then skips enqueueBuild entirely, and a duplicate sync while pending/processing is answered busy/409 without enqueueing. The executed demo against the real sources confirms one worker invocation for a duplicated create, busy plus one worker invocation for a duplicated in-flight sync, and no enqueue at all from the duplicate path; the second worker run only ever occurs for an explicit post-ready sync, which is a versioned rebuild and not duplication.",
+  "validation": {
+    "command": "node --import ./.prale-eval/register-hook.mjs ./.prale-eval/validate.mjs",
+    "status": "passed",
+    "notes": "5/5 checks passed, exit code 0. The harness imports the repository's real sources with no build step and no dependencies by using Node 24 built-in TypeScript type stripping plus a small resolve hook (.prale-eval/ts-resolve-hook.mjs) that maps relative `./x.js` specifiers to the sibling `x.ts` sources. Part A drives the real BuildQueue: duplicate same-key enqueue yields max observed concurrency 1 with both jobs completing, distinct keys reach concurrency 2, and onIdle(key) is a correct drain barrier. Part B drives the real CodeGraphService against a minimal in-memory IKnowledgeStore that mirrors SqliteKnowledgeStore's identity semantics, asserting duplicate create is idempotent (same id, one worker run) and duplicate in-flight sync returns busy with no extra run. Limitation: the repository's declared test runner (vitest) and tsx are not installed and node_modules is absent, so `pnpm test` / `vitest run` could not be executed and the dependency-free Node harness above was used instead; CodeGraphService was exercised with an injected fake store because better-sqlite3/drizzle (needed by SqliteKnowledgeStore) are likewise unavailable. No repository files were modified; only `.prale-eval/` was written."
+  }
+}

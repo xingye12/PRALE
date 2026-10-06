@@ -1,6 +1,6 @@
 import asyncio
 from dataclasses import dataclass
-from typing import Protocol
+from typing import Protocol, cast
 
 from agent_harness.domain.entries import JsonValue
 from agent_harness.runtime.generation import ToolDefinition
@@ -23,14 +23,35 @@ class AgentTool(Protocol):
     async def execute(self, arguments: JsonValue) -> ToolExecutionResult: ...
 
 
+class RuntimeControlTool(Protocol):
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def description(self) -> str: ...
+
+    @property
+    def input_schema(self) -> JsonValue: ...
+
+    @property
+    def control_kind(self) -> str: ...
+
+    @property
+    def max_result_tokens(self) -> int: ...
+
+
+def is_control_tool(tool: AgentTool | RuntimeControlTool | None) -> bool:
+    return tool is not None and isinstance(getattr(tool, "control_kind", None), str)
+
+
 class ToolRegistry:
-    def __init__(self, tools: tuple[AgentTool, ...] = ()) -> None:
+    def __init__(self, tools: tuple[AgentTool | RuntimeControlTool, ...] = ()) -> None:
         by_name = {tool.name: tool for tool in tools}
         if len(by_name) != len(tools):
             raise ValueError("tool names must be unique")
         self._by_name = by_name
 
-    def get(self, name: str) -> AgentTool | None:
+    def get(self, name: str) -> AgentTool | RuntimeControlTool | None:
         return self._by_name.get(name)
 
     def definitions(self) -> tuple[ToolDefinition, ...]:
@@ -49,8 +70,10 @@ class ToolRegistry:
             tool = self.get(name)
             if tool is None:
                 return ToolExecutionResult(content=f"unknown tool: {name}", is_error=True)
+            if is_control_tool(tool):
+                raise RuntimeError("control tools require a durable runtime dispatcher")
             try:
-                return await tool.execute(arguments)
+                return await cast(AgentTool, tool).execute(arguments)
             except Exception as error:
                 return ToolExecutionResult(content=f"tool failed: {error}", is_error=True)
 

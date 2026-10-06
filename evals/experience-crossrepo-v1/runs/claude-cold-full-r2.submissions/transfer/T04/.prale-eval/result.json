@@ -1,0 +1,66 @@
+{
+  "task_id": "T04",
+  "repository": "wattclaw",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "server/core/system.js",
+      "symbol": "localExec",
+      "start_line": 111,
+      "end_line": 156,
+      "observation": "Spawns a shell command and, on non-zero exit / timeout / spawn error, rejects with an Error. Before this change the rejection carried only a message, discarding the exit code, signal, stdout and stderr. The child 'close' handler now receives (code, signal) and every rejection path attaches err.diagnostics = { command, exitCode, signal, stdout, stderr, timedOut, spawnError } so the raw diagnostics survive the throw."
+    },
+    {
+      "path": "server/core/system.js",
+      "symbol": "normalizeExecFailure",
+      "start_line": 164,
+      "end_line": 178,
+      "observation": "Pure normalizer that maps any child-process failure (an Error carrying err.diagnostics, or a raw value plus explicit meta) into the repo's stable result shape { ok: false, error, command, exitCode, signal, stdout, stderr, timedOut, spawnError }. It never throws, merges diagnostics with caller-supplied meta via nullish coalescing, and keeps every diagnostic field instead of collapsing to a single message."
+    },
+    {
+      "path": "server/core/system.js",
+      "symbol": "localExecResult",
+      "start_line": 185,
+      "end_line": 192,
+      "observation": "Non-throwing wrapper around localExec: success resolves to { ok: true, error: null, command, exitCode: 0, signal: null, stdout, stderr: '', timedOut: false, spawnError: null }; failure is routed through normalizeExecFailure. Callers can branch on .ok instead of try/catch while retaining full diagnostics, matching the gateway-client.js result contract."
+    },
+    {
+      "path": "server/core/gateway-client.js",
+      "symbol": "gatewayAdminRpcForTarget",
+      "start_line": 60,
+      "end_line": 122,
+      "observation": "Establishes the repository's normalization convention for backend transport failures: HTTP errors, parse failures and thrown fetch errors are all converted to a discriminated { ok: false, error } result (and success to { ok: true, payload }), with diagnostics folded into the error message rather than propagating an exception. This is the precedent the child-process normalizer mirrors."
+    },
+    {
+      "path": "server/core/gateway-client.js",
+      "symbol": "gatewayHttpGet",
+      "start_line": 124,
+      "end_line": 158,
+      "observation": "Applies the same { ok: true, data } / { ok: false, error } contract to GET calls, catching fetch errors and returning them as structured results. Confirms the { ok, error } shape is the repo-wide normalized operation-result convention the new exec helpers adopt."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "server/core/system.js's localExec previously lost child-process diagnostics on failure (only an Error message survived); it now attaches a structured err.diagnostics object with command, exitCode, signal, stdout, stderr, timedOut and spawnError on every rejection path (non-zero close, timeout, spawn error).",
+      "evidence_paths": ["server/core/system.js"]
+    },
+    {
+      "claim": "server/core/system.js's normalizeExecFailure converts a fake backend command/child-process failure into a stable, JSON-serializable structured result { ok: false, error, command, exitCode, signal, stdout, stderr, timedOut, spawnError } without dropping any diagnostic field, and localExecResult wraps localExec so failures are returned as values instead of thrown.",
+      "evidence_paths": ["server/core/system.js"]
+    },
+    {
+      "claim": "server/core/gateway-client.js already normalizes backend transport failures into the { ok: false, error } shape rather than throwing (gatewayAdminRpcForTarget, gatewayHttpGet); the new child-process normalizer deliberately reuses this same { ok, error } contract so exec failures and gateway failures are handled identically by callers.",
+      "evidence_paths": ["server/core/gateway-client.js", "server/core/system.js"]
+    },
+    {
+      "claim": "The normalization is backward compatible: localExec still rejects with an Error (existing callers such as gatewayExec and the server/handlers/* gatewayExec users are unaffected) while additionally exposing err.diagnostics, so no call-site changes are required.",
+      "evidence_paths": ["server/core/system.js"]
+    }
+  ],
+  "conclusion": "A fake backend command/child-process failure is now normalized into a structured, non-throwing server result. server/core/system.js's localExec attaches diagnostics (command, exitCode, signal, stdout, stderr, timedOut, spawnError) to the Error it rejects with, normalizeExecFailure maps any failure into the stable shape { ok: false, error, ...diagnostics }, and localExecResult yields either { ok: true, ... } or { ok: false, ... } so callers branch on .ok instead of try/catch. This mirrors the existing { ok, error } convention in server/core/gateway-client.js. The executable demo runs five real scenarios (non-zero exit, command-not-found, timeout, success, raw error) and passes 86 assertions with 0 failures, preserving stdout/stderr/exitCode/signal/timeout diagnostics throughout.",
+  "validation": {
+    "command": "node --import ./.prale-eval/harness/register.mjs .prale-eval/demo-normalize-exec.mjs",
+    "status": "passed",
+    "notes": "Node v24.14.0. Exit code 0; 5 cases, 0 failures, 86 assertions. The workspace has no node_modules installed, so the optional check-disk-space dependency of server/core/system.js is supplied by a local resolution-hook stub (.prale-eval/harness/loader.mjs + check-disk-space-stub.mjs); that stub is never exercised by the exec paths under test. Case 2's assertion is environment-agnostic: the shell reported 'Permission denied' rather than 'not found' for the missing binary, so the check asserts non-empty stderr + exitCode 127 rather than exact wording. Raw captured output is in .prale-eval/demo-output.txt."
+  }
+}

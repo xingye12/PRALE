@@ -1,0 +1,97 @@
+{
+  "task_id": 20,
+  "repository": "wattclaw",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 15,
+      "observation": "The only exported symbol in this module. It takes the realpath'd agent workspace (workspaceReal) and a requested path, strips trailing slashes from the workspace, normalizes backslashes to forward slashes in the request, and decides whether the request is already workspace-absolute (equal to the workspace or prefixed by `${workspace}/`). Workspace-absolute inputs are returned verbatim with pathMode 'workspace-absolute'; everything else is joined onto the workspace root after leading slashes are dropped, labelled 'workspace-root-relative' when the original started with '/' and 'workspace-relative' otherwise. It is a pure string transform: it performs no realpath, no symlink resolution and no '..' rejection, so containment enforcement is deliberately deferred to the caller. The fixture run confirmed relative and leading-slash inputs both canonicalise under the workspace root, an in-workspace absolute path is preserved, and even a host-absolute path such as /etc/hostname is re-rooted under the workspace rather than escaping to the host filesystem."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "sanitizeFilename",
+      "start_line": 19,
+      "end_line": 27,
+      "observation": "Attachment filename sanitizer used before any generated remote name is built. It trims, returns '' for blank input, replaces every character that is not a Unicode letter/number/dot/hyphen/underscore with '_', collapses runs of underscores, strips leading/trailing underscores, and truncates to 60 characters. Because '/' and '\\\\' are replaced, traversal segments cannot survive as separators. Fixture results: '../etc/passwd' -> '.._etc_passwd', '报表 2026?.pdf' -> '报表_2026_.pdf', '  ' -> '', and 80 a's + '.pdf' -> a 60-character name, which is the rejection/neutralisation behaviour reported for unsafe attachment input."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "buildRemoteFileName",
+      "start_line": 36,
+      "end_line": 43,
+      "observation": "Builds the Gateway naming convention {sanitized-name}---{8-hex-uuid}{ext}: it lowercases the extension via extname, sanitizes the stem with sanitizeFilename (falling back to the literal 'file' when the sanitized stem is empty), appends an 8-character hex UUID suffix, and re-attaches the extension. The output is always a single path segment. On the fixture, '../../etc/passwd' produced fileName '.._.._etc_passwd---<8hex>' with ext '' (no separators, so it cannot traverse), while '季度 报告 2026.pdf' produced '季度_报告_2026---<8hex>.pdf'."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "uploadToGateway",
+      "start_line": 54,
+      "end_line": 63,
+      "observation": "Writes an uploaded buffer into the media directory. The upload directory is envConfig.GATEWAY_MEDIA_DIR or `${configDir}/media/inbound`, unless an explicit targetDir override is passed; the remote name comes from buildRemoteFileName, so the stored path is always `${uploadDir}/${sanitized}---{uuid}${ext}` and is confined to the media directory. It mkdir -p's the directory and returns { path, fileName, originalName, size }. Fixture run: a 15-byte buffer named '季度 报告.pdf' landed exactly at `<mediaDir>/季度_报告---<8hex>.pdf` with size 15 and byte-identical content, demonstrating the canonical remote path contract."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "deleteRemoteFile",
+      "start_line": 71,
+      "end_line": 79,
+      "observation": "Deletes the file at an absolute remotePath and returns true on success, true when the file is already absent (err.code === 'ENOENT'), and false for any other failure. Deletion is therefore idempotent, which the fixture confirmed by deleting the uploaded attachment twice and receiving true both times."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "writeRemoteFile",
+      "start_line": 88,
+      "end_line": 97,
+      "observation": "Writes utf8 content to remotePath after mkdir -p'ing its dirname, returning true on success and false (rather than throwing) on any failure. Fixture run: writing `<mediaDir>/nested/deep/note.txt` created the missing parents and returned true with verified content, while writing `<mediaDir>/blocked.txt/child.txt` where blocked.txt is an existing regular file returned false because mkdir failed with ENOTDIR — an observable rejection signal for an invalid attachment destination."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "isGeneratedFilePathAllowed",
+      "start_line": 39,
+      "end_line": 45,
+      "observation": "The allowed-name gate placed immediately after the escape check in the generated-file route. It lowercases every '/' segment and rejects the path if any segment is a denied segment ('.git', '.openclaw'), or if the final name is '.env' or starts with '.env.', or is one of the denied agent instruction/state names (agents.md, soul.md, user.md, identity.md, tools.md, bootstrap.md, memory.md, workspace-state.json, openclaw-workspace-state.json). The fixture run rejected downloads/.env, /downloads/.git/config and AGENTS.md with 403 'File access denied' even though all three resolve inside the workspace, showing a second, independent rejection cause beyond escape."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "createFileRoutes",
+      "start_line": 72,
+      "end_line": 140,
+      "observation": "createFileRoutes is declared at line 72 and registers the GET /api/chat/generated-file handler that composes the containment contract around the resolver: line 112 calls resolveGeneratedFileCandidatePath(workspaceReal, requestedPath); lines 123-131 realpath -e the candidate inside a try/catch and return 404 'File not found' when it does not exist; lines 134-140 compute posix.relative(workspaceReal, targetReal) and reject with 403 'File access denied' when the relative path is empty/'..'/'../*'/absolute (workspace escape) or when isGeneratedFilePathAllowed fails (denied name/segment). The handler function is not exported, so the operate demo replays this same sequence with fs.realpath as the realpath -e equivalent; the fixture reproduced each of these statuses and reasons for the 16 path operations."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "resolveGeneratedFileCandidatePath returns { candidatePath, pathMode } with pathMode in {workspace-absolute, workspace-root-relative, workspace-relative}: in-workspace absolute inputs are preserved verbatim, while relative and leading-slash inputs are canonicalised under the workspace root; a host-absolute input such as /etc/hostname is re-rooted under the workspace instead of reaching the host filesystem.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js"
+      ]
+    },
+    {
+      "claim": "The resolver itself performs no traversal or symlink validation; unsafe '..' input is caught only when the route realpaths the candidate and rejects any posix.relative result that is empty, '..', prefixed '../', or absolute, which yields HTTP 403 'File access denied' with the realpath named as the reason.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js"
+      ]
+    },
+    {
+      "claim": "Attachment filenames are neutralised to a single path segment and stored as {sanitized}---{8-hex-uuid}{ext}: sanitizeFilename strips separators, collapses underscores, trims to 60 chars and returns '' for blanks, and buildRemoteFileName falls back to 'file' plus a UUID suffix, so adversarial names such as '../etc/passwd' cannot escape GATEWAY_MEDIA_DIR.",
+      "evidence_paths": [
+        "server/gateway-file-transfer.js"
+      ]
+    },
+    {
+      "claim": "Attachment I/O reports normalized outcomes without throwing: uploadToGateway confines writes to GATEWAY_MEDIA_DIR and returns the canonical remote path with size, deleteRemoteFile is idempotent (true for success and ENOENT), and writeRemoteFile returns false for an impossible destination such as a path whose parent is a regular file.",
+      "evidence_paths": [
+        "server/gateway-file-transfer.js"
+      ]
+    }
+  ],
+  "conclusion": "Operating the resolver and attachment utilities on a controlled fixture produces the canonical paths and rejection reasons required by the task. Accepted input canonicalises under the workspace root: 'downloads/report.pdf' and '/downloads/report.pdf' both yield <workspaceReal>/downloads/report.pdf (modes workspace-relative and workspace-root-relative), and an in-workspace absolute path is preserved (workspace-absolute). Unsafe input is rejected with an explicit reason: traversal inputs '../outside/secret.txt', '/../outside/secret.txt' and 'downloads/../../outside/secret.txt' all realpath to <fixture>/outside/secret.txt and are rejected 403 'File access denied: resolves outside workspace root'; a symlink inside the workspace pointing outside is rejected the same way (403); contained sensitive names downloads/.env, /downloads/.git/config and AGENTS.md are rejected 403 'denied name or segment'; a directory is rejected 400 'Only regular files can be downloaded'; missing targets are 404; a NUL byte is rejected 400 pre-resolution; and /etc/hostname is re-rooted under the workspace (404) rather than escaping. On the attachment side, sanitizeFilename('../etc/passwd') -> '.._etc_passwd' and buildRemoteFileName('../../etc/passwd') -> '.._.._etc_passwd---<8hex>' contain no path separators, uploadToGateway writes only inside GATEWAY_MEDIA_DIR and returns the canonical path, deleteRemoteFile is idempotent, and writeRemoteFile returns false for an impossible destination. The demo, scripts/operate-generated-file-path-demo.mjs, reproduces all of this with 35/35 assertions passing (exit 0) and removes its fixture afterwards.",
+  "validation": {
+    "command": "node scripts/operate-generated-file-path-demo.mjs",
+    "status": "pass",
+    "notes": "Exit code 0; stderr 'DEMO OK: 35 assertions passed; fixture removed'. The demo imports the real resolveGeneratedFileCandidatePath from server/utils/generated-file-path.js and the real sanitizeFilename, buildRemoteFileName, uploadToGateway, deleteRemoteFile and writeRemoteFile from server/gateway-file-transfer.js, building and then deleting a self-contained fixture under <workspace>/.operate-fixture-*/. LIMITATION: the repo-native optional validation `npx vitest run server/utils/generated-file-path.test.js` was NOT run because vitest is declared in package.json but node_modules/ is not installed in this environment and installing dependencies is out of scope; instead the demo independently asserts the three resolution cases that test file covers (leading-slash -> workspace-root-relative, relative -> workspace-relative, workspace-absolute preserved). Only Node.js builtins were used."
+  }
+}

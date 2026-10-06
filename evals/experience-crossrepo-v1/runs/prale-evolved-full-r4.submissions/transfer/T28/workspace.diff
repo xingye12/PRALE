@@ -1,0 +1,460 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/operate-deliverable.md b/.prale-eval/operate-deliverable.md
+new file mode 100644
+index 0000000..0c7858c
+--- /dev/null
++++ b/.prale-eval/operate-deliverable.md
+@@ -0,0 +1,90 @@
++# Operate deliverable — offline-safe fixture verification (WattClaw, T28)
++
++## Chosen verification
++
++**Target fixture (frontend ↔ server pair of the generated-file path contract):**
++
++| Side | File | Symbol |
++| --- | --- | --- |
++| Server | `server/utils/generated-file-path.js` | `resolveGeneratedFileCandidatePath` |
++| Server test | `server/utils/generated-file-path.test.js` | fixture expectations |
++| Frontend | `src/utils/generated-attachments.ts` | `extractGeneratedAttachments` |
++| Frontend test | `src/utils/generated-attachments.test.ts` | fixture expectations |
++
++**Executable demo:** `.prale-eval/verify-fixture.mjs`
++
++```
++node .prale-eval/verify-fixture.mjs
++```
++
++It imports both fixture modules directly and asserts the checked-in expectations
++(5 assertions: 3 server path-resolution cases, 2 frontend attachment-extraction
++cases). It writes no repository files, opens no socket, and reads no `.env`.
++
++Observed result:
++
++```
++PASS  server fixture: leading-slash downloads path resolves from workspace root
++PASS  server fixture: ordinary relative path resolves from workspace root
++PASS  server fixture: absolute path already inside workspace is preserved
++PASS  frontend fixture: standalone MEDIA line becomes an absolute attachment
++PASS  frontend fixture: relative markdown link is extracted and unwrapped
++
++fixture verification: 5/5 passed (offline, node-only)
++```
++
++## Contract it normalizes
++
++Both fixtures encode one shared contract: *a delivered file is addressed by a
++workspace-relative path, and the server is the only party allowed to resolve it
++to an absolute path inside the agent workspace.*
++
++- Server side (`resolveGeneratedFileCandidatePath`, lines 1–14): normalizes the
++  workspace (trailing slashes stripped), converts `\` to `/`, and classifies the
++  request as `workspace-absolute`, `workspace-root-relative` (leading `/`) or
++  `workspace-relative`. It is a pure function — string in, tagged object out.
++- Frontend side (`extractGeneratedAttachments`, lines 93–214): recovers the same
++  workspace-relative addresses from assistant output (`MEDIA:` lines, delivery
++  cues, file tables, markdown links) and deduplicates them, e.g. collapsing
++  `/downloads/report.pdf`, `/home/.../downloads/report.pdf` and
++  `downloads/report.pdf` to a single attachment.
++
++The verification asserts that contract by feeding the exact fixture inputs and
++comparing the normalized outputs; it does not exercise any route, database or
++gateway.
++
++## Why this avoids runtime/deployment dependencies
++
++1. **The server fixture module has zero imports.** `server/utils/generated-file-path.js`
++   (lines 1–14) uses only `String.replace`/`startsWith`; there is nothing for
++   Node to resolve, so the absent `node_modules` is irrelevant.
++2. **The frontend fixture module is type-only + pure.** `extractGeneratedAttachments`
++   (lines 93–214) imports nothing; Node 24 strips its TypeScript declarations at
++   load time, so no `vite`/`vue-tsc` build is needed.
++3. **The official test entrypoints are toolchain-bound.** `package.json`
++   `scripts.test:server` (line 13) runs `vitest run …` and `scripts.build`
++   (line 11) runs `vue-tsc -b && vite build`; both need installed dev
++   dependencies, which this workspace does not have. The harness therefore
++   reproduces the fixture assertions with `node:assert` instead of invoking
++   vitest.
++4. **The runtime entrypoint is deliberately not touched.** `server/index.js`
++   builds an Express app over an HTTP server (line 352–353) and reaches
++   `server.listen(envConfig.PORT, …)` (line 2240), whose startup path schedules
++   retention, a model-health monitor, gateway workspace sync and the message
++   store. Importing it would require `.env` values, a database, a live Gateway
++   and a free port. The verification never imports `server/index.js`; it only
++   uses it as the contrast case explaining why fixture-level checking is the
++   narrow, dependency-free slice.
++5. **Nothing outside the workspace is read or written.** The modules under test
++   are in-memory transforms; the harness emits to stdout and sets an exit code.
++
++## Scope and limitations
++
++- `node_modules` is absent, so `npm run test:server` (vitest + `node --test`)
++  could not be executed. This limitation is recorded in
++  `result.json → validation.notes`.
++- As a secondary syntax guard, `node --check` was run on `server/index.js` and
++  `server/utils/generated-file-path.js`; this proves parseability only and is
++  **not** equivalent to the full suite.
++- The check is intentionally narrow: it covers the path/attachment fixture
++  contract, not routing, persistence, auth or deployment wiring.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..d94fa48
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,63 @@
++{
++  "task_id": "T28",
++  "repository": "wattclaw",
++  "mode": "operate",
++  "evidence": [
++    {
++      "path": "package.json",
++      "symbol": "scripts",
++      "start_line": 7,
++      "end_line": 21,
++      "observation": "The scripts object is the repository's operation contract. line 13 'test:server' runs `vitest run ...` for six suites plus `node --test` for external-session-projection, line 11 'build' runs `vue-tsc -b && vite build`, and line 16 'start' runs `node --env-file=.env server/index.js`. Exercising fixtures through these entrypoints requires installed dev dependencies and a populated .env, which is why the offline verification bypasses them and drives the fixture modules directly."
++    },
++    {
++      "path": "server/index.js",
++      "symbol": "server.listen",
++      "start_line": 2240,
++      "end_line": 2248,
++      "observation": "The server lifecycle entrypoint: `server.listen(envConfig.PORT, ...)` binds a port from environment config and its callback starts retention scheduling, the model-health monitor, shared-session dedup, gateway-side workspace sync and the message store. Importing this module is therefore runtime- and deployment-bound (port, .env, database, live Gateway), which is exactly the coupling the narrow fixture check avoids by never importing server/index.js."
++    },
++    {
++      "path": "server/utils/generated-file-path.js",
++      "symbol": "resolveGeneratedFileCandidatePath",
++      "start_line": 1,
++      "end_line": 14,
++      "observation": "Pure ES module with zero imports. It normalizes the workspace root (trailing slashes stripped), converts backslashes to forward slashes, and classifies a requested path as 'workspace-absolute', 'workspace-root-relative' or 'workspace-relative', returning a tagged { candidatePath, pathMode } object. Because it is a string-in/object-out transform, Node's binary alone can execute it with no dependency resolution, socket, env file or filesystem access."
++    },
++    {
++      "path": "src/utils/generated-attachments.ts",
++      "symbol": "extractGeneratedAttachments",
++      "start_line": 93,
++      "end_line": 214,
++      "observation": "The frontend counterpart of the same generated-file path contract. This pure function (module has only type declarations and no imports) recovers workspace-relative attachment paths from assistant output — MEDIA lines, delivery cues, horizontal and vertical file tables, and markdown links — then deduplicates equivalent paths across workspace directory prefixes. Node 24 strips its TypeScript types at load time, so it can be verified without a vite/vue-tsc build."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "package.json binds the repository's verification and startup paths to external toolchains (vitest/vite for tests and build; .env plus server/index.js for start), so a dependency-free check must call the fixture modules directly instead of running npm scripts.",
++      "evidence_paths": ["package.json"]
++    },
++    {
++      "claim": "server/index.js is runtime/deployment-bound: it builds an Express app and opens an HTTP listener whose callback wires monitors, gateway sync and the message store, so importing it would require .env values, a database, a live Gateway and a free port.",
++      "evidence_paths": ["server/index.js"]
++    },
++    {
++      "claim": "server/utils/generated-file-path.js is a zero-import pure function, so the server side of the fixture can be executed by the Node binary alone without node_modules or any deployment service.",
++      "evidence_paths": ["server/utils/generated-file-path.js"]
++    },
++    {
++      "claim": "src/utils/generated-attachments.ts exposes the frontend half of the same workspace-relative path contract as a pure, type-only module, so it loads via Node's native type stripping with no vite/vue-tsc build step.",
++      "evidence_paths": ["src/utils/generated-attachments.ts"]
++    },
++    {
++      "claim": "The chosen verification is a narrow, offline-safe fixture check: it re-asserts the checked-in expectations for both sides of the generated-file path fixture and passes 5/5 using only the Node runtime, leaving server/index.js's Express/database/Gateway bootstrap untouched.",
++      "evidence_paths": ["server/utils/generated-file-path.js", "src/utils/generated-attachments.ts", "server/index.js", "package.json"]
++    }
++  ],
++  "conclusion": "The narrow, offline-safe verification is to run node .prale-eval/verify-fixture.mjs, which imports the server fixture server/utils/generated-file-path.js (resolveGeneratedFileCandidatePath) and the frontend fixture src/utils/generated-attachments.ts (extractGeneratedAttachments) directly and asserts the checked-in fixture expectations (5/5 pass). It avoids runtime/deployment dependencies because both modules are pure with zero imports — no node_modules, vitest/vite toolchain, .env, database, Gateway or network is involved — whereas the package.json scripts route through vitest/vite and server/index.js's server.listen bootstrap is explicitly not imported.",
++  "validation": {
++    "command": "node .prale-eval/verify-fixture.mjs && node --check server/index.js && node --check server/utils/generated-file-path.js",
++    "status": "pass",
++    "notes": "Ran offline with only the Node v24.14.0 binary; node_modules is absent in this workspace. The harness passed 5/5 fixture assertions (3 server path-resolution cases mirroring server/utils/generated-file-path.test.js, 2 frontend attachment cases mirroring src/utils/generated-attachments.test.ts) and exited 0; node --check parsed server/index.js and server/utils/generated-file-path.js as ESM without error. LIMITATION: the official suite (`npm run test:server`, which needs vitest, and `npm run build`, which needs vue-tsc/vite) could not be executed because dev dependencies are not installed and installing them is out of scope; node --check and the node:assert fixture harness are lower-strength substitutes and are not equivalent to the full test suite. No repository source, task metadata, hidden-oracle file, package lock or git configuration was modified."
++  }
++}
+diff --git a/.prale-eval/verify-fixture.mjs b/.prale-eval/verify-fixture.mjs
+new file mode 100644
+index 0000000..010a410
+--- /dev/null
++++ b/.prale-eval/verify-fixture.mjs
+@@ -0,0 +1,82 @@
++// Offline-safe fixture verification for the WattClaw generated-file path fixture.
++//
++// Runs with ONLY the Node.js binary:
++//   node .prale-eval/verify-fixture.mjs
++//
++// Why this is offline-safe:
++//   * server/utils/generated-file-path.js is a pure ES module with ZERO imports
++//     (only String.prototype methods), so it needs no package resolution.
++//   * src/utils/generated-attachments.ts contains only type declarations plus a
++//     pure function; Node >= 22.18 strips the types at load time with no toolchain.
++//   * No vitest/vite/vue-tsc, no Express/SQLite/Postgres/WebSocket gateway, no
++//     .env file, no network socket and no filesystem writes are touched by the
++//     modules under test.
++//   * The assertions below mirror the checked-in fixture expectations in
++//     server/utils/generated-file-path.test.js and src/utils/generated-attachments.test.ts.
++
++import assert from 'node:assert/strict'
++
++import { resolveGeneratedFileCandidatePath } from '../server/utils/generated-file-path.js'
++import { extractGeneratedAttachments } from '../src/utils/generated-attachments.ts'
++
++const results = []
++function check(name, fn) {
++  try {
++    fn()
++    results.push({ name, status: 'pass' })
++  } catch (error) {
++    results.push({ name, status: 'fail', error: error.message })
++  }
++}
++
++// ── Server fixture: server/utils/generated-file-path.js ──
++const workspace = '/home/wattman/.wattclaw/user/report-agent'
++
++check('server fixture: leading-slash downloads path resolves from workspace root', () => {
++  assert.deepEqual(resolveGeneratedFileCandidatePath(workspace, '/downloads/report.pdf'), {
++    candidatePath: `${workspace}/downloads/report.pdf`,
++    pathMode: 'workspace-root-relative',
++  })
++})
++
++check('server fixture: ordinary relative path resolves from workspace root', () => {
++  assert.deepEqual(resolveGeneratedFileCandidatePath(workspace, 'downloads/report.pdf'), {
++    candidatePath: `${workspace}/downloads/report.pdf`,
++    pathMode: 'workspace-relative',
++  })
++})
++
++check('server fixture: absolute path already inside workspace is preserved', () => {
++  const absolutePath = `${workspace}/downloads/report.pdf`
++  assert.deepEqual(resolveGeneratedFileCandidatePath(workspace, absolutePath), {
++    candidatePath: absolutePath,
++    pathMode: 'workspace-absolute',
++  })
++})
++
++// ── Frontend fixture: src/utils/generated-attachments.ts ──
++check('frontend fixture: standalone MEDIA line becomes an absolute attachment', () => {
++  const result = extractGeneratedAttachments(
++    'The report is ready.\n\nMEDIA:/home/wattman/.wattclaw/user/agent/downloads/report.pdf',
++  )
++  assert.deepEqual(result.attachments, [
++    { name: 'report.pdf', path: '/home/wattman/.wattclaw/user/agent/downloads/report.pdf', media: true },
++  ])
++  assert.equal(result.content, 'The report is ready.')
++})
++
++check('frontend fixture: relative markdown link is extracted and unwrapped', () => {
++  const result = extractGeneratedAttachments('请下载 [分析报告](artifacts/report.pdf)。')
++  assert.deepEqual(result.attachments, [{ name: '分析报告', path: 'artifacts/report.pdf' }])
++  assert.equal(result.content, '请下载 分析报告。')
++})
++
++const failed = results.filter((entry) => entry.status === 'fail')
++for (const entry of results) {
++  console.log(`${entry.status === 'pass' ? 'PASS' : 'FAIL'}  ${entry.name}${entry.error ? ` — ${entry.error}` : ''}`)
++}
++console.log(`\nfixture verification: ${results.length - failed.length}/${results.length} passed (offline, node-only)`)
++
++if (failed.length > 0) {
++  process.exitCode = 1
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/operate-deliverable.md - 86694d8eb84c25a1cf5a4f3411edc09f6fe2cd14475fef378f93924279d2fa27
+snapshot .prale-eval/result.json - 2b52b9a314785c169c2673fc6dcbe41158b804f08ff31d49a59a82ada9c6e4fd
+snapshot .prale-eval/verify-fixture.mjs - cb54663fa49cc42cef097d972fd401436334f9d3fae60506c801996c844ddb84

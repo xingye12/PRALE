@@ -1,0 +1,91 @@
+{
+  "task_id": "T26",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue",
+      "start_line": 11,
+      "end_line": 24,
+      "observation": "`BuildQueue` is the per-asset-key serial execution queue. Its `queues` Map holds one `SerialQueue` per key, and `enqueue(key, job)` lazily creates that queue on first use and reuses it afterwards, so every later submission that carries the same key is appended to the SAME concurrency=1 queue rather than spawning a parallel build. It is fire-and-forget (`void q.add(job).catch(...)`) with the rejection swallowed because the job itself already committed a failed status. This is exactly the contract the fixture exercises: the duplicate submission of one source resolves to one queue slot."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "enqueue",
+      "start_line": 14,
+      "end_line": 24,
+      "observation": "`enqueue` is the single submission entry point. `let q = this.queues.get(key)` followed by the `if (!q)` creation branch (lines 16-20) is the keying/dedup mechanism: two calls with the same source key must share one `SerialQueue` instance, and two calls with different keys get independent instances (hence independent, possibly overlapping, throughput). The fixture asserts both halves of that behavior (same-key never concurrent; distinct keys may overlap)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "onIdle",
+      "start_line": 26,
+      "end_line": 33,
+      "observation": "`onIdle(key?)` is the deterministic join point. With a key it awaits only that key's `SerialQueue.onIdle()`; with no key it awaits every queue via `Promise.all([...this.queues.values()].map(q => q.onIdle()))`. The fixture uses `onIdle()` to prove the duplicated submission has fully drained before asserting the terminal `ready` state and to prove that no second effective build is pending."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue",
+      "start_line": 21,
+      "end_line": 101,
+      "observation": "`SerialQueue` is the zero-dependency concurrency=1 primitive that `BuildQueue` is composed from. `add()` (lines 45-55) pushes a task and calls `drain()`; `drain()` (lines 81-101) refuses to start while `this.running` is true and only re-enters after the current task settles, which is the mechanical guarantee that two jobs on one key can never execute concurrently. `onIdle()` (lines 65-71) resolves immediately when empty or parks a resolver released on the final task's `.finally`. The fixture verifies this primitive directly (FIFO add results) and indirectly via the same-key concurrency check."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "create",
+      "start_line": 132,
+      "end_line": 139,
+      "observation": "`CodeGraphService.create` is the idempotent submission path exercised by the fixture. It delegates to `store.createCodeGraph(params)` and only performs the create audit + `enqueueBuild(row)` when `existed` is false. The store keys existence on (service_id, team_id, repo_url, branch), so a second submission of the same source returns the existing row with `existed: true` and does NOT enqueue another build — this is the production mechanism that turns 'same source submitted twice' into one effective build."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "sync",
+      "start_line": 152,
+      "end_line": 171,
+      "observation": "`sync` is the second duplicate-submission route and the in-flight concurrency guard. If the row's status is `pending` or `processing` it returns `{ kind: \"busy\", status, step }` immediately (lines 156-159) without overwriting status, re-enqueuing, or writing audit. Only a terminal row (ready/failed) is re-accepted, bumping `version` and re-enqueuing. The fixture asserts the busy rejection for an in-flight duplicate and the acceptance of an explicit re-sync after the terminal state."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "runBuild",
+      "start_line": 275,
+      "end_line": 315,
+      "observation": "`runBuild` is what the queued job actually executes, and it is where the expected terminal state is recorded. It flips the row to `processing` with `internal_status: \"cloning\"` (lines 287-291), invokes the injected worker (which reports progress via `setInternalStatus`), then on success writes the terminal `status: \"ready\"` with `internal_status: null`, `sync_error: null`, `commit_hash`, `stats_json` and `last_sync_at` (lines 308-315). The fixture asserts precisely this recorded post-state after the duplicate submission drains."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "BuildQueue implements per-key serialization: `enqueue` reuses one `SerialQueue` instance for a repeated key (build-queue.ts:16-20) and distinct keys receive independent queues, and the underlying `SerialQueue.drain` refuses to run a second task while one is in flight. Therefore two submissions of the same source can never execute concurrently.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    },
+    {
+      "claim": "Submitting the same source twice yields exactly ONE effective build because CodeGraphService.create is idempotent on (service_id, team_id, repo_url, branch): the first call returns existed=false and enqueues a build, while the second returns existed=true and skips `enqueueBuild`; the in-flight `sync` route additionally rejects a duplicate with `kind: \"busy\"` instead of re-enqueuing.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    },
+    {
+      "claim": "The queued build records the expected terminal state: the duplicated source's row ends at `status: \"ready\"` with `internal_status` and `sync_error` cleared, `commit_hash`/`stats_json`/`last_sync_at` persisted from the worker result, version unchanged by the duplicate, and audit containing exactly one 'create' plus one 'ready'.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    },
+    {
+      "claim": "`BuildQueue.onIdle` provides the deterministic barrier the contract relies on: awaiting it (per key or globally) drains the shared per-key queues, so a test can prove the single build has completed and no second build remains pending before inspecting the recorded terminal state.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    }
+  ],
+  "conclusion": "The contract holds and is proven by an executable fixture that drives the real repository modules with zero third-party dependencies. `.prale-eval/fixture/queue-double-submit.mjs` submits the same source twice (create-then-create, plus an in-flight sync as the alternate duplicate route) against the real `CodeGraphService` backed by the real `BuildQueue`/`SerialQueue`. The result is exactly one effective build: one row, one worker invocation, the second submission returned `existed: true` on the same code_graph_id, and the in-flight duplicate sync was rejected as `busy`. The single build then drained via `onIdle()` and recorded the expected terminal state `status: \"ready\"` with internal_status/sync_error null, commit_hash `abc1234`, stats_json `{\"files\":7,\"nodes\":42,\"edges\":88}`, last_sync_at set, version 1, and an audit trail of one 'create' + one 'ready' with no duplicate build audit. Negative control (a different branch builds independently) and positive control (an explicit sync after the terminal state is accepted and returns to ready) both pass, confirming the dedup is source-key scoped rather than a blanket block. All 24 assertions pass and the fixture exits 0.",
+  "validation": {
+    "command": "node --experimental-strip-types .prale-eval/fixture/queue-double-submit.mjs && node .prale-eval/fixture/verify-citations.mjs",
+    "status": "passed",
+    "notes": "Fixture: 24/24 checks passed, exit code 0, output `{total: 24, passed: 24, failed: 0}`. It imports the real TS sources via `.prale-eval/fixture/ts-resolve.mjs` (a Node loader hook mapping the repo's bundler-style `./x.js` specifiers to `./x.ts`) and Node's built-in `--experimental-strip-types`; only an in-memory IKnowledgeStore stub and an injected worker are authored, no production logic is copied. Citation verifier: validates that result.json matches the current TASK.md metadata (task_id T26, repository tdam, mode contract), that every required evidence path (MemoryKnowledge/src/store/build-queue.ts) is present and symbol-covered by a claim, that every named symbol literally occurs inside its inclusive start_line/end_line range in the on-disk file, and that every claim's evidence_paths are cited in `evidence`. LIMITATION: this checkout has no node_modules, so `pnpm typecheck` / `vitest` and anything importing better-sqlite3, drizzle, or yaml could not run; no dependencies were installed (per instructions). The real `SqliteKnowledgeStore.createCodeGraph` idempotency SQL was therefore not executed — its behavior is modeled by the in-memory stub and read off the source comment/line range at sqlite-store.ts:65-69, not executed. `--experimental-strip-types` is required because the sources are TypeScript (`node` v24.14.0)."
+  }
+}

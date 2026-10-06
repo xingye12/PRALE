@@ -1,0 +1,73 @@
+{
+  "task_id": 24,
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "syncUserSessionsFromGateway",
+      "start_line": 118,
+      "end_line": 177,
+      "observation": "The sync entrypoint orchestrates duplicate-tolerant delivery: it lists sessions per owned agent, normalizes each row, and funnels every row through upsertSyncedUserSession keyed on sessionKey. Re-delivering the same Gateway payload re-invokes the same upsert for the same key, and the function only increments `changed` when the upsert reports a real transition (lines 163-168). A duplicate delivery therefore re-scans rows but produces zero mutations, which is exactly the harmlessness property being proven."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "scheduleUserSessionSync",
+      "start_line": 179,
+      "end_line": 216,
+      "observation": "Adds two independent layers of duplicate absorption at the scheduling boundary: an in-flight map (lines 195-199) makes a second concurrent sync for the same user reuse the existing promise instead of issuing another Gateway call, and a cooldown window (lines 189-193) drops a rapid re-schedule. Both return a skipped/coalesced result rather than performing work, so duplicate schedule delivery cannot double-apply to state."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "normalizeGatewaySessionForSync",
+      "start_line": 59,
+      "end_line": 77,
+      "observation": "Normalization is deterministic and total: it derives a stable sessionKey from key/sessionKey/session_key/id (line 63) and returns null for unusable rows. Because the same raw Gateway row always normalizes to the same sessionKey, duplicate delivery maps onto the same idempotency key instead of creating a new row."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "mapWithConcurrency",
+      "start_line": 79,
+      "end_line": 94,
+      "observation": "Bounded-concurrency fan-out over agents. It only affects ordering/timing of the upserts, not their identity: because upsert is keyed by sessionKey, interleaving from concurrency cannot turn one logical session into two rows. This supports the claim that duplicate/concurrent delivery is harmless under the concurrency model."
+    },
+    {
+      "path": "server/user-manager.js",
+      "symbol": "upsertSyncedUserSession",
+      "start_line": 614,
+      "end_line": 689,
+      "observation": "The idempotency primitive the sync layer relies on. It SELECTs the existing row by session_key (lines 621-625), inserts a fresh UUID row only when absent (lines 627-648), and otherwise computes the next projection with monotonic max() on lastMessageAt (lines 659-662). Critically, when nothing differs it returns { changed: false, action: 'unchanged' } and issues no UPDATE (line 673), so replaying identical or stale data is a true no-op."
+    },
+    {
+      "path": "server/core/session-sync.test.js",
+      "symbol": "coalesces scheduled syncs for the same user",
+      "start_line": 122,
+      "end_line": 138,
+      "observation": "Repository test that pins the coalescing contract: two concurrent scheduleUserSessionSync calls for one user must result in exactly one Gateway call (expect(calls).toBe(1)). This is the existing acceptance evidence that duplicate scheduling delivery is harmless."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Duplicate delivery of the same Gateway session listing is harmless: the second identical sync reports changed=0 and creates no additional rows, while still scanning the same inputs.",
+      "evidence_paths": ["server/core/session-sync.js", "server/user-manager.js"]
+    },
+    {
+      "claim": "Duplicate/out-of-order delivery cannot regress session state because upsertSyncedUserSession is keyed on session_key and advances last_message_at monotonically with Math.max, returning 'unchanged' when a replay carries an older or equal projection.",
+      "evidence_paths": ["server/core/session-sync.js", "server/user-manager.js"]
+    },
+    {
+      "claim": "Concurrent duplicate sync requests for the same user are coalesced at the scheduling boundary (in-flight promise reuse) and rapid repeats are absorbed by a cooldown, so duplicates never fan out into extra Gateway calls.",
+      "evidence_paths": ["server/core/session-sync.js", "server/core/session-sync.test.js"]
+    },
+    {
+      "claim": "Deterministic normalization plus keyed upsert make the operation idempotent regardless of agent-level concurrency: the same raw row always maps to the same sessionKey, so interleaved delivery cannot duplicate a logical session.",
+      "evidence_paths": ["server/core/session-sync.js"]
+    }
+  ],
+  "conclusion": "Duplicate delivery is harmless for session synchronization in WattClaw. Session sync is idempotent by construction: normalizeGatewaySessionForSync deterministically derives a stable session_key, syncUserSessionsFromGateway routes every row through upsertSyncedUserSession which is keyed on that session_key, and the upsert returns { changed: false, action: 'unchanged' } for an identical or stale projection, advancing last_message_at monotonically with Math.max and issuing no UPDATE. At the scheduling boundary, in-flight coalescing and a cooldown drop duplicate schedule requests before they reach the Gateway. The executable demo drives the real server/core/session-sync.js source through four duplicate-delivery scenarios (identical redelivery, out-of-order replay, concurrent schedules, cooldown) and all four produce zero spurious changes or duplicate rows.",
+  "validation": {
+    "command": "node .prale-eval/duplicate-delivery-demo.mjs",
+    "status": "passed",
+    "notes": "Node v24.14.0. All four assertions passed (exit 0): identical redelivery changed=2 then changed=0 with rows=2; older replay changed=0 with lastMessageAt held at 5000; concurrent schedules produced gatewayCalls=1; cooldown produced gatewayCalls=1 with reason=cooldown. The demo imports the verbatim source of server/core/session-sync.js via a data: URL and substitutes only the '../user-manager.js' dependency with an in-memory store mirroring the real upsertSyncedUserSession idempotency contract, because node_modules (better-sqlite3) is not installed in this workspace and dependencies must not be installed. vitest is likewise unavailable, so the repo's own session-sync.test.js could not be executed here; its coalescing contract is cited as evidence instead."
+  }
+}

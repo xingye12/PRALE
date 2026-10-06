@@ -1,0 +1,110 @@
+{
+  "task_id": "T07",
+  "repository": "tdam",
+  "mode": "contract",
+  "summary": "Contract the wiki ingest-v2 normalization on a fresh 17-file corpus that contains duplicate headings and malformed frontmatter, and prove (a) normalization is deterministic/order-independent and (b) invalid metadata is rejected explicitly with typed codes instead of being silently dropped.",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "slugify",
+      "start_line": 30,
+      "end_line": 64,
+      "observation": "slugify(input) is the single source of truth for entity-name -> stable filename normalization. It trims, returns \"\" for empty input, then scans character-by-character into alternating CJK / latin tokens: CJK runs are preserved verbatim, latin runs are lower-cased, and every other character (space, punctuation) is only a segment boundary. Tokens are joined with \"-\", repeated hyphens are collapsed and leading/trailing hyphens stripped. This is exactly why \"Redis Cluster\", \"redis   cluster\" and \"Redis-Cluster!\" all normalize to the same slug \"redis-cluster\" (duplicate-heading dedup) while \"Redis 主从\" stays \"redis-主从\" (CJK not transliterated). Determinism is structural: the output depends only on the input string, with no locale, clock, map iteration or randomness."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "TYPE_DIR",
+      "start_line": 72,
+      "end_line": 81,
+      "observation": "TYPE_DIR is the frozen type -> directory table (source->sources, entity->entities, concept->concepts, comparison->comparisons, synthesis/thesis/finding->synthesis, methodology->concepts). Because this mapping is a constant record, the same page type always lands in the same directory, which is the second half of the stable-path invariant the dedup step relies on."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "dirForType",
+      "start_line": 84,
+      "end_line": 87,
+      "observation": "dirForType normalizes the discriminator before lookup (trim + toLowerCase) and falls back to the key itself, or \"other\" when empty. This keeps path derivation deterministic for casing/whitespace variants of the type field and guarantees a non-empty directory segment even for unknown types."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "pageRelPath",
+      "start_line": 94,
+      "end_line": 98,
+      "observation": "pageRelPath(type, title) composes slugify(title) with dirForType(type) into `wiki/<dir>/<slug>.md`. It is the canonical dedup key: two documents whose title normalizes to the same slug AND whose type maps to the same directory resolve to the same path, so the second ingest collides with the first. Crucially the type participates in the key, so entity/\"Redis Cluster\" and concept/\"Redis Cluster\" deliberately do NOT collide (`wiki/entities/redis-cluster.md` vs `wiki/concepts/redis-cluster.md`), which is verified in the harness."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "FM_RE",
+      "start_line": 36,
+      "end_line": 36,
+      "observation": "FM_RE is the leading-frontmatter block detector (`^---\\r?\\n ... \\r?\\n---\\r?\\n?`). It tolerates CRLF line endings but anchors at offset 0, so a UTF-8 BOM before the opening fence makes the match fail; the harness therefore strips the BOM before applying this same regex and records a BOM_STRIPPED normalization event, keeping the block detector semantics while making encoding handling explicit."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "parseFrontmatter",
+      "start_line": 42,
+      "end_line": 62,
+      "observation": "parseFrontmatter is deliberately fail-open: a missing block returns {type:\"other\"} with hasFrontmatter:false; a YAML parse throw returns {type:\"other\"} with hasFrontmatter:false; a non-object parse result is likewise degraded; and even a structurally valid block with blank/non-string type is coerced to type:\"other\". Nothing throws and nothing is reported to the caller, so invalid metadata disappears silently. That is the exact gap the T07 contract closes: the harness mirrors the block-detection regex but replaces the silent degradation with typed, path-attributed rejections (MISSING_FRONTMATTER, MALFORMED_YAML, INVALID_TYPE, MISSING_TITLE, INVALID_FIELD, EMPTY_SLUG, NON_MAPPING_FRONTMATTER)."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "buildPage",
+      "start_line": 85,
+      "end_line": 101,
+      "observation": "buildPage defines the canonical output shape: type defaults to \"other\", the fixed field order is type -> title -> description -> sources -> tags -> timestamp -> extras, `locked` is explicitly excluded from the emitted frontmatter, unknown fields are passed through, and the body is whitespace-trimmed before being re-emitted as `---\\n<yaml>\\n---\\n\\n<body>\\n`. This is the contract the harness reproduces deterministically (fixed order, locked dropped, body trimmed) when it emits the merged canonical page for each dedup group."
+    },
+    {
+      "path": ".prale-eval/contract/normalize-corpus.mjs",
+      "symbol": "normalizeDocument",
+      "start_line": 129,
+      "end_line": 222,
+      "observation": "normalizeDocument is the executable contract gate: it records explicit normalization events (BOM_STRIPPED, CRLF_NORMALIZED, SCALAR_SOURCES_COERCED, LOCKED_DROPPED), applies the FM_RE block detector, parses the frontmatter with a dependency-free deterministic mini-parser, and returns either an accepted canonical page (real slugify/dirForType/pageRelPath derived path) or an explicit {source, code, message} rejection. It never throws, so no path can be dropped silently."
+    },
+    {
+      "path": ".prale-eval/contract/normalize-corpus.mjs",
+      "symbol": "runPipeline",
+      "start_line": 234,
+      "end_line": 292,
+      "observation": "runPipeline reads a given file order, normalizes/rejects every document, then groups accepted pages by their real pageRelPath. Groups with more than one member are duplicate-heading collisions; the owner is the lexicographically smallest source path and the merged sources are sorted before union, so the canonical output is independent of input order. This is the function the determinism check re-runs over 7 different orderings and asserts byte-identical JSON."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "slugify (slug.ts:30-64) is a pure, deterministic normalizer: title variants that differ only by case, whitespace or punctuation (\u201cRedis Cluster\u201d, \u201credis   cluster\u201d, \u201cRedis-Cluster!\u201d) all produce the identical slug \u201credis-cluster\u201d, whereas mixed latin+CJK headings preserve the CJK (\u201cRedis \u4e3b\u4ece\u201d and \u201credis \u4e3b\u4ece\u201d both \u2192 \u201credis-\u4e3b\u4ece\u201d). The harness confirms this directly by calling the real exported slugify, so duplicate headings in a corpus necessarily converge and the result cannot depend on run order.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts"
+      ]
+    },
+    {
+      "claim": "pageRelPath (slug.ts:94-98) combined with dirForType (slug.ts:84-87) and the constant TYPE_DIR table (slug.ts:72-81) yields one stable canonical path per (normalized type, normalized title): entity/\u201cRedis Cluster\u201d \u2192 wiki/entities/redis-cluster.md and concept/\u201cRedis Cluster\u201d \u2192 wiki/concepts/redis-cluster.md. This makes dedup deterministic while keeping the type discriminator in the key, so same-title pages of different types correctly do not collide.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts"
+      ]
+    },
+    {
+      "claim": "parseFrontmatter (frontmatter.ts:42-62) fails open by design: missing blocks, YAML parse errors, non-object results and blank/non-string type all degrade to {type:\"other\"} / hasFrontmatter:false without throwing or reporting, so malformed metadata is silently lost. FM_RE (frontmatter.ts:36) also anchors at offset 0 and therefore misses a BOM-prefixed fence. T07's contract must therefore add an explicit fail-closed gate rather than relying on the production parser to surface invalid metadata.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"
+      ]
+    },
+    {
+      "claim": "buildPage (frontmatter.ts:85-101) is the canonical output contract for every normalized page: fixed field order, type defaulting to \u201cother\u201d, unknown fields preserved, `locked` never written, and the body whitespace-trimmed. The T07 harness mirrors this shape when it emits one merged canonical page per dedup group, so normalized output is byte-stable and never leaks the user-only locked flag.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"
+      ]
+    },
+    {
+      "claim": "The executable contract in .prale-eval/contract/normalize-corpus.mjs is deterministic and explicit: runPipeline (lines 234-292) produces byte-identical canonical JSON across 7 different input orderings, dedupes the 3-way duplicate-heading group wiki/entities/redis-cluster.md to a single page with a sorted source union, and normalizeDocument (lines 129-222) rejects each of the 9 malformed corpus files with a typed {source, code, message} (MISSING_FRONTMATTER, MALFORMED_YAML x3, INVALID_TYPE, MISSING_TITLE, INVALID_FIELD, EMPTY_SLUG) while recording 4 explicit normalization events, leaving no page silently dropped (8 accepted + 9 rejected = 17 files). It achieves this by importing the real slugify/dirForType/pageRelPath from slug.ts under Node 24 type-stripping.",
+      "evidence_paths": [
+        ".prale-eval/contract/normalize-corpus.mjs",
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts"
+      ]
+    }
+  ],
+  "conclusion": "The wiki ingest-v2 normalization contract holds on the fresh T07 corpus. The real slugify/dirForType/pageRelPath from MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts collapse duplicate headings deterministically (3 distinct \u201cRedis Cluster\u201d spellings \u2192 one wiki/entities/redis-cluster.md, and the mixed CJK pair \u2192 wiki/entities/redis-\u4e3b\u4ece.md) while keeping the page type in the path key. Running the full pipeline over 7 file orderings and twice on the same order produced one byte-identical canonical output. The production parseFrontmatter/buildPage were found to fail open (malformed frontmatter degrades silently to type:\"other\"), so the contract adds an explicit gate that rejects all 9 malformed pages with typed, path-attributed codes and records normalization events (BOM_STRIPPED, CRLF_NORMALIZED, SCALAR_SOURCES_COERCED, LOCKED_DROPPED) instead of dropping them. 13/13 harness checks and all static citation checks pass. Limitation: the `yaml` package is not installed in this checkout (no node_modules) and dependencies must not be installed, so frontmatter.ts could not be imported directly; the harness re-implements the FM_RE block detection plus a deterministic mini-YAML parser that mirrors parseFrontmatter/buildPage shape, and this is recorded in the validation notes.",
+  "validation": {
+    "command": "node .prale-eval/contract/normalize-corpus.mjs && node .prale-eval/contract/verify-contract.mjs",
+    "status": "passed",
+    "notes": "normalize-corpus.mjs exits 0 with 13/13 checks (slugify purity, equivalent-heading collapse, CJK stability, type-scoped non-collision, duplicate-heading dedup to one page, explicit collision record, order-independent + repeat-run byte-identical output, 9/9 malformed pages rejected with expected typed codes, no silent drops, explicit normalization events, locked never written, slug-consistent canonical paths). verify-contract.mjs re-reads the current TASK.md, confirms result.task_id=\"T07\"/repository=\"tdam\"/mode=\"contract\", and statically validates every evidence symbol inside its inclusive range plus required-path claim coverage. LIMITATION: there is no node_modules anywhere in the checkout and installing dependencies is forbidden, so `yaml` (and therefore direct import of frontmatter.ts) and the repo's vitest suite could not be executed; frontmatter behavior was validated by a dependency-free parser that mirrors frontmatter.ts FM_RE/parseFrontmatter/buildPage semantics, and slug.ts was exercised directly via Node 24 TypeScript type-stripping. Also note the deliberate delta: the production parseFrontmatter tolerates malformed metadata by degrading to type:\"other\", while this contract intentionally fails closed with explicit rejection codes."
+  }
+}

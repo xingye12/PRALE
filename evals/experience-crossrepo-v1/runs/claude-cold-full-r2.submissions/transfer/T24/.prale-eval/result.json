@@ -1,0 +1,73 @@
+{
+  "task_id": "T24",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/models.py",
+      "symbol": "ModelInfoManager.get_model_from_cached_json_db",
+      "start_line": 223,
+      "end_line": 247,
+      "observation": "Metadata lookup for a model name. It checks the explicitly loaded local fixture dict first (line 224, `self.local_model_metadata.get(model)`), then the cached litellm price database, then tries a provider-qualified `provider/model` fallback. Every miss path returns a literal empty `dict()` (lines 235, 247), so a name that is absent from both the local fixture and the upstream database resolves to no metadata at all. Nothing is inferred from sibling local entries, prefix matches, or provider defaults, which is the mechanism that prevents a fabricated context window, cost, or capability set."
+    },
+    {
+      "path": "aider/models.py",
+      "symbol": "ModelInfoManager.get_model_info",
+      "start_line": 249,
+      "end_line": 274,
+      "observation": "Merges three knowledge sources: the local fixture/cached database, litellm's `get_model_info` (guarded by try/except so an unknown-model error is swallowed rather than converted into invented data), and OpenRouter fallbacks that only trigger for `openrouter/` names. If all lookups miss, it returns `cached_info` (line 274), which is the empty dict produced above. The unknown-model path therefore terminates in an explicit empty result instead of a default capability record."
+    },
+    {
+      "path": "aider/models.py",
+      "symbol": "Model.__init__",
+      "start_line": 330,
+      "end_line": 369,
+      "observation": "Stores the resolution result verbatim as `self.info = self.get_model_info(model)` (line 348) and derives `max_chat_history_tokens` from `self.info.get(\"max_input_tokens\") or 0` (line 355) which, for an unknown model, yields the documented minimum of 1024 (lines 356-358). Capability reads such as `info[\"max_input_tokens\"]` or `info[\"input_cost_per_token\"]` are simply absent on the empty dict, so callers cannot silently consume a claimed capability; they must fall back to explicit defaults."
+    },
+    {
+      "path": "aider/models.py",
+      "symbol": "sanity_check_model",
+      "start_line": 1164,
+      "end_line": 1200,
+      "observation": "Makes unknown-model handling explicit at the user-facing boundary. When `not model.info` it sets `show = True` and emits a tool_warning \"Unknown context window size and costs, using sane defaults.\" (lines 1188-1192) and additionally offers fuzzy-matched alternatives (lines 1194-1198). Line 1183 likewise warns \"Unknown which environment variables are required.\" when environment requirements are unknown. The function returns True for such a model, so the condition is reported rather than silently tolerated."
+    },
+    {
+      "path": "aider/models.py",
+      "symbol": "register_litellm_models",
+      "start_line": 1112,
+      "end_line": 1133,
+      "observation": "The public entry point for a local model metadata fixture. It reads a JSON5 file, skips empty/missing files without inventing entries, and merges each parsed definition into `model_info_manager.local_model_metadata` (line 1127). Only names literally present in the fixture enter the local knowledge base, which is what makes the negative case (a name absent from the fixture) meaningful and testable."
+    },
+    {
+      "path": "aider/models.py",
+      "symbol": "validate_variables",
+      "start_line": 1136,
+      "end_line": 1143,
+      "observation": "Returns an explicit structured result `{keys_in_environment, missing_keys}` listing every unset environment variable instead of assuming credentials are present. Combined with `validate_environment` (lines 743-780) this feeds `Model.missing_keys`/`keys_in_environment`, so an unknown-capability model surfaces its unknown environment requirements rather than claiming it is ready to run."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "aider/models.py resolves a model that is absent from both the local metadata fixture and upstream litellm data to an explicit empty result, never to fabricated metadata: ModelInfoManager.get_model_from_cached_json_db returns `{}` on every miss path and get_model_info propagates that `{}`.",
+      "evidence_paths": ["aider/models.py"]
+    },
+    {
+      "claim": "Because Model.__init__ stores that empty dict directly in self.info, capability lookups for an unknown model (max_input_tokens, costs, supports_* flags) are absent rather than silently defaulted, and max_chat_history_tokens falls back to the documented 1024-token floor rather than a value derived from a claimed capability.",
+      "evidence_paths": ["aider/models.py"]
+    },
+    {
+      "claim": "sanity_check_model makes unknown-model handling explicit: it returns True and emits a tool_warning stating the context window and costs are unknown (plus environment-requirement and fuzzy-match output), so an unknown model is reported instead of being silently treated as fully specified.",
+      "evidence_paths": ["aider/models.py"]
+    },
+    {
+      "claim": "register_litellm_models is the fixture boundary: it merges only the model names literally present in a local model metadata file into model_info_manager.local_model_metadata, so an unlisted sibling name gains no metadata from a fixture that describes other models.",
+      "evidence_paths": ["aider/models.py"]
+    }
+  ],
+  "conclusion": "The contract holds. aider/models.py treats unknown models explicitly on both the data path and the user-facing path: ModelInfoManager.get_model_from_cached_json_db and get_model_info return an empty dict for any name absent from the local fixture and upstream database (aider/models.py:223-274); Model.__init__ preserves that emptiness in self.info and falls back to the documented 1024-token history floor rather than a fabricated capability (aider/models.py:348-358); and sanity_check_model returns True with an explicit \"Unknown context window size and costs\" tool_warning plus fuzzy-match suggestions (aider/models.py:1164-1200). The executable contract in .prale-eval/contract_unknown_model.py registers a distinct local model metadata fixture that fully describes one local model and says nothing about a second, unlisted model, then verifies 12 clauses (fixture honoured, unlisted resolves to {}, no capability keys claimed, 1024-token floor, explicit warning, and control clauses showing the described model does the opposite). All 12 clauses pass.",
+  "validation": {
+    "command": "python .prale-eval/contract_unknown_model.py",
+    "status": "pass",
+    "notes": "Executed from the workspace root: 12/12 contract clauses PASS, exit code 0. Clause C1b is the positive control (the fixture-described model resolves to max_input_tokens=32768, input_cost_per_token=5e-07 and max_chat_history_tokens=2048), C2*/C3* assert the unlisted sibling yields {} and no claimed capability keys, and C4a-C4c assert sanity_check_model returns True and emits the explicit unknown-costs warning for the unlisted model while the described model does not. LIMITATION: the project's optional runtime dependencies litellm, json5 and oslex are not installed in this environment, so the repository's own tests/basic/test_models.py cannot be collected (ModuleNotFoundError: No module named 'json5'). No dependencies were installed, per task constraints. The demo therefore installs minimal in-process shims (json5 -> stdlib json, since the fixture is plain JSON; litellm -> a package with empty model knowledge that raises on get_model_info and reports no key mapping; oslex -> shlex.join, used only for shell quoting in aider/utils.py) and exercises aider/models.py unmodified. The shimmed behaviour matches what the repository's own test asserts for the same code path (tests/basic/test_models.py:28-31, test_get_model_info_nonexistent asserts get_model_info returns {}). When the real packages are importable the demo uses them instead."
+  }
+}

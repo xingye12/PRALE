@@ -1,0 +1,1731 @@
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..67081c8
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,122 @@
++# T07 — Contract: explicit CLI input overrides env/config for a boolean/tri-state option
++
++- Repository: `aider` (fixture baseline `48977eb`)
++- Mode: `contract`
++- Deliverable: executable demo + written contract for a boolean/tri-state option fixture
++- Artifacts: `.prale-eval/contract_demo.py` (runner), `.prale-eval/demo-run.json` (last run record), this file, `.prale-eval/result.json`
++
++## 1. The fixture
++
++The task asks for **a different** boolean/tri-state option fixture than the ones the suite
++already covers (`--show-diffs` + `AIDER_SHOW_DIFFS`, exercised by
++`tests/basic/test_main.py::TestMain.test_true_vals_in_env_file` / `test_false_vals_in_env_file`,
++and `--auto-commits`/`--dirty-commits`, exercised by `test_main_args`).
++
++Chosen fixture — the tri-state option `--analytics`:
++
++| Aspect | Value |
++| --- | --- |
++| CLI spelling | `--analytics` / `--no-analytics` |
++| Declaration | `aider/args.py:568-573`, `argparse.BooleanOptionalAction`, `default=None` |
++| States | `None` = unset/ask (the documented "random" default), `True` = force on, `False` = force off |
++| Environment input | `AIDER_ANALYTICS` (from `auto_env_var_prefix="AIDER_"`, `aider/args.py:41`) |
++| Config input | `analytics: <bool>` in `.aider.conf.yml` (YAML, `configargparse.YAMLConfigFileParser`, `aider/args.py:40`) |
++| Consumer | `aider/main.py:642` → `aider/analytics.py:119-131` (`need_to_ask`, which compares with `is False` / `is True` and asserts `None`) |
++
++Because the fixture is tri-state it has three interesting override cases instead of two:
++`--analytics` must beat a `false` env/config value, `--no-analytics` must beat a `true`
++env/config value, and *no* CLI/env/config input at all must still yield `None`.
++
++## 2. The contract
++
++For `--analytics` in `aider/args.py::get_parser`:
++
++1. **Precedence** — explicit CLI token > environment variable (`AIDER_ANALYTICS`) > YAML config
++   file (`analytics:`) > declared default (`None`).
++   Grounded in: `get_parser` wiring env/config as parser defaults
++   (`aider/args.py:35-42`) and `aider/main.py::main` loading `.env` files and then parsing
++   `argv` last (`aider/main.py:451-504`, `load_dotenv_files` at `501` < final `parser.parse_args(argv)` at `504`).
++2. **Override** — an explicit CLI token wins even against *both* an env var and a config file
++   disagreeing with it, and the negative spelling is a real, explicit CLI value (not "absent"):
++   - `AIDER_ANALYTICS=false` + `analytics: false` + `--analytics` ⇒ `True`
++   - `AIDER_ANALYTICS=true` + `analytics: true` + `--no-analytics` ⇒ `False`
++   - `AIDER_ANALYTICS=false` + `analytics: true` (no CLI) ⇒ `False` (env beats config)
++3. **No collateral change** — overriding only `--analytics` leaves every unrelated option at its
++   declared default: `auto_commits=True`, `dirty_commits=True`, `git=True`, `gitignore=True`,
++   `check_update=True`, `dry_run=False`, `attribute_author=None`
++   (declarations at `aider/args.py:395-400`, `439-450`, `451-459`, `604-609`; the
++   "flip only the named option" acceptance pattern is `tests/basic/test_main.py::test_main_args`).
++4. **Value normalisation** — env/config strings are coerced to real booleans, never left as
++   truthy strings: `aider/analytics.py::need_to_ask` compares `is False` / `is True` and asserts
++   `args_analytics is None` otherwise, while `tests/basic/test_main.py::setUp` sets
++   `AIDER_ANALYTICS="false"` for the whole suite.
++
++## 3. The executable demo
++
++`.prale-eval/contract_demo.py` (stdlib-only, run from the repository root):
++
++```bash
++python .prale-eval/contract_demo.py --static          # static contract checks (works everywhere)
++python .prale-eval/contract_demo.py --out .prale-eval/demo-run.json   # + runtime precedence matrix
++python .prale-eval/contract_demo.py --e2e             # optional: drive aider.main.main end to end
++```
++
++It prints a JSON verdict and exits non-zero if any check that could run failed.
++
++### 3a. Static checks (twelve, all pass in this environment)
++
++Parsed with `ast` from the repository sources:
++
++- `get_parser` configures `auto_env_var_prefix="AIDER_"` (env input) and
++  `configargparse.YAMLConfigFileParser` (config input) — `aider/args.py:35-42`.
++- `--analytics` is `argparse.BooleanOptionalAction` with `default=None` (tri-state), and therefore
++  also exposes `--no-analytics` — `aider/args.py:568-573`.
++- Unrelated defaults are declared exactly as asserted: `--auto-commits`/`--dirty-commits`
++  `default=True`, `--git`/`--gitignore` `default=True`, `--check-update` `default=True`,
++  `--dry-run` `default=False`, `--attribute-author` `default=None`.
++- The already-fixtured `--show-diffs` is a *different*, two-state option
++  (`store_true`, `default=False`) — `aider/args.py:395-400`.
++- `aider.main.main` calls `load_dotenv_files` (line 501) **before** the final
++  `parser.parse_args(argv)` (line 504) — CLI is applied last, i.e. it wins.
++- `tests/basic/test_main.py::test_main_args` asserts `kwargs["auto_commits"] is False/True`,
++  `kwargs["dirty_commits"] is True/False`; `setUp` pins `AIDER_ANALYTICS`; the suite covers
++  `AIDER_SHOW_DIFFS=on/off` and `test_yaml_config_file_loading`.
++
++### 3b. Runtime precedence matrix (six rows)
++
++Each row runs the real `aider.args.get_parser` in a temp cwd (config supplied through
++`default_config_files`, all ambient `AIDER_*` variables cleared first) and compares the observed
++namespace with the contract:
++
++| Row | `AIDER_ANALYTICS` | config `analytics:` | argv | expect `analytics` |
++| --- | --- | --- | --- | --- |
++| `defaults_only` | — | — | — | `None` |
++| `env_only` | `false` | — | — | `False` |
++| `config_only` | — | `true` | — | `True` |
++| `env_beats_config` | `false` | `true` | — | `False` |
++| `cli_true_beats_env_and_config` | `false` | `false` | `--analytics` | `True` |
++| `cli_false_beats_env_and_config` | `true` | `true` | `--no-analytics` | `False` |
++
++Every row additionally re-asserts all seven unrelated defaults from §2.3, so a passing row proves
++both "explicit CLI input wins" and "unrelated defaults are unchanged". The `--e2e` flag adds one
++`aider.main.main(["--no-analytics", "--config", <file>])` run with `AIDER_ANALYTICS=true` and
++`analytics: true`, expecting `coder.args.analytics is False`.
++
++## 4. Validation performed here and its limitation
++
++| Command | Result |
++| --- | --- |
++| `python .prale-eval/contract_demo.py --static` | **exit 0**, 12/12 static contract checks pass |
++| `python .prale-eval/contract_demo.py --out .prale-eval/demo-run.json` | exit 0; `static.ok=true`; `runtime.status="blocked: runtime dependencies unavailable"` |
++| `python -m pytest tests/basic/test_main.py -k "test_main_args or test_true_vals_in_env_file or test_yaml_config_file_loading" -q` | **collection error**: `ModuleNotFoundError: No module named 'git'` (`tests/basic/test_main.py:10`) |
++
++**Recorded limitation (optional validation dependency unavailable).** The runtime precedence matrix
++(§3b) and the project test-suite validation could not be executed in this sandbox because the
++repository's runtime dependencies are not installed — `configargparse` (pinned `==1.7.5` in
++`requirements.txt:70`), `shtab`, `litellm` and `GitPython` (`git`) are all missing, and installing
++dependencies or reaching outside the workspace is out of scope for this task. The demo handles this
++explicitly: it reports `runtime.status = "blocked: runtime dependencies unavailable"`, names the
++first missing module, and still fails loudly if the matrix runs and any row mismatches. No
++dependency was installed; nothing outside the workspace was read or written; no repository source,
++task metadata, hidden-oracle file, lock file or git configuration was modified (the only changes are
++the new `.prale-eval/` artifacts).
+diff --git a/.prale-eval/contract_demo.py b/.prale-eval/contract_demo.py
+new file mode 100644
+index 0000000..03ba97f
+--- /dev/null
++++ b/.prale-eval/contract_demo.py
+@@ -0,0 +1,463 @@
++#!/usr/bin/env python
++"""Executable contract demo for T07 (aider, mode=contract).
++
++Contract
++--------
++For the tri-state boolean fixture ``--analytics`` (``argparse.BooleanOptionalAction``,
++``default=None``) declared in ``aider/args.py::get_parser``:
++
++1. Input precedence is CLI > environment (``AIDER_*``, ``auto_env_var_prefix``)
++   > YAML config files (``.aider.conf.yml``) > declared default.
++2. An explicit CLI token (``--analytics`` / ``--no-analytics``) wins over an
++   environment variable and/or config-file value for the same option, including
++   the "negative" (``--no-``) spelling and the tri-state ``None`` default.
++3. Overriding that one option does not disturb unrelated option defaults
++   (``--auto-commits``, ``--dirty-commits``, ``--git``, ``--gitignore``,
++   ``--check-update``, ``--dry-run``, ``--attribute-author``).
++
++Modes
++-----
++* ``--static`` (default when the runtime dependencies are missing): stdlib-only
++  AST/text checks against ``aider/args.py``, ``aider/main.py`` and
++  ``tests/basic/test_main.py`` that prove the fixture is declared, that the
++  option is re-parsed from ``argv`` last, and that the public test contract
++  asserts CLI-flips-keep-unrelated-defaults.
++* default: additionally *executes* the precedence matrix above through
++  ``aider.args.get_parser`` (needs ``configargparse``, ``shtab``, ``litellm``,
++  ``GitPython`` ... i.e. the project's runtime requirements).
++* ``--e2e``: optionally also drives ``aider.main.main`` end to end.
++
++Output: JSON verdict on stdout (and to ``.prale-eval/demo-run.json`` with
++``--out``); exit code 0 only when every check that could run passed.
++"""
++
++import argparse
++import ast
++import json
++import os
++import pathlib
++import sys
++import tempfile
++
++REPO_ROOT = pathlib.Path(__file__).resolve().parents[1]
++ARGS_PY = REPO_ROOT / "aider" / "args.py"
++MAIN_PY = REPO_ROOT / "aider" / "main.py"
++TEST_MAIN_PY = REPO_ROOT / "tests" / "basic" / "test_main.py"
++
++FIXTURE = "--analytics"
++ENV_FIXTURE = "AIDER_ANALYTICS"
++CONFIG_FIXTURE = "analytics"
++
++# Unrelated options that must keep their declared defaults while the fixture is
++# overridden from the command line.
++UNRELATED_DEFAULTS = {
++    "auto_commits": True,
++    "dirty_commits": True,
++    "git": True,
++    "gitignore": True,
++    "check_update": True,
++    "dry_run": False,
++    "attribute_author": None,
++}
++
++
++# --------------------------------------------------------------------------- #
++# static contract checks (stdlib only)
++# --------------------------------------------------------------------------- #
++def _literal(node):
++    """Best-effort literal -> python value for AST constants / simple names."""
++    if node is None:
++        return None
++    try:
++        return ast.literal_eval(node)
++    except Exception:
++        pass
++    return ast.unparse(node)
++
++
++def _add_argument_calls(tree):
++    out = []
++    for node in ast.walk(tree):
++        if not isinstance(node, ast.Call):
++            continue
++        func = node.func
++        if not isinstance(func, ast.Attribute) or func.attr != "add_argument":
++            continue
++        opts = [
++            _literal(a)
++            for a in node.args
++            if isinstance(a, ast.Constant) and isinstance(a.value, str)
++        ]
++        kwargs = {kw.arg: _literal(kw.value) for kw in node.keywords if kw.arg}
++        out.append((opts, kwargs, node.lineno))
++    return out
++
++
++def _find_func(tree, name):
++    for node in ast.walk(tree):
++        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == name:
++            return node
++    return None
++
++
++def static_checks():
++    checks = []
++
++    def add(name, ok, detail):
++        checks.append({"check": name, "ok": bool(ok), "detail": detail})
++
++    args_src = ARGS_PY.read_text(encoding="utf-8")
++    args_tree = ast.parse(args_src)
++    calls = _add_argument_calls(args_tree)
++    by_opt = {opt: (opts, kwargs, lineno) for opts, kwargs, lineno in calls for opt in opts}
++
++    # 1. parser is wired to env vars (AIDER_ prefix) + YAML config files.
++    get_parser = _find_func(args_tree, "get_parser")
++    parser_kwargs = {}
++    if get_parser is not None:
++        for node in ast.walk(get_parser):
++            if (
++                isinstance(node, ast.Call)
++                and isinstance(node.func, ast.Attribute)
++                and node.func.attr == "ArgumentParser"
++            ):
++                parser_kwargs = {kw.arg: _literal(kw.value) for kw in node.keywords if kw.arg}
++                break
++    add(
++        "get_parser configures env var prefix AIDER_",
++        parser_kwargs.get("auto_env_var_prefix") == "AIDER_",
++        f"auto_env_var_prefix={parser_kwargs.get('auto_env_var_prefix')!r}",
++    )
++    add(
++        "get_parser configures YAML config file parser",
++        "YAMLConfigFileParser" in str(parser_kwargs.get("config_file_parser_class")),
++        f"config_file_parser_class={parser_kwargs.get('config_file_parser_class')!r}",
++    )
++
++    # 2. the tri-state fixture declaration.
++    fixture = by_opt.get(FIXTURE)
++    ok = (
++        fixture is not None
++        and "argparse.BooleanOptionalAction" in str(fixture[1].get("action"))
++        and fixture[1].get("default") is None
++    )
++    add(
++        f"{FIXTURE} is a tri-state BooleanOptionalAction with default None",
++        ok,
++        f"line {fixture[2]}: {fixture[1]}" if fixture else f"{FIXTURE} not found",
++    )
++    if fixture:
++        add(
++            f"{FIXTURE} exposes the --no- spelling used by explicit CLI input",
++            True,
++            "argparse.BooleanOptionalAction auto-registers --no-analytics",
++        )
++
++    # 3. unrelated defaults that must stay put.
++    missing = []
++    for opt, expected in (
++        ("--auto-commits", True),
++        ("--dirty-commits", True),
++        ("--git", True),
++        ("--gitignore", True),
++        ("--check-update", True),
++        ("--dry-run", False),
++        ("--attribute-author", None),
++    ):
++        got = by_opt.get(opt)
++        if got is None or got[1].get("default") != expected:
++            missing.append(f"{opt} default != {expected!r} ({got[1] if got else 'missing'})")
++    add(
++        "unrelated option defaults are declared as documented",
++        not missing,
++        "; ".join(missing) or "auto-commits/dirty-commits/git/gitignore/check-update/dry-run/attribute-author",
++    )
++
++    # 4. the fixture default is tri-state while sibling booleans are two-state
++    sibling = by_opt.get("--show-diffs")
++    add(
++        "the pre-existing --show-diffs env fixture is a different, two-state option",
++        sibling is not None and sibling[1].get("default") is False,
++        f"{sibling[1] if sibling else 'missing'}",
++    )
++
++    # 5. main() re-parses argv last, i.e. after the env/.env-file loading step.
++    main_tree = ast.parse(MAIN_PY.read_text(encoding="utf-8"))
++    main_func = _find_func(main_tree, "main")
++    load_line = None
++    parse_lines = []
++    if main_func is not None:
++        for node in ast.walk(main_func):
++            if isinstance(node, ast.Call):
++                fn = node.func
++                if isinstance(fn, ast.Name) and fn.id == "load_dotenv_files":
++                    load_line = node.lineno
++                elif isinstance(fn, ast.Attribute) and fn.attr == "parse_args":
++                    parse_lines.append(node.lineno)
++    add(
++        "aider.main.main loads env files before the final parser.parse_args(argv)",
++        load_line is not None
++        and bool(parse_lines)
++        and load_line < max(parse_lines),
++        f"load_dotenv_files@{load_line}, parse_args@{sorted(parse_lines)}",
++    )
++
++    # 6. the public test contract mirrors the same rules.
++    test_src = TEST_MAIN_PY.read_text(encoding="utf-8")
++    test_tree = ast.parse(test_src)
++    test_main_args = _find_func(test_tree, "test_main_args")
++    body = ast.get_source_segment(test_src, test_main_args) if test_main_args else ""
++    add(
++        "tests/basic/test_main.py::TestMain.test_main_args asserts CLI boolean flips",
++        'kwargs["auto_commits"] is False' in body and 'kwargs["auto_commits"] is True' in body,
++        "asserts --no-auto-commits/--auto-commits land on Coder.create(auto_commits=...)",
++    )
++    add(
++        "test_main_args asserts unrelated defaults survive an explicit CLI flip",
++        'kwargs["dirty_commits"] is True' in body and 'kwargs["dirty_commits"] is False' in body,
++        "empty argv keeps dirty_commits True; --no-dirty-commits flips only that flag",
++    )
++    add(
++        "the suite pins the fixture env var AIDER_ANALYTICS",
++        ENV_FIXTURE in test_src,
++        f"{ENV_FIXTURE} set in TestMain.setUp (restored in tearDown)",
++    )
++    add(
++        "the suite covers env-file sourced booleans (different fixture)",
++        "AIDER_SHOW_DIFFS=on" in test_src and "AIDER_SHOW_DIFFS=off" in test_src,
++        "test_true_vals_in_env_file / test_false_vals_in_env_file",
++    )
++    add(
++        "the suite covers YAML config-file sourcing",
++        _find_func(test_tree, "test_yaml_config_file_loading") is not None,
++        "config files feed parser defaults; CLI is parsed afterwards",
++    )
++    return checks
++
++
++# --------------------------------------------------------------------------- #
++# runtime precedence matrix
++# --------------------------------------------------------------------------- #
++def _runtime_env():
++    try:
++        import configargparse  # noqa: F401
++        import shtab  # noqa: F401
++        import litellm  # noqa: F401
++        import git  # noqa: F401
++    except Exception as exc:  # pragma: no cover - env dependent
++        return None, f"{type(exc).__name__}: {exc}"
++    return True, "runtime dependencies importable"
++
++
++def _observe(argv, env, config_text):
++    """Parse with the real aider parser and return the observed namespace."""
++    from aider.args import get_parser
++
++    with tempfile.TemporaryDirectory() as tmp:
++        cfg_files = []
++        if config_text is not None:
++            cfg = pathlib.Path(tmp) / ".aider.conf.yml"
++            cfg.write_text(config_text, encoding="utf-8")
++            cfg_files = [str(cfg)]
++        saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("AIDER_")}
++        for k in saved:
++            os.environ.pop(k, None)
++        os.environ.update(env)
++        try:
++            parser = get_parser(cfg_files, None)
++            args = parser.parse_args(argv)
++        finally:
++            for k in list(os.environ):
++                if k.startswith("AIDER_"):
++                    os.environ.pop(k, None)
++            for k, v in saved.items():
++                if v is not None:
++                    os.environ[k] = v
++
++    observed = {"analytics": args.analytics}
++    observed.update({name: getattr(args, name) for name in UNRELATED_DEFAULTS})
++    return observed
++
++
++MATRIX = [
++    {
++        "row": "defaults_only",
++        "argv": [],
++        "env": {},
++        "config": None,
++        "expect": {"analytics": None},
++        "why": "tri-state default stays None when no CLI/env/config input exists",
++    },
++    {
++        "row": "env_only",
++        "argv": [],
++        "env": {ENV_FIXTURE: "false"},
++        "config": None,
++        "expect": {"analytics": False},
++        "why": "environment input is coerced to the boolean tri-state value False",
++    },
++    {
++        "row": "config_only",
++        "argv": [],
++        "env": {},
++        "config": f"{CONFIG_FIXTURE}: true\n",
++        "expect": {"analytics": True},
++        "why": "YAML config input feeds the tri-state value True",
++    },
++    {
++        "row": "env_beats_config",
++        "argv": [],
++        "env": {ENV_FIXTURE: "false"},
++        "config": f"{CONFIG_FIXTURE}: true\n",
++        "expect": {"analytics": False},
++        "why": "documented precedence: env > config file",
++    },
++    {
++        "row": "cli_true_beats_env_and_config",
++        "argv": [FIXTURE],
++        "env": {ENV_FIXTURE: "false"},
++        "config": f"{CONFIG_FIXTURE}: false\n",
++        "expect": {"analytics": True},
++        "why": "explicit --analytics overrides both env and config file",
++    },
++    {
++        "row": "cli_false_beats_env_and_config",
++        "argv": ["--no-analytics"],
++        "env": {ENV_FIXTURE: "true"},
++        "config": f"{CONFIG_FIXTURE}: true\n",
++        "expect": {"analytics": False},
++        "why": "explicit --no-analytics overrides both env and config file",
++    },
++]
++
++
++def runtime_checks():
++    available, detail = _runtime_env()
++    result = {"available": bool(available), "detail": detail, "rows": [], "failures": []}
++    if not available:
++        return result
++
++    for row in MATRIX:
++        expect = dict(row["expect"])
++        # every row must also preserve every unrelated default
++        expect.update(UNRELATED_DEFAULTS)
++        try:
++            observed = _observe(row["argv"], row["env"], row["config"])
++        except Exception as exc:  # pragma: no cover - env dependent
++            result["failures"].append({"row": row["row"], "error": f"{type(exc).__name__}: {exc}"})
++            result["rows"].append({"row": row["row"], "status": "error"})
++            continue
++        mismatches = {
++            k: {"expected": v, "observed": observed.get(k)}
++            for k, v in expect.items()
++            if observed.get(k) is not v
++        }
++        result["rows"].append(
++            {
++                "row": row["row"],
++                "why": row["why"],
++                "argv": row["argv"],
++                "env": row["env"],
++                "config": row["config"],
++                "observed": observed,
++                "mismatches": mismatches,
++                "status": "pass" if not mismatches else "fail",
++            }
++        )
++        if mismatches:
++            result["failures"].append({"row": row["row"], "mismatches": mismatches})
++    return result
++
++
++def e2e_check():
++    """Optional end-to-end probe through aider.main.main (needs full runtime)."""
++    try:
++        from unittest.mock import patch
++
++        from prompt_toolkit.input import DummyInput
++        from prompt_toolkit.output import DummyOutput
++
++        from aider.main import main
++    except Exception as exc:  # pragma: no cover
++        return {"status": "skipped", "detail": f"{type(exc).__name__}: {exc}"}
++
++    with tempfile.TemporaryDirectory() as tmp:
++        cfg = pathlib.Path(tmp) / ".aider.conf.yml"
++        cfg.write_text(f"{CONFIG_FIXTURE}: true\n", encoding="utf-8")
++        saved = {k: os.environ.get(k) for k in list(os.environ) if k.startswith("AIDER_")}
++        for k in saved:
++            os.environ.pop(k, None)
++        os.environ.update({ENV_FIXTURE: "true", "OPENAI_API_KEY": "deadbeef"})
++        try:
++            with patch("aider.coders.Coder.create") as MockCoder:
++                coder = main(
++                    ["--no-analytics", "--config", str(cfg), "--no-git", "--yes"],
++                    input=DummyInput(),
++                    output=DummyOutput(),
++                    return_coder=True,
++                )
++                MockCoder.assert_not_called()
++            value = coder.args.analytics
++        except Exception as exc:  # pragma: no cover
++            return {"status": "error", "detail": f"{type(exc).__name__}: {exc}"}
++        finally:
++            for k in list(os.environ):
++                if k.startswith("AIDER_"):
++                    os.environ.pop(k, None)
++            for k, v in saved.items():
++                if v is not None:
++                    os.environ[k] = v
++    return {
++        "status": "pass" if value is False else "fail",
++        "observed_analytics": value,
++        "detail": "main(['--no-analytics', '--config', cfg]) with AIDER_ANALYTICS=true and "
++        "analytics: true in the config file",
++    }
++
++
++def main():
++    ap = argparse.ArgumentParser(description=__doc__)
++    ap.add_argument("--static", action="store_true", help="run only the stdlib static checks")
++    ap.add_argument("--e2e", action="store_true", help="also run the optional main() end-to-end probe")
++    ap.add_argument("--out", help="write the JSON verdict to this path as well")
++    ns = ap.parse_args()
++
++    checks = static_checks()
++    verdict = {
++        "fixture": {
++            "option": FIXTURE,
++            "env_var": ENV_FIXTURE,
++            "config_key": CONFIG_FIXTURE,
++            "type": "tri-state boolean (BooleanOptionalAction, default None)",
++            "unrelated_defaults": UNRELATED_DEFAULTS,
++        },
++        "static": {
++            "checks": checks,
++            "failures": [c["check"] for c in checks if not c["ok"]],
++        },
++    }
++    if not ns.static:
++        verdict["runtime"] = runtime_checks()
++    if ns.e2e:
++        verdict["e2e"] = e2e_check()
++
++    ok = not verdict["static"]["failures"]
++    if "runtime" in verdict:
++        rt = verdict["runtime"]
++        if not rt["available"]:
++            verdict["runtime"]["status"] = "blocked: runtime dependencies unavailable"
++        else:
++            ok = ok and not rt["failures"]
++    if "e2e" in verdict:
++        ok = ok and verdict["e2e"].get("status") in ("pass", "skipped")
++
++    verdict["ok"] = ok
++    text = json.dumps(verdict, indent=2, sort_keys=False)
++    print(text)
++    if ns.out:
++        pathlib.Path(ns.out).write_text(text + "\n", encoding="utf-8")
++    return 0 if ok else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/.prale-eval/demo-run.json b/.prale-eval/demo-run.json
+new file mode 100644
+index 0000000..342984f
+--- /dev/null
++++ b/.prale-eval/demo-run.json
+@@ -0,0 +1,90 @@
++{
++  "fixture": {
++    "option": "--analytics",
++    "env_var": "AIDER_ANALYTICS",
++    "config_key": "analytics",
++    "type": "tri-state boolean (BooleanOptionalAction, default None)",
++    "unrelated_defaults": {
++      "auto_commits": true,
++      "dirty_commits": true,
++      "git": true,
++      "gitignore": true,
++      "check_update": true,
++      "dry_run": false,
++      "attribute_author": null
++    }
++  },
++  "static": {
++    "checks": [
++      {
++        "check": "get_parser configures env var prefix AIDER_",
++        "ok": true,
++        "detail": "auto_env_var_prefix='AIDER_'"
++      },
++      {
++        "check": "get_parser configures YAML config file parser",
++        "ok": true,
++        "detail": "config_file_parser_class='configargparse.YAMLConfigFileParser'"
++      },
++      {
++        "check": "--analytics is a tri-state BooleanOptionalAction with default None",
++        "ok": true,
++        "detail": "line 568: {'action': 'argparse.BooleanOptionalAction', 'default': None, 'help': 'Enable/disable analytics for current session (default: random)'}"
++      },
++      {
++        "check": "--analytics exposes the --no- spelling used by explicit CLI input",
++        "ok": true,
++        "detail": "argparse.BooleanOptionalAction auto-registers --no-analytics"
++      },
++      {
++        "check": "unrelated option defaults are declared as documented",
++        "ok": true,
++        "detail": "auto-commits/dirty-commits/git/gitignore/check-update/dry-run/attribute-author"
++      },
++      {
++        "check": "the pre-existing --show-diffs env fixture is a different, two-state option",
++        "ok": true,
++        "detail": "{'action': 'store_true', 'help': 'Show diffs when committing changes (default: False)', 'default': False}"
++      },
++      {
++        "check": "aider.main.main loads env files before the final parser.parse_args(argv)",
++        "ok": true,
++        "detail": "load_dotenv_files@501, parse_args@[504]"
++      },
++      {
++        "check": "tests/basic/test_main.py::TestMain.test_main_args asserts CLI boolean flips",
++        "ok": true,
++        "detail": "asserts --no-auto-commits/--auto-commits land on Coder.create(auto_commits=...)"
++      },
++      {
++        "check": "test_main_args asserts unrelated defaults survive an explicit CLI flip",
++        "ok": true,
++        "detail": "empty argv keeps dirty_commits True; --no-dirty-commits flips only that flag"
++      },
++      {
++        "check": "the suite pins the fixture env var AIDER_ANALYTICS",
++        "ok": true,
++        "detail": "AIDER_ANALYTICS set in TestMain.setUp (restored in tearDown)"
++      },
++      {
++        "check": "the suite covers env-file sourced booleans (different fixture)",
++        "ok": true,
++        "detail": "test_true_vals_in_env_file / test_false_vals_in_env_file"
++      },
++      {
++        "check": "the suite covers YAML config-file sourcing",
++        "ok": true,
++        "detail": "config files feed parser defaults; CLI is parsed afterwards"
++      }
++    ],
++    "failures": []
++  },
++  "runtime": {
++    "available": false,
++    "detail": "ModuleNotFoundError: No module named 'configargparse'",
++    "rows": [],
++    "failures": [],
++    "status": "blocked: runtime dependencies unavailable"
++  },
++  "ok": true
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..c242c37
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,165 @@
++{
++  "task_id": "T07",
++  "repository": "aider",
++  "mode": "contract",
++  "fixture": {
++    "option": "--analytics",
++    "negative_spelling": "--no-analytics",
++    "kind": "boolean/tri-state option",
++    "declaration": "argparse.BooleanOptionalAction with default=None",
++    "environment_input": "AIDER_ANALYTICS (auto_env_var_prefix='AIDER_')",
++    "config_input": "analytics: <bool> in .aider.conf.yml (YAMLConfigFileParser)",
++    "unrelated_defaults_asserted": {
++      "auto_commits": true,
++      "dirty_commits": true,
++      "git": true,
++      "gitignore": true,
++      "check_update": true,
++      "dry_run": false,
++      "attribute_author": null
++    }
++  },
++  "evidence": [
++    {
++      "path": "aider/args.py",
++      "symbol": "get_parser",
++      "start_line": 35,
++      "end_line": 42,
++      "observation": "get_parser builds a configargparse.ArgumentParser with auto_env_var_prefix='AIDER_', config_file_parser_class=configargparse.YAMLConfigFileParser and default_config_files. These are the two non-CLI input sources: environment variables (AIDER_*) and YAML config files become the parser's defaults, while tokens given in argv are parsed afterwards by argparse, which is what makes explicit CLI input overridable-but-winning."
++    },
++    {
++      "path": "aider/args.py",
++      "symbol": "--analytics",
++      "start_line": 568,
++      "end_line": 573,
++      "observation": "The tri-state fixture itself: group.add_argument('--analytics', action=argparse.BooleanOptionalAction, default=None, help='... (default: random)'). default=None is the 'unset/ask' state, True forces analytics on, False forces it off, and BooleanOptionalAction auto-registers the explicit negative spelling --no-analytics that the contract exercises."
++    },
++    {
++      "path": "aider/args.py",
++      "symbol": "--auto-commits",
++      "start_line": 439,
++      "end_line": 450,
++      "observation": "The unrelated two-state options used as the 'defaults must not move' witnesses: --auto-commits (BooleanOptionalAction, default=True) and --dirty-commits (BooleanOptionalAction, default=True). Overriding --analytics from the CLI must leave these at True, exactly as tests/basic/test_main.py::test_main_args checks for its own CLI flips."
++    },
++    {
++      "path": "aider/args.py",
++      "symbol": "--show-diffs",
++      "start_line": 395,
++      "end_line": 400,
++      "observation": "The pre-existing, already-fixtured option is a different one: --show-diffs is a plain store_true action with default=False (so it has no --no- spelling), driven in the suite through the AIDER_SHOW_DIFFS env file. This is why the contract deliberately uses the different boolean/tri-state fixture --analytics."
++    },
++    {
++      "path": "aider/args.py",
++      "symbol": "--check-update",
++      "start_line": 604,
++      "end_line": 609,
++      "observation": "Another unrelated default asserted by the contract: --check-update is BooleanOptionalAction with default=True and its env source is AIDER_CHECK_UPDATE (pinned to 'false' in the test setUp). An explicit --analytics/--no-analytics must not disturb it."
++    },
++    {
++      "path": "aider/args.py",
++      "symbol": "--attribute-author",
++      "start_line": 451,
++      "end_line": 459,
++      "observation": "Sibling tri-state option (BooleanOptionalAction, default=None) consumed via main.py -> repo.py as coder.args.attribute_author; it shares the same contract shape as --analytics, confirming the tri-state default-None pattern is the repository's convention for options that must not be silently replaced by env/config input."
++    },
++    {
++      "path": "aider/main.py",
++      "symbol": "load_dotenv_files",
++      "start_line": 361,
++      "end_line": 387,
++      "observation": "Documents how environment input reaches the parser: .env files are searched (cwd -> git root -> HOME, plus an explicit --env-file) and loaded with load_dotenv(..., override=True), so AIDER_* variables defined in env files land in os.environ and are then picked up by auto_env_var_prefix. This is the 'environment/config input' side of the precedence contract."
++    },
++    {
++      "path": "aider/main.py",
++      "symbol": "main",
++      "start_line": 451,
++      "end_line": 504,
++      "observation": "The decisive ordering: the parser is rebuilt with the resolved default_config_files (496), argv is pre-parsed (498), the .env files named by/around the args are loaded (501), and then the final args = parser.parse_args(argv) (504). Because the CLI vector is parsed last, explicit CLI input is applied after env-var/config-file defaults exist and therefore wins, while options absent from argv keep their declared defaults."
++    },
++    {
++      "path": "aider/analytics.py",
++      "symbol": "need_to_ask",
++      "start_line": 119,
++      "end_line": 131,
++      "observation": "Consumption site of the tri-state fixture: need_to_ask returns False for exactly False, True for exactly True, and asserts args_analytics is None otherwise. That strict identity comparison proves the env/config strings must be coerced to real booleans (not left as truthy strings such as 'false'), which the contract's runtime matrix asserts for AIDER_ANALYTICS='false'."
++    },
++    {
++      "path": "tests/basic/test_main.py",
++      "symbol": "setUp",
++      "start_line": 22,
++      "end_line": 37,
++      "observation": "The suite's baseline environment for the fixture: os.environ['AIDER_ANALYTICS'] = 'false' (plus AIDER_CHECK_UPDATE='false'), a throwaway HOME so no real ~/.aider.conf.yml leaks in, and tearDown restoring the original environment. Any test that reaches the analytics gate therefore proves AIDER_ANALYTICS is parsed into the tri-state value False rather than the truthy string 'false'."
++    },
++    {
++      "path": "tests/basic/test_main.py",
++      "symbol": "test_main_args",
++      "start_line": 263,
++      "end_line": 290,
++      "observation": "The public acceptance pattern for 'explicit CLI input without changing unrelated defaults': main(['--no-auto-commits','--yes']) reaches Coder.create(auto_commits=False), main(['--auto-commits']) reaches auto_commits=True, the no-flag call main([]) still has dirty_commits=True and auto_commits=True, and main(['--no-dirty-commits']) flips only dirty_commits. Only the named option moves; the other defaulted options stay put."
++    },
++    {
++      "path": "tests/basic/test_main.py",
++      "symbol": "test_env_file_override",
++      "start_line": 292,
++      "end_line": 322,
++      "observation": "Pins the non-CLI input layering the contract overrides: named --env-file beats cwd .env, which beats git-root .env, which beats HOME .env, and a variable already present in the process environment (E=existing) survives dotenv loading. So env/config values do reach the parser and are exactly what an explicit CLI token has to beat."
++    },
++    {
++      "path": "tests/basic/test_main.py",
++      "symbol": "test_true_vals_in_env_file",
++      "start_line": 456,
++      "end_line": 462,
++      "observation": "The already-fixtured boolean: .env containing AIDER_SHOW_DIFFS=on makes Coder.create receive show_diffs=True. Its sibling test_false_vals_in_env_file (448-454) asserts AIDER_SHOW_DIFFS=off yields show_diffs=False. Together they show env-string boolean coercion works for a two-state option — the different, tri-state option --analytics is what this contract adds."
++    },
++    {
++      "path": "tests/basic/test_main.py",
++      "symbol": "test_false_vals_in_env_file",
++      "start_line": 448,
++      "end_line": 454,
++      "observation": "Negative env-string case for the pre-existing fixture: AIDER_SHOW_DIFFS=off must produce show_diffs=False (not a truthy string), i.e. env input for a boolean/optional option is normalized before it reaches the coder — the same normalization the contract asserts for AIDER_ANALYTICS=false."
++    },
++    {
++      "path": "tests/basic/test_main.py",
++      "symbol": "test_yaml_config_file_loading",
++      "start_line": 516,
++      "end_line": 575,
++      "observation": "Proves config-file input works and is ordered: .aider.conf.yml values in cwd (model=gpt-4-32k, map-tokens=4096), git root (gpt-4/2048) and HOME (gpt-3.5-turbo/1024) are picked up as the search path shrinks, and an explicit --config file (gpt-4-1106-preview/8192) wins. Since get_parser is re-parsed with argv last, a CLI token outranks these config values as well."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "aider/args.py declares the boolean/tri-state fixture as --analytics with action=argparse.BooleanOptionalAction and default=None, so it has three states (None = unset/ask, True = force on, False = force off) plus an explicit negative CLI spelling --no-analytics.",
++      "evidence_paths": ["aider/args.py"]
++    },
++    {
++      "claim": "get_parser wires the two non-CLI input sources for that same key: environment variables through auto_env_var_prefix='AIDER_' (AIDER_ANALYTICS) and YAML config files through configargparse.YAMLConfigFileParser (the analytics: key of .aider.conf.yml).",
++      "evidence_paths": ["aider/args.py"]
++    },
++    {
++      "claim": "aider.main.main resolves/rebuilds the parser from default_config_files, loads .env files (load_dotenv_files, override=True) and only then executes the final parser.parse_args(argv); explicit CLI tokens are therefore applied after env-var and config-file derived defaults, so CLI input wins while every option not named in argv keeps its declared default.",
++      "evidence_paths": ["aider/main.py", "aider/args.py"]
++    },
++    {
++      "claim": "tests/basic/test_main.py::TestMain.test_main_args is the public acceptance pattern for 'explicit CLI input overrides input without changing unrelated defaults': the explicit boolean flags change exactly the named option (auto_commits/dirty_commits) while the no-flag call keeps dirty_commits=True and auto_commits=True, which matches the declared defaults of --auto-commits/--dirty-commits (and --git default=True) in aider/args.py.",
++      "evidence_paths": ["tests/basic/test_main.py", "aider/args.py"]
++    },
++    {
++      "claim": "The suite both pins the fixture's environment variable (AIDER_ANALYTICS='false' in TestMain.setUp) and requires env strings to be coerced to real booleans, because aider.analytics.Analytics.need_to_ask compares with 'is False'/'is True' and asserts args_analytics is None otherwise; a truthy string like 'false' would break every test that reaches the analytics gate.",
++      "evidence_paths": ["tests/basic/test_main.py", "aider/analytics.py", "aider/args.py"]
++    },
++    {
++      "claim": "The already-covered fixture is a different option: --show-diffs is a plain store_true/default=False option exercised through AIDER_SHOW_DIFFS env files, and env-file override ordering is pinned by test_env_file_override; hence this contract's tri-state fixture --analytics (AIDER_ANALYTICS / analytics: in .aider.conf.yml / --analytics|--no-analytics) is the new, non-duplicate case.",
++      "evidence_paths": ["tests/basic/test_main.py", "aider/args.py"]
++    },
++    {
++      "claim": "Because the fixture is tri-state (default None), proving override behaviour requires asserting the negative CLI spelling and the untouched unrelated defaults too: the demo's matrix covers defaults-only, env-only, config-only, env-over-config, --analytics over env+config with value false, and --no-analytics over env+config with value true, re-checking auto_commits/dirty_commits/git/gitignore/check_update/dry_run/attribute_author in every row.",
++      "evidence_paths": ["aider/args.py", "tests/basic/test_main.py"]
++    }
++  ],
++  "conclusion": "Contract established for the boolean/tri-state fixture --analytics (action=argparse.BooleanOptionalAction, default=None) in aider/args.py::get_parser. The contract is: (1) input precedence is explicit CLI token > AIDER_ANALYTICS environment variable > `analytics:` in .aider.conf.yml (or the default_config_files chain) > declared default None; (2) the explicit CLI spellings --analytics and --no-analytics override a conflicting env var and config-file value for the same option, including the tri-state None case and the negative spelling; (3) overriding only --analytics leaves unrelated defaults untouched (auto_commits=True, dirty_commits=True, git=True, gitignore=True, check_update=True, dry_run=False, attribute_author=None). The behaviour is guaranteed by the repository's own wiring (configargparse defaults from env/config plus the final parser.parse_args(argv) in aider/main.py::main) and mirrors the accepted pattern in tests/basic/test_main.py::TestMain.test_main_args. The executable demo .prale-eval/contract_demo.py encodes this contract as twelve stdlib AST/text checks (all passing here) plus a six-row runtime precedence matrix that must be executed in a dependency-complete environment; in this sandbox the runtime matrix is blocked because configargparse==1.7.5, shtab, litellm and GitPython are not installed and installing dependencies is out of scope. No repository source, task metadata, lock file or git configuration was modified.",
++  "validation": {
++    "command": "python .prale-eval/contract_demo.py --out .prale-eval/demo-run.json  &&  python .prale-eval/contract_demo.py --static  &&  python -m pytest tests/basic/test_main.py -k \"test_main_args or test_true_vals_in_env_file or test_yaml_config_file_loading\" -q",
++    "status": "passed-static; runtime-matrix-blocked",
++    "notes": "1) `python .prale-eval/contract_demo.py --static` exit 0: all 12 stdlib-only contract checks pass — get_parser declares auto_env_var_prefix='AIDER_' and configargparse.YAMLConfigFileParser (aider/args.py:35-42); --analytics is BooleanOptionalAction/default=None at aider/args.py:568-573; the unrelated defaults are declared as asserted (aider/args.py:395-400, 439-450, 451-459, 604-609); aider/main.py::main calls load_dotenv_files before the final parser.parse_args(argv) (load_dotenv_files@501 < parse_args@504); tests/basic/test_main.py::test_main_args asserts kwargs['auto_commits'] is False/True and kwargs['dirty_commits'] is True/False; setUp pins AIDER_ANALYTICS; the suite covers AIDER_SHOW_DIFFS=on/off and test_yaml_config_file_loading. 2) The full run `python .prale-eval/contract_demo.py --out .prale-eval/demo-run.json` exits 0 with static ok=true and runtime status 'blocked: runtime dependencies unavailable (ModuleNotFoundError: No module named 'configargparse')', so the six-row precedence matrix (defaults-only, env-only, config-only, env-over-config, --analytics over env+config=false, --no-analytics over env+config=true) could not be executed here; it is executable as written once configargparse==1.7.5, shtab, litellm and GitPython are present (the optional --e2e flag additionally drives aider.main.main). 3) The focused pytest command fails at collection with ModuleNotFoundError: No module named 'git' (tests/basic/test_main.py:10) because GitPython is not installed in this sandbox; installing dependencies is explicitly out of scope, so this is recorded as an environment limitation rather than a product failure. No dependency was installed and no file outside the workspace was read or written."
++  }
++}
+diff --git a/.pytest_cache/.gitignore b/.pytest_cache/.gitignore
+new file mode 100644
+index 0000000..bc1a1f6
+--- /dev/null
++++ b/.pytest_cache/.gitignore
+@@ -0,0 +1,2 @@
++# Created by pytest automatically.
++*
+diff --git a/.pytest_cache/CACHEDIR.TAG b/.pytest_cache/CACHEDIR.TAG
+new file mode 100644
+index 0000000..fce15ad
+--- /dev/null
++++ b/.pytest_cache/CACHEDIR.TAG
+@@ -0,0 +1,4 @@
++Signature: 8a477f597d28d172789f06886806bc55
++# This file is a cache directory tag created by pytest.
++# For information about cache directory tags, see:
++#	https://bford.info/cachedir/spec.html
+diff --git a/.pytest_cache/README.md b/.pytest_cache/README.md
+new file mode 100644
+index 0000000..b89018c
+--- /dev/null
++++ b/.pytest_cache/README.md
+@@ -0,0 +1,8 @@
++# pytest cache directory #
++
++This directory contains data from the pytest's cache plugin,
++which provides the `--lf` and `--ff` options, as well as the `cache` fixture.
++
++**Do not** commit this to version control.
++
++See [the docs](https://docs.pytest.org/en/stable/how-to/cache.html) for more information.
+diff --git a/.pytest_cache/v/cache/lastfailed b/.pytest_cache/v/cache/lastfailed
+new file mode 100644
+index 0000000..154e8ed
+--- /dev/null
++++ b/.pytest_cache/v/cache/lastfailed
+@@ -0,0 +1,3 @@
++{
++  "tests/basic/test_main.py": true
++}
+\ No newline at end of file
+diff --git a/.pytest_cache/v/cache/nodeids b/.pytest_cache/v/cache/nodeids
+new file mode 100644
+index 0000000..0637a08
+--- /dev/null
++++ b/.pytest_cache/v/cache/nodeids
+@@ -0,0 +1 @@
++[]
+\ No newline at end of file
+diff --git a/aider/__pycache__/__init__.cpython-312.pyc b/aider/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..0ac449c4fdbecf01614b99d3f09e04647a9d899f
+GIT binary patch
+literal 751
+zcmZ`$&u<bz82yG>*j*MX5(JC!S4C4G{77nAO{@tao=AGOTsE8Th?E63vlI#^^hA>;
+z9__IwLt~=;3!FV67qUr{CZ0@;S?$H(#TjHZJ@_5o&iB1H?|a$#7!3M>)mJUF>mY#7
+zym3od9L~S7!)wq%M+VeU86nU;We@R`vCOB~5bCT)-~r+zp0~`07ZLXml?m3pJ=Sr3
+z1(oHlBy%0w4b4Rt;NRW<DzNKb^8ipUbN5|zzXQaZ04gD1obZR+hQqB6?Bi|dparkY
+zdC}$FY_2LPf8oiJ$QIj#TGeKw=g(&!tY_D<I%%`9qN)o*ReNH(S~r`t)$^uXU6Zhn
+zK`g81OPd<C$X3#C%cizd(<;?Qg<|GQ`LDGDmiCOeHujQM)d|i1?d2!?JH%|U)waN0
+zZEUru?VVfNqN-|!p{gfv&U4Nl=2~?#XHv}|8A>!GL)r}1pKs)AZCc57nzUxI2qZUO
+zl2g@cquNr{tl6DOkLpc*&mfN}e-Zw6);k6cMhKn4^|PgTUzuKt_XCcAQTkL!eV0Ix
+z2Fe6Sj*4S^a~i&J92<vM`z0p?f!HAPLUe+HH#=3X4mMtG9&8?6n<#gO!J+s*coO_z
+zOje7Zl;SjgZx|cL^MjHjEpGjEmO;Aw0}x7c&*gDA^|Hicq<=YK2wY(dbB(SXKOILi
+r2g;ceo$nIabY`uv$cMf{1m2_y2^dBEh1+;^3vo>N3-|G84Ke%;)&IY9
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/args.cpython-312.pyc b/aider/__pycache__/args.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..0447e020f5af4a00dca25951c107d361b2021cb2
+GIT binary patch
+literal 30128
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/__pycache__/__init__.cpython-312.pyc b/tests/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..31b194e6a05e4a86b46d08c8565ed4dbb860d330
+GIT binary patch
+literal 154
+zcmX@j%ge<81aA@rvOx4>5P=Rpvj9b=GgLBYGWxA#C}INgK7-W!veYlhEzmD0O3X>s
+zElN$y(M>G_5@s3Z2H9mr>H6jQMcKs#iOH$@C8@<F#rpB_nR%Hd@$q^EmA^P_a`RJ4
+ab5iY!Sb-)n0&y{j@sXL4k+Fyw$N~T+RV3vA
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/basic/__pycache__/__init__.cpython-312.pyc b/tests/basic/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3555bab8a9d24a775b7861678a8c83fedc289a4
+GIT binary patch
+literal 160
+zcmX@j%ge<81aA@rvOx4>5P=Rpvj9b=GgLBYGWxA#C}INgK7-W!vez%kEzmD0O3X>s
+zElN$y(M>G_5@s3Z2H9mr>H6jQMcKs#iOH$@C8@<F#rjE!#hJ<a@$s2?nI-Y@dIgog
+gIBatBQ%ZAE?TT1|<}m_sF^KVznURsPh#ANN05JL|8~^|S
+
+literal 0
+HcmV?d00001
+
+diff --git a/tests/basic/__pycache__/test_main.cpython-312-pytest-9.0.3.pyc b/tests/basic/__pycache__/test_main.cpython-312-pytest-9.0.3.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b3e673b89a742783251d392efe996da2b03322f3
+GIT binary patch
+literal 76736
+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
+
+literal 0
+HcmV?d00001
+
+snapshot .prale-eval/contract-deliverable.md - befa8ddcea225acc4880205f5e1475308bc2c5d4311a55699f1a61fa5bd47aba
+snapshot .prale-eval/contract_demo.py - 88ffd4e50dab961f5ba2639a87049abcb5f650e2582e1a3d766f0b32fe9f97f6
+snapshot .prale-eval/demo-run.json - a10ec7dac81154efd575c75838e271ec772657fbdffe7fdafb928fb0808f9299
+snapshot .prale-eval/result.json - 9980ed6a6aa9511716ae1670fd4dfa9083fbba1c3e1d9b0646638afd9a7326fd
+snapshot .pytest_cache/.gitignore - 3ed731b65d06150c138e2dadb0be0697550888a6b47eb8c45ecc9adba8b8e9bd
+snapshot .pytest_cache/CACHEDIR.TAG - 37dc88ef9a0abeddbe81053a6dd8fdfb13afb613045ea1eb4a5c815a74a3bde4
+snapshot .pytest_cache/README.md - 73fd6fccdd802c419a6b2d983d6c3173b7da97558ac4b589edec2dfe443db9ad
+snapshot .pytest_cache/v/cache/lastfailed - 84684da687880558776a6c5f67b039b74d557a805e21838d335d9612328a9d69
+snapshot .pytest_cache/v/cache/nodeids - 4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945
+snapshot aider/__pycache__/__init__.cpython-312.pyc - 78c6f251b8ed7fd1d44dfc717c7dc162bbd62083c5ad0e7274f0c5a9982f2201
+snapshot aider/__pycache__/args.cpython-312.pyc - af4f40e6ece43b638615c7a10febb8a3aceeac8cfcc993c2276fc25c395b65e3
+snapshot tests/__pycache__/__init__.cpython-312.pyc - 18fd2726f1ce69fd3a6ae8535555b805bd5c98b16fd9b19143fb58426b8602fd
+snapshot tests/basic/__pycache__/__init__.cpython-312.pyc - abeee9c086776b869994617dadf13c531d2b5bb31fbee82020d729614fc0ec86
+snapshot tests/basic/__pycache__/test_main.cpython-312-pytest-9.0.3.pyc - a011f9d93daf51a9826a5758858d43465e934cc0a565cc529dc6ba4891f117c2

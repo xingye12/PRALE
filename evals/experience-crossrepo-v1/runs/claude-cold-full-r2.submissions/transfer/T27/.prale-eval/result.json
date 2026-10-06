@@ -1,0 +1,69 @@
+{
+  "task_id": "T27",
+  "repository": "tdam",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "Transport",
+      "start_line": 24,
+      "end_line": 28,
+      "observation": "`Transport` is the SDK's transport seam: `post<T>(path, body)` is required and `get?<T>(path, query)` is optional. The v3 `MemoryClient` accepts either a config object or an object satisfying this interface (its constructor branches on `\"post\" in configOrTransport`), so a fake backend can be injected at exactly this boundary. The demo instead supplies a real `node:http` backend over 127.0.0.1 and lets the production `V3HttpTransport` satisfy `Transport`, which exercises the same seam end to end."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "MemoryClientConfig",
+      "start_line": 8,
+      "end_line": 19,
+      "observation": "`MemoryClientConfig` fixes the connection scope carried on every request: `endpoint` (base URL), `apiKey` (Bearer token), `serviceId` (sent as the `x-tdai-service-id` header), plus optional `timeout` and `rejectUnauthorized`. This is the config the demo builds its client from, which is why each recorded request shows `Authorization: Bearer demo-api-key`, `x-tdai-service-id: svc-demo-0001` and `Content-Type: application/json` on both the write and the read."
+    },
+    {
+      "path": "sdk/memory-core/typescript/demo/fake-backend-demo.mjs",
+      "symbol": "startFakeBackend",
+      "start_line": 48,
+      "end_line": 106,
+      "observation": "The local fake HTTP backend. It records every request into `requestLog` in arrival order (`seq`, `method`, `path`, lowercased headers, parsed JSON body), then answers `/v3/conversation/add` and `/v3/conversation/query` with a `{code, message, request_id, data}` envelope plus `x-qcloud-transaction-id` and `x-trace-id` response headers. Any other path returns a non-zero `code`, which the transport would surface as a `TDAMError`. This is what makes request order, scope metadata and the normalized result observable without any external service."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "`sdk/memory-core/typescript/src/client.ts` defines the injectable `Transport` interface (required `post`, optional `get`) that the v3 `MemoryClient` accepts in place of a config, making the HTTP boundary substitutable for a local fake backend without touching SDK code.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/demo/fake-backend-demo.mjs"
+      ]
+    },
+    {
+      "claim": "`sdk/memory-core/typescript/src/client.ts` defines `MemoryClientConfig`, whose `apiKey` and `serviceId` become the `Authorization: Bearer <apiKey>` and `x-tdai-service-id: <serviceId>` headers on every request; the demo observes exactly these headers on both the write and the read.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/demo/fake-backend-demo.mjs"
+      ]
+    },
+    {
+      "claim": "A write followed by a scoped read produces exactly two ordered POSTs: `/v3/conversation/add` (seq 1) strictly before `/v3/conversation/query` (seq 2), each carrying the isolation scope `team_id`/`agent_id`/`user_id` inside the JSON body alongside the transport-level headers.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/demo/fake-backend-demo.mjs",
+        "sdk/memory-core/typescript/src/client.ts"
+      ]
+    },
+    {
+      "claim": "The result of each call is the normalized operation result: the server's `{code, message, request_id, data}` envelope is unwrapped to `data` and the `x-trace-id` response header is attached as `trace_id`, so envelope keys never leak into the returned object.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/demo/fake-backend-demo.mjs"
+      ]
+    },
+    {
+      "claim": "Scope metadata is derived per call from the isolation context: `withIsolation({ userId, sessionId: null })` rewrites `user_id` to `user-77` and drops `session_id` entirely, while untouched fields (`team_id`, `agent_id`) carry over.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/demo/fake-backend-demo.mjs"
+      ]
+    }
+  ],
+  "conclusion": "A runnable, dependency-free demo of the tdam memory SDK exists at `sdk/memory-core/typescript/demo/fake-backend-demo.mjs`. It starts a local fake HTTP backend on 127.0.0.1 via `node:http` and drives the real, unbuilt `MemoryClient` (`src/v3/client.ts`) through the real `V3HttpTransport` (`src/v3/http.ts`) over Node's global `fetch`. It performs one write (`addConversation` -> POST /v3/conversation/add) and then one scoped read (`queryConversation` -> POST /v3/conversation/query), and verifies: (1) request order, (2) scope metadata — bearer/service headers plus the `team_id`/`agent_id`/`user_id`/`session_id` isolation fields in the body with `undefined` values (`task_id`) stripped, and (3) the normalized result — envelope unwrapped to `data` with `trace_id` attached from `x-trace-id`. All 8 checks pass with exit code 0. The transport seam that makes this substitution possible is `Transport` in `sdk/memory-core/typescript/src/client.ts`.",
+  "validation": {
+    "command": "node --experimental-transform-types demo/fake-backend-demo.mjs",
+    "status": "passed",
+    "notes": "Run from `/tmp/prale-real-eval-0igasr3w/workspace/sdk/memory-core/typescript`; exit code 0, 8/8 checks passed. Real HTTP round trips against a loopback `node:http` backend; no network access and no dependencies installed. LIMITATION: the workspace has no `node_modules`, so `undici`, `typescript`/`tsc` and `vitest` are unavailable and `npm/pnpm install` was not permitted. Two consequences, both handled without modifying SDK sources: (a) `demo/loader.mjs` is an ESM resolve hook that maps the `undici` import in `src/v3/http.ts` to `demo/undici-stub.mjs` (the `Agent` dispatcher is only constructed for `rejectUnauthorized: false`, which this demo never sets, so the stub is loaded but never used) and rewrites the SDK's `./x.js` specifiers onto their `.ts` sources; (b) Node's strip-only type support rejects the parameter property in `IsolationContext`, hence the required `--experimental-transform-types` flag, which also emits an experimental-feature warning on stderr (stderr warning only; assertions and exit code are unaffected). Because `tsc` is unavailable, the demo was not type-checked with the project's `tsconfig.json`; the suite in `package.json` (`vitest run`, `include: tests/**/*.test.ts`) was likewise not executed since vitest is not installed and the fixture ships no `tests/` directory."
+  }
+}

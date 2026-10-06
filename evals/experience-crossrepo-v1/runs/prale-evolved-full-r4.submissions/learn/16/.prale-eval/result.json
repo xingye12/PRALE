@@ -1,0 +1,87 @@
+{
+  "task_id": 16,
+  "repository": "wattclaw",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "syncUserSessionsFromGateway",
+      "start_line": 118,
+      "end_line": 177,
+      "observation": "Top-level session metadata sync for one user. Ordering: it first resolves the user's owned agent ids (getAgentIdsForUser), then dispatches one `sessions.list` call per agent through `mapWithConcurrency(agentIds, gatewayConcurrency, ...)`, so agents run with bounded concurrency (default gatewayConcurrency=2) and cross-agent completion order is not deterministic. Within each agent, the loop `for (const raw of rawSessions)` walks the gateway list in returned order and calls `upsertSyncedUserSession({ userId, ...session })` sequentially, so per-agent writes follow gateway listing order. Idempotency/identity keys: (userId, sessionKey) at the upsert boundary; rows are also gated by membership in `allowedAgentIds` (session.agentId) and by `recentlyDeletedSessionKeys.has(session.sessionKey)`. The whole run is wrapped in `withTimeout(run(), overallTimeoutMs)` (default 8s), and the result reports scanned/inserted/updated/changed counts."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "mapWithConcurrency",
+      "start_line": 79,
+      "end_line": 94,
+      "observation": "Bounded-concurrency mapper that fixes how sync work is ordered. It spawns `Math.min(Math.max(1, limit), items.length)` workers; each worker grabs the next index via a shared `nextIndex` counter and writes `results[index] = await mapper(items[index], index)`. Output order is therefore preserved by index, but the *execution/completion order across agents is interleaved and non-deterministic* (up to `limit` agents in flight). This is the source of the ordering guarantee/limitation for session sync: per-agent sequences are ordered, cross-agent ordering is not."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "scheduleUserSessionSync",
+      "start_line": 179,
+      "end_line": 216,
+      "observation": "Scheduling/idempotency layer keyed by `userId`. Two dedup mechanisms: (1) a per-user cooldown — `lastSyncAtByUserId.get(userId)` compared against `cooldownMs` (DEFAULT_SESSION_SYNC_OPTIONS.cooldownMs = 60_000) returns `{ skipped: true, reason: 'cooldown' }`; (2) an in-flight coalescer — `inFlightByUserId.get(userId)` returns the already-pending promise instead of starting a second sync for the same user, and the promise is removed from the map in `.finally()`. `lastSyncAtByUserId.set(userId, Date.now())` is only recorded on success. So the idempotency key for scheduling is the user id, not the session key."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "normalizeGatewaySessionForSync",
+      "start_line": 59,
+      "end_line": 77,
+      "observation": "Normalizes a raw Gateway session row into the sync shape and establishes the identity keys used downstream. It reads `sessionKey` from `row.key || row.sessionKey || row.session_key || row.id` and `agentId` from `row.agentId || row.agent_id || row.agent || extractAgentIdFromSessionKey(sessionKey) || fallbackAgentId`; a row without a sessionKey or agentId returns null and is dropped. This is where the stable idempotency pair (agentId, sessionKey) originates, and it also maps activity via readExplicitMessageActivity (lastMessageAt/last_message_at/lastActivity/.../createdAt)."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "_persistOwnerScopedUpdate",
+      "start_line": 122,
+      "end_line": 156,
+      "observation": "The single owner-scoped writer that defines the usage-cache idempotency key. The UPDATE targets `user_sessions` with `WHERE user_id = ? AND session_key = ?`, binding (entry.userId, entry.sessionKey) last, so the composite (user_id, session_key) is the idempotency/identity key and a repeated write of the same values converges to the same row state. It also uses guarded CASE expressions so a null/empty model or model_provider does not overwrite an existing value, and returns `result?.changes === 1`, i.e. success is defined as exactly one matching row (0 rows means the row is not owned by that user or does not exist). `updated_at` is stamped with a fresh `Date.now()` on every write."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "batchUpdateMatchedGatewayUsage",
+      "start_line": 158,
+      "end_line": 229,
+      "observation": "Batch synchronization entry point. Ordering: it iterates `for (const session of gatewayResult.sessions)` in the exact array order supplied by the Gateway, and issues one `_persistOwnerScopedUpdate` per session sequentially (no transaction, no re-sort). Per session it derives the key as `session.key || session.sessionKey || session.id`, looks up current ownership rows via a prepared SELECT (scoped by `userId` when provided, else global), and applies an idempotency/conflict policy: 0 owner rows -> `report.skippedUnmatched++`; more than 1 owner row -> `report.skippedConflict++` (the same session_key owned by multiple users is never written ambiguously); exactly 1 owner -> write owner.user_id + session_key. Only a `changes === 1` result increments `report.updated`; otherwise `report.failed` (and a bounded warning log). A returned report shape is {scanned, updated, skippedUnmatched, skippedConflict, failed, durationMs}."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "updateSessionUsageForUser",
+      "start_line": 89,
+      "end_line": 120,
+      "observation": "Single-session write path that also fixes the idempotency key and timestamp semantics. It builds the entry with the caller-supplied `userId` and `sessionKey`, stamps `usageSyncedAt: Date.now()`, then calls `_persistOwnerScopedUpdate(entry)`; a non-update logs 'owner-scoped usage update skipped' and the returned `updated` flag is false. Passing a null/undefined userId never throws but yields `updated: false` because the WHERE user_id = ? predicate matches nothing — confirming ownership is part of the write key. Model normalization happens before the write via _normalizeModelFields."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "getSessionOwner",
+      "start_line": 231,
+      "end_line": 235,
+      "observation": "Resolves `session_key -> user_id` (the read side of the same key), returning null when unknown. It is the ownership lookup that lets callers establish the user_id half of the (user_id, session_key) key before invoking the owner-scoped write, and read helpers such as getSessionUsage/getAgentUsage consistently filter on `usage_synced_at IS NOT NULL`, i.e. a row only participates once a sync has stamped it."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "session-sync ordering is two-level: per-user agent fan-out runs with bounded concurrency (DEFAULT_SESSION_SYNC_OPTIONS.gatewayConcurrency = 2) via mapWithConcurrency, so work within a single agent's returned session list is processed in list order, while completion order across agents is interleaved/non-deterministic; the whole user sync is bounded by an overall timeout (default 8000ms).",
+      "evidence_paths": ["server/core/session-sync.js"]
+    },
+    {
+      "claim": "session-sync idempotency keys are the user id at the scheduling layer (cooldown lastSyncAtByUserId plus inFlightByUserId coalescing keyed by userId) and the (userId, sessionKey) pair at the persistence layer: normalizeGatewaySessionForSync derives a stable sessionKey, upsertSyncedUserSession is called with { userId, ...session }, and recentlyDeletedSessionKeys is keyed by sessionKey.",
+      "evidence_paths": ["server/core/session-sync.js"]
+    },
+    {
+      "claim": "session-usage-cache ordering follows the Gateway response array order: batchUpdateMatchedGatewayUsage iterates gatewayResult.sessions sequentially and calls _persistOwnerScopedUpdate in that same order with no reordering or batching transaction.",
+      "evidence_paths": ["server/core/session-usage-cache.js"]
+    },
+    {
+      "claim": "session-usage-cache idempotency key is the composite (user_id, session_key): _persistOwnerScopedUpdate issues UPDATE user_sessions ... WHERE user_id = ? AND session_key = ?, success is defined as changes === 1, keyless sessions are skippedUnmatched, session_keys with more than one owner row are skippedConflict, and each write stamps a fresh usage_synced_at/updated_at, so repeated identical syncs are convergent (last-write-wins on usage_synced_at).",
+      "evidence_paths": ["server/core/session-usage-cache.js"]
+    }
+  ],
+  "conclusion": "Synchronization in `server/core/session-sync.js` and `server/core/session-usage-cache.js` is ordered and de-duplicated by two distinct keys. (1) Ordering — session-sync is two-level: it fans out one `sessions.list` call per owned agent with bounded concurrency (`mapWithConcurrency`, gatewayConcurrency=2), so session rows within a given agent are processed in the Gateway's list order, but cross-agent completion order is interleaved and not deterministic; the run is wrapped in `withTimeout` (8000ms). Before persistence, rows are filtered by the user's allowed agent ids and by `recentlyDeletedSessionKeys`. Usage-cache writes are strictly sequential in the Gateway payload array order (`for (const session of gatewayResult.sessions)`), each dispatched to `_persistOwnerScopedUpdate`; no cross-session transaction or re-sort is applied. (2) Idempotency keys — at the scheduling layer the key is the user id: `scheduleUserSessionSync` uses `lastSyncAtByUserId` for a per-user cooldown (60s default) and `inFlightByUserId` to coalesce concurrent syncs for the same userId. At the persistence layer the key is the pair `(userId, sessionKey)`: session sync calls `upsertSyncedUserSession({ userId, ...session })` after `normalizeGatewaySessionForSync` derives a stable `sessionKey` from key/sessionKey/session_key/id; usage-cache `_persistOwnerScopedUpdate` writes with `WHERE user_id = ? AND session_key = ?` and treats `changes === 1` as success. Ownership resolution is enforced there too: 0 owner rows -> skippedUnmatched, >1 owner rows -> skippedConflict (ambiguous ownership never written), and `getSessionOwner` provides the reverse `session_key -> user_id` lookup. Each successful write stamps `usage_synced_at = Date.now()`, making repeated synchronization convergent (idempotent last-write-wins), with reads filtered on `usage_synced_at IS NOT NULL`. Scope note: this is a static, source-grounded reading of the two named modules plus their call-site/test expectations; it was not exercised against a live Gateway.",
+  "validation": {
+    "command": "node --check server/core/session-sync.js && node --check server/core/session-usage-cache.js && node --input-type=module -e '<static assertions over both files: bounded-concurrency worker loop, mapWithConcurrency(agentIds, gatewayConcurrency), inFlightByUserId.get/set(userId), lastSyncAtByUserId cooldown, upsertSyncedUserSession({ userId, ...session }), recentlyDeletedSessionKeys.has(session.sessionKey), UPDATE ... WHERE user_id = ? AND session_key = ?, result?.changes === 1, owners.length > 1 -> skippedConflict, owners.length === 0 -> skippedUnmatched, sequential for..of over gatewayResult.sessions, usageSyncedAt: Date.now()>'",
+    "status": "passed",
+    "notes": "Both modules parse cleanly under Node v24.14.0 (`node --check`), and all 12 static assertions over the two source files PASSED (ALL_STATIC_CHECKS_PASSED), confirming the cited ordering and idempotency-key constructs at the quoted line ranges. Limitation: the repository's own vitest suites (server/core/session-sync.test.js and server/core/session-usage-cache.test.js, run via `npm run test:server`) could NOT be executed because dependencies are not installed in this workspace (no node_modules / no vitest binary); per instructions no dependencies were installed. The vitest files were read only to corroborate the (userId, sessionKey) WHERE clause, changes===1 semantics, skippedUnmatched/skippedConflict policy, and per-user coalescing, all of which the static assertions reproduce."
+  }
+}

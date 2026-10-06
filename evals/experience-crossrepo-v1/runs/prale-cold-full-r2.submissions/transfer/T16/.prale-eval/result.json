@@ -1,0 +1,106 @@
+{
+  "task_id": "T16",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.start",
+      "start_line": 164,
+      "end_line": 170,
+      "observation": "The start() edge is the only transition that enters the watch session: it re-initialises stop_event to a fresh threading.Event, resets changed_files to an empty set (the command-buffer reset edge), then launches the daemon watcher_thread running watch_files. Before start() the helper is IDLE (stop_event is None and watcher_thread is None); after it returns the helper is RUNNING with a live thread, which is the legal IDLE -> RUNNING edge modelled by the new test."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.stop",
+      "start_line": 172,
+      "end_line": 179,
+      "observation": "The stop() edge is the legal RUNNING -> IDLE transition (it sets stop_event, joins the watcher thread, then nulls both watcher_thread and stop_event). Crucially it guards both handles with 'if self.stop_event:' / 'if self.watcher_thread:', so an illegal edge such as stop() before start(), or a repeated stop() after the session is already IDLE, is tolerated as a no-op instead of raising AttributeError. That guard is the exact behaviour the illegal-edge tests pin down."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.handle_changes",
+      "start_line": 135,
+      "end_line": 143,
+      "observation": "handle_changes is the command-buffer transition: an empty batch returns False and leaves the buffer untouched (illegal/empty edge, no transition), while a non-empty batch unions the changed paths into changed_files, calls io.interrupt_input() and returns True. The new state-transition test drives this buffer sub-machine from the empty state and asserts both the false/no-op edge and the growing-buffer edge."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.process_changes",
+      "start_line": 181,
+      "end_line": 255,
+      "observation": "process_changes is the command edge that consumes the buffered changed_files: with nothing actionable (lines 202-207) it returns the empty string '' and performs no work, which the test uses as the illegal IDLE --process_changes()--> no-op edge; with an 'ai!'/'ai?' comment it returns the watch_code_prompt/watch_ask_prompt concatenated with the AI-comment context, and adds unseen files to coder.abs_fnames."
+    },
+    {
+      "path": "tests/basic/test_watch.py",
+      "symbol": "MinimalCoder",
+      "start_line": 8,
+      "end_line": 15,
+      "observation": "The existing suite already defines the MinimalCoder test double (io, root '.', abs_fnames set, get_rel_fname) that FileWatcher requires; the new lifecycle test reuses the same shape so it constructs FileWatcher without a real coder or network/IO stack."
+    },
+    {
+      "path": "tests/basic/test_watch.py",
+      "symbol": "test_handle_changes",
+      "start_line": 99,
+      "end_line": 112,
+      "observation": "This existing test asserts the discrete buffer behaviour only: handle_changes([]) is falsy and leaves changed_files empty, while a single modification adds exactly one path. It never exercises start()/stop(), threading state, or illegal edges such as stop-before-start, so it establishes the contract the new state-transition module extends rather than duplicates."
+    },
+    {
+      "path": "tests/basic/test_watch_lifecycle.py",
+      "symbol": "test_illegal_edge_stop_before_start",
+      "start_line": 301,
+      "end_line": 312,
+      "observation": "New focused test: on a freshly constructed IDLE watcher, stop() (an edge absent from the legal transition table) must be a guarded no-op that leaves stop_event and watcher_thread None. A mutation that removes stop()'s None-guard makes this test raise AttributeError, confirming the test discriminates on the illegal edge."
+    },
+    {
+      "path": "tests/basic/test_watch_lifecycle.py",
+      "symbol": "test_legal_edge_running_to_idle",
+      "start_line": 249,
+      "end_line": 261,
+      "observation": "New focused test: with a controllable watchfiles.watch replacement, start() moves IDLE -> RUNNING (live watcher_thread, non-None stop_event) and stop() moves RUNNING -> IDLE, signalling the watcher and clearing both handles. This is the legal edge pair of the lifecycle machine."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "aider.watch.FileWatcher is a distinct two-state session lifecycle helper: start() is the legal IDLE -> RUNNING edge and stop() is the legal RUNNING -> IDLE edge, with the observable state defined by (stop_event, watcher_thread) and resetting changed_files on start.",
+      "evidence_paths": [
+        "aider/watch.py",
+        "tests/basic/test_watch_lifecycle.py"
+      ]
+    },
+    {
+      "claim": "Illegal edges are handled as guarded no-ops rather than exceptions: stop() before start() and repeated stop() when already IDLE are safe because stop() null-checks both stop_event and watcher_thread, so the helper stays in IDLE.",
+      "evidence_paths": [
+        "aider/watch.py",
+        "tests/basic/test_watch_lifecycle.py"
+      ]
+    },
+    {
+      "claim": "handle_changes([]) is an illegal empty edge that returns False without mutating changed_files, whereas a non-empty batch is the legal command edge that grows the buffer and interrupts input; process_changes() with nothing pending is the illegal command edge returning an empty string.",
+      "evidence_paths": [
+        "aider/watch.py",
+        "tests/basic/test_watch_lifecycle.py"
+      ]
+    },
+    {
+      "claim": "tests/basic/test_watch.py only pins discrete FileWatcher behaviours (gitignore matching, handle_changes buffer, AI-comment parsing) and never drives the start/stop threading lifecycle, which is why the new tests/basic/test_watch_lifecycle.py provides the missing state-transition coverage using legal and illegal edges.",
+      "evidence_paths": [
+        "tests/basic/test_watch.py",
+        "aider/watch.py"
+      ]
+    },
+    {
+      "claim": "tests/basic/test_watch_lifecycle.py contains an executable state-transition test module: it patches aider.watch.watch with a controllable watch generator, models IDLE/RUNNING plus a disjoint LEGAL_TRANSITIONS/ILLEGAL_TRANSITIONS table, and passes all 11 cases while a mutation that removes stop()'s guard makes it fail.",
+      "evidence_paths": [
+        "tests/basic/test_watch_lifecycle.py",
+        "aider/watch.py"
+      ]
+    }
+  ],
+  "conclusion": "The distinct session/watch/command lifecycle helper is aider.watch.FileWatcher. Its lifecycle is a two-state machine (IDLE, RUNNING) reachable only through the legal edges start() and stop(), with the command buffer driven by handle_changes()/process_changes(). Illegal edges (stop before start, repeated stop, empty change batch, process_changes with nothing pending) are guarded no-ops and the new tests/basic/test_watch_lifecycle.py asserts each one. The module executes under pytest even though the third-party deps grep_ast/pathspec/watchfiles are absent in this environment (the test injects import-only stubs when the real packages are missing), and all 11 tests pass.",
+  "validation": {
+    "command": "python -m pytest tests/basic/test_watch_lifecycle.py -q",
+    "status": "passed",
+    "notes": "11 passed in ~0.1s. The lifecycle machine depends only on stdlib threading; because grep_ast, pathspec and watchfiles are not installed in this sandbox (and dependencies must not be installed), the test module injects minimal import-only stubs for those packages before importing aider.watch and replaces aider.watch.watch with a controllable generator, so the legal edges are exercised deterministically and the background thread terminates on stop(). A follow-up mutation check (replacing FileWatcher.stop with an unguarded version via python -c) made test_illegal_edge_stop_before_start fail with AttributeError, confirming the illegal-edge assertion is discriminating, not vacuous. Limitation: the repo's optional lint check (flake8, configured in .flake8) is not installed and dependencies must not be installed, so it could not be run; a manual line-length check (max 100) over the new test file found no violations."
+  }
+}

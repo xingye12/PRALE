@@ -1,0 +1,62 @@
+{
+  "task_id": "T19",
+  "repository": "pi",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "packages/agent/src/proxy.ts",
+      "symbol": "ProxyAssistantMessageEvent",
+      "start_line": 36,
+      "end_line": 61,
+      "observation": "Declares the proxy wire protocol, including the single terminal failure variant `{ type: \"error\"; reason: Extract<StopReason, \"aborted\" | \"error\">; errorMessage?: string; usage; providerThinkingLevel? }`. That variant is the one stable error shape every server-side failure is mapped onto, which is exactly the contract the T19 demo copies into a local command adapter."
+    },
+    {
+      "path": "packages/agent/src/proxy.ts",
+      "symbol": "streamProxy",
+      "start_line": 120,
+      "end_line": 265,
+      "observation": "`streamProxy` rejects an unusable response up front: when `!response.ok` (lines 174-185) it throws before ever reading `response.body`, so an invalid/error response cannot produce partial effects for the consumer. Every later failure mode is normalized into the same terminal event - the mid-stream drop branch (lines 232-243) and the catch block (lines 246-256) both push `{ type: \"error\", reason, error: partial }` and then `stream.end()`, so callers see exactly one error shape regardless of the cause."
+    },
+    {
+      "path": "packages/agent/src/proxy.ts",
+      "symbol": "processProxyEvent",
+      "start_line": 270,
+      "end_line": 406,
+      "observation": "Processes each server event in a discriminated switch and validates the precondition before mutating the partial message: `text_delta` (282-295) checks `content?.type === \"text\"` and throws `Received text_delta for non-text content` instead of writing, and the same guard-before-mutation pattern repeats for text_end (307), thinking_delta (325), thinking_end (339), and toolcall_delta (365). Invalid input is therefore rejected before the state mutation takes effect; unknown event types fall through to the exhaustive `never` check and return `undefined` (lines 400-404) rather than corrupting state, and `toolcall_end` likewise returns `undefined` for a mismatched content slot (line 380)."
+    },
+    {
+      "path": "packages/agent/demo/rpc-adapter-demo.mjs",
+      "symbol": "createLocalRpcAdapter",
+      "start_line": 172,
+      "end_line": 228,
+      "observation": "The demo adapter: `dispatch(request)` runs the whole validation phase first (plain-object envelope, non-empty string command, known command, plain-object params, schema check via `validateParams`) and returns early on every problem, so the fake effect (`effect.apply`) is only reachable on line 212 after all checks pass. The effect call itself is wrapped in try/catch so even a throwing command body is folded into the identical rejection envelope instead of propagating."
+    },
+    {
+      "path": "packages/agent/demo/rpc-adapter-demo.mjs",
+      "symbol": "reject",
+      "start_line": 55,
+      "end_line": 66,
+      "observation": "The single constructor for the stable error shape `{ ok: false, error: { code, message, details } }`; it rejects non-string codes/messages and non-object details, so all four failure classes (invalid_request, unknown_command, invalid_params, effect_failed) are byte-for-byte the same shape. `isErrorEnvelope` (lines 69-90) is the executable predicate the test suite uses to assert that shape."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "`packages/agent/src/proxy.ts` funnels every failure mode into one stable terminal error shape: `streamProxy` throws for a non-ok response before consuming the body (lines 174-185) and both the dropped-stream branch (232-243) and the catch block (246-256) push the same `{ type: \"error\", reason, error }` event declared by the `ProxyAssistantMessageEvent` error variant (36-61).",
+      "evidence_paths": ["packages/agent/src/proxy.ts"]
+    },
+    {
+      "claim": "`processProxyEvent` in `packages/agent/src/proxy.ts` rejects invalid event/state combinations before mutating the partial message (e.g. `text_delta` throws at line 293 before touching `content.text`), which is the reject-before-effect property the T19 demo transfers to command dispatch.",
+      "evidence_paths": ["packages/agent/src/proxy.ts"]
+    },
+    {
+      "claim": "The T19 demo `packages/agent/demo/rpc-adapter-demo.mjs` implements the same contract locally: `createLocalRpcAdapter().dispatch()` validates the request envelope, command name, and params and returns early, so invalid input is rejected before the fake effect runs (effect count stays 0), and `reject()` is the only error constructor, giving one stable error shape for invalid_request, unknown_command, invalid_params, and effect_failed. This is verified by `node --test packages/agent/demo/rpc-adapter-demo.test.mjs` (6/6 passing).",
+      "evidence_paths": ["packages/agent/src/proxy.ts", "packages/agent/demo/rpc-adapter-demo.mjs"]
+    }
+  ],
+  "conclusion": "The demo is complete and executable with plain Node (no dependencies installed): `node packages/agent/demo/rpc-adapter-demo.mjs` runs a self-checking scripted demo whose 10 cases all pass and whose summary reports `effectsApplied: 2` for the 2 valid requests while all 8 invalid requests leave the fake effect at 0 calls, and `node --test packages/agent/demo/rpc-adapter-demo.test.mjs` passes 6/6 tests asserting rejection-before-effect and the single error shape. The design is grounded in `packages/agent/src/proxy.ts`: a validation/rejection phase that runs before any state mutation (processProxyEvent type guards, non-ok response thrown before body consumption) and exactly one normalized error envelope for every failure (`ProxyAssistantMessageEvent`'s `type: \"error\"` variant pushed by both the dropped-stream branch and the catch block).",
+  "validation": {
+    "command": "node --test packages/agent/demo/rpc-adapter-demo.test.mjs",
+    "status": "passed",
+    "notes": "6/6 node:test tests pass (0 fail, 0 skipped): valid input applies the fake effect exactly once and returns `{ ok: true, result }`; 18 invalid requests each return a well-formed error envelope and leave `effect.count() === 0`; every rejection (including a throwing command body and a locally built `reject()`) has exactly the keys `[ok, error]` / `[error.code, error.message, error.details]`; `dispatch` never throws for `null`, `undefined`, numbers, strings, arrays, functions, symbols, or `explode`. Supplementary run: `node packages/agent/demo/rpc-adapter-demo.mjs` -> scripted demo summary `{\"summary\":\"pass\",\"cases\":10,\"failures\":0,\"effectsApplied\":2}`, exit 0; CLI rejection path `node packages/agent/demo/rpc-adapter-demo.mjs 'not json'` also returns the same envelope. LIMITATION: the workspace has no installed dependencies (`node_modules` absent) and the task forbids installing them, so the repository's vitest suite for the cited source file (`packages/agent/test/proxy.test.ts`, run via `npm run test -w @earendil-works/pi-agent-core`) could not be executed; the demo and its test file are dependency-free ESM precisely so the focused validation still runs with plain node v24.14.0."
+  }
+}

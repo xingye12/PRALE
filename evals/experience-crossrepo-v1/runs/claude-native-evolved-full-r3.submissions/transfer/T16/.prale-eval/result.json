@@ -1,0 +1,69 @@
+{
+  "task_id": "T16",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.start",
+      "start_line": 164,
+      "end_line": 170,
+      "observation": "The legal entry edge of the watcher lifecycle (IDLE -> RUNNING). start() materialises a fresh threading.Event in stop_event, resets changed_files to an empty set (discarding any previously accumulated names), and spawns a daemon thread running watch_files(). These two side effects are exactly what a state-transition assertion checks: after start() the running state is observably distinct from IDLE."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.stop",
+      "start_line": 172,
+      "end_line": 179,
+      "observation": "The legal exit edge (RUNNING -> IDLE) and the illegal-edge guard. stop() sets stop_event, joins the watcher thread, then nulls both watcher_thread and stop_event. Both branches are guarded by truthiness (`if self.stop_event:` / `if self.watcher_thread:`), so stop() issued before start() - an illegal edge in the state machine - is a safe no-op, and a repeated stop() on an already-stopped watcher is idempotent."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.handle_changes",
+      "start_line": 135,
+      "end_line": 143,
+      "observation": "The per-transition effect function independent of start/stop. An empty batch ([]) is rejected by the `if not changes: return False` guard so it returns False and leaves changed_files untouched; a non-empty batch normalises paths to strings, unions them into changed_files, calls io.interrupt_input(), and returns True. This is the illegal (empty) vs legal (non-empty) edge pair the state-transition test exercises."
+    },
+    {
+      "path": "tests/basic/test_watch.py",
+      "symbol": "test_handle_changes",
+      "start_line": 124,
+      "end_line": 137,
+      "observation": "The pre-existing test that already pins the illegal empty-change edge: `assert not watcher.handle_changes([])` plus `assert len(watcher.changed_files) == 0`, followed by the legal non-empty edge asserting the file is recorded. It establishes the acceptance baseline the new lifecycle test extends."
+    },
+    {
+      "path": "tests/basic/test_watch.py",
+      "symbol": "test_file_watcher_lifecycle_state_transitions",
+      "start_line": 217,
+      "end_line": 284,
+      "observation": "The new deliverable state-transition test for the FileWatcher lifecycle helper (a distinct session/watch/command helper from the comment-parsing tests). It walks IDLE -> RUNNING -> IDLE: asserts IDLE invariants, treats stop()-before-start() and handle_changes([]) as guarded no-op illegal edges, asserts start() resets changed_files and yields a live daemon thread, asserts a non-empty batch mutates state, asserts stop() joins the thread and restores IDLE, treats repeated stop() as idempotent, and finally restarts and cleanly stops. watch_files is replaced with a stop_event-parking stub so the transition is deterministic and touches no real files."
+    },
+    {
+      "path": "tests/basic/test_watch.py",
+      "symbol": "_ensure_optional_stub",
+      "start_line": 7,
+      "end_line": 26,
+      "observation": "A guarded import shim that registers placeholder modules for the optional runtime dependencies watchfiles, grep_ast and oslex only when importlib.util.find_spec cannot find the real package. This lets aider.watch (which imports watchfiles and grep_ast) be collected and the state machine exercised in an environment where those optional packages are absent; it is a no-op wherever the real dependencies are installed."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "FileWatcher models a reversible two-state lifecycle helper: start() is the legal IDLE -> RUNNING edge (fresh stop_event, changed_files reset, live daemon thread) and stop() is the legal RUNNING -> IDLE edge (stop_event set, thread joined and cleared), so start()/stop() round-trips return the watcher to observably IDLE state.",
+      "evidence_paths": ["aider/watch.py", "tests/basic/test_watch.py"]
+    },
+    {
+      "claim": "The illegal edges of the lifecycle are handled as guarded no-ops rather than crashes or state corruption: stop() before start() and a repeated stop() do nothing because both branches in stop() are None-guarded, and handle_changes([]) returns False without mutating changed_files via the `if not changes: return False` guard, a behaviour already pinned by test_handle_changes.",
+      "evidence_paths": ["aider/watch.py", "tests/basic/test_watch.py"]
+    },
+    {
+      "claim": "The new test_file_watcher_lifecycle_state_transitions exercises both the legal edges (start, non-empty handle_changes, stop, restart) and the illegal edges (stop-before-start, repeated stop, empty change batch) of the FileWatcher helper, replacing the blocking watch_files loop with a stop_event-parking stub so the transitions are deterministic and require no real filesystem events.",
+      "evidence_paths": ["tests/basic/test_watch.py", "aider/watch.py"]
+    }
+  ],
+  "conclusion": "The FileWatcher session/watch lifecycle in aider/watch.py is a compact two-state machine (IDLE <-> RUNNING) whose transitions are start() and stop(), with handle_changes() as the per-transition effect independent of lifecycle state. The deliverable adds an executable state-transition test, test_file_watcher_lifecycle_state_transitions, to tests/basic/test_watch.py that asserts the legal edges (start, non-empty handle_changes, stop, restart) and the illegal edges (stop-before-start, repeated stop, empty batch), all of which are handled defensively as no-ops by the None-guards in stop() and the empty-guard in handle_changes(). To run in this environment, where the optional runtime dependencies watchfiles, grep_ast and oslex are not installed, the test module installs guarded import stubs that are inert whenever the real packages are present. The full tests/basic/test_watch.py suite passes (5 passed).",
+  "validation": {
+    "command": "python -m pytest tests/basic/test_watch.py -v",
+    "status": "passed",
+    "notes": "5 passed in 0.16s, including the new test_file_watcher_lifecycle_state_transitions. Environment limitation recorded: the optional runtime dependencies watchfiles, grep_ast and oslex were NOT installed, so the existing test module could not even be collected. A guarded import shim (_ensure_optional_stub, tests/basic/test_watch.py:7-26) registers inert placeholder modules for exactly these three packages only when importlib.util.find_spec fails; the shim is a no-op when the real dependencies are present. No dependency was installed. The shim substitutes watchfiles.watch with an empty iterator and grep_ast.TreeContext with a bare class, but the lifecycle test replaces watch_files with a stop_event-parking stub and never calls TreeContext, so the asserted behaviour (start/stop/handle_changes state transitions) is exercised directly against the real aider/watch.py code paths."
+  }
+}

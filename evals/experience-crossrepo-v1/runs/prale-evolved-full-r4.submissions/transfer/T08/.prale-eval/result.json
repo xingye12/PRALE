@@ -1,0 +1,105 @@
+{
+  "task_id": "T08",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "request": "Contract a different configuration fixture where the first job fails and the next job must still settle deterministically.",
+  "deliverables": [
+    ".prale-eval/result.json",
+    ".prale-eval/contract-deliverable.md",
+    ".prale-eval/config-queue-failure-fixture.mjs",
+    ".prale-eval/validate-result.mjs"
+  ],
+  "evidence": [
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "enqueue",
+      "start_line": 15,
+      "end_line": 20,
+      "observation": "enqueue(transformFn, label, method='config.patch') wraps each configuration job in its own Promise, pushes { transformFn, label, method, resolve, reject } onto the FIFO _queue and kicks _process(). Settlement is therefore per-job: one job's rejection cannot resolve or reject another job's promise, and the (transformFn, label, method) triple is the queued unit the fixture contracts."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_process",
+      "start_line": 24,
+      "end_line": 37,
+      "observation": "The single-flight drain: the _running guard makes re-entrant enqueue() calls return without starting a second loop, the while loop shifts exactly one item per iteration and awaits _execute(item), then item.resolve(result.data) on ok / item.reject(result.error) on failure. Crucially the loop is not broken by a rejection (lines 27-35) and _running is only cleared after the queue is empty (line 36), so a failing first job still leaves the next job to be drained and settled in order."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_waitForSlot",
+      "start_line": 46,
+      "end_line": 54,
+      "observation": "The proactive sliding-window throttle: _cleanWindow() drops timestamps older than _WINDOW_MS (60s) and the method returns immediately while fewer than _MAX_PATCHES (3) patches were recorded in the window, only sleeping when the window is full. In the fixture only one or two patches are issued, so no wall-clock wait is introduced and failure/settlement timing stays deterministic."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_execute",
+      "start_line": 60,
+      "end_line": 99,
+      "observation": "The per-job pipeline the fixture drives: config.get → transformFn(sourceConfig) (a falsy transform resolves early with data:null, line 69) → _waitForSlot() → config.patch with baseHash from the fresh read (line 72) → _recordPatch() → a second config.get → config.apply with the second payload's baseHash (line 80) → resolve({ok:true, data:undefined}). Every non-ok gateway reply is turned into a thrown Error (lines 65, 73, 77, 81), which is what makes 'the first job fails' an explicit, observable rejection."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "isOcc",
+      "start_line": 84,
+      "end_line": 97,
+      "observation": "The catch gate that makes failure deterministic: only errors whose message contains 'config changed since last load' (isOcc) or 'rate limit' (isRateLimit) are retried, and only while attempt < maxRetries-1; every other error falls through to console.error plus return { ok:false, error: err } with no backoff. The fixture's first-job errors ('gateway transport offline', 'config.patch rejected: invalid logLevel') are non-retryable, so the first job rejects on attempt 1 and the queue proceeds immediately to the next job."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "configQueueExecute",
+      "start_line": 102,
+      "end_line": 106,
+      "observation": "Module-level singleton (const configQueue = new ConfigQueue()) plus the exported entry point configQueueExecute(transformFn, label, method) that production handlers (server/handlers/channels.js, system.js, agent-team.js) call. The fixture loads this exact module and its ConfigQueue class, so the contracted failure-isolation guarantee is about the real serialized config-write path, not a re-implementation."
+    },
+    {
+      "path": ".prale-eval/config-queue-failure-fixture.mjs",
+      "symbol": "createScriptedGateway",
+      "start_line": 58,
+      "end_line": 90,
+      "observation": "The scripted configuration fixture: an in-memory Gateway config document ({ agents, gateway, bindings } + hash) whose config.get returns a fresh deep copy, whose config.patch replaces the document and advances the hash only when accepted, and whose failGet/failPatch knobs make the first N calls of a method return a non-retryable error. This is the 'different configuration fixture': failure is injected at the gateway/config layer rather than by throwing inside transformFn."
+    },
+    {
+      "path": ".prale-eval/config-queue-failure-fixture.mjs",
+      "symbol": "FIXTURES",
+      "start_line": 93,
+      "end_line": 136,
+      "observation": "Declares the two contracted fixtures and their expected normalized results. get-fails-first: job1's first config.get fails → expected trace [config.get:fail, config.get:ok, config.patch:ok, config.get:ok, config.apply:ok], 1 patch, 1 apply, final logLevel 'debug', baseHash 'hash-s1-1'. patch-fails-first: job1's config.patch is rejected → expected trace [config.get:ok, config.patch:fail, config.get:ok, config.patch:ok, config.get:ok, config.apply:ok] with BOTH patch base hashes equal to 'hash-s2-1', proving the failed job left the hash untouched."
+    },
+    {
+      "path": ".prale-eval/config-queue-failure-fixture.mjs",
+      "symbol": "runFixture",
+      "start_line": 159,
+      "end_line": 201,
+      "observation": "Enqueues the failing job first and the next job second on one queue instance, awaits both with Promise.allSettled, and records the normalized operation result: per-job status/error, second job outcome, queue length (drained), hash before/after, exact call trace, patch/apply counts, patch base hashes and final config. main() replays each fixture REPEATS=30 times and requires a single distinct run signature, which is the executable determinism check."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "_execute executes one configuration job as a strict read→transform→write→apply chain, and its catch block retries only the two named transient classes (OCC 'config changed since last load' and 'rate limit'). Any other failure — a config.get transport error or a rejected config.patch — returns { ok:false, error } on the first attempt with no sleep, so 'the first job fails' is deterministic (single attempt, stable error identity) instead of a timing-dependent retry.",
+      "evidence_paths": ["server/core/config-queue.js", ".prale-eval/config-queue-failure-fixture.mjs"]
+    },
+    {
+      "claim": "The queue drain is failure-isolated and FIFO: _process holds the _running single-flight guard, shifts one queued job per iteration, rejects that job's promise with its own error on failure, and continues the same while loop until the queue is empty. Therefore when the first job fails, the next enqueued job is still executed and settled in order, and _running is only released after the queue has drained.",
+      "evidence_paths": ["server/core/config-queue.js", ".prale-eval/config-queue-failure-fixture.mjs"]
+    },
+    {
+      "claim": "The failed first job never mutates the gateway configuration: a failed config.get aborts before transformFn runs, and a rejected config.patch aborts before _recordPatch() and config.apply. The document and its hash are unchanged, so the next job reads that same baseHash and settles deterministically (config.get → transform → _waitForSlot → config.patch → config.get → config.apply, resolving undefined). The fixture asserts this as an exact call trace, patch/apply counts and patch base-hash list, and requires identical results over 30 replays per fixture.",
+      "evidence_paths": ["server/core/config-queue.js", ".prale-eval/config-queue-failure-fixture.mjs"]
+    },
+    {
+      "claim": "configQueueExecute is the production entry point onto the module-level singleton configQueue, used by server/handlers/channels.js, server/handlers/system.js and server/handlers/agent-team.js, so the contracted failure isolation applies to the real serialized config-write path rather than a fixture-local re-implementation.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "The fixture rebinds only the single gateway-client import specifier (so it can run without node_modules) and otherwise loads the unmodified server/core/config-queue.js source; the determinism contract is checked by requiring one distinct JSON signature across 30 replays per fixture in addition to the per-check expectations.",
+      "evidence_paths": [".prale-eval/config-queue-failure-fixture.mjs", "server/core/config-queue.js"]
+    }
+  ],
+  "conclusion": "The different configuration fixture required by this task is implemented and passing: .prale-eval/config-queue-failure-fixture.mjs drives the real server/core/config-queue.js ConfigQueue with a scripted in-memory Gateway config document, and contracts two failure-ordering cases. In get-fails-first the first job's config.get returns a non-retryable transport error, so job1 rejects with that exact error after a single attempt and never transforms or writes config; the next job then reads the untouched document (same hash), patches it, re-reads and applies, resolving undefined with the expected trace [config.get:fail, config.get:ok, config.patch:ok, config.get:ok, config.apply:ok]. In patch-fails-first job1 reads and transforms but its config.patch is rejected, so no patch is recorded and no apply is issued; the next job then patches and applies against the same base hash. Both fixtures produced byte-identical normalized results across 30 replays (60 runs total), exit code 0, and each per-run check (first job rejected, next job settled, queue drained, exact trace, patch/apply counts, base hashes, final config) passed.",
+  "validation": {
+    "command": "node --check .prale-eval/config-queue-failure-fixture.mjs && node .prale-eval/config-queue-failure-fixture.mjs && node .prale-eval/validate-result.mjs",
+    "status": "pass",
+    "notes": "config-queue-failure-fixture.mjs: exit code 0, '[fixture] get-fails-first: PASS (30/30 identical runs; first job rejected, next job settled)' and '[fixture] patch-fails-first: PASS (30/30 identical runs ...)' then '[fixture] ALL CHECKS PASSED'. validate-result.mjs re-opened .prale-eval/result.json and programmatically asserted: task_id/repository/mode equal the literals parsed from TASK.md (T08 / wattclaw / contract); every evidence entry's file exists, start_line <= end_line, and the named symbol literally occurs inside the cited inclusive range; every claim has non-empty evidence_paths naming existing paths; the required path server/core/config-queue.js has substantive evidence and claim coverage; and .prale-eval/contract-deliverable.md exists. LIMITATION: node_modules and the vitest runner are absent from this workspace, so the repository's official vitest suite could not be executed and no dependency was installed; the fixture (which executes the real ConfigQueue source) plus the static result checks are the substitute evidence, and they are lower strength than the full test suite."
+  }
+}

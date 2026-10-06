@@ -1,0 +1,173 @@
+{
+  "task_id": "T23",
+  "repository": "wattclaw",
+  "mode": "demo",
+  "request": "Demo using local fake gateway/config fixtures: show an allowed tenant request reaches the fake backend while a mismatched tenant is rejected before dispatch.",
+  "evidence": [
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getHttpTargetForCurrentRequest",
+      "start_line": 448,
+      "end_line": 466,
+      "observation": "The per-request dispatch target is derived solely from the request-context tenant: baseUrl = `http://${tenant.host}:${tenant.port}` and headers = { Authorization: `Bearer ${tenant.token || ''}` }. Because host/port and the bearer token both come from the resolved tenant record, a tenant can never inherit another tenant's endpoint or credential; this is exactly the mapping the demo re-implements and proves against two fake backends. The method also returns the tenant object, so the caller can attribute the response to an owning tenant."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getTenantForUser",
+      "start_line": 501,
+      "end_line": 509,
+      "observation": "Resolves the caller's tenant through the user_tenant_assignments -> openclaw_tenants join and returns a single normalized tenant (normalizeTenant). A user therefore has exactly one bound tenant, which is the invariant the demo fixtures encode (demo-alice -> tenant-a, demo-bob -> tenant-b) and the invariant a mismatched request violates."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getGatewayForCurrentRequest",
+      "start_line": 397,
+      "end_line": 411,
+      "observation": "Request-scoped gateway selection: tenant = contextTenant || (user ? ensureUserTenant(user) : getDefaultTenant()), then ensureGatewayClient(tenant) + ensureConnected(...). Every RPC issued while a request context is active is bound to that context's tenant gateway, so tenant isolation is enforced at the single routing choke point rather than per call site."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "MultiTenantGatewayProxy",
+      "start_line": 130,
+      "end_line": 152,
+      "observation": "The exported proxy's call() resolves the per-request tenant gateway and forwards method/params/timeout. This is the outward-facing entry point the demo models: routing happens before any transport write, so a tenant decision (including a rejection) always precedes dispatch."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "normalizeTenant",
+      "start_line": 2052,
+      "end_line": 2065,
+      "observation": "normalizeTenant maps an openclaw_tenants DB row onto the exact tenant record consumed by routing: id, containerName, token, host (falling back to container_name), port (default 18789), maxUsers, dataSource and status. The demo fixture uses this same field shape, which is why the routing helpers (getTenantForUser/getHttpTargetForCurrentRequest) and the fixture records are structurally interchangeable."
+    },
+    {
+      "path": "server/core/request-context.js",
+      "symbol": "runWithRequestContext",
+      "start_line": 5,
+      "end_line": 7,
+      "observation": "AsyncLocalStorage-backed request context: runWithRequestContext stores { user, tenant } for the lifetime of the request callback. The demo uses the identical AsyncLocalStorage pattern so the tenant binding is the same shape as production."
+    },
+    {
+      "path": "server/core/request-context.js",
+      "symbol": "getRequestTenant",
+      "start_line": 17,
+      "end_line": 19,
+      "observation": "Returns the tenant stored on the request context (or null). This is the value getHttpTargetForCurrentRequest uses when building the dispatch target, which is why a request can be compared against the tenant it was authorized for before dispatch."
+    },
+    {
+      "path": "server/core/auth.js",
+      "symbol": "authMiddleware",
+      "start_line": 25,
+      "end_line": 36,
+      "observation": "Authentication middleware resolves the tenant with ensureTenantForUser(req.currentUser), attaches it to req.currentTenant, and then runs the rest of the request inside runWithRequestContext({ user, tenant }). The tenant binding is therefore established by the server before any handler dispatches a gateway call - the exact ordering the demo reproduces."
+    },
+    {
+      "path": "server/core/gateway-client.js",
+      "symbol": "_buildGatewayHttpOptions",
+      "start_line": 14,
+      "end_line": 30,
+      "observation": "The HTTP dispatch layer consumes getGatewayHttpTargetForCurrentRequest() and, when a per-tenant target exists, returns { baseUrl, headers } from that tenant; only when no tenant target exists does it fall back to the global OPENCLAW_WS_URL/OPENCLAW_AUTH_TOKEN. This is the code path the demo's fake backend stands in for."
+    },
+    {
+      "path": "server/index.js",
+      "symbol": "broadcastWattClawProjectsChanged",
+      "start_line": 390,
+      "end_line": 398,
+      "observation": "Existing repository precedent for tenant-mismatch rejection: the shared SSE fan-out skips every non-admin client whose tenantId differs from the event tenant (`if (!client.isAdmin && tenantId && client.tenantId !== tenantId) continue`). The demo generalizes the same predicate into a pre-dispatch guard, so a mismatched tenant never reaches a backend."
+    },
+    {
+      "path": "demo/tenant-routing-demo.mjs",
+      "symbol": "handleRequest",
+      "start_line": 137,
+      "end_line": 193,
+      "observation": "Executable demo lifecycle: bind the fixture user to its one tenant, enter the AsyncLocalStorage request context, evaluate the mismatch guard BEFORE building any target, and only then build baseUrl/bearer from the context tenant and POST to the fake backend. The rejected branch returns status 403 with dispatched=false and does not increment env.dispatchAttempts."
+    },
+    {
+      "path": "demo/tenant-routing-demo.mjs",
+      "symbol": "startFakeBackend",
+      "start_line": 75,
+      "end_line": 102,
+      "observation": "Starts one local fake gateway backend per fixture tenant on an ephemeral 127.0.0.1 port, publishing the resolved port back into the tenant record. Each backend records every inbound request (method, URL, Authorization header, RPC body) and only accepts its own bearer token, which is what lets the demo prove zero traffic for the rejected case."
+    },
+    {
+      "path": "demo/tenant-routing-demo.mjs",
+      "symbol": "getHttpTargetForCurrentRequest",
+      "start_line": 120,
+      "end_line": 127,
+      "observation": "Local mirror of the production routing helper: the target is built from getRequestTenant() only, producing `http://${tenant.host}:${tenant.port}` and `Bearer ${tenant.token}` - identical semantics to server/core/multi-tenant-gateway.js:448-466, exercised end to end by the demo."
+    },
+    {
+      "path": "demo/fixtures/gateway-config.json",
+      "symbol": "tenants",
+      "start_line": 9,
+      "end_line": 30,
+      "observation": "Fake gateway/config fixture: two tenant records (tenant-a/tenant-b) carrying the same fields the production code reads (id, containerName, host, port, token, dataSource, maxUsers, status), plus users and user_tenant_assignments (demo-alice -> tenant-a, demo-bob -> tenant-b). port 0 means 'bind an ephemeral local fake backend', mirroring how a provisioned tenant gets a concrete host/port."
+    },
+    {
+      "path": "demo/fixtures/requests.json",
+      "symbol": "cases",
+      "start_line": 4,
+      "end_line": 41,
+      "observation": "Declarative demo requests and expectations: allowed-tenant-a (200, dispatched, backend tenant-a, bearer demo-token-tenant-a), mismatched-tenant-b for demo-alice (403, not dispatched, error contains 'tenant mismatch', no new backend requests), and allowed-tenant-b (200, backend tenant-b, bearer demo-token-tenant-b)."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "A tenant's gateway target is derived only from the tenant bound to the request context (baseUrl from tenant.host/port and bearer from tenant.token), so routing cannot be redirected to another tenant's backend by request input.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js",
+        "server/core/request-context.js",
+        "server/core/gateway-client.js"
+      ]
+    },
+    {
+      "claim": "A user is bound to exactly one tenant (user_tenant_assignments -> openclaw_tenants via getTenantForUser), so an explicit request for a different tenant is a detectable mismatch rather than a valid routing alternative.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js",
+        "demo/fixtures/gateway-config.json"
+      ]
+    },
+    {
+      "claim": "The repository already rejects cross-tenant delivery instead of proceeding (broadcastWattClawProjectsChanged skips clients whose tenantId differs from the event tenant); the demo lifts that same mismatch predicate in front of dispatch.",
+      "evidence_paths": [
+        "server/index.js"
+      ]
+    },
+    {
+      "claim": "In the executable demo, the allowed request (demo-alice -> tenant-a) reaches the tenant-a fake backend as HTTP 200 with Authorization: Bearer demo-token-tenant-a while the tenant-b fake backend receives zero requests.",
+      "evidence_paths": [
+        "demo/tenant-routing-demo.mjs",
+        "demo/fixtures/requests.json",
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "In the executable demo, the mismatched request (demo-alice asking for tenant-b) is rejected with HTTP 403 before dispatch: no target is built, the dispatch-attempt counter is unchanged, and neither fake backend receives a byte.",
+      "evidence_paths": [
+        "demo/tenant-routing-demo.mjs",
+        "demo/fixtures/requests.json",
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "Tenant isolation is enforced at a single request-scoped routing choke point (MultiTenantGatewayProxy.call -> getGatewayForCurrentRequest -> ensureGatewayClient/ensureConnected), so every gateway RPC issued during a request inherits the caller's tenant credential rather than a shared global token.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js",
+        "server/core/auth.js"
+      ]
+    }
+  ],
+  "conclusion": "The demo contract holds end to end against local fixtures and two local fake gateway backends, with no Docker, no network access beyond 127.0.0.1 and no npm dependencies. An allowed request is routed to its own tenant backend using that tenant's host/port and bearer token (200, one recorded backend request with a valid token), while a request that asks for a tenant other than the one the caller is bound to is rejected with 403 before dispatch: the routing target is never built, the dispatch counter does not advance, and both fake backends record zero additional traffic. This matches the production behaviour cited in server/core/multi-tenant-gateway.js (getTenantForUser 501-509, getGatewayForCurrentRequest 397-411, getHttpTargetForCurrentRequest 448-466, MultiTenantGatewayProxy.call 148-151), server/core/request-context.js (runWithRequestContext 5-7, getRequestTenant 17-19), server/core/auth.js (authMiddleware 25-36), server/core/gateway-client.js (_buildGatewayHttpOptions 14-30) and the existing cross-tenant skip in server/index.js (broadcastWattClawProjectsChanged 390-398).",
+  "validation": {
+    "command": "node demo/tenant-routing-demo.mjs",
+    "status": "pass",
+    "notes": "Run from the repository root on Node v24.14.0; exit code 0, printed 'DEMO OK: allowed tenant request reached its fake backend; mismatched tenant was rejected (403) before dispatch.' Observed normalized operation results: allowed-tenant-a -> status 200, dispatched true, boundTenantId tenant-a, backendTenantId tenant-a, authorization 'Bearer demo-token-tenant-a', backend response {\"ok\":true,\"tenant\":\"tenant-a\",\"rpc\":\"sessions.list\"}; mismatched-tenant-b -> status 403, dispatched false, error 'tenant mismatch: user demo-alice is bound to tenant-a but requested tenant-b', dispatch attempt counter unchanged (1), no fake backend received a request; allowed-tenant-b -> status 200, dispatched true, backendTenantId tenant-b, authorization 'Bearer demo-token-tenant-b'. Final backend traffic: tenant-a 1 request / tenant-b 1 request, allTokensValid true, totalDispatchAttempts 2 (three cases, one pre-dispatch rejection). The demo uses only Node standard library modules (node:http, node:async_hooks, node:fs, node:path, node:url) and binds ephemeral ports on 127.0.0.1, so it is reproducible offline. LIMITATION RECORDED: the repository has no installed node_modules in this workspace (better-sqlite3, vitest and the other devDependencies are unavailable) and dependencies must not be installed, so the existing suites (npm run test:server, which needs vitest/better-sqlite3) could not be executed and the demo deliberately avoids importing server/core/multi-tenant-gateway.js directly, since it transitively imports server/database.js -> better-sqlite3. Instead the demo re-implements the cited routing helpers faithfully and checks them against the same fixture shape, and citation grounding was verified by asserting each cited symbol appears inside its stated inclusive line range. No optional validation dependency was installed or downloaded."
+  },
+  "artifacts": {
+    "deliverable": ".prale-eval/demo-deliverable.md",
+    "demo_entrypoint": "demo/tenant-routing-demo.mjs",
+    "fixtures": [
+      "demo/fixtures/gateway-config.json",
+      "demo/fixtures/requests.json"
+    ]
+  }
+}

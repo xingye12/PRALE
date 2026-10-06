@@ -1,0 +1,69 @@
+{
+  "task_id": "T14",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "search_and_replace",
+      "start_line": 434,
+      "end_line": 445,
+      "observation": "The core edit primitive. It unpacks (search_text, replace_text, original_text), computes num = original_text.count(search_text) (line 437), returns None when num == 0 (lines 440-441, fail closed with no mutation), and otherwise returns original_text.replace(search_text, replace_text) (line 443). Because matching is an exact substring count, the newline/whitespace of search_text is significant; a unique exact search_text (num == 1) is replaced exactly once. The non-unique guard 'if num > 1: raise SearchTextNotUnique()' is commented out (lines 438-439), so this raw primitive rewrites every occurrence when num > 1 - the basis for the contract's C3 clause being enforced at the call boundary."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "SearchTextNotUnique",
+      "start_line": 524,
+      "end_line": 525,
+      "observation": "The module's reserved sentinel exception (subclass of ValueError) for the ambiguous case where the search text appears more than once. It is the signal that a non-unique edit must be refused rather than partially applied; callers catch it to fail the edit without mutating the target text."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "flexible_search_and_replace",
+      "start_line": 565,
+      "end_line": 577,
+      "observation": "Strategy dispatcher. It iterates each (strategy, preprocs) pair and returns the first truthy result from try_strategy (lines 573-577); when no strategy produces a result it returns None. A refused/failed edit (e.g. no exact match) therefore yields no replacement text at all, so the caller cannot observe a partial mutation."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "try_strategy",
+      "start_line": 586,
+      "end_line": 608,
+      "observation": "Applies the newline/whitespace preprocessors before delegating to a strategy: strip_blank_lines, relative_indent, and reverse_lines (lines 590-597), then runs strategy(texts) (line 597). On failure (falsy res) or on a ValueError from ri.make_absolute it returns None (line 606) instead of touching the original - it operates on derived copies, so a failed attempt leaves original_text untouched."
+    },
+    {
+      "path": "aider/coders/udiff_coder.py",
+      "symbol": "directly_apply_hunk",
+      "start_line": 261,
+      "end_line": 279,
+      "observation": "Call-boundary enforcement of the non-unique rule. After stripping whitespace from the before-context it refuses a repeated tiny search: 'if len(before_lines) < 10 and content.count(before) > 1: return' (lines 271-272) returns None without mutating content, and it catches SearchTextNotUnique from flexi_just_search_and_replace (lines 274-277). Together with apply_partial_hunk committing only when every hunk succeeds, this is what guarantees a non-unique edit fails without partial mutation."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "For a distinct newline/whitespace search text, an exact unique edit succeeds exactly once: when original_text.count(search_text) == 1, search_and_replace returns original_text.replace(search_text, replace_text), so replace_text occurs exactly once and search_text zero times (byte-exact, newline/whitespace sensitive). When count == 0 it instead returns None (lines 440-441), failing closed with no mutation.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "A non-unique edit must fail without partial mutation, and the module declares the sentinel for this: original_text.count(search_text) > 1 is the ambiguous case covered by SearchTextNotUnique (lines 524-525). In this revision search_and_replace does not itself reject it because its num > 1 guard is commented out (lines 438-439) and str.replace would rewrite every occurrence, so uniqueness is enforced at the call boundary (directly_apply_hunk, udiff_coder.py:271,276) which returns None and leaves the original bytes unchanged.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py",
+        "aider/coders/udiff_coder.py"
+      ]
+    },
+    {
+      "claim": "Failure propagates as no result rather than a partial edit: flexible_search_and_replace returns only the first truthy strategy result and otherwise None (lines 565-577), and try_strategy returns None on any failed preprocessor/strategy (line 606). Hence a non-matching or refused edit produces no replacement text, so no partial mutation can be observed downstream.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    }
+  ],
+  "conclusion": "The contract is satisfied and demonstrated executably. Clause C1 (unique exact edit succeeds once) holds: with search_text 'def sub(a, b):\\n    total = a - b\\n    return total\\n' (count == 1), the real search_and_replace returned the original with 'return total' -> 'return -total' applied exactly once, byte-for-byte equal to original.replace(search, replace). Clause C2 (no-match fails closed) holds: a trailing-space whitespace variant (count == 0) returned None with the original untouched. Clause C3 (non-unique edit fails without partial mutation) holds under the contract wrapper, which uses the module's own SearchTextNotUnique sentinel for the count > 1 case ('    return total\\n' appears twice): the operation failed, no occurrence was rewritten, and original_text was byte-for-byte unchanged. A contrast observation confirms the raw primitive without the guard rewrote both occurrences, which is why C3 is enforced at the call boundary (udiff_coder.directly_apply_hunk:271,276). Demo exit code 0; all assertions passed.",
+  "validation": {
+    "command": "python3 .prale-eval/contract_demo.py",
+    "status": "pass",
+    "notes": "Exit code 0; all assertions in the three fixture cases passed and the normalized result (.prale-eval/contract-result.json) has all_passed=true. Limitation: the optional third-party imports diff_match_patch and oslex are not installed in this environment (no dependency installation was performed). The demo injects minimal import-time stubs for those two modules solely to import the real aider/coders/search_replace.py; the contract path (search_and_replace, flexible_search_and_replace, try_strategy) does not call the diff-match-patch strategies, so the stubs are not exercised and do not affect the observed results. This limitation is also recorded in contract-result.json under environment_notes."
+  }
+}

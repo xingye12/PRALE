@@ -1,0 +1,202 @@
+{
+  "task_id": 11,
+  "repository": "tdam",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "MemoryCore/src/core/index.ts",
+      "symbol": "TdaiCore",
+      "start_line": 24,
+      "end_line": 26,
+      "observation": "This barrel module is the public in-process surface of MemoryCore/src/core. It re-exports the `TdaiCore` facade (and its `TdaiCoreOptions`) from ./tdai-core.js; `TdaiCore` is the host-neutral client that every host (OpenClaw plugin, Hermes, standalone gateway, CLI) constructs and then calls for recall/capture/search. The same file also re-exports `StorePool` (per-instance store lifecycle) and `StoragePaths`/storage backends, so the barrel is where the client contract, the persistence-layer factories, and the path abstraction become one import unit."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "MemoryClientConfig",
+      "start_line": 8,
+      "end_line": 19,
+      "observation": "Shared out-of-process client config for the TypeScript SDK. `MemoryClientConfig` fixes the transport-level metadata a memory operation carries: `endpoint` (base URL), `apiKey` (Bearer token), `serviceId` (sent as the `x-tdai-service-id` header and used server-side as the per-instance store key), plus optional `timeout` (default 30000 ms) and `rejectUnauthorized`. Note that the doc comment states the v2 `MemoryClient` class was removed and only v3 API is exported; this interface survives because `v3/*.ts` clients consume it."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "Transport",
+      "start_line": 24,
+      "end_line": 28,
+      "observation": "The injectable transport seam of the SDK: `post<T>(path, body?)` is required and `get?<T>(path, query?)` is optional. Because it is a structural interface, callers/tests can substitute a mock transport without a live gateway, and the v3 clients program against it rather than a concrete HTTP class — this is the exact boundary where a memory read/write operation leaves the client and becomes a network call."
+    },
+    {
+      "path": "MemoryCore/src/core/tdai-core.ts",
+      "symbol": "handleTurnCommitted",
+      "start_line": 412,
+      "end_line": 432,
+      "observation": "In-process write entry point of the `TdaiCore` client. It awaits `storeReady`, ensures the scheduler is started, then delegates the committed turn to `performAutoCapture`, forwarding messages, sessionKey/sessionId, originalUserText/userMessageCount, the vectorStore, embeddingService and storage. This is the host hook (OpenClaw `agent_end` / Hermes `sync_turn()`) that turns a finished conversation turn into persisted memory."
+    },
+    {
+      "path": "MemoryCore/src/core/tdai-core.ts",
+      "symbol": "handleBeforeRecall",
+      "start_line": 374,
+      "end_line": 406,
+      "observation": "In-process read entry point of the `TdaiCore` client. It awaits `storeReady`, then calls `performAutoRecall` with userText, sessionKey, config, vectorStore/embeddingService and storage, measures latency, and fire-and-forget reports recall metrics. Hosts map this to OpenClaw `before_prompt_build` / Hermes `prefetch()`. `searchMemories`/`searchConversations` (further below) are the tool-facing reads over the same store."
+    },
+    {
+      "path": "MemoryCore/src/core/hooks/auto-capture.ts",
+      "symbol": "performAutoCapture",
+      "start_line": 46,
+      "end_line": 347,
+      "observation": "The write pipeline behind `handleTurnCommitted`. It records raw messages locally via `recordConversation` (L0 JSONL) and, when a `vectorStore`+`embeddingService` are supplied, also writes each L0 message vector with `vectorStore.upsertL0(...)` (deferred/background embedding for sqlite-style stores, synchronous for remote/VDB stores). It does NOT trigger L1 extraction itself; it only notifies the `MemoryPipelineManager` scheduler, which decides when to run L1/L2/L3."
+    },
+    {
+      "path": "MemoryCore/src/core/conversation/l0-recorder.ts",
+      "symbol": "recordConversation",
+      "start_line": 93,
+      "end_line": 314,
+      "observation": "Local L0 persistence boundary for the in-process path. It slices/positions the new messages, filters noise, builds `L0MessageRecord` objects (sessionKey, sessionId, userId, agentId, recordedAt, id, role, content, timestamp) and appends them as one-JSON-line-per-message to `StoragePaths.conversation(YYYY-MM-DD)` via the injected `StorageAdapter` (or `fs` fallback). Missing isolation fields are defaulted to DEFAULT_ISOLATION_ID so the three-dim tenancy metadata is always present on the record."
+    },
+    {
+      "path": "MemoryCore/src/core/store/types.ts",
+      "symbol": "L0Record",
+      "start_line": 141,
+      "end_line": 162,
+      "observation": "The canonical write shape handed to the persistence layer. `L0Record` carries `id`, `sessionKey`, `sessionId`, the optional strict-isolation triple `teamId`/`userId`/`agentId` plus `taskId`, `role`, `messageText`, `recordedAt` and original `timestamp`. The doc comment notes these isolation fields are mandatory once gateway enforcement is on and are defaulted/migrated otherwise. This is the metadata that persists with every L0 memory operation."
+    },
+    {
+      "path": "MemoryCore/src/core/store/types.ts",
+      "symbol": "IMemoryStore",
+      "start_line": 551,
+      "end_line": 708,
+      "observation": "The persistence boundary abstraction. `IMemoryStore` declares the write/read contract used by both the in-process path and the gateway handlers, including L0 upsert/query/search, L1 query/search/count, profile L2/L3 storage, and optional user/agent entity CRUD. Because `TdaiCore` and the gateway depend on this interface (not on SQLite or TCVDB directly), the backend can be swapped via `createStoreBundle`/`StorePool`."
+    },
+    {
+      "path": "MemoryCore/src/core/store/sqlite.ts",
+      "symbol": "upsertL0",
+      "start_line": 1860,
+      "end_line": 1949,
+      "observation": "Concrete local persistence implementation of the L0 write boundary. `VectorStore.upsertL0(record, embedding)` writes the L0 metadata row plus FTS synchronously and writes the vector only when a non-zero embedding is supplied (deferred-embedding fast path). It is fault-tolerant: it never throws, returns false on failure, and logs a warning, which is why callers can treat a failed write as non-fatal."
+    },
+    {
+      "path": "MemoryCore/src/gateway/v2-router.ts",
+      "symbol": "handleConversationAdd",
+      "start_line": 664,
+      "end_line": 810,
+      "observation": "The service-mode write handler for `POST /v2|/v3/conversation/add` (shared L0–L3 data-plane handler). It validates the body, enforces the tenancy-isolation triple (422 when enforced and missing), runs the quota check against `auth.serviceId`, optionally auto-registers the chat_memory asset via the metadata service, then builds an `L0Record` per message carrying teamId/userId/agentId/taskId from the resolved isolation and calls `store.upsertL0(record, emb)`. It notifies the pipeline, mirrors L0 to JSONL only in standalone mode, and returns accepted ids/versions/count."
+    },
+    {
+      "path": "MemoryCore/src/gateway/v2-router.ts",
+      "symbol": "handleConversationQuery",
+      "start_line": 812,
+      "end_line": 881,
+      "observation": "The service-mode read handler for `POST /v2|/v3/conversation/query`. It resolves the store, then reads through `store.queryL0Paginated(...)` filtering by sessionId plus the isolation fields (teamId/userId/agentId/taskId), mapping rows back to `ConversationItem` including the isolation metadata in the response. A legacy fallback path post-filters rows by the same isolation fields. This shows the same metadata set scoping both writes and reads."
+    },
+    {
+      "path": "MemoryCore/src/gateway/v2-router.ts",
+      "symbol": "handleAtomicSearch",
+      "start_line": 1192,
+      "end_line": 1279,
+      "observation": "The service-mode L1 read handler for `POST /v2|/v3/atomic/search`. It builds a search filter from the resolved isolation (teamId/userId/agentId/taskId) — deliberately omitting sessionId so L1 recall is agent-scoped across sessions — calls `executeMemorySearch`, reports recall metrics, and maps results to `AtomicSearchHit` including id/type/content/version/team_id/user_id/agent_id/task_id/timestamps and score."
+    },
+    {
+      "path": "MemoryCore/src/gateway/v2-schemas.ts",
+      "symbol": "resolveIsolation",
+      "start_line": 364,
+      "end_line": 393,
+      "observation": "Canonical resolver for the metadata carried with every gateway memory operation. It reads team_id/user_id/agent_id/session_id/task_id from the request body first and falls back to the `x-tdai-*` headers, then fills missing userId/agentId/sessionId with DEFAULT_ISOLATION_ID (or a legacy placeholder). The returned ctx is attached to per-request router deps so handlers can persist the isolation triple on every L0/L1 write without changing handler signatures."
+    },
+    {
+      "path": "MemoryCore/src/gateway/v2-router.ts",
+      "symbol": "collectV3Missing",
+      "start_line": 130,
+      "end_line": 150,
+      "observation": "The /v3 strict-isolation gate. For L0–L3 data-plane subpaths it requires team_id + agent_id + user_id (session_id intentionally optional so reads can aggregate across sessions) sourced from body or `x-tdai-*` headers; a missing field yields a 422 before the handler runs. This is the enforcement point for the metadata the SDK sends in `baseBody()`."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "IsolationContext",
+      "start_line": 54,
+      "end_line": 106,
+      "observation": "The SDK-side metadata container. `IsolationContext` holds teamId/agentId/userId (all required non-empty via `requireNonEmpty`) and optional sessionId/taskId. `baseBody()` emits `team_id`/`agent_id`/`user_id`/`task_id`; `resolveSession()` lets reads omit session_id to aggregate across sessions, while `resolveSessionForWrite()` throws if session_id is absent so writes cannot be silently merged into a server-side default bucket."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "addConversation",
+      "start_line": 193,
+      "end_line": 199,
+      "observation": "The SDK write call. `MemoryClient.addConversation` POSTs to `/v3/conversation/add` with `...this.iso.baseBody()` (team_id/agent_id/user_id/task_id) plus a session_id resolved via `resolveSessionForWrite` and the `messages` array. This is the client half of the service-mode write path that terminates in `handleConversationAdd` and `IMemoryStore.upsertL0`."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "MemoryClient",
+      "start_line": 147,
+      "end_line": 198,
+      "observation": "The v3 data-plane client class. Its constructor accepts either a `V3MemoryClientConfig` (building a `V3HttpTransport` from endpoint/apiKey/serviceId/userKey/timeout/rejectUnauthorized) or an injected `Transport` + `V3IsolationContext`; `withIsolation(...)` derives a re-scoped client sharing the same transport. The class body documents the read/write session rules: writes require sessionId, reads may omit it, and L2/L3 are team+agent profile data."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "V3HttpTransport",
+      "start_line": 8,
+      "end_line": 122,
+      "observation": "Strict HTTP transport used by the v3 clients. The constructor validates the endpoint is http(s), apiKey and serviceId are non-empty, and sets the headers that carry operation metadata: `Authorization: Bearer <apiKey>`, `x-tdai-service-id: <serviceId>` and `Content-Type: application/json`, with optional `x-tdai-user-key`. `post`/`get` serialize the JSON body/query, abort on timeout, unwrap the `{code,message,request_id,data}` envelope, and surface `x-trace-id`/`x-qcloud-transaction-id`."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/types.ts",
+      "symbol": "V3MemoryClientConfig",
+      "start_line": 22,
+      "end_line": 51,
+      "observation": "Extends the shared `MemoryClientConfig` with the strict-isolation fields teamId/agentId/userId (required) and optional sessionId/taskId/userKey, and defines `V3IsolationContext` as the wire shape `{team_id, agent_id, user_id, session_id?, task_id?}`. This mirrors exactly the `resolveIsolation`/`collectV3Missing` server-side contract, so the metadata carried on a memory operation is symmetric between client and server."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "MemoryCore/src/core/index.ts is the barrel that exposes the in-process client (`TdaiCore`) plus the persistence/lifecycle primitives (`StorePool`, `StoragePaths`, storage backends) as one public import surface; `TdaiCore` is the host-neutral client entry point for recall/capture/search.",
+      "evidence_paths": [
+        "MemoryCore/src/core/index.ts",
+        "MemoryCore/src/core/tdai-core.ts"
+      ]
+    },
+    {
+      "claim": "sdk/memory-core/typescript/src/client.ts defines the out-of-process client contract: `MemoryClientConfig` fixes transport metadata (endpoint, apiKey, serviceId, timeout, rejectUnauthorized) and the `Transport` interface (required `post`, optional `get`) is the injectable boundary where a memory operation becomes a network call.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/src/v3/client.ts",
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    },
+    {
+      "claim": "The persistence boundary of the memory write/read flow is the `IMemoryStore` interface (implemented by SQLite VectorStore and TCVDB); writes land via `upsertL0` carrying the L0Record, and reads go through query/search operations filtered by the same isolation metadata.",
+      "evidence_paths": [
+        "MemoryCore/src/core/store/types.ts",
+        "MemoryCore/src/core/store/sqlite.ts",
+        "MemoryCore/src/gateway/v2-router.ts"
+      ]
+    },
+    {
+      "claim": "A memory operation carries a consistent metadata set — the tenancy isolation fields teamId/team_id, agentId/agent_id, userId/user_id, sessionId/session_id, taskId/task_id — plus source identity and timestamps; the SDK sends them in `baseBody()`, the gateway resolves them from body or `x-tdai-*` headers, /v3 enforces the triple, and handlers persist them on each L0Record.",
+      "evidence_paths": [
+        "MemoryCore/src/core/store/types.ts",
+        "MemoryCore/src/gateway/v2-schemas.ts",
+        "MemoryCore/src/gateway/v2-router.ts",
+        "sdk/memory-core/typescript/src/v3/types.ts"
+      ]
+    },
+    {
+      "claim": "In the in-process path, the write boundary is the local L0 JSONL recorder invoked by the capture hook: `handleTurnCommitted` -> `performAutoCapture` -> `recordConversation` appends one L0MessageRecord per message (with session + isolation metadata) through the StorageAdapter, while also optionally indexing L0 vectors via `IMemoryStore.upsertL0`.",
+      "evidence_paths": [
+        "MemoryCore/src/core/tdai-core.ts",
+        "MemoryCore/src/core/hooks/auto-capture.ts",
+        "MemoryCore/src/core/conversation/l0-recorder.ts"
+      ]
+    },
+    {
+      "claim": "The read path is symmetric to the write path: in-process `handleBeforeRecall` -> `performAutoRecall` retrieves L1/L2/L3, and service-mode handlers (`handleConversationQuery`, `handleAtomicSearch`) query the same store with the isolation-scoped filters, returning the metadata (team_id/user_id/agent_id/task_id) on each hit.",
+      "evidence_paths": [
+        "MemoryCore/src/core/tdai-core.ts",
+        "MemoryCore/src/gateway/v2-router.ts"
+      ]
+    }
+  ],
+  "conclusion": "MemoryCore/src implements a four-layer (L0–L3) memory system with two complementary client surfaces and one persistence abstraction. (1) Client: in-process, the host-neutral `TdaiCore` facade exported by `MemoryCore/src/core/index.ts` is constructed by each host (OpenClaw/Hermes/gateway/CLI) and offers handleTurnCommitted (write) and handleBeforeRecall/searchMemories (read); out-of-process, the TypeScript SDK basis in `sdk/memory-core/typescript/src/client.ts` defines `MemoryClientConfig` (endpoint/apiKey/serviceId/timeout/TLS) and the injectable `Transport`, which the v3 `MemoryClient` turns into POSTs to `/v3/conversation/add`, `/v3/conversation/query`, `/v3/atomic/search`, etc., over `V3HttpTransport`. (2) Persistence boundary: the `IMemoryStore` interface (`MemoryCore/src/core/store/types.ts`), implemented by the local SQLite `VectorStore` (L0 metadata+FTS synchronous, vector deferred) and by TCVDB for service mode; `StorePool` supplies per-instance store instances. The in-process path additionally persists L0 as JSONL through `recordConversation`/`StoragePath` using the StorageAdapter. (3) Metadata carried with a memory operation: the tenancy isolation tuple (team_id/teamId, agent_id/agentId, user_id/userId, session_id/sessionId, task_id/taskId) plus record id, sessionKey, role, content/messageText, recordedAt and original timestamp. The SDK emits the tuple via `IsolationContext.baseBody()`, the gateway resolves it from the request body or `x-tdai-*` headers (`resolveIsolation`), `/v3` enforces team+agent+user via `collectV3Missing` (422 when missing, session optional for cross-session reads), and handlers persist it onto every `L0Record`/search filter so writes cannot be silently merged into a default bucket and reads stay isolation-scoped. Writes require a non-empty session_id client-side (`resolveSessionForWrite`), while reads may omit it to aggregate across sessions.",
+  "validation": {
+    "command": "node -e \"const fs=require('fs');const r=JSON.parse(fs.readFileSync('.prale-eval/result.json','utf8'));const assert=require('assert');assert.strictEqual(r.task_id,11);assert.strictEqual(r.repository,'tdam');assert.strictEqual(r.mode,'explore');for(const k of ['evidence','claims','conclusion','validation'])assert.ok(k in r,k);const req=['MemoryCore/src/core/index.ts','sdk/memory-core/typescript/src/client.ts'];for(const p of req){const e=r.evidence.find(x=>x.path===p);assert.ok(e&&e.symbol&&e.start_line<=e.end_line, 'missing evidence '+p);const c=r.claims.find(cl=>cl.evidence_paths.includes(p));assert.ok(c,'missing claim for '+p);}for(const e of r.evidence){const lines=fs.readFileSync(e.path,'utf8').split('\\n');const seg=lines.slice(e.start_line-1,e.end_line).join('\\n');assert.ok(seg.includes(e.symbol),'symbol not in range: '+e.path+' '+e.symbol);}console.log('OK',r.evidence.length,'evidence,',r.claims.length,'claims');\"",
+    "status": "passed",
+    "notes": "Focused validation parsed .prale-eval/result.json, asserted task_id=11/repository=tdam/mode=explore and the presence of evidence/claims/conclusion/validation, confirmed both contract-required paths have an evidence entry and at least one claim, and independently verified every cited symbol string actually occurs within its cited inclusive start_line/end_line range in the current checkout. Node v24.14.0 is available. TypeScript build/test suites were NOT run because neither the root, MemoryCore/, nor sdk/memory-core/typescript/ node_modules directories exist and the task forbids installing dependencies; this limitation is recorded here instead of installing packages."
+  }
+}

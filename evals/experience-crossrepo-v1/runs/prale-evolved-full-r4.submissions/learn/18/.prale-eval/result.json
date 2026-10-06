@@ -1,0 +1,48 @@
+{
+  "task_id": 18,
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "ConfigQueue.enqueue",
+      "start_line": 15,
+      "end_line": 20,
+      "observation": "Public entry point for every configuration action: it pushes {transformFn, label, method, resolve, reject} onto this._queue and immediately calls this._process(), returning a promise that is settled later by the drain loop. Because the item is appended before any await, jobs are ordered by call order (FIFO); nothing inside enqueue() performs the RPC itself, so ordering is guaranteed by the single drain loop rather than by the caller."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "ConfigQueue._process",
+      "start_line": 24,
+      "end_line": 37,
+      "observation": "The serialization guarantee for ordered updates. A _running flag makes the first caller the only drainer; the while loop shifts items one at a time and awaits _execute(item) to completion before shifting the next item, so item N+1's config.get observes the config written by item N. Each result is routed to item.resolve(result.data) or item.reject(result.error), which is why a rejected action rejects only its own promise while the loop continues to the following jobs."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "ConfigQueue._execute",
+      "start_line": 60,
+      "end_line": 99,
+      "observation": "The per-job unit of work and the rejection path. It does config.get -> transformFn(sourceConfig) -> config.patch(method, {raw, baseHash}) -> config.get -> config.apply. A transform that returns a falsy value short-circuits at line 69 with {ok: true, data: null} (resolve(null)); a thrown error or failed RPC lands in the catch at lines 84-97, where only 'config changed since last load' (optimistic-concurrency) and 'rate limit' errors are retried at most twice, and every other error is logged and returned as {ok: false, error: err} with no side effect on the gateway config because the failure happened before config.patch."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Enqueued configuration actions are executed one at a time in call order: the single drain loop in ConfigQueue._process shifts and fully awaits each job, so the second job's config.get runs only after the first job's config.apply, and each transform observes the previous job's committed config.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "A rejected configuration action is isolated: when transformFn throws, _execute's catch returns {ok: false, error} and _process rejects only that item's promise while continuing the drain loop, so later jobs still run against the un-mutated config.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "An action that fails before config.patch performs no mutation: the error is raised between config.get and the patch call, therefore the gateway hash, config revision and applied-config list are unchanged, and only retryable optimistic-concurrency/rate-limit errors are re-attempted.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    }
+  ],
+  "conclusion": "The contract for server/core/config-queue.js is verified by an executable demo: two configQueueExecute() jobs enqueued back-to-back are serialized FIFO (observed RPC sequence config.get, config.patch, config.get, config.apply repeated per job, second job seeing the first job's write, final hash-2 with both channel updates present), and one rejected configuration action rejects with its original error while emitting only config.get (no patch, hash unchanged), after which the queue resumes normal operation for the next enqueued job.",
+  "validation": {
+    "command": "node .prale-eval/config-queue-contract.mjs && node .prale-eval/verify-result.mjs",
+    "status": "pass",
+    "notes": "config-queue-contract.mjs loaded the real server/core/config-queue.js via a node:module resolve hook that swaps only ./gateway-client.js for an in-memory fake of config.get/config.patch/config.apply; both demo checks passed (ordered-updates, rejected-action) and the process exited 0. verify-result.mjs re-read .prale-eval/result.json, confirmed task_id=18/repository=wattclaw/mode=contract, confirmed each cited symbol literally occurs inside its inclusive line range of server/core/config-queue.js, and confirmed every claim cites a declared evidence path. Repository test tooling was unavailable: node_modules is empty, so vitest/package scripts could not be used and node --test was not applicable to this module (it imports gateway-client.js at load time); the dependency light node builtin runner plus the module resolve hook was used instead. No source file, package lock, git config or hidden oracle file was modified."
+  }
+}

@@ -1,0 +1,97 @@
+{
+  "task_id": "03",
+  "repository": "pi",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "packages/agent/src/harness/agent-harness.ts",
+      "symbol": "AgentLane",
+      "start_line": 538,
+      "end_line": 580,
+      "observation": "The public lane contract splits an operation into a durable intent phase and an effect phase. accept(request) durably commits the operation meta (including its intent) and state and returns an OperationAdmission/OperationResultRecord carrying the operationId (line 546); effects are only produced by drive({ operationId }) (line 547) and the run/prompt/compact/navigate helpers. Because an effect can only be driven with an operationId that acceptance created, no observable effect exists until the operation's durable intent has been admitted."
+    },
+    {
+      "path": "packages/agent/src/harness/agent-harness.ts",
+      "symbol": "OperationAdmission",
+      "start_line": 119,
+      "end_line": 123,
+      "observation": "OperationAdmission is the value returned once acceptance settles, carrying operationId, kind and startedAt. It is the capability token required by DriveOptions.operationId (lines 136-140) and DriveOutcome (lines 165-169), so the harness's type surface makes the effect-bearing drive unreachable without a settled admission."
+    },
+    {
+      "path": "packages/agent/test/harness/execution-tools.test.ts",
+      "symbol": "keeps an operation's effect unobservable until durable intent settlement admits it",
+      "start_line": 185,
+      "end_line": 221,
+      "observation": "The added contract test drives the execution boundary directly. With the drive's effect gate still settling (control.beginAbort with an unresolved cancellation), executeToolCall throws AbortRequested synchronously through gate.admit, the tool body's execute spy is never called and no partial update is recorded (observed === []). Only a freshly admitted gate runs the effect exactly once (observed === ['effect'], execute called once), proving the operation's effect cannot be observed before its durable-intent settlement admits it."
+    },
+    {
+      "path": "packages/agent/test/harness/execution-tools.test.ts",
+      "symbol": "lets abort-first gate refusal escape without invoking the tool",
+      "start_line": 173,
+      "end_line": 183,
+      "observation": "The pre-existing gate-refusal test already fixes the primitive contract that executeToolCall must not cross the external tool-effect boundary when admission is refused, which the new test specialises to the settlement-pending case."
+    },
+    {
+      "path": "packages/agent/src/harness/runtime/drive/tools.ts",
+      "symbol": "publishToolIntent",
+      "start_line": 187,
+      "end_line": 227,
+      "observation": "publishToolIntent commits the durable intent for a tool call: it writes the prepared arguments under pi.op.tool_args and advances the operation state to effect_pending via lane.continueOperation, returning only after that commit settles. startToolInvocation (lines 475-513) awaits this before calling performToolInvocation, so the tool effect is unreachable until the durable intent write has landed."
+    },
+    {
+      "path": "packages/agent/src/harness/runtime/lane.ts",
+      "symbol": "settleOperation",
+      "start_line": 388,
+      "end_line": 445,
+      "observation": "settleOperation is the durable commit primitive: inside Lane.command it awaits mutator.commit(writes) before adopting the new in-memory state and before invoking materialize/events. continueOperation (lines 451-478) builds on it to refuse new effects once durable control is cancel_requested. This is the ordering that makes an effect unobservable before durable intent settlement."
+    },
+    {
+      "path": "packages/agent/src/harness/execution/tools.ts",
+      "symbol": "executeToolCall",
+      "start_line": 125,
+      "end_line": 158,
+      "observation": "executeToolCall is the single effect boundary for tools. It only runs the tool inside gate.admit(...), so a gate that refuses admission (settlement still pending or settled against the effect) throws AbortRequested before call.tool.execute is reached, leaving the effect unobserved."
+    },
+    {
+      "path": "packages/agent/src/harness/execution/effect-gate.ts",
+      "symbol": "createGate",
+      "start_line": 31,
+      "end_line": 64,
+      "observation": "createGate exposes the procedure-facing admission capability used by the drive. admit() synchronously throws AbortRequested while the drive is aborting (settlement in progress) and the stored error once closed, which is the runtime mechanism the contract test relies on."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The public AgentLane contract makes an operation's effect unreachable without a settled durable intent: accept() durably commits the operation meta/intent and returns the admission (operationId), and drive({ operationId }) is the only path that can produce effects, so no effect can be observed before acceptance settles.",
+      "evidence_paths": [
+        "packages/agent/src/harness/agent-harness.ts"
+      ]
+    },
+    {
+      "claim": "The added test in execution-tools.test.ts shows an operation's effect cannot be observed before durable intent settlement admits it: with the gate still settling, executeToolCall throws AbortRequested, the execute spy is never invoked and observed stays empty; only once a gate admits the settled intent does the effect run exactly once.",
+      "evidence_paths": [
+        "packages/agent/test/harness/execution-tools.test.ts"
+      ]
+    },
+    {
+      "claim": "At the drive level the ordering is enforced positively: publishToolIntent commits the durable tool-args intent and effect_pending state, and startToolInvocation only runs performToolInvocation after that commit resolves, so the tool effect cannot be observed before its durable intent settles.",
+      "evidence_paths": [
+        "packages/agent/src/harness/runtime/drive/tools.ts",
+        "packages/agent/src/harness/execution/tools.ts"
+      ]
+    },
+    {
+      "claim": "Lane.settleOperation/continueOperation implement the durable settlement boundary: the storage commit is awaited before in-memory state, materializers and events, and continueOperation refuses to start new effects once durable control is cancel_requested, which is why an unadmitted effect is never observed.",
+      "evidence_paths": [
+        "packages/agent/src/harness/runtime/lane.ts",
+        "packages/agent/src/harness/execution/effect-gate.ts"
+      ]
+    }
+  ],
+  "conclusion": "The contract holds: an operation's effect is unreachable until its durable intent has settled. Acceptance durably commits the operation intent and hands back the operationId that drive()/effect execution requires; tool effects are published only after publishToolIntent commits the pi.op.tool_args intent and effect_pending state; and the execution boundary executeToolCall runs the tool solely inside gate.admit, which refuses admission while settlement is pending or has settled against the effect. The minimal test added to packages/agent/test/harness/execution-tools.test.ts pins the execution-boundary half of this contract: a settling gate leaves the effect and its updates unobserved (AbortRequested, execute never called), while an admitted gate runs it exactly once.",
+  "validation": {
+    "command": "cd packages/agent && npx vitest --run --config vitest.harness.config.ts test/harness/execution-tools.test.ts",
+    "status": "unavailable",
+    "notes": "No node_modules directory exists in the workspace (packages/agent/node_modules and the repo root are both absent) and no vitest/tsx/tsgo/tsc binary is on PATH, so the focused harness test could not be executed. Dependencies were not installed because the task forbids installing dependencies. The new test was written to mirror the surrounding known-good patterns (clearPrepared/prepareToolCall/createGate/executeToolCall, literal-typed content via 'as const'); it should be re-run with the command above once dependencies are present."
+  }
+}

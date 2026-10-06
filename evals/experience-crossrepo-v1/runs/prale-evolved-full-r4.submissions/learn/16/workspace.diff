@@ -1,0 +1,298 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..4aa653e
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,87 @@
++{
++  "task_id": 16,
++  "repository": "wattclaw",
++  "mode": "explore",
++  "evidence": [
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "syncUserSessionsFromGateway",
++      "start_line": 118,
++      "end_line": 177,
++      "observation": "Top-level session metadata sync for one user. Ordering: it first resolves the user's owned agent ids (getAgentIdsForUser), then dispatches one `sessions.list` call per agent through `mapWithConcurrency(agentIds, gatewayConcurrency, ...)`, so agents run with bounded concurrency (default gatewayConcurrency=2) and cross-agent completion order is not deterministic. Within each agent, the loop `for (const raw of rawSessions)` walks the gateway list in returned order and calls `upsertSyncedUserSession({ userId, ...session })` sequentially, so per-agent writes follow gateway listing order. Idempotency/identity keys: (userId, sessionKey) at the upsert boundary; rows are also gated by membership in `allowedAgentIds` (session.agentId) and by `recentlyDeletedSessionKeys.has(session.sessionKey)`. The whole run is wrapped in `withTimeout(run(), overallTimeoutMs)` (default 8s), and the result reports scanned/inserted/updated/changed counts."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "mapWithConcurrency",
++      "start_line": 79,
++      "end_line": 94,
++      "observation": "Bounded-concurrency mapper that fixes how sync work is ordered. It spawns `Math.min(Math.max(1, limit), items.length)` workers; each worker grabs the next index via a shared `nextIndex` counter and writes `results[index] = await mapper(items[index], index)`. Output order is therefore preserved by index, but the *execution/completion order across agents is interleaved and non-deterministic* (up to `limit` agents in flight). This is the source of the ordering guarantee/limitation for session sync: per-agent sequences are ordered, cross-agent ordering is not."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "scheduleUserSessionSync",
++      "start_line": 179,
++      "end_line": 216,
++      "observation": "Scheduling/idempotency layer keyed by `userId`. Two dedup mechanisms: (1) a per-user cooldown — `lastSyncAtByUserId.get(userId)` compared against `cooldownMs` (DEFAULT_SESSION_SYNC_OPTIONS.cooldownMs = 60_000) returns `{ skipped: true, reason: 'cooldown' }`; (2) an in-flight coalescer — `inFlightByUserId.get(userId)` returns the already-pending promise instead of starting a second sync for the same user, and the promise is removed from the map in `.finally()`. `lastSyncAtByUserId.set(userId, Date.now())` is only recorded on success. So the idempotency key for scheduling is the user id, not the session key."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "normalizeGatewaySessionForSync",
++      "start_line": 59,
++      "end_line": 77,
++      "observation": "Normalizes a raw Gateway session row into the sync shape and establishes the identity keys used downstream. It reads `sessionKey` from `row.key || row.sessionKey || row.session_key || row.id` and `agentId` from `row.agentId || row.agent_id || row.agent || extractAgentIdFromSessionKey(sessionKey) || fallbackAgentId`; a row without a sessionKey or agentId returns null and is dropped. This is where the stable idempotency pair (agentId, sessionKey) originates, and it also maps activity via readExplicitMessageActivity (lastMessageAt/last_message_at/lastActivity/.../createdAt)."
++    },
++    {
++      "path": "server/core/session-usage-cache.js",
++      "symbol": "_persistOwnerScopedUpdate",
++      "start_line": 122,
++      "end_line": 156,
++      "observation": "The single owner-scoped writer that defines the usage-cache idempotency key. The UPDATE targets `user_sessions` with `WHERE user_id = ? AND session_key = ?`, binding (entry.userId, entry.sessionKey) last, so the composite (user_id, session_key) is the idempotency/identity key and a repeated write of the same values converges to the same row state. It also uses guarded CASE expressions so a null/empty model or model_provider does not overwrite an existing value, and returns `result?.changes === 1`, i.e. success is defined as exactly one matching row (0 rows means the row is not owned by that user or does not exist). `updated_at` is stamped with a fresh `Date.now()` on every write."
++    },
++    {
++      "path": "server/core/session-usage-cache.js",
++      "symbol": "batchUpdateMatchedGatewayUsage",
++      "start_line": 158,
++      "end_line": 229,
++      "observation": "Batch synchronization entry point. Ordering: it iterates `for (const session of gatewayResult.sessions)` in the exact array order supplied by the Gateway, and issues one `_persistOwnerScopedUpdate` per session sequentially (no transaction, no re-sort). Per session it derives the key as `session.key || session.sessionKey || session.id`, looks up current ownership rows via a prepared SELECT (scoped by `userId` when provided, else global), and applies an idempotency/conflict policy: 0 owner rows -> `report.skippedUnmatched++`; more than 1 owner row -> `report.skippedConflict++` (the same session_key owned by multiple users is never written ambiguously); exactly 1 owner -> write owner.user_id + session_key. Only a `changes === 1` result increments `report.updated`; otherwise `report.failed` (and a bounded warning log). A returned report shape is {scanned, updated, skippedUnmatched, skippedConflict, failed, durationMs}."
++    },
++    {
++      "path": "server/core/session-usage-cache.js",
++      "symbol": "updateSessionUsageForUser",
++      "start_line": 89,
++      "end_line": 120,
++      "observation": "Single-session write path that also fixes the idempotency key and timestamp semantics. It builds the entry with the caller-supplied `userId` and `sessionKey`, stamps `usageSyncedAt: Date.now()`, then calls `_persistOwnerScopedUpdate(entry)`; a non-update logs 'owner-scoped usage update skipped' and the returned `updated` flag is false. Passing a null/undefined userId never throws but yields `updated: false` because the WHERE user_id = ? predicate matches nothing — confirming ownership is part of the write key. Model normalization happens before the write via _normalizeModelFields."
++    },
++    {
++      "path": "server/core/session-usage-cache.js",
++      "symbol": "getSessionOwner",
++      "start_line": 231,
++      "end_line": 235,
++      "observation": "Resolves `session_key -> user_id` (the read side of the same key), returning null when unknown. It is the ownership lookup that lets callers establish the user_id half of the (user_id, session_key) key before invoking the owner-scoped write, and read helpers such as getSessionUsage/getAgentUsage consistently filter on `usage_synced_at IS NOT NULL`, i.e. a row only participates once a sync has stamped it."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "session-sync ordering is two-level: per-user agent fan-out runs with bounded concurrency (DEFAULT_SESSION_SYNC_OPTIONS.gatewayConcurrency = 2) via mapWithConcurrency, so work within a single agent's returned session list is processed in list order, while completion order across agents is interleaved/non-deterministic; the whole user sync is bounded by an overall timeout (default 8000ms).",
++      "evidence_paths": ["server/core/session-sync.js"]
++    },
++    {
++      "claim": "session-sync idempotency keys are the user id at the scheduling layer (cooldown lastSyncAtByUserId plus inFlightByUserId coalescing keyed by userId) and the (userId, sessionKey) pair at the persistence layer: normalizeGatewaySessionForSync derives a stable sessionKey, upsertSyncedUserSession is called with { userId, ...session }, and recentlyDeletedSessionKeys is keyed by sessionKey.",
++      "evidence_paths": ["server/core/session-sync.js"]
++    },
++    {
++      "claim": "session-usage-cache ordering follows the Gateway response array order: batchUpdateMatchedGatewayUsage iterates gatewayResult.sessions sequentially and calls _persistOwnerScopedUpdate in that same order with no reordering or batching transaction.",
++      "evidence_paths": ["server/core/session-usage-cache.js"]
++    },
++    {
++      "claim": "session-usage-cache idempotency key is the composite (user_id, session_key): _persistOwnerScopedUpdate issues UPDATE user_sessions ... WHERE user_id = ? AND session_key = ?, success is defined as changes === 1, keyless sessions are skippedUnmatched, session_keys with more than one owner row are skippedConflict, and each write stamps a fresh usage_synced_at/updated_at, so repeated identical syncs are convergent (last-write-wins on usage_synced_at).",
++      "evidence_paths": ["server/core/session-usage-cache.js"]
++    }
++  ],
++  "conclusion": "Synchronization in `server/core/session-sync.js` and `server/core/session-usage-cache.js` is ordered and de-duplicated by two distinct keys. (1) Ordering — session-sync is two-level: it fans out one `sessions.list` call per owned agent with bounded concurrency (`mapWithConcurrency`, gatewayConcurrency=2), so session rows within a given agent are processed in the Gateway's list order, but cross-agent completion order is interleaved and not deterministic; the run is wrapped in `withTimeout` (8000ms). Before persistence, rows are filtered by the user's allowed agent ids and by `recentlyDeletedSessionKeys`. Usage-cache writes are strictly sequential in the Gateway payload array order (`for (const session of gatewayResult.sessions)`), each dispatched to `_persistOwnerScopedUpdate`; no cross-session transaction or re-sort is applied. (2) Idempotency keys — at the scheduling layer the key is the user id: `scheduleUserSessionSync` uses `lastSyncAtByUserId` for a per-user cooldown (60s default) and `inFlightByUserId` to coalesce concurrent syncs for the same userId. At the persistence layer the key is the pair `(userId, sessionKey)`: session sync calls `upsertSyncedUserSession({ userId, ...session })` after `normalizeGatewaySessionForSync` derives a stable `sessionKey` from key/sessionKey/session_key/id; usage-cache `_persistOwnerScopedUpdate` writes with `WHERE user_id = ? AND session_key = ?` and treats `changes === 1` as success. Ownership resolution is enforced there too: 0 owner rows -> skippedUnmatched, >1 owner rows -> skippedConflict (ambiguous ownership never written), and `getSessionOwner` provides the reverse `session_key -> user_id` lookup. Each successful write stamps `usage_synced_at = Date.now()`, making repeated synchronization convergent (idempotent last-write-wins), with reads filtered on `usage_synced_at IS NOT NULL`. Scope note: this is a static, source-grounded reading of the two named modules plus their call-site/test expectations; it was not exercised against a live Gateway.",
++  "validation": {
++    "command": "node --check server/core/session-sync.js && node --check server/core/session-usage-cache.js && node --input-type=module -e '<static assertions over both files: bounded-concurrency worker loop, mapWithConcurrency(agentIds, gatewayConcurrency), inFlightByUserId.get/set(userId), lastSyncAtByUserId cooldown, upsertSyncedUserSession({ userId, ...session }), recentlyDeletedSessionKeys.has(session.sessionKey), UPDATE ... WHERE user_id = ? AND session_key = ?, result?.changes === 1, owners.length > 1 -> skippedConflict, owners.length === 0 -> skippedUnmatched, sequential for..of over gatewayResult.sessions, usageSyncedAt: Date.now()>'",
++    "status": "passed",
++    "notes": "Both modules parse cleanly under Node v24.14.0 (`node --check`), and all 12 static assertions over the two source files PASSED (ALL_STATIC_CHECKS_PASSED), confirming the cited ordering and idempotency-key constructs at the quoted line ranges. Limitation: the repository's own vitest suites (server/core/session-sync.test.js and server/core/session-usage-cache.test.js, run via `npm run test:server`) could NOT be executed because dependencies are not installed in this workspace (no node_modules / no vitest binary); per instructions no dependencies were installed. The vitest files were read only to corroborate the (userId, sessionKey) WHERE clause, changes===1 semantics, skippedUnmatched/skippedConflict policy, and per-user coalescing, all of which the static assertions reproduce."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/result.json - d602c49ee2045eb84fa1b1ac8cb6e9d3292ce5ffca946b338bad32cb5c8ae669

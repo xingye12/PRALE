@@ -1,0 +1,1000 @@
+diff --git a/package.json b/package.json
+index d916a65..0cd082b 100644
+--- a/package.json
++++ b/package.json
+@@ -10,7 +10,7 @@
+     "dev:all": "concurrently -n \"frontend,backend\" -c \"blue,green\" \"vite\" \"node --env-file=.env server/index.js\"",
+     "build": "vue-tsc -b && vite build",
+     "build:test": "vue-tsc -b && vite build --mode test",
+-    "test:server": "vitest run server/core/session-sync.test.js server/core/usage-sync.test.js server/core/session-usage-cache.test.js server/handlers/cron.test.js server/services/feishu-project-sync.test.js server/user-manager.test.js --exclude '**/.claude/**' --exclude '**/.tmp/**' && node --test --test-force-exit server/services/external-session-projection.test.js",
++    "test:server": "vitest run server/core/session-sync.test.js server/core/usage-sync.test.js server/core/session-usage-cache.test.js server/handlers/cron.test.js server/services/feishu-project-sync.test.js server/user-manager.test.js --exclude '**/.claude/**' --exclude '**/.tmp/**' && node --test --test-force-exit server/services/external-session-projection.test.js server/utils/generated-file-metadata.test.js",
+     "db:hygiene": "node scripts/db-hygiene.mjs",
+     "preview": "vite preview",
+     "start": "node --env-file=.env server/index.js",
+diff --git a/server/handlers/files.js b/server/handlers/files.js
+index 7927f7a..d5e6963 100644
+--- a/server/handlers/files.js
++++ b/server/handlers/files.js
+@@ -3,6 +3,11 @@ import { authMiddleware } from '../core/auth.js'
+ import { getAllDigitalEmployees, getDigitalEmployees, getAgentWorkspaceForUser } from '../user-manager.js'
+ import { expandHomePath, safePath } from '../utils/index.js'
+ import { resolveGeneratedFileCandidatePath } from '../utils/generated-file-path.js'
++import {
++  generatedFileMimeType,
++  isGeneratedFilePathAllowed,
++  normalizeGeneratedFileRequestPath,
++} from '../utils/generated-file-metadata.js'
+ import { gatewayExec } from '../core/system.js'
+ import multer from 'multer'
+ import { dirname, basename, extname, posix } from 'path'
+@@ -23,56 +28,13 @@ const upload = multer({
+ })
+ 
+ const GENERATED_FILE_MAX_BYTES = 100 * 1024 * 1024
+-const GENERATED_FILE_DENIED_SEGMENTS = new Set(['.git', '.openclaw'])
+-const GENERATED_FILE_DENIED_NAMES = new Set([
+-  'agents.md',
+-  'soul.md',
+-  'user.md',
+-  'identity.md',
+-  'tools.md',
+-  'bootstrap.md',
+-  'memory.md',
+-  'workspace-state.json',
+-  'openclaw-workspace-state.json',
+-])
+-
+-function isGeneratedFilePathAllowed(relativePath) {
+-  const segments = relativePath.split('/').filter(Boolean).map((segment) => segment.toLowerCase())
+-  if (segments.some((segment) => GENERATED_FILE_DENIED_SEGMENTS.has(segment))) return false
+-  const name = segments[segments.length - 1] || ''
+-  if (name === '.env' || name.startsWith('.env.')) return false
+-  return !GENERATED_FILE_DENIED_NAMES.has(name)
+-}
+-
+-function generatedFileMimeType(filePath) {
+-  const ext = extname(filePath).slice(1).toLowerCase()
+-  const types = {
+-    pdf: 'application/pdf',
+-    doc: 'application/msword',
+-    docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
+-    xls: 'application/vnd.ms-excel',
+-    xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+-    ppt: 'application/vnd.ms-powerpoint',
+-    pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
+-    csv: 'text/csv',
+-    txt: 'text/plain',
+-    md: 'text/markdown',
+-    json: 'application/json',
+-    zip: 'application/zip',
+-    png: 'image/png',
+-    jpg: 'image/jpeg',
+-    jpeg: 'image/jpeg',
+-    gif: 'image/gif',
+-    webp: 'image/webp',
+-    svg: 'image/svg+xml',
+-  }
+-  return types[ext] || 'application/octet-stream'
+-}
++// The user-controlled generated-file path/attachment metadata rules live in the
++// dependency-free ../utils/generated-file-metadata.js so they can be unit tested.
+ 
+ export function createFileRoutes(app) {
+   app.get('/api/chat/generated-file', authMiddleware, async (req, res) => {
+     const sessionKey = typeof req.query.sessionKey === 'string' ? req.query.sessionKey.trim() : ''
+-    const requestedPath = typeof req.query.path === 'string' ? req.query.path.trim().replace(/\\/g, '/') : ''
++    const requestedPath = normalizeGeneratedFileRequestPath(req.query.path)
+     const agentId = sessionKey.match(/^agent:([^:]+):/)?.[1] || ''
+     const requestTraceId = typeof req.query.traceId === 'string' ? req.query.traceId.trim().slice(0, 100) : ''
+     const traceId = requestTraceId || `generated-file-${randomUUID().slice(0, 8)}`
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..15ca5c0
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,108 @@
++# Contract deliverable — generated-file (chat attachment) request parsing/normalization
++
++Repository: `wattclaw` · Task: `T15` · Mode: `contract`
++
++## Requested evaluation
++
++"Add a focused parser/normalizer test for a user-controlled configuration or attachment
++metadata fixture."
++
++The user-controlled attachment metadata under test is the one handled by
++`GET /api/chat/generated-file` (`server/handlers/files.js`): the `path` query value sent by
++the client, the workspace path it resolves to, and the `name` / `path` / `mimeType`
++metadata that is echoed back in the response.
++
++## Contract (as implemented)
++
++`GET /api/chat/generated-file?sessionKey=…&path=…` evaluates a user-controlled `path`
++through this ordered pipeline:
++
++| # | Step | Code | Rule |
++|---|------|------|------|
++| 1 | normalize request | `normalizeGeneratedFileRequestPath` (`server/utils/generated-file-metadata.js:52`) | non-string → `''`; otherwise `trim()` then `\` → `/` |
++| 2 | reject | `files.js:51-54` | empty result or an embedded NUL byte → `400 Invalid generated file request` |
++| 3 | resolve | `resolveGeneratedFileCandidatePath` (`server/utils/generated-file-path.js:1`) | path equal to / below the workspace realpath → `workspace-absolute`; otherwise re-anchor under the workspace (`/`-prefixed → `workspace-root-relative`, else `workspace-relative`) |
++| 4 | realpath | `files.js:86` | `realpath -e` on the candidate; missing target → `404` |
++| 5 | containment | `files.js:96-102` | `posix.relative(workspaceReal, targetReal)` must be non-empty, not `..`, not `../…`, not absolute → otherwise `403 access-denied` |
++| 6 | denylist | `isGeneratedFilePathAllowed` (`server/utils/generated-file-metadata.js:60`) | case-insensitive: any `.git` / `.openclaw` segment, or a basename of `.env`, `.env.*`, `agents.md`, `soul.md`, `user.md`, `identity.md`, `tools.md`, `bootstrap.md`, `memory.md`, `workspace-state.json`, `openclaw-workspace-state.json` → `403` |
++| 7 | size | `files.js:113-115` | larger than `GENERATED_FILE_MAX_BYTES` (100 MiB, `files.js:30`) → `413` |
++| 8 | metadata | `files.js:120-130` | `file = { name: basename(targetReal), path: relativePath, size, mimeType: generatedFileMimeType(targetReal) }`; extension is lowercased, unknown/missing extension → `application/octet-stream` |
++
++Layering note: the denylist is a *policy* filter, not the traversal boundary. `../outside.txt`
++is still allowed by `isGeneratedFilePathAllowed`; it is rejected by the step-5 containment
++check. Denied directories such as `../.git/config` are additionally rejected by the denylist
++(for example if the workspace root itself changes).
++
++## Changes made
++
++| Path | Change |
++|------|--------|
++| `server/utils/generated-file-metadata.js` | **new** dependency-free module holding the previously inline `isGeneratedFilePathAllowed` and `generatedFileMimeType` logic plus the now-extracted `normalizeGeneratedFileRequestPath`, and the exported denylist constants |
++| `server/handlers/files.js` | imports those helpers instead of defining them inline (behaviour-preserving; call sites at lines 37, 98, 128) |
++| `server/utils/generated-file-metadata.test.js` | **new** focused parser/normalizer test suite (13 `node:test` tests, fixture-driven) |
++| `server/utils/generated-file-metadata.demo.mjs` | **new** executable demo printing the normalized operation result per fixture |
++| `package.json` | `test:server` also runs the new suite via the existing `node --test` invocation |
++
++No task metadata, hidden-oracle file, package lock, or git configuration was modified.
++
++## Executable demo (verified in this checkout)
++
++```
++$ node server/utils/generated-file-metadata.demo.mjs
++workspace: /home/wattman/.wattclaw/user/report-agent
++{"raw":"/downloads/Q2\\report.pdf","requestedPath":"/downloads/Q2/report.pdf","candidatePath":"/home/wattman/.wattclaw/user/report-agent/downloads/Q2/report.pdf","pathMode":"workspace-root-relative","status":200,"attachment":{"name":"report.pdf","path":"downloads/Q2/report.pdf","mimeType":"application/pdf"}}
++{"raw":"  attachments\\2026\\forecast.XLSX  ","requestedPath":"attachments/2026/forecast.XLSX","candidatePath":"/home/wattman/.wattclaw/user/report-agent/attachments/2026/forecast.XLSX","pathMode":"workspace-relative","status":200,"attachment":{"name":"forecast.XLSX","path":"attachments/2026/forecast.XLSX","mimeType":"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"}}
++{"raw":"/home/wattman/.wattclaw/user/report-agent/notes/summary.md","requestedPath":"/home/wattman/.wattclaw/user/report-agent/notes/summary.md","candidatePath":"/home/wattman/.wattclaw/user/report-agent/notes/summary.md","pathMode":"workspace-absolute","status":200,"attachment":{"name":"summary.md","path":"notes/summary.md","mimeType":"text/markdown"}}
++{"raw":"/home/wattman/.wattclaw/user/report-agent-evil/leak.txt","requestedPath":"/home/wattman/.wattclaw/user/report-agent-evil/leak.txt","candidatePath":"/home/wattman/.wattclaw/user/report-agent/home/wattman/.wattclaw/user/report-agent-evil/leak.txt","pathMode":"workspace-root-relative","status":200,"attachment":{"name":"leak.txt","path":"home/wattman/.wattclaw/user/report-agent-evil/leak.txt","mimeType":"text/plain"}}
++{"raw":"../outside.txt","requestedPath":"../outside.txt","candidatePath":"/home/wattman/.wattclaw/user/report-agent/../outside.txt","pathMode":"workspace-relative","status":403,"reason":"access-denied"}
++{"raw":".git/config","requestedPath":".git/config","candidatePath":"/home/wattman/.wattclaw/user/report-agent/.git/config","pathMode":"workspace-relative","status":403,"reason":"access-denied"}
++{"raw":"/AGENTS.md","requestedPath":"/AGENTS.md","candidatePath":"/home/wattman/.wattclaw/user/report-agent/AGENTS.md","pathMode":"workspace-root-relative","status":403,"reason":"access-denied"}
++{"raw":"/.env","requestedPath":"/.env","candidatePath":"/home/wattman/.wattclaw/user/report-agent/.env","pathMode":"workspace-root-relative","status":403,"reason":"access-denied"}
++{"raw":null,"requestedPath":"","status":400,"reason":"invalid-request"}
++```
++
++The demo stops after step 6 (it does not touch the filesystem), so its `200` rows mean
++"policy-accepted candidate path"; the handler would still answer `404` if the realpath does
++not exist or `413` if the file exceeds 100 MiB. Row 4 is the interesting one: a look-alike
++sibling workspace is *not* honoured as an absolute path — it is re-anchored inside the
++workspace, so it can never address files outside it.
++
++## Focused test (verified in this checkout)
++
++```
++$ node --test server/utils/generated-file-metadata.test.js
++✔ normalizeGeneratedFileRequestPath trims and folds user-controlled separators
++✔ normalizeGeneratedFileRequestPath collapses non-string query values to empty
++✔ normalizeGeneratedFileRequestPath keeps rejectable input rejectable
++✔ resolves normalized request paths into the workspace with a stable path mode
++✔ a workspace with a trailing slash still yields workspace-absolute paths
++✔ look-alike sibling workspace paths are re-anchored, never treated as absolute
++✔ denylist segments and names are the case-insensitive contract constants
++✔ isGeneratedFilePathAllowed accepts ordinary attachments
++✔ isGeneratedFilePathAllowed rejects VCS/state dirs and secret or agent-instruction files
++✔ the denylist is a policy check, not the traversal boundary
++✔ generatedFileMimeType parses the resolved attachment extension
++✔ composes normalization, containment and metadata for user-controlled fixtures
++✔ an empty attachment path can never be normalized into the workspace root
++ℹ tests 13
++ℹ pass 13
++ℹ fail 0
++```
++
++Behaviour-preservation check for the extraction (run from the repository root, comparing the
++worktree module against `git show HEAD:server/handlers/files.js`):
++
++```
++{"mimeChecked":26,"mimeDiff":0,"denyChecked":13,"denyDiff":0}
++```
++
++## Environment limitation recorded for validation
++
++This checkout has **no `node_modules`**, so the repository's `vitest` suites
++(`npm run test:server` first stage) and anything importing `express`, `multer`,
++`better-sqlite3`, … cannot be executed here. `node --test` is the built-in runner and was
++therefore used for the focused suite (the repository already runs one suite that way,
++`server/services/external-session-projection.test.js`, which itself fails in this checkout
++with `ERR_MODULE_NOT_FOUND: Cannot find package 'better-sqlite3'` — pre-existing and
++unrelated to this change). The new suite deliberately imports only dependency-free modules
++so that it stays runnable in this state.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..e73b05e
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,125 @@
++{
++  "task_id": "T15",
++  "repository": "wattclaw",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "server/handlers/files.js",
++      "symbol": "createFileRoutes",
++      "start_line": 34,
++      "end_line": 135,
++      "observation": "createFileRoutes owns the acceptance contract for user-controlled attachment metadata: it registers GET /api/chat/generated-file and, in order, normalizes the client-supplied path query value (line 37 via the imported normalizeGeneratedFileRequestPath), rejects an empty or NUL-byte result with 400 (51-54), resolves the candidate against the realpath'd workspace (line 74 via resolveGeneratedFileCandidatePath), rejects anything escaping the workspace and everything on the denylist with 403 (96-102, denylist call at line 98), rejects non-regular files and oversized files with 400/413 (104-116), and finally echoes file metadata name/path/size/mimeType parsed from the resolved real path back to the client (120-130, MIME parse at line 128). The inline helpers this route used to define are now imported from ../utils/generated-file-metadata.js (lines 6-10); the route itself and its call sites are unchanged."
++    },
++    {
++      "path": "server/handlers/files.js",
++      "symbol": "GENERATED_FILE_MAX_BYTES",
++      "start_line": 30,
++      "end_line": 30,
++      "observation": "The 100 MiB attachment size cap for the generated-file download contract is declared once here and enforced in the route at lines 113-115 (413 'File is too large to download'); the surrounding lines 31-32 document that the user-controlled path/metadata rules were moved to ../utils/generated-file-metadata.js so they can be unit tested."
++    },
++    {
++      "path": "server/utils/generated-file-path.js",
++      "symbol": "resolveGeneratedFileCandidatePath",
++      "start_line": 1,
++      "end_line": 15,
++      "observation": "Pure normalizer for the user-controlled path: strips trailing slashes from the workspace realpath, folds backslashes to '/', and classifies the request as 'workspace-absolute' only when the requested value equals the workspace or starts with '<workspace>/'; every other value is re-anchored under the workspace (leading slashes stripped) and reported as 'workspace-root-relative' or 'workspace-relative'. This is why a look-alike sibling workspace such as /home/wattman/.wattclaw/user/report-agent-evil is never treated as absolute by the handler, and is the function the new test suite drives."
++    },
++    {
++      "path": "server/utils/generated-file-metadata.js",
++      "symbol": "normalizeGeneratedFileRequestPath",
++      "start_line": 52,
++      "end_line": 54,
++      "observation": "Parses/normalizes the user-controlled path query value: non-string input collapses to '' (so the route answers 400) and strings are trimmed then have '\\' folded to '/' before any path resolution. This is the exact expression the handler used inline before extraction (files.js:37), so empty/whitespace-only and Windows-separator requests behave identically."
++    },
++    {
++      "path": "server/utils/generated-file-metadata.js",
++      "symbol": "isGeneratedFilePathAllowed",
++      "start_line": 60,
++      "end_line": 66,
++      "observation": "Case-insensitive policy normalizer over the workspace-relative path: it lowercases the path segments, denies any segment in GENERATED_FILE_DENIED_SEGMENTS (.git, .openclaw) and denies the basenames .env, .env.* and the agent-instruction/state files listed in GENERATED_FILE_DENIED_NAMES (agents.md, soul.md, user.md, identity.md, tools.md, bootstrap.md, memory.md, workspace-state.json, openclaw-workspace-state.json). Moved verbatim from files.js, where it is the 403 decision at line 98."
++    },
++    {
++      "path": "server/utils/generated-file-metadata.js",
++      "symbol": "generatedFileMimeType",
++      "start_line": 71,
++      "end_line": 74,
++      "observation": "Attachment-metadata parser: takes the last extension via path.extname, lowercases it, and maps it through GENERATED_FILE_MIME_TYPES (pdf/doc/docx/xls/xlsx/ppt/pptx/csv/txt/md/json/zip/png/jpg/jpeg/gif/webp/svg), falling back to application/octet-stream for unknown or missing extensions. This value is what the handler advertises as file.mimeType at files.js:128."
++    },
++    {
++      "path": "server/utils/generated-file-metadata.test.js",
++      "symbol": "decideGeneratedFileDownload",
++      "start_line": 30,
++      "end_line": 66,
++      "observation": "The new focused test suite's fixture harness: it replays the handler's ordered decision chain (normalize -> 400 guard -> resolveGeneratedFileCandidatePath -> workspace-containment check -> isGeneratedFilePathAllowed -> attachment metadata) for each user-controlled fixture, with posix.relative standing in for the realpath round trip. The 13 node:test cases below it cover separator/trim normalization, non-string values, NUL bytes, pathMode classification, sibling-workspace re-anchoring, the exported denylist constants, accepted vs denied attachment names (case variants), the traversal-vs-denylist layering, MIME parsing, and the composed end-to-end fixture table."
++    },
++    {
++      "path": "server/utils/generated-file-metadata.demo.mjs",
++      "symbol": "FIXTURES",
++      "start_line": 20,
++      "end_line": 30,
++      "observation": "The executable demo's fixture list of user-controlled attachment paths (root-relative, Windows separators with padding, workspace-absolute, sibling look-alike, traversal, .git, AGENTS.md, .env, non-string). Running `node server/utils/generated-file-metadata.demo.mjs` prints the normalized operation result for each fixture; the recorded output is reproduced in .prale-eval/contract-deliverable.md."
++    },
++    {
++      "path": "package.json",
++      "symbol": "test:server",
++      "start_line": 13,
++      "end_line": 13,
++      "observation": "The repository test entry point now runs the new focused suite with the built-in runner, in the same `node --test --test-force-exit` invocation that already runs the dependency-free server/services/external-session-projection.test.js suite, so the parser/normalizer test is part of `npm run test:server` in a fully installed checkout."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "The user-controlled `path` query value of generated-file downloads is parsed and normalized before any filesystem access: non-string values collapse to '', strings are trimmed and Windows separators are folded to '/', and the empty / NUL-byte result is rejected with 400.",
++      "evidence_paths": [
++        "server/handlers/files.js",
++        "server/utils/generated-file-metadata.js",
++        "server/utils/generated-file-metadata.test.js"
++      ]
++    },
++    {
++      "claim": "After normalization the request is anchored under the workspace realpath: only a path equal to or below the workspace is honoured as workspace-absolute, while look-alike sibling workspaces and UNC-style inputs are re-anchored inside the workspace, so the user-controlled value can never address a path outside the workspace root.",
++      "evidence_paths": [
++        "server/utils/generated-file-path.js",
++        "server/handlers/files.js",
++        "server/utils/generated-file-metadata.test.js"
++      ]
++    },
++    {
++      "claim": "Attachment access is then decided by two distinct layers: a workspace-containment check on posix.relative(workspaceReal, targetReal) (403) and a case-insensitive denylist rejecting .git/.openclaw segments plus .env*/.env-style secrets and agent-instruction/state files by basename; the denylist alone is not a traversal boundary (../outside.txt passes it and is stopped by containment).",
++      "evidence_paths": [
++        "server/handlers/files.js",
++        "server/utils/generated-file-metadata.js",
++        "server/utils/generated-file-metadata.test.js"
++      ]
++    },
++    {
++      "claim": "The metadata answered to the client for an accepted attachment is derived from the resolved real path: name = basename, path = workspace-relative posix path, mimeType = lowercased extension lookup with unknown or missing extensions mapped to application/octet-stream, and files above the 100 MiB GENERATED_FILE_MAX_BYTES cap are rejected with 413.",
++      "evidence_paths": [
++        "server/handlers/files.js",
++        "server/utils/generated-file-metadata.js",
++        "server/utils/generated-file-metadata.test.js"
++      ]
++    },
++    {
++      "claim": "The extraction of the parser/normalizer helpers out of server/handlers/files.js into server/utils/generated-file-metadata.js is behaviour-preserving: the new module and the previous inline implementations produce identical outputs across the checked MIME/extension corpus and relative-path corpus used for validation.",
++      "evidence_paths": [
++        "server/handlers/files.js",
++        "server/utils/generated-file-metadata.js"
++      ]
++    },
++    {
++      "claim": "A focused, dependency-free parser/normalizer suite for these user-controlled fixtures now exists and passes: 13 node:test cases driven by fixture tables, runnable via `node --test server/utils/generated-file-metadata.test.js`, wired into `npm run test:server`, and accompanied by an executable demo that prints the normalized operation result.",
++      "evidence_paths": [
++        "server/utils/generated-file-metadata.test.js",
++        "server/utils/generated-file-metadata.demo.mjs",
++        "package.json"
++      ]
++    }
++  ],
++  "conclusion": "The task is delivered as a focused parser/normalizer test for user-controlled generated-file (chat attachment) request metadata. The previously inline normalizers in server/handlers/files.js (request-path normalization, workspace-relative path policy/denylist, extension-to-MIME parsing) were extracted into the dependency-free server/utils/generated-file-metadata.js, which the route now imports with identical behaviour, and a new fixture-driven node:test suite (server/utils/generated-file-metadata.test.js) exercises the full contract together with the existing resolveGeneratedFileCandidatePath normalizer in server/utils/generated-file-path.js. All 13 tests pass in this checkout via `node --test`, the executable demo reproduces the normalized operation results, and the extraction was verified equivalent to the pre-change inline code over 26 MIME/extension inputs and 13 relative paths with zero differences. No task metadata, hidden-oracle file, package lock or git configuration was touched.",
++  "validation": {
++    "command": "node --test server/utils/generated-file-metadata.test.js && node server/utils/generated-file-metadata.demo.mjs && node --check server/handlers/files.js",
++    "status": "pass",
++    "notes": "Focused suite: 13 tests, 13 pass, 0 fail (also passes with the repository's flag form `node --test --test-force-exit server/utils/generated-file-metadata.test.js`). The demo prints one normalized JSON result per user-controlled fixture and `node --check` confirms server/handlers/files.js still parses. Behaviour-preservation check (worktree module vs `git show HEAD:server/handlers/files.js`, executed inline with node): {\"mimeChecked\":26,\"mimeDiff\":0,\"denyChecked\":13,\"denyDiff\":0}. LIMITATION: this checkout has no node_modules, so the repository's declared dependencies (vitest, express, multer, better-sqlite3, ...) are unavailable and the first stage of `npm run test:server` (vitest) cannot be executed here; the pre-existing server/services/external-session-projection.test.js also fails in this state with ERR_MODULE_NOT_FOUND ('better-sqlite3' imported from server/database.js), unrelated to this change. The new suite was therefore written against dependency-free modules and run with the built-in node test runner; server/handlers/files.js itself cannot be imported in this checkout (it transitively requires better-sqlite3 through user-manager -> database), which is why its route-level contract is covered through the extracted pure helpers and the executable demo that replays its decision order."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+diff --git a/server/utils/generated-file-metadata.demo.mjs b/server/utils/generated-file-metadata.demo.mjs
+new file mode 100644
+index 0000000..71b415e
+--- /dev/null
++++ b/server/utils/generated-file-metadata.demo.mjs
+@@ -0,0 +1,73 @@
++// Executable demo for the generated-file request contract implemented by
++// GET /api/chat/generated-file (see server/handlers/files.js).
++//
++// It replays the handler's ordered decision for user-controlled `path` query values
++// using the same pure helpers the handler calls, and prints the normalized result for
++// every fixture. No dependencies, no server, no gateway access:
++//
++//   node server/utils/generated-file-metadata.demo.mjs
++import { posix } from 'path'
++
++import { resolveGeneratedFileCandidatePath } from './generated-file-path.js'
++import {
++  generatedFileMimeType,
++  isGeneratedFilePathAllowed,
++  normalizeGeneratedFileRequestPath,
++} from './generated-file-metadata.js'
++
++const WORKSPACE = '/home/wattman/.wattclaw/user/report-agent'
++
++const FIXTURES = [
++  '/downloads/Q2\\report.pdf',
++  '  attachments\\2026\\forecast.XLSX  ',
++  `${WORKSPACE}/notes/summary.md`,
++  '/home/wattman/.wattclaw/user/report-agent-evil/leak.txt',
++  '../outside.txt',
++  '.git/config',
++  '/AGENTS.md',
++  '/.env',
++  undefined,
++]
++
++function decide(rawPath) {
++  const requestedPath = normalizeGeneratedFileRequestPath(rawPath)
++  if (!requestedPath || requestedPath.includes('\0')) {
++    return { raw: rawPath ?? null, requestedPath, status: 400, reason: 'invalid-request' }
++  }
++
++  const { candidatePath, pathMode } = resolveGeneratedFileCandidatePath(WORKSPACE, requestedPath)
++  const relativePath = posix.relative(WORKSPACE, candidatePath)
++  const escapedWorkspace = !relativePath
++    || relativePath === '..'
++    || relativePath.startsWith('../')
++    || posix.isAbsolute(relativePath)
++
++  if (escapedWorkspace || !isGeneratedFilePathAllowed(relativePath)) {
++    return {
++      raw: rawPath ?? null,
++      requestedPath,
++      candidatePath,
++      pathMode,
++      status: 403,
++      reason: 'access-denied',
++    }
++  }
++
++  return {
++    raw: rawPath ?? null,
++    requestedPath,
++    candidatePath,
++    pathMode,
++    status: 200,
++    attachment: {
++      name: posix.basename(candidatePath),
++      path: relativePath,
++      mimeType: generatedFileMimeType(candidatePath),
++    },
++  }
++}
++
++console.log(`workspace: ${WORKSPACE}`)
++for (const fixture of FIXTURES) {
++  console.log(JSON.stringify(decide(fixture)))
++}
+diff --git a/server/utils/generated-file-metadata.js b/server/utils/generated-file-metadata.js
+new file mode 100644
+index 0000000..52e4369
+--- /dev/null
++++ b/server/utils/generated-file-metadata.js
+@@ -0,0 +1,74 @@
++// Pure parsers/normalizers for the user-controlled metadata of a generated-file
++// (chat attachment) download request: the `path` query value, the workspace-relative
++// path computed from the resolved file, and the attachment name/extension that is
++// echoed back to the client.
++//
++// These helpers are kept dependency-free (no express/multer/gateway/fs, only the
++// stdlib `path.extname` parser) so the security-relevant parsing and normalization
++// can be unit tested directly, following the precedent of ./generated-file-path.js.
++// `server/handlers/files.js` only wires them into the HTTP route, it does not own
++// the rules.
++
++import { extname } from 'path'
++
++export const GENERATED_FILE_DENIED_SEGMENTS = new Set(['.git', '.openclaw'])
++
++export const GENERATED_FILE_DENIED_NAMES = new Set([
++  'agents.md',
++  'soul.md',
++  'user.md',
++  'identity.md',
++  'tools.md',
++  'bootstrap.md',
++  'memory.md',
++  'workspace-state.json',
++  'openclaw-workspace-state.json',
++])
++
++const GENERATED_FILE_MIME_TYPES = {  // extension -> MIME type
++  pdf: 'application/pdf',
++  doc: 'application/msword',
++  docx: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
++  xls: 'application/vnd.ms-excel',
++  xlsx: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
++  ppt: 'application/vnd.ms-powerpoint',
++  pptx: 'application/vnd.openxmlformats-officedocument.presentationml.presentation',
++  csv: 'text/csv',
++  txt: 'text/plain',
++  md: 'text/markdown',
++  json: 'application/json',
++  zip: 'application/zip',
++  png: 'image/png',
++  jpg: 'image/jpeg',
++  jpeg: 'image/jpeg',
++  gif: 'image/gif',
++  webp: 'image/webp',
++  svg: 'image/svg+xml',
++}
++
++// Normalizes the raw `path` query value of GET /api/chat/generated-file.
++// Non-string input collapses to '' so the route can answer 400, and Windows-style
++// separators are folded to '/' before any path resolution happens.
++export function normalizeGeneratedFileRequestPath(value) {
++  return typeof value === 'string' ? value.trim().replace(/\\/g, '/') : ''
++}
++
++// Case-insensitive policy check over the segments of the path that is *already*
++// known to live inside the agent workspace (the caller computes posix.relative).
++// It rejects VCS/agent-state directories by segment and secret/agent-instruction
++// files by basename, so a renamed casing cannot slip an attachment through.
++export function isGeneratedFilePathAllowed(relativePath) {
++  const segments = relativePath.split('/').filter(Boolean).map((segment) => segment.toLowerCase())
++  if (segments.some((segment) => GENERATED_FILE_DENIED_SEGMENTS.has(segment))) return false
++  const name = segments[segments.length - 1] || ''
++  if (name === '.env' || name.startsWith('.env.')) return false
++  return !GENERATED_FILE_DENIED_NAMES.has(name)
++}
++
++// Parses the attachment extension of the resolved real path into the MIME type
++// advertised to the client. The extension is lowercased first, so `REPORT.PDF` and
++// `report.pdf` agree; unknown or missing extensions stay generic.
++export function generatedFileMimeType(filePath) {
++  const ext = extname(filePath).slice(1).toLowerCase()
++  return GENERATED_FILE_MIME_TYPES[ext] || 'application/octet-stream'
++}
+diff --git a/server/utils/generated-file-metadata.test.js b/server/utils/generated-file-metadata.test.js
+new file mode 100644
+index 0000000..1500808
+--- /dev/null
++++ b/server/utils/generated-file-metadata.test.js
+@@ -0,0 +1,290 @@
++// Focused parser/normalizer test for the user-controlled metadata of a generated-file
++// (chat attachment) download request: the `path` query value sent to
++// GET /api/chat/generated-file, the workspace-relative path it is resolved to, and the
++// attachment name/MIME type parsed from the resolved file.
++//
++// Runs with the built-in node test runner and needs no dependencies (vitest/express/
++// multer/gateway are all absent from this checkout), matching the existing
++// server/services/external-session-projection.test.js precedent.
++import test from 'node:test'
++import assert from 'node:assert/strict'
++import { posix } from 'path'
++
++import { resolveGeneratedFileCandidatePath } from './generated-file-path.js'
++import {
++  GENERATED_FILE_DENIED_NAMES,
++  GENERATED_FILE_DENIED_SEGMENTS,
++  generatedFileMimeType,
++  isGeneratedFilePathAllowed,
++  normalizeGeneratedFileRequestPath,
++} from './generated-file-metadata.js'
++
++// The agent workspace exactly as `realpath -e` reports it to the handler.
++const WORKSPACE = '/home/wattman/.wattclaw/user/report-agent'
++
++// Mirrors the ordered decision the /api/chat/generated-file handler makes for a single
++// request: normalize the user-controlled `path`, resolve it against the workspace, run
++// the workspace-containment check and the denylist check, then expose the attachment
++// metadata. `posix.relative` stands in for the `realpath -e` round trip the handler
++// performs on the candidate path.
++function decideGeneratedFileDownload(rawPath, workspace = WORKSPACE) {
++  const requestedPath = normalizeGeneratedFileRequestPath(rawPath)
++  if (!requestedPath || requestedPath.includes('\0')) {
++    return { requestedPath, status: 400, reason: 'invalid-request' }
++  }
++
++  const { candidatePath, pathMode } = resolveGeneratedFileCandidatePath(workspace, requestedPath)
++  const relativePath = posix.relative(workspace.replace(/\/+$/, ''), candidatePath)
++  const escapedWorkspace = !relativePath
++    || relativePath === '..'
++    || relativePath.startsWith('../')
++    || posix.isAbsolute(relativePath)
++
++  if (escapedWorkspace || !isGeneratedFilePathAllowed(relativePath)) {
++    return {
++      requestedPath,
++      candidatePath,
++      pathMode,
++      relativePath,
++      status: 403,
++      reason: 'access-denied',
++    }
++  }
++
++  return {
++    requestedPath,
++    candidatePath,
++    pathMode,
++    relativePath,
++    status: 200,
++    attachment: {
++      name: posix.basename(candidatePath),
++      path: relativePath,
++      mimeType: generatedFileMimeType(candidatePath),
++    },
++  }
++}
++
++test('normalizeGeneratedFileRequestPath trims and folds user-controlled separators', () => {
++  const fixtures = [
++    { raw: '/downloads/Q2\\report.pdf', expected: '/downloads/Q2/report.pdf' },
++    { raw: '  attachments\\2026\\forecast.XLSX  ', expected: 'attachments/2026/forecast.XLSX' },
++    { raw: 'downloads\\\\nested//report.pdf', expected: 'downloads//nested//report.pdf' },
++    { raw: '\\\\fileserver\\share\\report.pdf', expected: '//fileserver/share/report.pdf' },
++    { raw: '', expected: '' },
++    { raw: '   ', expected: '' },
++  ]
++
++  for (const { raw, expected } of fixtures) {
++    assert.equal(normalizeGeneratedFileRequestPath(raw), expected, `raw=${JSON.stringify(raw)}`)
++  }
++})
++
++test('normalizeGeneratedFileRequestPath collapses non-string query values to empty', () => {
++  for (const raw of [undefined, null, 42, true, ['a/b.pdf'], { path: 'a/b.pdf' }]) {
++    assert.equal(normalizeGeneratedFileRequestPath(raw), '', `raw=${JSON.stringify(raw) ?? 'undefined'}`)
++  }
++})
++
++test('normalizeGeneratedFileRequestPath keeps rejectable input rejectable', () => {
++  // Null bytes survive normalization on purpose: the route still has to answer 400.
++  const withNullByte = normalizeGeneratedFileRequestPath('downloads/re\0port.pdf')
++  assert.equal(withNullByte, 'downloads/re\0port.pdf')
++  assert.equal(withNullByte.includes('\0'), true)
++
++  // `..` is not collapsed here either; containment is enforced after resolution.
++  assert.equal(normalizeGeneratedFileRequestPath('../outside.txt'), '../outside.txt')
++})
++
++test('resolves normalized request paths into the workspace with a stable path mode', () => {
++  const fixtures = [
++    {
++      raw: '/downloads/Q2/report.pdf',
++      candidatePath: `${WORKSPACE}/downloads/Q2/report.pdf`,
++      pathMode: 'workspace-root-relative',
++    },
++    {
++      raw: '  attachments\\2026\\forecast.XLSX  ',
++      candidatePath: `${WORKSPACE}/attachments/2026/forecast.XLSX`,
++      pathMode: 'workspace-relative',
++    },
++    {
++      raw: `${WORKSPACE}/notes/summary.md`,
++      candidatePath: `${WORKSPACE}/notes/summary.md`,
++      pathMode: 'workspace-absolute',
++    },
++    {
++      raw: '//fileserver/share/report.pdf',
++      candidatePath: `${WORKSPACE}/fileserver/share/report.pdf`,
++      pathMode: 'workspace-root-relative',
++    },
++  ]
++
++  for (const { raw, candidatePath, pathMode } of fixtures) {
++    const normalized = normalizeGeneratedFileRequestPath(raw)
++    assert.deepEqual(
++      resolveGeneratedFileCandidatePath(WORKSPACE, normalized),
++      { candidatePath, pathMode },
++      `raw=${JSON.stringify(raw)}`,
++    )
++  }
++})
++
++test('a workspace with a trailing slash still yields workspace-absolute paths', () => {
++  const requested = `${WORKSPACE}/downloads/report.pdf`
++  assert.deepEqual(
++    resolveGeneratedFileCandidatePath(`${WORKSPACE}///`, requested),
++    { candidatePath: requested, pathMode: 'workspace-absolute' },
++  )
++})
++
++test('look-alike sibling workspace paths are re-anchored, never treated as absolute', () => {
++  const raw = '/home/wattman/.wattclaw/user/report-agent-evil/leak.txt'
++  const resolved = resolveGeneratedFileCandidatePath(WORKSPACE, normalizeGeneratedFileRequestPath(raw))
++
++  assert.equal(resolved.pathMode, 'workspace-root-relative')
++  assert.equal(
++    resolved.candidatePath,
++    `${WORKSPACE}/home/wattman/.wattclaw/user/report-agent-evil/leak.txt`,
++  )
++  assert.equal(resolved.candidatePath.startsWith(`${WORKSPACE}/`), true)
++})
++
++test('denylist segments and names are the case-insensitive contract constants', () => {
++  assert.deepEqual([...GENERATED_FILE_DENIED_SEGMENTS].sort(), ['.git', '.openclaw'])
++  assert.equal(GENERATED_FILE_DENIED_NAMES.has('agents.md'), true)
++  assert.equal(GENERATED_FILE_DENIED_NAMES.has('workspace-state.json'), true)
++  assert.equal(GENERATED_FILE_DENIED_NAMES.has('openclaw-workspace-state.json'), true)
++})
++
++test('isGeneratedFilePathAllowed accepts ordinary attachments', () => {
++  for (const relativePath of [
++    'downloads/Q2/report.pdf',
++    'downloads/report.PDF',
++    'sub/dir/notes.txt',
++    'agents.md.bak',
++    '.envrc',
++    'reports/.gitignore-notes.md',
++  ]) {
++    assert.equal(isGeneratedFilePathAllowed(relativePath), true, relativePath)
++  }
++})
++
++test('isGeneratedFilePathAllowed rejects VCS/state dirs and secret or agent-instruction files', () => {
++  const denied = [
++    '.git/config',
++    'downloads/.git/config',
++    '.GIT/HEAD',
++    '.openclaw/state.json',
++    'downloads/.OpenClaw/workspace-state.json',
++    '.env',
++    '.Env',
++    'downloads/.env.local',
++    'sub/.env.production',
++    'AGENTS.md',
++    'agents.md',
++    'soul.MD',
++    'memory.md',
++    'tools.md',
++    'identity.md',
++    'user.md',
++    'bootstrap.md',
++    'downloads/Workspace-State.JSON',
++    'openclaw-workspace-state.json',
++  ]
++
++  for (const relativePath of denied) {
++    assert.equal(isGeneratedFilePathAllowed(relativePath), false, relativePath)
++  }
++})
++
++test('the denylist is a policy check, not the traversal boundary', () => {
++  // A plain traversal escapes the workspace through the `../` containment check in the
++  // handler, which runs before/independently of the denylist.
++  const traversal = '..\\outside.txt'
++  const normalizedTraversal = normalizeGeneratedFileRequestPath(traversal)
++  assert.equal(normalizedTraversal, '../outside.txt')
++  assert.equal(isGeneratedFilePathAllowed(normalizedTraversal), true)
++  assert.equal(decideGeneratedFileDownload(traversal).status, 403)
++
++  // A traversal that lands on a denied directory is caught by the denylist too.
++  assert.equal(isGeneratedFilePathAllowed('../.git/config'), false)
++  assert.equal(isGeneratedFilePathAllowed('../.openclaw/workspace-state.json'), false)
++})
++
++test('generatedFileMimeType parses the resolved attachment extension', () => {
++  const fixtures = [
++    ['report.pdf', 'application/pdf'],
++    ['report.PDF', 'application/pdf'],
++    ['forecast.xlsx', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet'],
++    ['deck.PPTX', 'application/vnd.openxmlformats-officedocument.presentationml.presentation'],
++    ['notes.csv', 'text/csv'],
++    ['summary.md', 'text/markdown'],
++    ['data.json', 'application/json'],
++    ['photo.JPEG', 'image/jpeg'],
++    ['clip.webp', 'image/webp'],
++    ['icon.svg', 'image/svg+xml'],
++    ['bundle.zip', 'application/zip'],
++    ['README', 'application/octet-stream'],
++    ['archive.7z', 'application/octet-stream'],
++  ]
++
++  for (const [filePath, mimeType] of fixtures) {
++    assert.equal(generatedFileMimeType(`${WORKSPACE}/downloads/${filePath}`), mimeType, filePath)
++  }
++})
++
++test('composes normalization, containment and metadata for user-controlled fixtures', () => {
++  const fixtures = [
++    {
++      raw: '/downloads/Q2\\report.pdf',
++      expected: {
++        status: 200,
++        relativePath: 'downloads/Q2/report.pdf',
++        attachment: {
++          name: 'report.pdf',
++          path: 'downloads/Q2/report.pdf',
++          mimeType: 'application/pdf',
++        },
++      },
++    },
++    {
++      raw: '  attachments\\2026\\forecast.XLSX  ',
++      expected: {
++        status: 200,
++        relativePath: 'attachments/2026/forecast.XLSX',
++        attachment: {
++          name: 'forecast.XLSX',
++          path: 'attachments/2026/forecast.XLSX',
++          mimeType: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
++        },
++      },
++    },
++    { raw: '../outside.txt', expected: { status: 403, relativePath: '../outside.txt' } },
++    { raw: '../../etc/passwd', expected: { status: 403, relativePath: '../../etc/passwd' } },
++    { raw: '.git/config', expected: { status: 403, relativePath: '.git/config' } },
++    { raw: '/AGENTS.md', expected: { status: 403, relativePath: 'AGENTS.md' } },
++    { raw: '/.env', expected: { status: 403, relativePath: '.env' } },
++    { raw: undefined, expected: { status: 400 } },
++    { raw: 'downloads/re\0port.pdf', expected: { status: 400 } },
++  ]
++
++  for (const { raw, expected } of fixtures) {
++    const result = decideGeneratedFileDownload(raw)
++    assert.equal(result.status, expected.status, `raw=${JSON.stringify(raw) ?? 'undefined'}`)
++    if (expected.relativePath !== undefined) {
++      assert.equal(result.relativePath, expected.relativePath, `raw=${JSON.stringify(raw) ?? 'undefined'}`)
++    }
++    if (expected.attachment !== undefined) {
++      assert.deepEqual(result.attachment, expected.attachment, `raw=${JSON.stringify(raw)}`)
++    }
++  }
++})
++
++test('an empty attachment path can never be normalized into the workspace root', () => {
++  assert.equal(decideGeneratedFileDownload('   ').status, 400)
++  assert.equal(normalizeGeneratedFileRequestPath('   '), '')
++  // Only a whitespace-free empty string was previously rejected, so make sure the
++  // normalized value - not the raw value - is what the handler validates.
++  assert.equal(decideGeneratedFileDownload(undefined).candidatePath, undefined)
++})
+snapshot .prale-eval/contract-deliverable.md - 10be7e49bed86811f0554b69d752d25293f588d67d927148a8cdc84e9080c1ff
+snapshot .prale-eval/result.json - d757e8030b413df2c4c05278b93415f67ebe693caf872ff1f3c04ef9c0dc9858
+snapshot package.json d790ef238d4c6ae2c5d5949bb955193e56d48e2bb5461b84db932115333d6a25 406aca9b9557806dd15c37092f053ecf77c844f675a594e281d889d7dda2498d
+snapshot server/handlers/files.js 74254e8b2a09c11d0a455e4da8226b892feaf592f589accf435f95108e46e835 463f9dd94bc9d0514dec6f0c526f31e890bbd31ae2fd4cc680037d58bbebfa85
+snapshot server/utils/generated-file-metadata.demo.mjs - 9d92f246337dca8c72e2cb6ee5608519bf01b7bfe28406011f498da575c9cbc2
+snapshot server/utils/generated-file-metadata.js - 492ac231204a9f2ae5247e7a86ecafe0516611f5709cd2ccd1fffa06b993fcc7
+snapshot server/utils/generated-file-metadata.test.js - 1368664f7f69ab48d910cc9d479c3ab7df59da37cc4137878d2761cdb7842312

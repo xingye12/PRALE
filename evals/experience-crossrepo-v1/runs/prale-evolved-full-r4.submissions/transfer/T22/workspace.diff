@@ -1,0 +1,749 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/operate-deliverable.md b/.prale-eval/operate-deliverable.md
+new file mode 100644
+index 0000000..c18e30d
+--- /dev/null
++++ b/.prale-eval/operate-deliverable.md
+@@ -0,0 +1,105 @@
++# T22 — Normalize a fake backend command/child-process failure into a structured server result
++
++Repository: `wattclaw` · Mode: `operate`
++
++## Problem
++
++`server/core/system.js#localExec` (line 111) spawns the local "backend" command with
++`spawn(cmd, { stdio: 'pipe', shell: true })`. On failure it **rejects** with a bare
++`Error` whose message is a single collapsed string:
++
++```js
++reject(new Error((stderr || stdout || `Command failed with exit code ${code}`).trim()))
++```
++
++`gatewayExec` (line 150) is a one-line pass-through to `localExec`, and every handler
++that shells out (`server/handlers/files.js`, `skill-store.js`, `workspace.js`,
++`backup.js`) therefore only ever sees `err.message`. Exit code, signal, and the partial
++stdout/stderr captured while the fake backend was running are dropped, and the server's
++generic error path (`server/index.js` error middleware → `{ ok:false, error:{ message } }`)
++can no longer distinguish "backend rejected the input" (exit 3) from "backend binary is
++missing" (ENOENT) from "backend hung" (timeout).
++
++The repository already has a normalization precedent for *remote* backends:
++`server/core/gateway-client.js#gatewayAdminRpcForTarget` (line 60) never throws on
++transport failure — it resolves `{ ok:false, error }` and keeps a WS fallback for 404s.
++T22 adds the equivalent for *local* child processes.
++
++## Deliverable
++
++New module `server/core/process-result.js` (only Node built-ins, no new dependencies):
++
++| Export | Contract |
++| --- | --- |
++| `PROCESS_FAILURE_KIND` | `spawn_error` \| `nonzero_exit` \| `timeout` |
++| `PROCESS_FAILURE_CODE` | `PROCESS_SPAWN_ERROR` \| `PROCESS_NONZERO_EXIT` \| `PROCESS_TIMEOUT` |
++| `buildProcessDiagnostics(error, context)` | Lossless diagnostic bundle, `context` wins over fields carried on the error |
++| `normalizeProcessFailure(error, context)` | Total (never throws) → `{ ok:false, error:{ code, kind, message, diagnostics } }` |
++| `runCommandResult(cmd, options)` | Same spawn semantics as `localExec`, but always **resolves** |
++
++### Normalized operation result
++
++Success:
++
++```json
++{ "ok": true,
++  "payload": { "command": "...", "exitCode": 0, "signal": null,
++               "stdout": "...", "stderr": "...", "durationMs": 23 } }
++```
++
++Failure — diagnostics are a first-class field, nothing is folded into `message`:
++
++```json
++{ "ok": false,
++  "error": {
++    "code": "PROCESS_NONZERO_EXIT",
++    "kind": "nonzero_exit",
++    "message": "fake-backend: upstream 503",
++    "diagnostics": {
++      "command": "node -e \"...\"",
++      "cwd": null,
++      "exitCode": 3,
++      "signal": null,
++      "stdout": "partial payload",
++      "stderr": "fake-backend: upstream 503",
++      "timedOut": false,
++      "timeoutMs": null,
++      "durationMs": 25,
++      "spawnCode": null,
++      "errno": null,
++      "syscall": null
++    }
++  } }
++```
++
++`runCommandResult` mirrors `localExec`'s timeout policy (SIGTERM, then SIGKILL after
++5 s) but sets `diagnostics.timedOut = true` and keeps the partial output. The
++`options.spawnImpl` seam lets callers/tests inject a fake child process (e.g. one that
++emits an `error` event with `code: 'ENOENT'`) without touching the real shell — this is
++how the "fake backend" scenarios are produced deterministically.
++
++## Executable demo
++
++```
++node server/core/process-result.demo.mjs
++```
++
++The demo drives six scenarios and asserts the contract, exiting non-zero on any failure:
++
++1. Fake backend exits `3` after writing to both streams → `exitCode: 3`, `stdout`,
++   `stderr` all preserved (and a message-only envelope is shown to lose them).
++2. Fake backend cannot be spawned (injected ENOENT `error` event) →
++   `kind: spawn_error`, `spawnCode: 'ENOENT'`, `errno: -2`, `command` kept.
++3. Fake backend hangs → `kind: timeout`, `timedOut: true`, `timeoutMs: 500`,
++   partial stdout kept.
++4. Success path → `{ ok:true, payload:{ exitCode:0, stdout:'ok' } }`.
++5. `normalizeProcessFailure(new Error('boom'))` is total → never throws.
++6. The cited contract symbols (`localExec`, `gatewayExec`, `gatewayAdminRpcForTarget`,
++   `_sanitizeLogParams`) still exist in the source files.
++
++Observed run: all checks passed, exit code `0`.
++
++## Scope / minimality
++
++Only two files are added: the module and its demo. No existing file, task metadata,
++lockfile, or git configuration is modified, and no dependency is installed.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..29a200c
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,77 @@
++{
++  "task_id": "T22",
++  "repository": "wattclaw",
++  "mode": "operate",
++  "evidence": [
++    {
++      "path": "server/core/system.js",
++      "symbol": "localExec",
++      "start_line": 111,
++      "end_line": 148,
++      "observation": "localExec spawns the backend command with spawn(cmd, { stdio: 'pipe', shell: true }), accumulates stdout/stderr, and on a non-zero exit rejects with new Error((stderr || stdout || `Command failed with exit code ${code}`).trim()). The rejection is a bare Error, so exit code, signal and the accumulated stdout/stderr are collapsed into one message and never reach a structured server result. The timeout branch (lines 140-146) does the same: it SIGTERMs/SIGKILLs the child and rejects a message-only error, discarding partial output and the timedOut fact."
++    },
++    {
++      "path": "server/core/system.js",
++      "symbol": "gatewayExec",
++      "start_line": 150,
++      "end_line": 152,
++      "observation": "gatewayExec is a one-line pass-through to localExec, so every handler that shells out (server/handlers/files.js, skill-store.js, workspace.js, backup.js) inherits the same lossy rejection surface; this is the call site the new normalization must be able to stand in for."
++    },
++    {
++      "path": "server/core/gateway-client.js",
++      "symbol": "gatewayAdminRpcForTarget",
++      "start_line": 60,
++      "end_line": 122,
++      "observation": "Existing precedent for normalizing a backend failure into a structured server result: on transport/HTTP failure it never throws, resolving { ok: false, error } (including the 404 -> WebSocket fallback at lines 90-101 and the catch branch returning { ok: false, error: err.message } at line 118) and { ok: true, payload } on success. The child-process path had no equivalent normalizer for local command failures."
++    },
++    {
++      "path": "server/core/gateway-client.js",
++      "symbol": "_sanitizeLogParams",
++      "start_line": 32,
++      "end_line": 53,
++      "observation": "Failure/observation logging in this module is defensive (redacts sensitive keys, depth-limited, try/catch fallback). It shows the file's convention of keeping diagnostic context available while never leaking it into executable paths, which the new normalizer mirrors by returning diagnostics as data rather than interpolating them into a message."
++    },
++    {
++      "path": "server/core/process-result.js",
++      "symbol": "normalizeProcessFailure",
++      "start_line": 69,
++      "end_line": 103,
++      "observation": "New normalizer: total (never throws) conversion of any child-process/fake-backend error into { ok:false, error:{ code, kind, message, diagnostics } }, classifying spawn_error vs nonzero_exit vs timeout and delegating diagnostics to buildProcessDiagnostics so exitCode/signal/stdout/stderr/timeoutMs/spawnCode/errno survive."
++    },
++    {
++      "path": "server/core/process-result.js",
++      "symbol": "runCommandResult",
++      "start_line": 114,
++      "end_line": 193,
++      "observation": "New executor that keeps localExec's spawn semantics (shell:true, piped stdio, SIGTERM then SIGKILL after 5s) but always resolves: { ok:true, payload:{ command, exitCode, signal, stdout, stderr, durationMs } } on success and the normalizeProcessFailure envelope on failure. options.spawnImpl injects a fake child process so a fake backend failure (non-zero exit, ENOENT error event, hang) is produced deterministically."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "system.js#localExec (and its gatewayExec pass-through) rejects a child-process/fake-backend failure as a message-only Error, so the exit code, signal and partial stdout/stderr are lost before any handler can build a server result; this is the defect T22 normalizes.",
++      "evidence_paths": ["server/core/system.js"]
++    },
++    {
++      "claim": "system.js#gatewayExec is a thin pass-through to localExec, so every shelling-out handler inherits the same lossy failure surface rather than a structured { ok, error } result.",
++      "evidence_paths": ["server/core/system.js"]
++    },
++    {
++      "claim": "gateway-client.js#gatewayAdminRpcForTarget is the repository's precedent for normalizing backend failures into { ok:false, error } / { ok:true, payload } without throwing, and _sanitizeLogParams shows the file's diagnostic-preserving convention; the local child-process path lacked the equivalent.",
++      "evidence_paths": ["server/core/gateway-client.js"]
++    },
++    {
++      "claim": "The new server/core/process-result.js#runCommandResult resolves instead of rejecting and returns { ok:true, payload } or a normalized { ok:false, error:{ code, kind, message, diagnostics } } that retains exit code, signal, stdout, stderr, timeoutMs, timedOut, spawn code/errno — verified by the executable demo, which asserts all three fake-backend failure kinds and the success path.",
++      "evidence_paths": [
++        "server/core/system.js",
++        "server/core/gateway-client.js",
++        "server/core/process-result.js"
++      ]
++    }
++  ],
++  "conclusion": "In wattclaw, a fake backend command/child-process failure is now normalized into the repository's structured server-result envelope without losing diagnostics. Two files were added: server/core/process-result.js exports normalizeProcessFailure(error, context) (total, never throws) and runCommandResult(cmd, options) (same spawn semantics as system.js#localExec but always resolves), returning { ok:true, payload:{ command, exitCode, signal, stdout, stderr, durationMs } } on success and { ok:false, error:{ code, kind, message, diagnostics } } on failure, where kind is spawn_error | nonzero_exit | timeout and diagnostics retains command, cwd, exitCode, signal, stdout, stderr, timedOut, timeoutMs, durationMs, spawnCode, errno and syscall. This mirrors the existing normalization contract in gateway-client.js#gatewayAdminRpcForTarget (never throw; return { ok, error } / { ok, payload }) and closes the gap left by system.js#localExec, which rejects with a single collapsed message. server/core/process-result.demo.mjs executes three deterministic fake-backend failures (non-zero exit with stdout+stderr, injected ENOENT spawn error, and a hang that trips the timeout) plus a success and a bare-error case; all assertions pass (exit 0). No existing file, task metadata, lockfile or git configuration was modified and no dependency was installed.",
++  "validation": {
++    "command": "node server/core/process-result.demo.mjs",
++    "status": "pass",
++    "notes": "Exit code 0; output ends with 'ALL CHECKS PASSED'. Scenarios: (1) fake backend exits 3 after writing stdout 'partial payload' and stderr 'fake-backend: upstream 503' -> PROCESS_NONZERO_EXIT with exitCode 3 and both streams preserved; (2) injected spawn 'error' event (ENOENT, errno -2) -> PROCESS_SPAWN_ERROR with spawnCode/errno/command preserved; (3) hanging backend with timeoutMs 500 -> PROCESS_TIMEOUT with timedOut true, timeoutMs 500 and partial stdout preserved; (4) success -> { ok:true, payload:{ exitCode:0, stdout:'ok' } }; (5) normalizeProcessFailure(new Error('boom')) is total; (6) cited symbols localExec, gatewayExec, gatewayAdminRpcForTarget, _sanitizeLogParams still resolve via grep in the source files. Supporting checks: `node --check server/core/process-result.js` and `node --check server/core/process-result.demo.mjs` (syntax OK), plus a programmatic symbol-in-range assertion that each cited symbol text occurs inside its inclusive start_line/end_line range in server/core/system.js, server/core/gateway-client.js and server/core/process-result.js. LIMITATION: the repository's official suite (`npm run test:server`, vitest + node --test) could not be executed because node_modules is absent in this sandbox and installing dependencies is disallowed; the demo uses only Node built-ins (node:assert/strict, node:events, node:child_process) and is therefore the strongest available focused validation, but it is not equivalent to the full suite."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+diff --git a/server/core/process-result.demo.mjs b/server/core/process-result.demo.mjs
+new file mode 100644
+index 0000000..989748d
+--- /dev/null
++++ b/server/core/process-result.demo.mjs
+@@ -0,0 +1,132 @@
++// Executable demo / validation for `server/core/process-result.js`.
++//
++// Run: node server/core/process-result.demo.mjs
++//
++// It drives three fake-backend child-process failures through
++// `runCommandResult` and asserts that the structured server result keeps the
++// diagnostics (exit code, signal, stdout, stderr, timeout) that
++// `system.js#localExec` collapses into a single Error message. Exits non-zero
++// if any assertion fails.
++
++import assert from 'node:assert/strict'
++import { EventEmitter } from 'node:events'
++import { execFileSync } from 'node:child_process'
++
++import {
++  PROCESS_FAILURE_KIND,
++  normalizeProcessFailure,
++  runCommandResult,
++} from './process-result.js'
++
++const node = process.execPath
++const print = (label, value) => console.log(`${label}\n${JSON.stringify(value, null, 2)}\n`)
++
++// ── 1. Fake backend exits non-zero, but wrote diagnostics to both streams ──
++const exitCmd = `${node} -e "process.stdout.write('partial payload'); process.stderr.write('fake-backend: upstream 503'); process.exit(3)"`
++const nonzero = await runCommandResult(exitCmd)
++
++print('[1] nonzero exit normalized', nonzero)
++assert.equal(nonzero.ok, false)
++assert.equal(nonzero.error.kind, PROCESS_FAILURE_KIND.NONZERO_EXIT)
++assert.equal(nonzero.error.code, 'PROCESS_NONZERO_EXIT')
++assert.equal(nonzero.error.diagnostics.exitCode, 3)
++assert.match(nonzero.error.diagnostics.stdout, /partial payload/)
++assert.match(nonzero.error.diagnostics.stderr, /upstream 503/)
++// The lossy baseline: collapsing into a message-only envelope drops exit code
++// and stdout, which is what `localExec`'s rejection forces on callers.
++const lossy = { ok: false, error: nonzero.error.message }
++assert.equal(typeof lossy.error, 'string')
++assert.equal(lossy.error.diagnostics, undefined)
++confidenceCheck('nonzero exit', [
++  ['exitCode preserved', nonzero.error.diagnostics.exitCode === 3],
++  ['stdout preserved', nonzero.error.diagnostics.stdout.includes('partial payload')],
++  ['stderr preserved', nonzero.error.diagnostics.stderr.includes('upstream 503')],
++  ['message-only envelope loses diagnostics', lossy.error.diagnostics === undefined],
++])
++
++// ── 2. Fake backend cannot be spawned at all (injected ENOENT 'error' event) ──
++function fakeFailingSpawn() {
++  const child = new EventEmitter()
++  child.stdout = new EventEmitter()
++  child.stderr = new EventEmitter()
++  child.kill = () => true
++  setImmediate(() => {
++    const err = new Error('spawn fake-backend ENOENT')
++    err.code = 'ENOENT'
++    err.errno = -2
++    err.syscall = 'spawn fake-backend'
++    child.emit('error', err)
++  })
++  return child
++}
++const spawnError = await runCommandResult('fake-backend --probe', { spawnImpl: fakeFailingSpawn })
++
++print('[2] spawn error normalized', spawnError)
++assert.equal(spawnError.ok, false)
++assert.equal(spawnError.error.kind, PROCESS_FAILURE_KIND.SPAWN_ERROR)
++assert.equal(spawnError.error.code, 'PROCESS_SPAWN_ERROR')
++assert.equal(spawnError.error.diagnostics.spawnCode, 'ENOENT')
++assert.equal(spawnError.error.diagnostics.errno, -2)
++assert.equal(spawnError.error.diagnostics.command, 'fake-backend --probe')
++confidenceCheck('spawn error', [
++  ['ENOENT code preserved', spawnError.error.diagnostics.spawnCode === 'ENOENT'],
++  ['errno preserved', spawnError.error.diagnostics.errno === -2],
++  ['command preserved', spawnError.error.diagnostics.command === 'fake-backend --probe'],
++])
++
++// ── 3. Fake backend hangs; timeout kills it but keeps partial output ──
++const hangCmd = `${node} -e "process.stdout.write('starting'); setTimeout(() => {}, 10000)"`
++const timedOut = await runCommandResult(hangCmd, { timeoutMs: 500 })
++
++print('[3] timeout normalized', timedOut)
++assert.equal(timedOut.ok, false)
++assert.equal(timedOut.error.kind, PROCESS_FAILURE_KIND.TIMEOUT)
++assert.equal(timedOut.error.code, 'PROCESS_TIMEOUT')
++assert.equal(timedOut.error.diagnostics.timedOut, true)
++assert.equal(timedOut.error.diagnostics.timeoutMs, 500)
++confidenceCheck('timeout', [
++  ['timedOut flagged', timedOut.error.diagnostics.timedOut === true],
++  ['timeoutMs preserved', timedOut.error.diagnostics.timeoutMs === 500],
++  ['partial stdout preserved', timedOut.error.diagnostics.stdout.includes('starting')],
++])
++
++// ── 4. Success path still resolves with a structured payload ──
++const okResult = await runCommandResult(`${node} -e "process.stdout.write('ok')"`)
++print('[4] success normalized', okResult)
++assert.equal(okResult.ok, true)
++assert.equal(okResult.payload.exitCode, 0)
++assert.equal(okResult.payload.stdout, 'ok')
++confidenceCheck('success', [
++  ['ok flag set', okResult.payload.stdout === 'ok'],
++  ['exitCode zero', okResult.payload.exitCode === 0],
++])
++
++// ── 5. `normalizeProcessFailure` is total (never throws) on bare errors ──
++const bare = normalizeProcessFailure(new Error('boom'))
++print('[5] bare error normalized', bare)
++assert.equal(bare.ok, false)
++assert.equal(bare.error.kind, PROCESS_FAILURE_KIND.SPAWN_ERROR)
++confidenceCheck('bare error', [
++  ['never throws', bare.ok === false],
++  ['diagnostics bundle present', typeof bare.error.diagnostics.stderr === 'string'],
++])
++
++// ── 6. Cited contract symbols are still present in the source files ──
++const cited = [
++  ['server/core/system.js', 'localExec'],
++  ['server/core/system.js', 'gatewayExec'],
++  ['server/core/gateway-client.js', 'gatewayAdminRpcForTarget'],
++  ['server/core/gateway-client.js', '_sanitizeLogParams'],
++]
++for (const [file, symbol] of cited) {
++  const out = execFileSync('grep', ['-c', symbol, file], { encoding: 'utf8' }).trim()
++  assert.ok(Number(out) >= 1, `${symbol} missing from ${file}`)
++}
++console.log('[6] cited symbols present:', cited.map(([f, s]) => `${s}@${f}`).join(', '))
++
++function confidenceCheck(name, checks) {
++  const failed = checks.filter(([, ok]) => !ok)
++  if (failed.length) throw new Error(`${name}: failed ${failed.map(([c]) => c).join('; ')}`)
++}
++
++console.log('\nALL CHECKS PASSED')
+diff --git a/server/core/process-result.js b/server/core/process-result.js
+new file mode 100644
+index 0000000..07cf869
+--- /dev/null
++++ b/server/core/process-result.js
+@@ -0,0 +1,203 @@
++// Normalized process-execution results for server handlers.
++//
++// `system.js#localExec` / `system.js#gatewayExec` reject with a bare Error whose
++// message is a single collapsed string (`stderr || stdout || exit code`). The
++// exit code, signal and the partial stdout/stderr that were captured while the
++// fake backend was running are discarded before any `{ ok: false, error }`
++// handler can observe them (see `gateway-client.js#gatewayAdminRpcForTarget`,
++// which already normalizes remote gateway failures into `{ ok, error }` but has
++// no equivalent for local child processes).
++//
++// This module keeps the same spawn semantics (shell: true, piped stdio, SIGTERM
++// then SIGKILL on timeout) but always RESOLVES with the repository's structured
++// server-result envelope and carries the raw diagnostics through it instead of
++// flattening them into one string.
++
++import { spawn } from 'child_process'
++
++export const PROCESS_FAILURE_KIND = Object.freeze({
++  SPAWN_ERROR: 'spawn_error',
++  NONZERO_EXIT: 'nonzero_exit',
++  TIMEOUT: 'timeout',
++})
++
++export const PROCESS_FAILURE_CODE = Object.freeze({
++  [PROCESS_FAILURE_KIND.SPAWN_ERROR]: 'PROCESS_SPAWN_ERROR',
++  [PROCESS_FAILURE_KIND.NONZERO_EXIT]: 'PROCESS_NONZERO_EXIT',
++  [PROCESS_FAILURE_KIND.TIMEOUT]: 'PROCESS_TIMEOUT',
++})
++
++function asText(value, fallback = '') {
++  if (typeof value === 'string') return value
++  if (value === undefined || value === null) return fallback
++  return String(value)
++}
++
++function pick(source, key) {
++  return source && Object.prototype.hasOwnProperty.call(source, key) ? source[key] : undefined
++}
++
++/**
++ * Build the lossless diagnostic bundle for a child-process failure.
++ * Values are taken from the explicit `context` first (captured live by
++ * `runCommandResult`) and fall back to fields carried on the Error object
++ * itself, so wrapping code cannot silently drop them.
++ */
++export function buildProcessDiagnostics(error = {}, context = {}) {
++  const diagnostics = {
++    command: pick(context, 'command') ?? pick(error, 'command') ?? null,
++    cwd: pick(context, 'cwd') ?? pick(error, 'cwd') ?? null,
++    exitCode: pick(context, 'exitCode') ?? pick(error, 'exitCode') ?? null,
++    signal: pick(context, 'signal') ?? pick(error, 'signal') ?? null,
++    stdout: asText(pick(context, 'stdout') ?? pick(error, 'stdout')),
++    stderr: asText(pick(context, 'stderr') ?? pick(error, 'stderr')),
++    timedOut: Boolean(pick(context, 'timedOut') ?? pick(error, 'timedOut')),
++    timeoutMs: pick(context, 'timeoutMs') ?? pick(error, 'timeoutMs') ?? null,
++    durationMs: pick(context, 'durationMs') ?? pick(error, 'durationMs') ?? null,
++    spawnCode: pick(error, 'code') ?? null,
++    errno: pick(error, 'errno') ?? null,
++    syscall: pick(error, 'syscall') ?? null,
++  }
++  return diagnostics
++}
++
++/**
++ * Normalize any child-process / fake-backend failure into a structured
++ * `{ ok: false, error: { code, kind, message, diagnostics } }` server result.
++ * Never throws and never discards stdout/stderr/exit code.
++ */
++export function normalizeProcessFailure(error = {}, context = {}) {
++  const diagnostics = buildProcessDiagnostics(error, context)
++
++  let kind
++  if (diagnostics.timedOut) {
++    kind = PROCESS_FAILURE_KIND.TIMEOUT
++  } else if (diagnostics.exitCode !== null && diagnostics.exitCode !== undefined) {
++    kind = PROCESS_FAILURE_KIND.NONZERO_EXIT
++  } else {
++    kind = PROCESS_FAILURE_KIND.SPAWN_ERROR
++  }
++
++  const rawMessage = asText(pick(error, 'message')).trim()
++  let message = rawMessage
++  if (!message) {
++    if (kind === PROCESS_FAILURE_KIND.TIMEOUT) {
++      const seconds = diagnostics.timeoutMs ? Math.round(diagnostics.timeoutMs / 1000) : null
++      message = seconds ? `Command timed out after ${seconds}s` : 'Command timed out'
++    } else if (kind === PROCESS_FAILURE_KIND.NONZERO_EXIT) {
++      message = `Command failed with exit code ${diagnostics.exitCode}`
++    } else {
++      message = 'Failed to spawn command'
++    }
++  }
++
++  return {
++    ok: false,
++    error: {
++      code: PROCESS_FAILURE_CODE[kind],
++      kind,
++      message,
++      diagnostics,
++    },
++  }
++}
++
++/**
++ * Run a (possibly fake) backend command and always resolve with a structured
++ * server result instead of rejecting:
++ *   success -> { ok: true,  payload: { command, exitCode, signal, stdout, stderr, durationMs } }
++ *   failure -> { ok: false, error:   { code, kind, message, diagnostics } }
++ *
++ * `options.spawnImpl` lets callers/tests inject a fake child process (e.g. one
++ * that emits an `error` event) without touching the real shell.
++ */
++export function runCommandResult(cmd, options = {}) {
++  const {
++    timeoutMs = 0,
++    cwd = undefined,
++    env = undefined,
++    spawnImpl = spawn,
++  } = options
++
++  return new Promise((resolve) => {
++    const startedAt = Date.now()
++    const context = {
++      command: cmd,
++      cwd: cwd ?? null,
++      stdout: '',
++      stderr: '',
++      exitCode: null,
++      signal: null,
++      timedOut: false,
++      timeoutMs: timeoutMs || null,
++      durationMs: null,
++    }
++
++    let child
++    try {
++      child = spawnImpl(cmd, { stdio: 'pipe', shell: true, cwd, env })
++    } catch (err) {
++      context.durationMs = Date.now() - startedAt
++      resolve(normalizeProcessFailure(err, context))
++      return
++    }
++
++    let timer = null
++    let killTimer = null
++
++    const finishFailure = (err) => {
++      if (timer) clearTimeout(timer)
++      if (killTimer) clearTimeout(killTimer)
++      context.durationMs = Date.now() - startedAt
++      resolve(normalizeProcessFailure(err || {}, context))
++    }
++
++    if (child.stdout && typeof child.stdout.on === 'function') {
++      child.stdout.on('data', (data) => { context.stdout += data.toString() })
++    }
++    if (child.stderr && typeof child.stderr.on === 'function') {
++      child.stderr.on('data', (data) => { context.stderr += data.toString() })
++    }
++
++    child.on('close', (code, signal) => {
++      if (timer) clearTimeout(timer)
++      if (killTimer) clearTimeout(killTimer)
++      context.exitCode = code
++      context.signal = signal ?? null
++      context.durationMs = Date.now() - startedAt
++
++      if (code === 0 || code === undefined || code === null) {
++        resolve({
++          ok: true,
++          payload: {
++            command: cmd,
++            exitCode: code ?? 0,
++            signal: context.signal,
++            stdout: context.stdout,
++            stderr: context.stderr,
++            durationMs: context.durationMs,
++          },
++        })
++        return
++      }
++
++      resolve(normalizeProcessFailure(
++        new Error((context.stderr || context.stdout || `Command failed with exit code ${code}`).trim()),
++        context
++      ))
++    })
++
++    child.on('error', (err) => finishFailure(err))
++
++    if (timeoutMs > 0) {
++      timer = setTimeout(() => {
++        context.timedOut = true
++        child.kill('SIGTERM')
++        killTimer = setTimeout(() => {
++          try { child.kill('SIGKILL') } catch { /* already gone */ }
++        }, 5000)
++        finishFailure(new Error(`Command timed out after ${Math.round(timeoutMs / 1000)}s`))
++      }, timeoutMs)
++    }
++  })
++}
+snapshot .prale-eval/operate-deliverable.md - 6cb9a7078c0907acc4ca9ec8a0c5c6ef31d81174ae8d4bd410bef312ccaa2c0c
+snapshot .prale-eval/result.json - 247b64e373155b42f6dcfff2d8c8546d9bcd6aca51e8a812c0bef2ba54c33ebc
+snapshot server/core/process-result.demo.mjs - 4628db22e25063cf18da15828a55604e3c3669ec889db12cfd864bbda1abfa57
+snapshot server/core/process-result.js - 4dc52afccc8cbb38e918676a98463b19417d3c7f6ccaee2171d2bd43b5cff6bc

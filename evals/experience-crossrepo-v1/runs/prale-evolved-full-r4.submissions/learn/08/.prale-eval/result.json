@@ -1,0 +1,80 @@
+{
+  "task_id": "08",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "search_and_replace",
+      "start_line": 434,
+      "end_line": 444,
+      "observation": "The literal search/replace strategy. It computes `num = original_text.count(search_text)`, but the ambiguity guard is commented out (`# if num > 1: #    raise SearchTextNotUnique()`); the only live guard is `if num == 0: return`. It then calls `original_text.replace(search_text, replace_text)` with no count argument, so an ambiguous (multi-occurrence) search_text is silently expanded to EVERY occurrence rather than failing. This is the normalized operation result of the ambiguity contract at this call site."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "SearchTextNotUnique",
+      "start_line": 524,
+      "end_line": 525,
+      "observation": "`class SearchTextNotUnique(ValueError)` is the repository's marker exception for an ambiguous SEARCH side. It is defined here but never raised by `search_and_replace` (the raise is commented out), so the ambiguity failure contract is only enforced elsewhere (e.g. the udiff coder catches it). Naming this symbol grounds the claim that search_replace.py owns the ambiguity-signal type without enforcing it in the literal strategy."
+    },
+    {
+      "path": "aider/coders/editblock_coder.py",
+      "symbol": "try_dotdotdots",
+      "start_line": 190,
+      "end_line": 240,
+      "observation": "Handles `...` elision in an edit block. It splits the SEARCH and REPLACE into pieces and, for each non-empty piece, `if whole.count(part) == 0: raise ValueError` and `if whole.count(part) > 1: raise ValueError`. The `> 1` branch is the focused ambiguous-match failure: an ambiguous SEARCH piece is refused instead of guessed, and only a unique piece is applied via `whole.replace(part, replace, 1)`."
+    },
+    {
+      "path": "aider/coders/editblock_coder.py",
+      "symbol": "replace_most_similar_chunk",
+      "start_line": 157,
+      "end_line": 187,
+      "observation": "The edit-block entry point that turns the ambiguous-match guard into a normalized failure result. It tries a perfect/whitespace-tolerant match, then wraps `try_dotdotdots` in `try: ... except ValueError: pass`, and after the disabled fuzzy fallback returns `None`. Consequence: when `try_dotdotdots` raises on an ambiguous piece, `replace_most_similar_chunk` returns `None` (no edit applied), which `do_replace` and `EditBlockCoder.apply_edits` surface as a SearchReplaceNoExactMatch failure."
+    },
+    {
+      "path": "tests/basic/test_editblock.py",
+      "symbol": "TestUtils.test_replace_ambiguous_match_with_ellipsis_fails",
+      "start_line": 616,
+      "end_line": 630,
+      "observation": "The focused ambiguous-match failure case added by this task. With whole=\"beta\\nalpha\\nbeta\\ngamma\\n\", part=\"beta\\n...\\nbeta\\n\" (the \"beta\\n\" piece matches twice) and replace=\"beta2\\n...\\nbeta2\\n\", it asserts `eb.replace_most_similar_chunk(whole, part, replace) is None`: the edit fails rather than silently rewriting an arbitrary occurrence."
+    },
+    {
+      "path": "tests/basic/test_editblock.py",
+      "symbol": "TestUtils.test_replace_unambiguous_match_with_ellipsis_succeeds",
+      "start_line": 632,
+      "end_line": 639,
+      "observation": "The mirror/contrast case for the added failure test: part=\"alpha\\n...\\ngamma\\n\" with unique pieces is applied normally, returning \"alpha\\nbeta\\nGAMMA\\n\". Together with the failure test it pins the boundary of the contract (unique -> applied, ambiguous -> fail)."
+    },
+    {
+      "path": "tests/basic/test_editblock.py",
+      "symbol": "TestUtils.test_replace_multiple_matches",
+      "start_line": 278,
+      "end_line": 287,
+      "observation": "The pre-existing contract case for plain (non-elided) duplicate SEARCH text: whole=\"line1\\nline2\\nline1\\nline3\\n\" with part=\"line1\\n\" replaces only the first occurrence (\"only replace first occurrence\"). It documents that ambiguity without `...` resolves to the first match via perfect_replace, which is why the newly added failure case targets the `...` elision path where ambiguity is explicitly rejected."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "search_replace.py defines the ambiguity signal but does not enforce it in its literal strategy: search_and_replace computes `num = original_text.count(search_text)` yet the `if num > 1: raise SearchTextNotUnique()` guard is commented out, so it calls `str.replace` without a count and rewrites every occurrence of an ambiguous SEARCH; SearchTextNotUnique exists solely as the marker exception type for this case.",
+      "evidence_paths": ["aider/coders/search_replace.py"]
+    },
+    {
+      "claim": "Edit-block handling enforces a focused ambiguous-match failure: in try_dotdotdots a `...` SEARCH piece that matches more than one location raises ValueError (`whole.count(part) > 1`), replace_most_similar_chunk swallows that ValueError and returns None, so the edit is reported as failed instead of silently editing an arbitrary occurrence.",
+      "evidence_paths": ["aider/coders/editblock_coder.py"]
+    },
+    {
+      "claim": "tests/basic/test_editblock.py now contains a focused ambiguous-match failure case (test_replace_ambiguous_match_with_ellipsis_fails) asserting the edit-block matcher returns None for an ambiguous `...` piece, paired with test_replace_unambiguous_match_with_ellipsis_succeeds for the unique case and the pre-existing test_replace_multiple_matches documenting that a plain duplicate SEARCH replaces only the first occurrence.",
+      "evidence_paths": ["tests/basic/test_editblock.py"]
+    },
+    {
+      "claim": "The ambiguity contract differs between the two entry points: the edit-block path (editblock_coder.try_dotdotdots -> replace_most_similar_chunk) fails on an ambiguous `...` piece, whereas search_replace.search_and_replace deliberately (guard commented out) rewrites all occurrences; both files therefore participate in defining the end-to-end ambiguous-match behavior.",
+      "evidence_paths": ["aider/coders/search_replace.py", "aider/coders/editblock_coder.py", "tests/basic/test_editblock.py"]
+    }
+  ],
+  "conclusion": "Contract established and demonstrated for ambiguous search/replace matches in aider. The edit-block matcher refuses to guess: an ambiguous `...` SEARCH piece triggers ValueError in try_dotdotdots, which replace_most_similar_chunk converts to a None result that apply_edits reports as a SearchReplaceNoExactMatch failure, while a unique piece still applies. A focused failure case (test_replace_ambiguous_match_with_ellipsis_fails) plus its unambiguous mirror were added to tests/basic/test_editblock.py, alongside the pre-existing test_replace_multiple_matches that documents first-occurrence behavior for plain duplicates. Separately, aider/coders/search_replace.py's literal search_and_replace strategy leaves its SearchTextNotUnique ambiguity guard commented out, so it rewrites every occurrence; SearchTextNotUnique is the marker exception for that case. The contract is executable via .prale-eval/demo_ambiguous_match.py, which runs the real extracted functions with the standard library only.",
+  "validation": {
+    "command": "python .prale-eval/demo_ambiguous_match.py && python - <<'PY'\nimport ast, json\nsrc = open('tests/basic/test_editblock.py').read()\ntree = ast.parse(src)\nnames = {n.name for n in ast.walk(tree) if isinstance(n, ast.FunctionDef)}\nassert 'test_replace_ambiguous_match_with_ellipsis_fails' in names\nassert 'test_replace_unambiguous_match_with_ellipsis_succeeds' in names\nlines = src.splitlines()\nfor n in ast.walk(tree):\n    if isinstance(n, ast.FunctionDef) and n.name.startswith('test_replace_ambiguous'):\n        assert 616 <= n.lineno <= 630, n.lineno\nr = json.load(open('.prale-eval/result.json'))\nassert r['task_id'] == '08' and r['repository'] == 'aider' and r['mode'] == 'contract'\npaths = {e['path'] for e in r['evidence']}\nassert 'aider/coders/search_replace.py' in paths and 'tests/basic/test_editblock.py' in paths\nassert all({'path','symbol','start_line','end_line','observation'} <= set(e) for e in r['evidence'])\nassert all({'claim','evidence_paths'} <= set(c) for c in r['claims'])\nfor c in r['claims']:\n    assert c['evidence_paths']\nprint('result.json schema + citations OK')\nPY",
+    "status": "passed",
+    "notes": "Primary validation: .prale-eval/demo_ambiguous_match.py extracts the real functions (try_dotdotdots, replace_most_similar_chunk, search_and_replace, ...) from the repository via AST and executes the four contract points; exit 0 (ambiguous `...` -> None/failed, unique -> applied, search_and_replace rewrites all occurrences of an ambiguous search_text, plain duplicate -> first occurrence). Secondary: an AST/JSON check confirms the new test methods exist with the cited line range and that result.json has task_id=08, repository=aider, mode=contract, one evidence entry for each required path (search_replace.py, tests/basic/test_editblock.py) with all mandated keys, and every claim carries evidence_paths. LIMITATION: `python -m pytest tests/basic/test_editblock.py` could not be run because the sandbox lacks the aider runtime dependencies (collection fails with `ModuleNotFoundError: No module named 'json5'`; `diff_match_patch` is also absent) and installing dependencies is out of scope; the AST-extraction demo substitutes a dependency-free execution of the same real code. No optional validation dependency was installed."
+  }
+}

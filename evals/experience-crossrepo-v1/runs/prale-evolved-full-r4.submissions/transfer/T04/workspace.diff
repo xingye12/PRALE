@@ -1,0 +1,243 @@
+diff --git a/packages/coding-agent/test/settings-manager.test.ts b/packages/coding-agent/test/settings-manager.test.ts
+index 8e1bb83..e8bc109 100644
+--- a/packages/coding-agent/test/settings-manager.test.ts
++++ b/packages/coding-agent/test/settings-manager.test.ts
+@@ -665,4 +665,52 @@ describe("SettingsManager", () => {
+ 			expect(manager.getShellPath()).toBe(homedir());
+ 		});
+ 	});
++
++	describe("settings precedence", () => {
++		// One fixture (the `theme` setting) exercised across the four-layer resolution order:
++		// explicit CLI override > project settings > user/global settings > built-in default.
++		// `applyOverrides` is the in-memory, non-persisted path the CLI uses for `--use-theme`
++		// (see packages/coding-agent/src/main.ts), so it stands in for the "explicit CLI value" layer.
++		const themePrecedenceCases = [
++			{
++				layer: "built-in default when nothing is configured",
++				expected: undefined,
++			},
++			{
++				layer: "user/global value over the default",
++				userTheme: "user-theme",
++				expected: "user-theme",
++			},
++			{
++				layer: "project value over the user value",
++				userTheme: "user-theme",
++				projectTheme: "project-theme",
++				expected: "project-theme",
++			},
++			{
++				layer: "explicit CLI value over the project value",
++				userTheme: "user-theme",
++				projectTheme: "project-theme",
++				cliTheme: "cli-theme",
++				expected: "cli-theme",
++			},
++		];
++
++		it.each(themePrecedenceCases)("resolves theme from the $layer", ({ userTheme, projectTheme, cliTheme, expected }) => {
++			if (userTheme !== undefined) {
++				writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: userTheme }));
++			}
++			if (projectTheme !== undefined) {
++				writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ theme: projectTheme }));
++			}
++
++			const manager = SettingsManager.create(projectDir, agentDir);
++
++			if (cliTheme !== undefined) {
++				manager.applyOverrides({ theme: cliTheme });
++			}
++
++			expect(manager.getTheme()).toBe(expected);
++		});
++	});
+ });
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..1eb01b4
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,109 @@
++# T04 contract deliverable — project-vs-user-vs-CLI precedence assertion (`pi`)
++
++## What the contract is
++
++For a settings fixture resolved by `SettingsManager`, value provenance follows this order
++(highest wins):
++
++1. **explicit CLI value** — applied in memory via `SettingsManager.applyOverrides(...)`
++   (the path `packages/coding-agent/src/main.ts` uses for `--use-theme`),
++2. **project settings** — `<projectDir>/.pi/settings.json`,
++3. **user/global settings** — `<agentDir>/settings.json`,
++4. **built-in default**.
++
++The contract under test is narrower than "everything merges": for the `theme` fixture the
++**project** value must beat the **user/global** value and the **default**, and must
++**lose** to an **explicit CLI value**.
++
++## Executable demo (the added test)
++
++File: `packages/coding-agent/test/settings-manager.test.ts`
++Block: `describe("settings precedence", ...)` (lines 669–715).
++
++The table `themePrecedenceCases` (lines 674–697) drives `it.each(themePrecedenceCases)`
++(lines 699–714). Each row writes the settings files it names, creates the manager, optionally
++applies the CLI layer, and asserts the observed theme:
++
++| row (`layer`) | user file | project file | CLI override | expected `getTheme()` |
++| --- | --- | --- | --- | --- |
++| built-in default when nothing is configured | — | — | — | `undefined` |
++| user/global value over the default | `user-theme` | — | — | `user-theme` |
++| project value over the user value | `user-theme` | `project-theme` | — | `project-theme` |
++| explicit CLI value over the project value | `user-theme` | `project-theme` | `cli-theme` | `cli-theme` |
++
++Rows 3 and 4 are the requested assertion: the project value wins over user/default, and then
++loses to the explicit CLI value.
++
++```ts
++it.each(themePrecedenceCases)("resolves theme from the $layer", ({ userTheme, projectTheme, cliTheme, expected }) => {
++    if (userTheme !== undefined) {
++        writeFileSync(join(agentDir, "settings.json"), JSON.stringify({ theme: userTheme }));
++    }
++    if (projectTheme !== undefined) {
++        writeFileSync(join(projectDir, ".pi", "settings.json"), JSON.stringify({ theme: projectTheme }));
++    }
++
++    const manager = SettingsManager.create(projectDir, agentDir);
++
++    if (cliTheme !== undefined) {
++        manager.applyOverrides({ theme: cliTheme });
++    }
++
++    expect(manager.getTheme()).toBe(expected);
++});
++```
++
++## Why the assertion is faithful to the source
++
++- `SettingsManager.create()` merges user/global then project settings
++  (`deepMergeSettings(this.globalSettings, this.projectSettings)`), so project wins over
++  user/default.
++- `applyOverrides()` (`packages/coding-agent/src/core/settings-manager.ts`, lines 568–570)
++  re-merges the given overrides on top of the current merged settings and keeps them
++  **in memory only** — it does not mark the field modified or write the file. This is exactly
++  the "explicit CLI value" layer (`main.ts` line 667 applies `{ theme: parsed.useTheme }`).
++- `getTheme()` (lines 788–791) returns the merged `theme`, so it is the observable that
++  exposes the winning layer.
++
++Because the four rows use four distinct expected values, the table is discriminating: any
++ordering mistake (project not overriding user, or CLI not overriding project) fails the run.
++
++## How to run
++
++```sh
++cd packages/coding-agent
++npx vitest run test/settings-manager.test.ts
++```
++
++Focused subset only:
++
++```sh
++cd packages/coding-agent
++npx vitest run test/settings-manager.test.ts -t "settings precedence"
++```
++
++## Validation status and limitations
++
++`vitest` (4.1.9) is declared in `packages/coding-agent/package.json`, but this checkout has no
++`node_modules` and dependency installation is out of scope, so the canonical command above
++could not be executed here. **Limitation recorded rather than worked around by installing
++dependencies.**
++
++Substitute checks actually performed inside the workspace:
++
++1. `node --experimental-strip-types --check packages/coding-agent/test/settings-manager.test.ts`
++   → exit 0 (the edited file parses).
++2. A temporary offline harness (a minimal `vitest` shim plus stubs for `proper-lockfile`,
++   `undici`, `@earendil-works/pi-ai` and `cross-spawn`, wired through a Node
++   module-resolution loader) imported the real `src/core/settings-manager.ts` and ran the
++   tests:
++   - new `settings precedence` block: **4 passed / 0 failed**;
++   - whole `settings-manager.test.ts`: **50 passed / 0 failed**.
++
++   The harness was removed afterwards, so the only workspace change is the test file.
++
++## Files changed
++
++- `packages/coding-agent/test/settings-manager.test.ts` — added the `settings precedence`
++  table-driven block (48 inserted lines). No task metadata, hidden-oracle file, package lock,
++  or git configuration was modified.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..6f20868
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,62 @@
++{
++  "task_id": "T04",
++  "repository": "pi",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "packages/coding-agent/test/settings-manager.test.ts",
++      "symbol": "themePrecedenceCases",
++      "start_line": 669,
++      "end_line": 697,
++      "observation": "New table-driven fixture block `describe(\"settings precedence\", ...)` defines the `themePrecedenceCases` table with four rows covering the full resolution order for the `theme` setting: (1) built-in default (expected `undefined`), (2) a user/global value that wins over the default, (3) a project value that wins over the user value, (4) an explicit CLI value that wins over the project value. Each row carries `userTheme`, `projectTheme`, `cliTheme` and `expected`, so the same assertion is applied to every layer of the precedence chain."
++    },
++    {
++      "path": "packages/coding-agent/test/settings-manager.test.ts",
++      "symbol": "applyOverrides",
++      "start_line": 699,
++      "end_line": 714,
++      "observation": "`it.each(themePrecedenceCases)` turns the table into one test per row. Each run writes `agentDir/settings.json` (user/global) and/or `projectDir/.pi/settings.json` (project) as the row requires, creates the manager with `SettingsManager.create(projectDir, agentDir)`, applies the CLI layer via `manager.applyOverrides({ theme: cliTheme })` only for the row that supplies `cliTheme`, and asserts `manager.getTheme()` equals the row's `expected`. This is the assertion that a fixture's project value beats user/default but loses to an explicit CLI value."
++    },
++    {
++      "path": "packages/coding-agent/src/core/settings-manager.ts",
++      "symbol": "applyOverrides",
++      "start_line": 568,
++      "end_line": 570,
++      "observation": "`applyOverrides(overrides)` re-runs `deepMergeSettings(this.settings, overrides)` over the already user+project merged settings and keeps the result in memory only (no write, no markModified). It is therefore the correct stand-in for the top, explicit-CLI precedence layer: a later merge applied on top of the file-derived value wins, and the following `save()`/`reload()` would discard it."
++    },
++    {
++      "path": "packages/coding-agent/src/core/settings-manager.ts",
++      "symbol": "getTheme",
++      "start_line": 788,
++      "end_line": 791,
++      "observation": "`getTheme()` reads `this.settings.theme` (the deep-merged global+project value, plus any in-memory overrides) and returns it unless it is a slash-separated automatic theme. Because it reads exactly the merged object that `create()` (project over global) and `applyOverrides()` (CLI over project) populate, it is the observable used by the new table to prove project > user/default and CLI > project."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "The new `describe(\"settings precedence\")` block is table-driven: the `themePrecedenceCases` table holds one row per precedence layer, and `it.each(themePrecedenceCases)` asserts each row against `manager.getTheme()`. Rows 3 and 4 encode the requested contract directly: the project value (`project-theme`) wins over the user/global value (`user-theme`) and over the default, while an explicit CLI value (`cli-theme`, applied through `applyOverrides`) wins over the project value.",
++      "evidence_paths": [
++        "packages/coding-agent/test/settings-manager.test.ts"
++      ]
++    },
++    {
++      "claim": "The precedence order the table pins down matches the source: project settings are deep-merged over the user/global settings when the manager is created, and an explicit CLI value is layered on top via `applyOverrides`, which deep-merges in memory without persisting. `getTheme()` observes the resulting merged `theme`. Hence CLI > project > user > default for this fixture.",
++      "evidence_paths": [
++        "packages/coding-agent/test/settings-manager.test.ts",
++        "packages/coding-agent/src/core/settings-manager.ts"
++      ]
++    },
++    {
++      "claim": "The four rows are discriminating: they use four distinct expected values (undefined, \"user-theme\", \"project-theme\", \"cli-theme\"), so a wrong ordering (for example project failing to override user, or CLI failing to override project) would fail at least one row instead of silently passing.",
++      "evidence_paths": [
++        "packages/coding-agent/test/settings-manager.test.ts"
++      ]
++    }
++  ],
++  "conclusion": "Added a table-driven assertion to `packages/coding-agent/test/settings-manager.test.ts`: a new `describe(\"settings precedence\")` block whose `themePrecedenceCases` table drives `it.each`, proving that for the `theme` fixture the project value (projectDir/.pi/settings.json) wins over the user/global value and the built-in default, and then loses to an explicit CLI value supplied through `SettingsManager.applyOverrides({ theme })` (the same in-memory path `main.ts` uses for `--use-theme`). Only the test file changed; no task metadata, hidden-oracle file, package lock, or git configuration was touched.",
++  "validation": {
++    "command": "cd packages/coding-agent && npx vitest run test/settings-manager.test.ts",
++    "status": "blocked-dependency; substitute checks passed",
++    "notes": "LIMITATION: vitest 4.1.9 is declared in packages/coding-agent/package.json but this checkout has no node_modules and the task forbids installing dependencies, so the canonical vitest command above could not be executed. Substitute evidence actually run inside the workspace: (1) `node --experimental-strip-types --check packages/coding-agent/test/settings-manager.test.ts` -> exit 0, so the edited file parses; (2) a temporary offline harness (a minimal vitest shim plus stubs for proper-lockfile, undici, @earendil-works/pi-ai and cross-spawn wired through a Node module-resolution loader) imported the real packages/coding-agent/src/core/settings-manager.ts and ran the new block: 4 passed / 0 failed, and the whole file: 50 passed / 0 failed; the harness directory was removed afterwards, so the only workspace change is the test file. Passing the four table rows is what proves project > user/default and CLI > project against the real SettingsManager implementation."
++  }
++}
+snapshot .prale-eval/contract-deliverable.md - cc847d36ad05bf56a80cf396434d28c75e389f049e0d5937e9f64c121cd8c33d
+snapshot .prale-eval/result.json - 24347b03b8d303ab31042e8dd972335570f5fea4ebd8501ba6bcb6c7c4da7e9d
+snapshot packages/coding-agent/test/settings-manager.test.ts 9174509b95e92feaf18cb5adf77e601c5c631c5b875eca5906c949653f3edbe3 71888218ea42e58ac1daf43ef096c5caea7ce31367824fc4fcc7355ddd407dba

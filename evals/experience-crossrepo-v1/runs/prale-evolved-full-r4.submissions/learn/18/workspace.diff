@@ -1,0 +1,676 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/config-queue-contract.mjs b/.prale-eval/config-queue-contract.mjs
+new file mode 100644
+index 0000000..23158a4
+--- /dev/null
++++ b/.prale-eval/config-queue-contract.mjs
+@@ -0,0 +1,165 @@
++// Executable contract demo for server/core/config-queue.js
++//
++// Covers the two behaviours requested by TASK.md:
++//   1. ordered updates      -> enqueued jobs are serialized FIFO, and every job
++//                              observes the config written by the previous job.
++//   2. one rejected action  -> a failing job rejects its own promise, leaves the
++//                              gateway config untouched, and does not stall the
++//                              queue for the jobs enqueued after it.
++//
++// The real server/core/gateway-client.js is replaced (resolve hook) with
++// .prale-eval/stub-gateway-client.mjs, an in-memory fake of the admin RPC
++// surface: config.get, config.patch, config.apply.
++
++import assert from 'node:assert/strict'
++import { registerHooks } from 'node:module'
++
++const stubUrl = new URL('./stub-gateway-client.mjs', import.meta.url).href
++const targetUrl = new URL('../server/core/config-queue.js', import.meta.url).href
++
++registerHooks({
++  resolve (specifier, context, nextResolve) {
++    if (specifier === './gateway-client.js' && String(context.parentURL || '').endsWith('/server/core/config-queue.js')) {
++      return { url: stubUrl, format: 'module', shortCircuit: true }
++    }
++    return nextResolve(specifier, context)
++  },
++})
++
++const { configQueueExecute } = await import(targetUrl)
++
++// ---------------------------------------------------------------- fake gateway
++const gateway = {
++  config: { channels: {}, mcp: { servers: {} } },
++  hash: 'hash-0',
++  rev: 0,
++  calls: [],
++  applied: [],
++}
++
++globalThis.__configQueueRpcHandler = async (method, params = {}) => {
++  gateway.calls.push({ method })
++  if (method === 'config.get') {
++    return { ok: true, payload: { config: JSON.parse(JSON.stringify(gateway.config)), hash: gateway.hash } }
++  }
++  if (method === 'config.patch') {
++    gateway.config = JSON.parse(params.raw)
++    gateway.hash = `hash-${++gateway.rev}`
++    return { ok: true, payload: { hash: gateway.hash } }
++  }
++  if (method === 'config.apply') {
++    gateway.applied.push(JSON.parse(params.raw))
++    return { ok: true, payload: {} }
++  }
++  return { ok: false, error: `unsupported method ${method}` }
++}
++
++const results = {}
++let failures = 0
++
++async function check (name, fn) {
++  results[name] = { status: 'pending' }
++  try {
++    await fn()
++    results[name].status = 'pass'
++    console.log(`PASS ${name}`)
++  } catch (err) {
++    failures++
++    results[name].status = 'fail'
++    results[name].error = err.message
++    console.log(`FAIL ${name}: ${err.message}`)
++  }
++}
++
++// ------------------------------------------------ 1. ordered updates (FIFO)
++await check('ordered-updates', async () => {
++  gateway.calls.length = 0
++  const observed = []
++
++  // Enqueued without awaiting, so the queue must serialize them itself.
++  const pA = configQueueExecute((cfg) => {
++    observed.push('A')
++    return { ...cfg, channels: { ...cfg.channels, alpha: { enabled: true } } }
++  }, 'add-alpha')
++
++  const pB = configQueueExecute((cfg) => {
++    observed.push('B')
++    // B must see the config written by A.
++    assert.deepEqual(cfg.channels.alpha, { enabled: true }, 'B must observe the update made by A')
++    assert.deepEqual(cfg.channels.beta, undefined, 'B must not observe its own write yet')
++    return { ...cfg, channels: { ...cfg.channels, beta: { enabled: true } } }
++  }, 'add-beta')
++
++  const [ra, rb] = await Promise.all([pA, pB])
++  assert.equal(ra, undefined, 'config.patch jobs resolve with undefined')
++  assert.equal(rb, undefined)
++
++  // Strict FIFO execution: each job runs get -> patch -> get -> apply, and the
++  // second job's get happens only after the first job's apply.
++  assert.deepEqual(
++    gateway.calls.map(c => c.method),
++    ['config.get', 'config.patch', 'config.get', 'config.apply',
++      'config.get', 'config.patch', 'config.get', 'config.apply'],
++    `unexpected RPC sequence: ${gateway.calls.map(c => c.method).join(',')}`
++  )
++  assert.deepEqual(observed, ['A', 'B'], 'transform order must be FIFO')
++  assert.equal(gateway.hash, 'hash-2', 'each applied update bumps the config revision')
++  assert.deepEqual(gateway.config.channels, {
++    alpha: { enabled: true },
++    beta: { enabled: true },
++  }, 'both ordered updates must be present in the final config')
++
++  results['ordered-updates'].call_sequence = gateway.calls.map(c => c.method)
++  results['ordered-updates'].final_hash = gateway.hash
++})
++
++// ------------------------------------------- 2. one rejected config action
++await check('rejected-action', async () => {
++  const revBefore = gateway.rev
++  const hashBefore = gateway.hash
++  const callsBefore = gateway.calls.length
++  gateway.calls.length = 0
++
++  // A non-retryable failure must reject immediately (no silent retry).
++  const rejected = configQueueExecute((_cfg) => {
++    throw new Error('invalid configuration: mcp.servers.broken is not an object')
++  }, 'reject-broken-mcp')
++
++  await assert.rejects(rejected, (err) => {
++    assert.match(err.message, /invalid configuration/, 'rejection must surface the original error')
++    return true
++  })
++
++  // The rejected job must have mutated nothing: it stopped before config.patch.
++  assert.deepEqual(gateway.calls.map(c => c.method), ['config.get'], 'a rejected action must not patch or apply')
++  assert.equal(gateway.rev, revBefore, 'rejected action must not bump the config revision')
++  assert.equal(gateway.hash, hashBefore, 'rejected action must not change the config hash')
++
++  // The queue keeps serving later jobs after the rejection (recovery).
++  gateway.calls.length = 0
++  const recovered = await configQueueExecute((cfg) => {
++    assert.deepEqual(cfg.mcp, { servers: {} }, 'later job sees the un-mutated config')
++    return { ...cfg, mcp: { servers: { good: { command: 'run' } } } }
++  }, 'add-good-mcp')
++
++  assert.equal(recovered, undefined)
++  assert.deepEqual(gateway.calls.map(c => c.method),
++    ['config.get', 'config.patch', 'config.get', 'config.apply'],
++    'queue must resume normal operation after a rejection')
++  assert.deepEqual(gateway.config.mcp, { servers: { good: { command: 'run' } } })
++
++  results['rejected-action'].rejected_calls = callsBefore >= 0 ? ['config.get'] : []
++  results['rejected-action'].recovery_sequence = gateway.calls.map(c => c.method)
++  results['rejected-action'].recovered = true
++})
++
++const summary = {
++  demo: 'server/core/config-queue.js contract',
++  covered: ['ordered updates', 'one rejected configuration action'],
++  total_patches: gateway.rev,
++  checks: results,
++  status: failures === 0 ? 'pass' : 'fail',
++}
++console.log('\n--- demo result ---')
++console.log(JSON.stringify(summary, null, 2))
++process.exit(failures === 0 ? 0 : 1)
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..cf559a4
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,98 @@
++# Contract demo — `server/core/config-queue.js`
++
++Task: `learn/18` · repository `wattclaw` · mode `contract`
++Request: *cover ordered updates and one rejected configuration action.*
++
++## 1. Contract under test
++
++`server/core/config-queue.js` exports `configQueueExecute(transformFn, label, method = 'config.patch')`,
++which is the single funnel for gateway config modifications (used by `server/handlers/channels.js`,
++`system.js` and `agent-team.js`).
++
++| # | Contract clause | Source | Behaviour |
++|---|-----------------|--------|-----------|
++| C1 | **Ordered updates** | `ConfigQueue.enqueue` L15–20, `ConfigQueue._process` L24–37 | `enqueue()` appends `{transformFn, label, method, resolve, reject}` to `this._queue` and calls `_process()`. A `_running` flag makes the first caller the only drainer; the `while` loop shifts one item and fully `await`s `_execute(item)` before the next shift. Jobs therefore run strictly FIFO and job *N+1*'s `config.get` observes the config committed by job *N*. |
++| C2 | **One rejected configuration action** | `ConfigQueue._execute` L60–99 | `_execute` runs `config.get` → `transformFn(sourceConfig)` → `config.patch{raw, baseHash}` → `config.get` → `config.apply`. A thrown error (or failed RPC) is caught at L84–97; only `config changed since last load` (optimistic concurrency) and `rate limit` errors are retried (max 2 retries, L87–93), everything else is returned as `{ok: false, error}`. `_process` then rejects **only that item's** promise and keeps draining, so the failure does not stall the queue and later jobs see the un-mutated config. |
++| C3 | **No mutation on rejection** | `_execute` L60–83 | The failure path is reached before the `config.patch` call at L72, so a rejected action leaves the gateway hash, revision and applied config untouched. A transform returning a falsy value short-circuits at L69 as `{ok: true, data: null}` (resolved `null`, not a rejection). |
++
++## 2. Executable demo
++
++`node .prale-eval/config-queue-contract.mjs` (exit code 0 = contract holds).
++
++The demo imports the **real** `server/core/config-queue.js`; a `node:module` `registerHooks` resolve
++hook redirects only its `./gateway-client.js` import to `.prale-eval/stub-gateway-client.mjs`, an
++in-memory fake of the admin-RPC surface (`config.get`, `config.patch`, `config.apply`) driven by
++`globalThis.__configQueueRpcHandler`. No network, database, env file or npm install is involved, and
++no repository source file is modified.
++
++Coverage:
++
++1. **`ordered-updates`** — two `configQueueExecute()` calls are issued back-to-back *without* awaiting,
++   so only the queue itself can serialize them. Assertions:
++   * observed transform order is `['A', 'B']` (FIFO);
++   * job B's transform sees `channels.alpha` written by job A and has not yet seen its own write;
++   * the recorded RPC sequence is exactly
++     `config.get, config.patch, config.get, config.apply, config.get, config.patch, config.get, config.apply`
++     — proving job B's `config.get` happens only after job A's `config.apply`;
++   * both jobs resolve `undefined` and the final config contains `alpha` **and** `beta` (`hash-2`).
++2. **`rejected-action`** — a transform throws `invalid configuration: mcp.servers.broken is not an object`.
++   Assertions:
++   * `assert.rejects` matches the original message (no silent retry, no swallowed error);
++   * the recorded RPC sequence for that job is only `['config.get']` — nothing was patched or applied;
++   * gateway revision and hash are unchanged (no mutation);
++   * a *subsequent* job enqueued after the rejection succeeds normally against the un-mutated config
++     (`['config.get','config.patch','config.get','config.apply']`), showing the queue recovered.
++
++Raw run captured in `.prale-eval/demo-output.txt`.
++
++## 3. Normalized operation result
++
++```json
++{
++  "demo": "server/core/config-queue.js contract",
++  "covered": ["ordered updates", "one rejected configuration action"],
++  "total_patches": 3,
++  "checks": {
++    "ordered-updates": {
++      "status": "pass",
++      "call_sequence": ["config.get","config.patch","config.get","config.apply",
++                        "config.get","config.patch","config.get","config.apply"],
++      "final_hash": "hash-2"
++    },
++    "rejected-action": {
++      "status": "pass",
++      "rejected_calls": ["config.get"],
++      "recovery_sequence": ["config.get","config.patch","config.get","config.apply"],
++      "recovered": true
++    }
++  },
++  "status": "pass"
++}
++```
++
++`total_patches: 3` also confirms the built-in throttle window (`_MAX_PATCHES = 3` per 60 s, L10–12,
++`_waitForSlot` L46–54) was not tripped: the third patch still has only two timestamps recorded, so no
++artificial wait was introduced into the demo.
++
++## 4. Evidence citations (independently checked)
++
++`node .prale-eval/verify-result.mjs` re-reads `.prale-eval/result.json` and asserts that each cited
++symbol literally occurs inside its inclusive line range of the real file:
++
++* `server/core/config-queue.js:15-20` — `ConfigQueue.enqueue`
++* `server/core/config-queue.js:24-37` — `ConfigQueue._process`
++* `server/core/config-queue.js:60-99` — `ConfigQueue._execute`
++
++It also asserts `task_id === 18`, `repository === "wattclaw"`, `mode === "contract"`, that every
++claim cites a declared evidence path, and that `validation.command/status/notes` are present.
++
++## 5. Limitations
++
++* `node_modules` is empty in this checkout, so the repository's `vitest` suites and
++  `npm run test:server` could not be executed and no dependency was installed; the demo uses only
++  Node builtins (`node:assert`, `node:module`).
++* `node --test` was not applicable to this module because `config-queue.js` resolves
++  `./gateway-client.js` at load time (which transitively reaches `server/database.js` and the
++  uninstalled `better-sqlite3`); the resolve hook isolates that single edge instead.
++* Optional validation dependency unavailable → recorded here and in `result.json.validation.notes`.
++* No task metadata, hidden-oracle file, package lock or git configuration was modified.
+diff --git a/.prale-eval/demo-output.txt b/.prale-eval/demo-output.txt
+new file mode 100644
+index 0000000..e388477
+--- /dev/null
++++ b/.prale-eval/demo-output.txt
+@@ -0,0 +1,43 @@
++PASS ordered-updates
++[ConfigQueue] reject-broken-mcp failed: invalid configuration: mcp.servers.broken is not an object
++PASS rejected-action
++
++--- demo result ---
++{
++  "demo": "server/core/config-queue.js contract",
++  "covered": [
++    "ordered updates",
++    "one rejected configuration action"
++  ],
++  "total_patches": 3,
++  "checks": {
++    "ordered-updates": {
++      "status": "pass",
++      "call_sequence": [
++        "config.get",
++        "config.patch",
++        "config.get",
++        "config.apply",
++        "config.get",
++        "config.patch",
++        "config.get",
++        "config.apply"
++      ],
++      "final_hash": "hash-2"
++    },
++    "rejected-action": {
++      "status": "pass",
++      "rejected_calls": [
++        "config.get"
++      ],
++      "recovery_sequence": [
++        "config.get",
++        "config.patch",
++        "config.get",
++        "config.apply"
++      ],
++      "recovered": true
++    }
++  },
++  "status": "pass"
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..ffbc981
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,48 @@
++{
++  "task_id": 18,
++  "repository": "wattclaw",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "ConfigQueue.enqueue",
++      "start_line": 15,
++      "end_line": 20,
++      "observation": "Public entry point for every configuration action: it pushes {transformFn, label, method, resolve, reject} onto this._queue and immediately calls this._process(), returning a promise that is settled later by the drain loop. Because the item is appended before any await, jobs are ordered by call order (FIFO); nothing inside enqueue() performs the RPC itself, so ordering is guaranteed by the single drain loop rather than by the caller."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "ConfigQueue._process",
++      "start_line": 24,
++      "end_line": 37,
++      "observation": "The serialization guarantee for ordered updates. A _running flag makes the first caller the only drainer; the while loop shifts items one at a time and awaits _execute(item) to completion before shifting the next item, so item N+1's config.get observes the config written by item N. Each result is routed to item.resolve(result.data) or item.reject(result.error), which is why a rejected action rejects only its own promise while the loop continues to the following jobs."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "ConfigQueue._execute",
++      "start_line": 60,
++      "end_line": 99,
++      "observation": "The per-job unit of work and the rejection path. It does config.get -> transformFn(sourceConfig) -> config.patch(method, {raw, baseHash}) -> config.get -> config.apply. A transform that returns a falsy value short-circuits at line 69 with {ok: true, data: null} (resolve(null)); a thrown error or failed RPC lands in the catch at lines 84-97, where only 'config changed since last load' (optimistic-concurrency) and 'rate limit' errors are retried at most twice, and every other error is logged and returned as {ok: false, error: err} with no side effect on the gateway config because the failure happened before config.patch."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "Enqueued configuration actions are executed one at a time in call order: the single drain loop in ConfigQueue._process shifts and fully awaits each job, so the second job's config.get runs only after the first job's config.apply, and each transform observes the previous job's committed config.",
++      "evidence_paths": ["server/core/config-queue.js"]
++    },
++    {
++      "claim": "A rejected configuration action is isolated: when transformFn throws, _execute's catch returns {ok: false, error} and _process rejects only that item's promise while continuing the drain loop, so later jobs still run against the un-mutated config.",
++      "evidence_paths": ["server/core/config-queue.js"]
++    },
++    {
++      "claim": "An action that fails before config.patch performs no mutation: the error is raised between config.get and the patch call, therefore the gateway hash, config revision and applied-config list are unchanged, and only retryable optimistic-concurrency/rate-limit errors are re-attempted.",
++      "evidence_paths": ["server/core/config-queue.js"]
++    }
++  ],
++  "conclusion": "The contract for server/core/config-queue.js is verified by an executable demo: two configQueueExecute() jobs enqueued back-to-back are serialized FIFO (observed RPC sequence config.get, config.patch, config.get, config.apply repeated per job, second job seeing the first job's write, final hash-2 with both channel updates present), and one rejected configuration action rejects with its original error while emitting only config.get (no patch, hash unchanged), after which the queue resumes normal operation for the next enqueued job.",
++  "validation": {
++    "command": "node .prale-eval/config-queue-contract.mjs && node .prale-eval/verify-result.mjs",
++    "status": "pass",
++    "notes": "config-queue-contract.mjs loaded the real server/core/config-queue.js via a node:module resolve hook that swaps only ./gateway-client.js for an in-memory fake of config.get/config.patch/config.apply; both demo checks passed (ordered-updates, rejected-action) and the process exited 0. verify-result.mjs re-read .prale-eval/result.json, confirmed task_id=18/repository=wattclaw/mode=contract, confirmed each cited symbol literally occurs inside its inclusive line range of server/core/config-queue.js, and confirmed every claim cites a declared evidence path. Repository test tooling was unavailable: node_modules is empty, so vitest/package scripts could not be used and node --test was not applicable to this module (it imports gateway-client.js at load time); the dependency light node builtin runner plus the module resolve hook was used instead. No source file, package lock, git config or hidden oracle file was modified."
++  }
++}
+diff --git a/.prale-eval/stub-gateway-client.mjs b/.prale-eval/stub-gateway-client.mjs
+new file mode 100644
+index 0000000..0795e53
+--- /dev/null
++++ b/.prale-eval/stub-gateway-client.mjs
+@@ -0,0 +1,9 @@
++// Test double for server/core/gateway-client.js (used only by the contract demo).
++// The real module is bypassed via a node:module resolve hook so that no network,
++// database or env access is required. The behaviour is driven by a handler that
++// the demo installs on globalThis before importing config-queue.js.
++export async function gatewayAdminRpc(method, params = {}, timeoutMs = 15_000) {
++  const handler = globalThis.__configQueueRpcHandler
++  if (typeof handler !== 'function') throw new Error('stub-gateway-client: no RPC handler installed')
++  return handler(method, params, timeoutMs)
++}
+diff --git a/.prale-eval/verify-result.mjs b/.prale-eval/verify-result.mjs
+new file mode 100644
+index 0000000..baffa68
+--- /dev/null
++++ b/.prale-eval/verify-result.mjs
+@@ -0,0 +1,67 @@
++// Focused validation for .prale-eval/result.json:
++//  - metadata matches the current TASK.md
++//  - every evidence entry names a real symbol that really lives inside the
++//    cited inclusive line range of a real repository file
++//  - every claim cites at least one declared evidence path
++//  - the required delivery keys are present
++import assert from 'node:assert/strict'
++import { readFileSync, existsSync } from 'node:fs'
++import path from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
++const result = JSON.parse(readFileSync(path.join(root, '.prale-eval', 'result.json'), 'utf8'))
++
++assert.equal(result.task_id, 18, 'task_id must be the number 18')
++assert.equal(result.repository, 'wattclaw', 'repository must be wattclaw')
++assert.equal(result.mode, 'contract', 'mode must be contract')
++for (const key of ['evidence', 'claims', 'conclusion', 'validation']) {
++  assert.ok(key in result, `result.json must contain ${key}`)
++}
++assert.ok(Array.isArray(result.evidence) && result.evidence.length > 0, 'evidence must be a non-empty list')
++assert.ok(Array.isArray(result.claims) && result.claims.length > 0, 'claims must be a non-empty list')
++
++const requiredPaths = ['server/core/config-queue.js']
++const declared = new Set()
++
++for (const ev of result.evidence) {
++  for (const key of ['path', 'symbol', 'start_line', 'end_line', 'observation']) {
++    assert.ok(key in ev, `evidence entry missing ${key}: ${JSON.stringify(ev)}`)
++  }
++  assert.ok(Number.isInteger(ev.start_line) && Number.isInteger(ev.end_line), `line range must be integers: ${ev.path}`)
++  assert.ok(ev.start_line >= 1 && ev.end_line >= ev.start_line, `invalid line range: ${ev.path}`)
++  const abs = path.join(root, ev.path)
++  assert.ok(existsSync(abs), `evidence path does not exist: ${ev.path}`)
++  const lines = readFileSync(abs, 'utf8').split('\n')
++  assert.ok(ev.end_line <= lines.length, `end_line ${ev.end_line} beyond EOF of ${ev.path}`)
++  const window = lines.slice(ev.start_line - 1, ev.end_line).join('\n')
++  // The symbol may be written as "Class.member"; the source text only contains "member".
++  const token = ev.symbol.split('.').pop()
++  assert.ok(window.includes(token), `symbol "${ev.symbol}" (token "${token}") not found in ${ev.path}:${ev.start_line}-${ev.end_line}`)
++  assert.ok(typeof ev.observation === 'string' && ev.observation.length >= 40, `observation too thin for ${ev.path}:${ev.symbol}`)
++  declared.add(ev.path)
++}
++
++for (const p of requiredPaths) {
++  assert.ok(declared.has(p), `required evidence path missing: ${p}`)
++}
++
++for (const claim of result.claims) {
++  assert.ok(typeof claim.claim === 'string' && claim.claim.length >= 20, `claim too thin: ${JSON.stringify(claim)}`)
++  assert.ok(Array.isArray(claim.evidence_paths) && claim.evidence_paths.length > 0, `claim missing evidence_paths: ${claim.claim}`)
++  for (const p of claim.evidence_paths) {
++    assert.ok(declared.has(p), `claim cites a path with no evidence entry: ${p}`)
++  }
++}
++for (const p of requiredPaths) {
++  assert.ok(result.claims.some(c => c.evidence_paths.includes(p)), `no claim cites required path ${p}`)
++}
++
++for (const key of ['command', 'status', 'notes']) {
++  assert.ok(key in result.validation, `validation missing ${key}`)
++}
++assert.ok(['pass', 'fail', 'skipped'].includes(result.validation.status), 'validation.status must be pass|fail|skipped')
++assert.ok(typeof result.conclusion === 'string' && result.conclusion.length >= 20, 'conclusion too thin')
++
++console.log(`OK: result.json valid — ${result.evidence.length} evidence entries, ${result.claims.length} claims, required paths cited`)
++for (const ev of result.evidence) console.log(`  - ${ev.path}:${ev.start_line}-${ev.end_line} ${ev.symbol}`)
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/config-queue-contract.mjs - 5df872896423a5753c8f13ffe66d1d4f5cfe662e2b6347613e2bbca9930bf497
+snapshot .prale-eval/contract-deliverable.md - 9f52bad4017644986f5459fd7c4c83fc04b9fd606bab06714d8a02dcec233895
+snapshot .prale-eval/demo-output.txt - d49f409b5973c43bb57748938894c094b6ecd599a92976a44e719736a9b36e9a
+snapshot .prale-eval/result.json - ca2a0b4df97f4df92cf6a6e0f072248e109347e926eb2d2163c32ebdc2850d53
+snapshot .prale-eval/stub-gateway-client.mjs - 17e231fe3a8719d5834147b586a3fa221925ee38851bf490bab550093c4b4eef
+snapshot .prale-eval/verify-result.mjs - 331c798c7080efcf09a542d16c4243b79b3b5b977d507fed93b4c4f7990819d6

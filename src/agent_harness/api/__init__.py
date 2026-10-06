@@ -16,6 +16,18 @@ from agent_harness.api.pagination import Page, decode_cursor, encode_cursor
 from agent_harness.api.project import ProjectInfo, ProjectRuntimeConfig
 from agent_harness.api.rpc import HarnessRpc
 from agent_harness.api.service import AuthenticatedHarnessService, AuthenticationError, StaticTokenAuthenticator
+from agent_harness.api.subagents import (
+    SubagentAdmission,
+    SubagentConfig,
+    SubagentDefinition,
+    SubagentError,
+    SubagentRecoveryReport,
+    SubagentRequest,
+    SubagentResult,
+    SubagentSnapshot,
+    SubagentStopResult,
+    SubagentWaitResult,
+)
 from agent_harness.api.tui import TuiController
 from agent_harness.domain.memory import MemoryScope
 
@@ -24,6 +36,16 @@ __all__ = [
     "AuthenticationError",
     "Harness",
     "HarnessRpc",
+    "SubagentAdmission",
+    "SubagentConfig",
+    "SubagentDefinition",
+    "SubagentError",
+    "SubagentRecoveryReport",
+    "SubagentRequest",
+    "SubagentResult",
+    "SubagentSnapshot",
+    "SubagentStopResult",
+    "SubagentWaitResult",
     "InvalidCursor",
     "MemoryNotFound",
     "MemoryScope",

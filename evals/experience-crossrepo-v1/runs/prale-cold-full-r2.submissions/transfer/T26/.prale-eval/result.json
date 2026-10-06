@@ -1,0 +1,75 @@
+{
+  "task_id": "T26",
+  "repository": "pi",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "parseArgs",
+      "start_line": 36,
+      "end_line": 71,
+      "observation": "Argument gate for the publisher. `--input` is always required, but `--bucket` and `--endpoint` are enforced only when `dryRun` is false (lines 67-69), so the `--dry-run` invocation needs no bucket, endpoint or AWS credentials and therefore performs no network work. The accepted flags (lines 51-61) contain nothing that could trigger remote I/O by itself."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "main",
+      "start_line": 263,
+      "end_line": 288,
+      "observation": "Local operation path that was exercised. `main` validates the bundle with `validateBundle` (fully local: reads models.json, models.all.json, providers.json and the provider shards, checks the chat projection, required providers and the 500-model floor), writes the normalized `publication.json` next to the fixture, prints it, and then returns at line 285-288 while `options.dryRun` is set - before `mkdtempSync` and before any `downloadIndex`/`uploadJson` call, so `aws` never runs. The returned JSON is the normalized operation result (schemaVersion, minimumPiVersion, sha256 revision, per-type counts, totalModelCount, modelTypes)."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "aws",
+      "start_line": 184,
+      "end_line": 198,
+      "observation": "The single network egress point of the script: it shells out to the AWS CLI (`spawnSync(\"aws\", ...)`) for S3 copy operations, used only by `downloadIndex` (line 200) and `uploadJson` (line 215), which are reachable only after the dry-run early return. The module imports only node:crypto, node:fs, node:os, node:path, node:child_process, node:util and the local ./model-catalog-protocol.ts (lines 3-23) - there is no `fetch`, no HTTP client and no SDK usage - so the dry-run path is offline-safe by construction."
+    },
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "build:offline",
+      "start_line": 60,
+      "end_line": 61,
+      "observation": "Declares the package's offline contract: `build:offline` = `npm run check:model-data && tsgo -p tsconfig.build.json && ... cp -r src/providers/data dist/providers/data`. It validates and copies already-materialized model data and never refreshes provider catalogs from the network. The contrast is `build` (line 60) which first runs `generate-models`, the step that performs live `fetch()` calls in packages/ai/scripts/generate-models.ts. In this fixture `packages/ai/src/providers/data/` is intentionally absent (it is gitignored) and the network is unavailable, so `build:offline`/`check:model-data` is the documented offline entry point but cannot complete here - which is why the publisher dry run is the narrowest valid local check."
+    },
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "generate-models",
+      "start_line": 56,
+      "end_line": 58,
+      "observation": "The three data-production scripts (`generate-models`, `hydrate-model-data`, `generate-model-catalog`) all route through scripts/generate-models.ts, which is the only model-data step that talks to the network (live `fetch` to NVIDIA, OpenRouter and the Vercel AI gateway endpoints). Because the fixture lacks both hydrated data and network access, these scripts are out of scope for the operated check; `check:model-data` (line 59) is the offline validator that reports the intentional gap instead."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "`scripts/publish-model-catalog.mjs --dry-run` validates and normalizes a fully materialized model-catalog bundle using only Node built-ins and exits before any S3/AWS call: `parseArgs` requires bucket/endpoint only when publishing, and `main` returns at the dry-run guard before `mkdtempSync`, `downloadIndex` and `uploadJson`. This makes the dry run the narrowest valid local check for this repository in an environment without network data.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs"
+      ]
+    },
+    {
+      "claim": "The publisher's only network egress is the `aws()` helper, which spawns the AWS CLI; it is unreachable on the dry-run path and the module imports no HTTP client or fetch implementation, so executing the dry run cannot perform network I/O.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs"
+      ]
+    },
+    {
+      "claim": "`packages/ai/package.json` separates network-refreshing model generation (`generate-models`, `hydrate-model-data`, which reach live provider APIs through scripts/generate-models.ts) from the offline validation/compile path (`check:model-data`, `build:offline`, which only validate and copy pre-existing `src/providers/data`). In this fixture that data directory is intentionally absent, so the offline ai-package checks cannot complete and the catalog publisher dry run is the narrowest check that can actually validate something meaningful offline.",
+      "evidence_paths": [
+        "packages/ai/package.json"
+      ]
+    },
+    {
+      "claim": "Operating the offline fixture succeeded and produced a normalized result: the dry run exited 0 and wrote publication.json with schemaVersion 1, minimumPiVersion 0.80.7, revision sha256-be07e8c3d434c1e871fd56089844fe59123234ab563dc445c1dc3d7d99a2a119, providerCount 3, modelCount/chatModelCount 501, imageModelCount 1, classifierModelCount 1, totalModelCount 503 and modelTypes [chat, image, classifier]; the repository's own focused test for the same path (`node --test scripts/publish-model-catalog.test.mjs`) also passed 1/1 without network access.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs",
+        "packages/ai/package.json"
+      ]
+    }
+  ],
+  "conclusion": "The fixture is an offline checkout that intentionally carries no network-derived model data: `packages/ai/src/providers/data/` (gitignored hydration output) is absent and the scripts that would produce it perform live `fetch` calls, so `packages/ai`'s `generate-models`/`hydrate-model-data` cannot run. The narrowest valid local check that still validates real behavior is the catalog publisher's `--dry-run` path, operated against a self-contained bundle materialized at `.prale-eval/fixture/model-catalog`. It exited 0 and emitted a deterministic normalized publication (revision sha256-be07e8c3..., 3 providers, 501 chat + 1 image + 1 classifier = 503 models). The check is offline-safe by construction: `parseArgs` does not require `--bucket`/`--endpoint` for a dry run, and `main` returns before `mkdtempSync`/`downloadIndex`/`uploadJson`, the only callers of the `aws()` helper that spawns the AWS CLI (which is not installed here); the module imports only Node built-ins plus the local protocol file and never fetches. No tracked repository file was modified; all new artifacts live under `.prale-eval/`.",
+  "validation": {
+    "command": "node scripts/publish-model-catalog.mjs --input .prale-eval/fixture/model-catalog --source-commit 669a8c6e8cdd6b8e8d0e6712b1ca1acee3def168 --dry-run",
+    "status": "passed",
+    "notes": "Exit code 0; stdout printed the normalized publication and ended with `Validated model catalog at .../.prale-eval/fixture/model-catalog; no objects uploaded.` The run wrote `.prale-eval/fixture/model-catalog/publication.json` (revision sha256-be07e8c3d434c1e871fd56089844fe59123234ab563dc445c1dc3d7d99a2a119, providerCount 3, modelCount/chatModelCount 501, imageModelCount 1, classifierModelCount 1, totalModelCount 503). Offline safety: (1) the dry run requires only `--input`; `--bucket`/`--endpoint` are enforced only when publishing (parseArgs lines 67-69); (2) `main` returns at the dry-run guard (lines 285-288) before `mkdtempSync`, `downloadIndex` and `uploadJson`, the only callers of `aws()` (lines 184-198) which spawns the AWS CLI - verified absent via `command -v aws`; (3) the file imports only node:crypto, node:fs, node:os, node:path, node:child_process, node:util and the local ./model-catalog-protocol.ts, with no fetch/HTTP/SDK usage; (4) the fixture bundle is generated deterministically from local JSON only. Secondary focused check: `node --test scripts/publish-model-catalog.test.mjs` -> 1 test, 1 pass, 0 fail (it builds its own synthetic bundle and also uses --dry-run). Limitations of this offline fixture: `packages/ai/src/providers/data/` is intentionally absent and gitignored, so `npm --prefix packages/ai run check:model-data` fails with ENOENT on amazon-bedrock.json and the network-fetching `generate-models`/`hydrate-model-data` steps were deliberately not run; consequently the root script `npm run check:model-catalog` (which reads .artifacts/model-catalog) cannot be exercised because that bundle cannot be produced without network data. TypeScript/vitest-based suites were not run because no node_modules are installed in the fixture; node:test built-ins covered the publisher and protocol paths."
+  }
+}

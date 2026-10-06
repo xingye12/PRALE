@@ -1,0 +1,155 @@
+{
+  "task_id": "T01",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.enqueue",
+      "start_line": 15,
+      "end_line": 24,
+      "observation": "The dedup-critical entry point. enqueue(key, job) looks up (or lazily creates on lines 17-20) ONE SerialQueue per asset key and appends the job to it, then fires it without awaiting (void q.add(job).catch(...)). Because every duplicate submission for the same asset key is routed to the same per-key FIFO, two submissions can never produce overlapping/duplicated execution of that asset's build; the rejection swallow on lines 21-23 keeps a failed duplicate from leaking an unhandled rejection."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue (class + private queues map)",
+      "start_line": 11,
+      "end_line": 13,
+      "observation": "The class holds exactly one `Map<string, SerialQueue>` (line 12). The dedup identity is therefore precisely the caller-supplied asset key (code_graph_id / wiki_id), and a missing key creates a fresh queue, so unrelated assets stay independent rather than being globally serialized."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.onIdle",
+      "start_line": 27,
+      "end_line": 33,
+      "observation": "onIdle(key?) waits for the named key's queue (line 29) or for all per-key queues (line 32) to drain. It gives callers/tests a deterministic boundary to observe that N duplicate submissions produced exactly one committed generation of effective work."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue.drain",
+      "start_line": 81,
+      "end_line": 101,
+      "observation": "The concurrency=1 engine behind BuildQueue. drain() returns immediately while a task is already running (line 82 guard on this.running/this.paused), shifts exactly one queued entry (line 84), and on settlement either starts the next entry (line 98) or resolves all idle waiters (lines 93-96). This is what guarantees that same-key duplicate jobs execute strictly sequentially — no overlapping effective work."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue.add",
+      "start_line": 45,
+      "end_line": 54,
+      "observation": "FIFO enqueue: pushes a {task, resolve, reject} entry and immediately calls drain(), returning a promise bound to the task result. Queued duplicates are retained in submission order, which the demo observes as order [0,1,2,3,4] with maxInFlight === 1."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.create",
+      "start_line": 132,
+      "end_line": 139,
+      "observation": "Idempotent create. enqueueBuild(row) is reached ONLY inside `if (!existed)` (lines 134-137), so a duplicate build submission of the same (service_id, team_id, repo_url, branch) returns the existing row with existed=true and enqueues zero additional work."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.sync",
+      "start_line": 153,
+      "end_line": 171,
+      "observation": "The 'busy' guard. While a build is pending/processing the method returns {kind:'busy'} (lines 157-159) WITHOUT mutating status, writing audit, or calling enqueueBuild, so duplicate/concurrent sync submissions are rejected instead of duplicated. Only a non-pending row is flipped to pending (lines 160-166) and enqueued exactly once (line 169)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.enqueueBuild",
+      "start_line": 269,
+      "end_line": 273,
+      "observation": "The single enqueue call site for code graphs: this.queue.enqueue(row.code_graph_id, ...) keys the BuildQueue by code_graph_id, so both the initial create build and every accepted sync share one serial queue per asset."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/wiki-service.ts",
+      "symbol": "WikiService.ingest",
+      "start_line": 272,
+      "end_line": 290,
+      "observation": "The wiki/source analogue of the same contract: not_found, then the pending/processing busy short-circuit (lines 276-278) rejects duplicate submissions without re-enqueueing or rewriting audit; otherwise the row is set to pending (lines 280-285) and enqueued once (line 288). WikiService.sync (line 293-295) delegates to ingest, so duplicate ingest/sync submissions cannot create duplicate effective builds."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/wiki-service.ts",
+      "symbol": "WikiService.enqueueBuild",
+      "start_line": 1010,
+      "end_line": 1012,
+      "observation": "Keys the shared BuildQueue by row.wiki_id, giving each wiki asset a single serial lane for its queued ingest/build."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/sqlite-store.ts",
+      "symbol": "SqliteKnowledgeStore.createCodeGraph",
+      "start_line": 69,
+      "end_line": 137,
+      "observation": "Origin of the `existed` flag that suppresses duplicate enqueue: a lookup on (service_id, team_id, repo_url, branch, deleted_at IS NULL) returns the existing row with existed=true (line 83), and even the unique-index race path re-reads and returns the winning row with existed=true (line 132). Duplicate submissions therefore converge on one row and one build."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/sqlite-store.ts",
+      "symbol": "SqliteKnowledgeStore.createWiki",
+      "start_line": 264,
+      "end_line": 329,
+      "observation": "The wiki counterpart: idempotency key (service_id, team_id, name, deleted_at IS NULL) — existing row returns existed=true (line 277), racing inserts likewise return the winner (line 324), so duplicate wiki creation does not allocate a second asset."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/index-db.ts",
+      "symbol": "upsertSource",
+      "start_line": 219,
+      "end_line": 242,
+      "observation": "Duplicate *source* submission idempotency: if the stored sha256 equals the incoming sha256 the function returns \"unchanged\" without writing (line 241). Re-uploading identical bytes therefore does not create a new source generation; only changed content (line 231) resets status to 'uploaded'."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/index-db.ts",
+      "symbol": "classifySources",
+      "start_line": 310,
+      "end_line": 323,
+      "observation": "Incremental gate that prevents duplicate *effective* work downstream: a file whose previous status is already 'ingested' AND whose sha256 is unchanged goes to `skipped` (line 321) rather than `toIngest` (line 320). Re-submitting the same source bytes therefore skips the expensive extraction/LLM work instead of repeating it."
+    },
+    {
+      "path": "MemoryKnowledge/src/module.ts",
+      "symbol": "sharedQueue (in createKnowledgeModule)",
+      "start_line": 205,
+      "end_line": 211,
+      "observation": "Composition root: a single shared BuildQueue instance (line 210) is injected into both WikiService and CodeGraphService, so wiki and code-graph lanes share the same per-key serialization guarantees across services."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "MemoryKnowledge serializes builds per asset key, so duplicate submissions sharing one key are queued on one FIFO lane and can never execute overlapping/duplicated effective work.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    },
+    {
+      "claim": "The code-graph submission path is idempotent end-to-end: a duplicate create returns existed=true and calls enqueueBuild zero times, and a duplicate sync while pending/processing returns 'busy' without enqueueing, so only one build job is created per accepted generation.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/sqlite-store.ts"
+      ]
+    },
+    {
+      "claim": "The wiki/source submission path applies the same contract: create is idempotent by (service_id, team_id, name), and ingest/sync returns 'busy' for pending/processing rows without re-enqueueing; the shared BuildQueue is keyed by wiki_id.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/wiki-service.ts",
+        "MemoryKnowledge/src/store/sqlite-store.ts",
+        "MemoryKnowledge/src/module.ts"
+      ]
+    },
+    {
+      "claim": "Duplicate source *content* submission is a content-addressed no-op: upsertSource returns 'unchanged' for an identical sha256, and classifySources routes already-ingested unchanged files to 'skipped', so duplicate uploads do not repeat extraction/LLM work.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/index-db.ts"
+      ]
+    },
+    {
+      "claim": "Executable proof: driving the real BuildQueue/SerialQueue sources with 9 duplicate submissions for one asset key yields exactly 2 effective runs (1 per accepted generation) with max same-key concurrency 1, while 3 distinct keys can run concurrently (max concurrency 3).",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    }
+  ],
+  "conclusion": "Confirmed. Duplicate source/build submission in MemoryKnowledge does not create duplicate effective work, because dedup is enforced at three independent layers that were each verified in source and (where dependency-free) exercised at runtime: (1) the submission guard — CodeGraphService.create enqueues only when existed===false, CodeGraphService.sync and WikiService.ingest return 'busy' for pending/processing rows, and the store returns existed=true for an existing idempotency key, so duplicate submissions collapse to at most one accepted generation; (2) the queue — BuildQueue keeps one SerialQueue per asset key and SerialQueue runs with concurrency=1, so even duplicate jobs that do reach the same key execute strictly sequentially with no overlap (demo: max same-key concurrency 1, FIFO preserved); (3) content addressing for sources — upsertSource returns 'unchanged' and classifySources skips already-ingested files with an unchanged sha256, so identical re-uploads do not re-run extraction. The executable demo against the real build-queue.ts/serial-queue.ts passed 10/10 checks. Limitation: layers (1) and (3) were verified statically (better-sqlite3/drizzle are not installed in this workspace), so their runtime behaviour is cited from source rather than executed here.",
+  "validation": {
+    "command": "node --import ./.prale-eval/ts-resolve-loader.mjs .prale-eval/verify-dedup.ts",
+    "status": "passed",
+    "notes": "No node_modules are installed in the workspace and installing dependencies is out of scope, so the demo runs the repository's real TypeScript sources via Node 24 native type stripping plus a 20-line dependency-free ESM resolver hook (.prale-eval/ts-resolve-loader.mjs) that maps the repo's `./x.js` specifiers to the on-disk `./x.ts`. Result: 10/10 checks passed, exit 0 — (a) 5 same-key duplicate jobs => maxConcurrent=1, FIFO [0,1,2,3,4]; (b) 3 distinct keys => maxConcurrent=3 (per-key, not global serialization); (c) duplicate create => existed=false,true,true and post-ready=true with exactly 1 effective run; (d) sync during pending/processing => 'busy', no re-enqueue; (e) 9 duplicate submissions total => exactly 2 effective runs (one per accepted generation); (f) SerialQueue.add resolves FIFO results and returns to idle. Citation integrity was separately checked programmatically: every (path, start_line, end_line) in `evidence` exists and its slice contains a token of the named symbol. Layers requiring better-sqlite3 (store idempotency and sha-based source dedup) could not be executed and are supported by static source citations only."
+  }
+}

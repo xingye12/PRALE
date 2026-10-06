@@ -1,0 +1,125 @@
+{
+  "task_id": 19,
+  "repository": "wattclaw",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "pruneWattClawProjectsForUser",
+      "start_line": 125,
+      "end_line": 205,
+      "observation": "Daily retention state machine. Lists projects, filters by owned agents when provided, then per project computes terminalStatus (success/failed/fail), terminalExpired (now - updatedAt >= FINAL_PROJECT_RETENTION_MS = 3 days), restoredExpired (status === 'archived' with restoredAt > 0 and now - restoredAt >= RESTORED_PROJECT_RETENTION_MS = 24h), and archivedNeedsUnload (archived with restoredAt === 0 and at least one agent still loaded). Only expired-terminal / expired-restored / still-loaded-archived projects are archived; everything else is pushed to skipped/kept. Archived projects whose agents are already unloaded are moved to archived without an RPC (archive is idempotent), otherwise it calls 'wattclaw.team.project.archive'. Returns { scanned, kept, archived, skipped, failed }."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "activateWattClawProjectRuntime",
+      "start_line": 207,
+      "end_line": 256,
+      "observation": "Activation/restore transition. Lists current gateway agents, computes project members missing from that list, and re-creates only those members via 'wattclaw.team.project.member.update' (passing through name/role/soul/skills/richSkills/models). Re-fetches agents.list if any member was restored, then throws if any project agent id is still absent ('WattClaw agents were not restored'). Returns { project, agents, restored }, where restored is true exactly when the incoming project status is 'archived' — this is the archived -> restored signal consumed by the server's markWattClawProjectRestored."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "ensureWattClawProjectRuntime",
+      "start_line": 308,
+      "end_line": 342,
+      "observation": "Idempotent ensure/loading transition for a non-archived project. If all desired agent ids are already present in agents.list it returns immediately; otherwise it applies the gateway config (config.get then config.apply, tolerating the expected 'Connection closed' / 'WebSocket not connected' post-apply disconnect), waits pollIntervalMs, then polls agents.list until the deadline (DEFAULT_TIMEOUT_MS 30s, DEFAULT_POLL_INTERVAL_MS 300ms). Throws 'WattClaw agents were not loaded' with the still-missing ids if the timeout elapses. This is the ensure_loaded guard invoked from server/index.js project start."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "nextWattClawRetentionRunAt",
+      "start_line": 84,
+      "end_line": 94,
+      "observation": "Schedules the retention sweep at 18:00 Asia/Shanghai (UTC+8) each day: computes 18:00 Shanghai as a UTC instant and rolls forward 24h when that instant is <= now. This is the cron-equivalent trigger for the state machine in pruneWattClawProjectsForUser."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "trackWattClawProjectOwnership",
+      "start_line": 344,
+      "end_line": 374,
+      "observation": "Post-transition ownership registration. For each project member it calls trackAgent(userId, agentId, name, {workspace, description}) and trackSession(userId, 'agent:<id>:main', agentId, project.name, 'main'), returning { agentIds, sessionKeys }. This runs whenever a project is created/started/activated/updated so multi-user isolation keeps the project's agents and sessions owned by the acting user."
+    },
+    {
+      "path": "server/services/wattclaw-project-events.js",
+      "symbol": "publishFile",
+      "start_line": 67,
+      "end_line": 115,
+      "observation": "File-to-event translation that drives the observed project lifecycle. Reads the watched file (readJsonFile treats ENOENT as missing), skips unchanged content unless force=true, bumps entry.revision. For config.json it publishes 'wattclaw.team.project.deleted' when the file is missing and 'wattclaw.team.project.updated' with { project: value } otherwise. For task-list.json it publishes 'wattclaw.team.tasks.updated' with tasks ([] when missing) and throws if a present task-list is not an array. This is the source of the realtime lifecycle events the frontend store consumes."
+    },
+    {
+      "path": "server/services/wattclaw-project-events.js",
+      "symbol": "createWattClawProjectEventService",
+      "start_line": 55,
+      "end_line": 192,
+      "observation": "Realtime watcher service factory. subscribe(clientId, projectId, tenantId, projectDir) unsubscribes any prior subscription, keys watchers by '<tenant|single>:<projectId>', creates an fs.watch (persistent:false) over the project directory, registers the client, and force-publishes both config.json and task-list.json immediately. Watcher callbacks debounce per-file (default 80ms) via scheduleFile and only react to basename matches in WATCHED_FILES ({config.json, task-list.json}). unsubscribe removes the client and closes the watcher when it was the last one; stop() closes all; getActiveProjectCount exposes the live watcher count."
+    },
+    {
+      "path": "server/services/wattclaw-project-events.js",
+      "symbol": "resolveWattClawProjectDirectory",
+      "start_line": 21,
+      "end_line": 34,
+      "observation": "Resolves the on-disk project directory that the event service watches, validating projectId (and tenantId when present) as safe path segments, then probing container/host data roots, GATEWAY_CONFIG_DIR, /home/wattman/.openclaw and $HOME/.openclaw with the '.wattclaw-team/projects/<id>' suffix, returning the first existing candidate or null. Subscription fails with 503 when this returns null, so it gates whether lifecycle events can be observed at all."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "A project has terminal statuses success/failed/fail that are retained for 3 days (FINAL_PROJECT_RETENTION_MS) and then archived by the daily retention sweep, while non-terminal statuses (pending, in_progress) and fresh terminal projects are skipped/kept; 'fail' is treated identically to 'failed'.",
+      "evidence_paths": ["server/services/wattclaw-project-runtime.js"]
+    },
+    {
+      "claim": "An archived project re-enters retention decision-making through access state: once restored (restoredAt > 0) it is re-archived after 24h (RESTORED_PROJECT_RETENTION_MS); if it was never restored (restoredAt === 0) it is archived only while its agents are still loaded on the gateway, and is treated as already-kept when its agents are gone.",
+      "evidence_paths": ["server/services/wattclaw-project-runtime.js"]
+    },
+    {
+      "claim": "Activation is the archived -> restored transition: activateWattClawProjectRuntime re-creates only the project members missing from agents.list via wattclaw.team.project.member.update, re-lists agents, throws if any project agent is still missing, and returns restored === (status === 'archived').",
+      "evidence_paths": ["server/services/wattclaw-project-runtime.js"]
+    },
+    {
+      "claim": "Scheduling is deterministic wall-clock based: nextWattClawRetentionRunAt targets 18:00 Asia/Shanghai every day, rolling to the next day when the candidate instant is not strictly after now.",
+      "evidence_paths": ["server/services/wattclaw-project-runtime.js"]
+    },
+    {
+      "claim": "Every project mutation fans out to per-user ownership tracking: trackWattClawProjectOwnership registers each member agent and its 'agent:<id>:main' session for the acting user, which is what keeps retention and visibility scoped to the correct owner.",
+      "evidence_paths": ["server/services/wattclaw-project-runtime.js"]
+    },
+    {
+      "claim": "Project lifecycle is emitted from disk-file changes: config.json transitions produce wattclaw.team.project.updated (present) or wattclaw.team.project.deleted (missing), and task-list.json produces wattclaw.team.tasks.updated with tasks [] when missing, so the frontend state mirrors the project file rather than an in-memory model.",
+      "evidence_paths": ["server/services/wattclaw-project-events.js"]
+    },
+    {
+      "claim": "Realtime observation is subscription-scoped and idempotent: subscribing force-publishes both watched files to the new client immediately, watcher callbacks are debounced per file and filtered to config.json/task-list.json, and the watcher is closed as soon as the last client unsubscribes (getActiveProjectCount returns 0), so no events are emitted after the last unsubscribe.",
+      "evidence_paths": ["server/services/wattclaw-project-events.js"]
+    },
+    {
+      "claim": "Event observation is gated on directory resolution: resolveWattClawProjectDirectory validates path segments and probes a fixed candidate list, returning null when the project directory does not exist, which the server maps to a 503 and therefore no lifecycle stream.",
+      "evidence_paths": ["server/services/wattclaw-project-events.js"]
+    },
+    {
+      "claim": "The runtime and events services compose into one lifecycle: the runtime decides and performs project state changes (retain/archive/restore/load), and the events service is what surfaces the resulting project file state to clients, so a runtime archive is observable as a config.json-driven 'archived' project.updated.",
+      "evidence_paths": ["server/services/wattclaw-project-runtime.js", "server/services/wattclaw-project-events.js"]
+    }
+  ],
+  "lifecycle_table": [
+    { "state": "pending", "kind": "non-terminal", "retention_action": "kept (skipped)", "trigger": "daily sweep at 18:00 Asia/Shanghai", "guard": "not terminal and not archived", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205)" },
+    { "state": "in_progress", "kind": "non-terminal", "retention_action": "kept (skipped)", "trigger": "daily sweep", "guard": "status not in {success, failed, fail}", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205)" },
+    { "state": "success", "kind": "terminal", "retention_action": "archived after 3 days", "trigger": "daily sweep", "guard": "now - max(updatedAt, createdAt) >= 3*24h; calls wattclaw.team.project.archive", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205); FINAL_PROJECT_RETENTION_MS (80)" },
+    { "state": "failed / fail", "kind": "terminal", "retention_action": "archived after 3 days", "trigger": "daily sweep", "guard": "'fail' normalized to same terminal branch as 'failed'; archive RPC on success, failure recorded in result.failed", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205)" },
+    { "state": "success (fresh)", "kind": "terminal", "retention_action": "kept (skipped)", "trigger": "daily sweep", "guard": "now - updatedAt < 3 days", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205)" },
+    { "state": "archived (restored)", "kind": "archived", "retention_action": "re-archived after 24h", "trigger": "daily sweep + access state restoredAt > 0", "guard": "now - restoredAt >= 24h (RESTORED_PROJECT_RETENTION_MS); calls archive RPC", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205)" },
+    { "state": "archived (restored, fresh)", "kind": "archived", "retention_action": "kept (skipped)", "trigger": "daily sweep", "guard": "restoredAt > 0 but now - restoredAt < 24h", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205)" },
+    { "state": "archived (cold, agents loaded)", "kind": "archived", "retention_action": "archived now (unload agents)", "trigger": "daily sweep", "guard": "restoredAt === 0 and at least one project agent still in agents.list", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205)" },
+    { "state": "archived (cold, agents gone)", "kind": "archived", "retention_action": "kept (no RPC)", "trigger": "daily sweep", "guard": "restoredAt === 0 and no project agent loaded; treated as already unloaded", "evidence": "wattclaw-project-runtime.js:pruneWattClawProjectsForUser (125-205)" },
+    { "state": "archived -> restored", "kind": "restore transition", "retention_action": "n/a", "trigger": "project activate / start", "guard": "activateWattClawProjectRuntime re-creates only missing members via member.update, re-lists, throws if any agent still missing", "evidence": "wattclaw-project-runtime.js:activateWattClawProjectRuntime (207-256)" },
+    { "state": "any -> loaded (ensure)", "kind": "load transition", "retention_action": "n/a", "trigger": "project start when runtime agents not yet loaded", "guard": "if missing agents: config.get + config.apply then poll agents.list until 30s deadline (300ms interval)", "evidence": "wattclaw-project-runtime.js:ensureWattClawProjectRuntime (308-342)" },
+    { "state": "file written -> project.updated", "kind": "event", "retention_action": "n/a", "trigger": "config.json created/modified", "guard": "basename matches WATCHED_FILES; debounced 80ms; skipped if raw content unchanged unless force", "evidence": "wattclaw-project-events.js:publishFile (67-115)" },
+    { "state": "file removed -> project.deleted", "kind": "event", "retention_action": "n/a", "trigger": "config.json deleted/absent", "guard": "readJsonFile returns missing on ENOENT", "evidence": "wattclaw-project-events.js:publishFile (67-115)" },
+    { "state": "task-list written -> tasks.updated", "kind": "event", "retention_action": "n/a", "trigger": "task-list.json created/modified/removed", "guard": "present value must be an array else logged error and no publish; missing publishes tasks: []", "evidence": "wattclaw-project-events.js:publishFile (67-115)" },
+    { "state": "subscribe -> immediate snapshot", "kind": "event", "retention_action": "n/a", "trigger": "client subscribes to a project", "guard": "force-publishes both config.json and task-list.json to that client only", "evidence": "wattclaw-project-events.js:createWattClawProjectEventService.subscribe (166-175)" },
+    { "state": "last unsubscribe -> watcher closed", "kind": "event", "retention_action": "n/a", "trigger": "client unsubscribes / SSE disconnect", "guard": "closes watcher when entry.clients.size === 0; getActiveProjectCount returns 0; no further events", "evidence": "wattclaw-project-events.js:unsubscribe (156-164)" }
+  ],
+  "conclusion": "WattClaw project lifecycle in these two modules is a file-backed, day-driven state machine. wattclaw-project-runtime.js owns state decisions and transitions: it schedules a daily 18:00 Asia/Shanghai sweep (nextWattClawRetentionRunAt), and pruneWattClawProjectsForUser partitions owned projects into kept/skipped versus archived using three orthogonal expiry rules — terminal success/failed/fail older than 3 days, restored archived projects older than 24h, and cold archived projects whose agents are still loaded. Activation (activateWattClawProjectRuntime) is the archived -> restored edge, re-creating only missing members and reporting restored=true, while ensureWattClawProjectRuntime is the load edge that applies gateway config and polls until all agents are present or a 30s deadline passes; trackWattClawProjectOwnership fans every transition out into per-user agent/session ownership for multi-user isolation. wattclaw-project-events.js is the observation half: it resolves and watches each project's config.json and task-list.json, force-publishes both on subscribe, then translates file writes into wattclaw.team.project.updated, wattclaw.team.project.deleted and wattclaw.team.tasks.updated events (debounced 80ms, per-client subscriptions, watcher closed on last unsubscribe/orphan). Together, runtime decides and applies project state, and events surfaces the resulting project-file state to clients, so an archive performed by retention becomes a config.json-driven 'archived' project.updated on the wire. The lifecycle_table above enumerates the states and transitions; all 16 focused runtime checks passed.",
+  "validation": {
+    "command": "node .prale-eval/validate.mjs",
+    "status": "passed",
+    "notes": "The repository has no test framework installed (node_modules/.bin/vitest absent) and dependency installation is out of scope, so the supplied vitest suites (wattclaw-project-runtime.test.js, wattclaw-project-events.test.js) could not be executed as-is. Instead a dependency-free ESM harness exercised the real modules directly: retention scheduling (18:00 Asia/Shanghai) and the full prune state machine (terminal 3-day expiry for success/failed/fail, 24h restored-archive expiry, cold-archived keep/archive split, ownership filtering), activation restore semantics, and the file-driven event service (subscribe force-publish, project.updated on config change, project.deleted on config removal, watcher close on unsubscribe, directory resolution) using a temporary directory under .prale-eval that is removed afterward. Result: 16/16 checks passed. `node --check` also passed for both source files. The harness file was removed after the run."
+  }
+}

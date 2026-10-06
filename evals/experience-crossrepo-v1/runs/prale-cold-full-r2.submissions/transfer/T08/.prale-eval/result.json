@@ -1,0 +1,123 @@
+{
+  "task_id": "T08",
+  "repository": "wattclaw",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "package.json",
+      "symbol": "scripts",
+      "start_line": 7,
+      "end_line": 21,
+      "observation": "The `scripts` block is the repository's declared verification surface. `test:server` (line 13) is vitest-based ('vitest run server/core/session-sync.test.js ... server/user-manager.test.js') with a trailing `node --test --test-force-exit server/services/external-session-projection.test.js`, while `dev:server` (line 9) and `start` (line 16) boot the real service via `node --env-file=.env server/index.js`. Every declared check therefore depends on node_modules and/or a populated .env; the T08 verification deliberately uses neither and instead runs a stdlib-only harness that imports the pure fixture modules directly."
+    },
+    {
+      "path": "package.json",
+      "symbol": "devDependencies",
+      "start_line": 62,
+      "end_line": 79,
+      "observation": "The dev toolchain that the repository's own test entry point needs is declared here: `vitest` (line 77), plus `@vitest/coverage-v8`, `happy-dom`, `@vue/test-utils`, `typescript`, `vue-tsc`, `vite` and `playwright`. These are declared but not installed in this offline workspace (no node_modules), which is exactly why the chosen verification cannot use `npm run test:server` and must be runnable by bare Node built-ins."
+    },
+    {
+      "path": "server/index.js",
+      "symbol": "loadEnvConfig",
+      "start_line": 161,
+      "end_line": 166,
+      "observation": "`loadEnvConfig()` (defined at line 161, invoked at line 343 as `const envConfig = loadEnvConfig()`) is the deployment/environment boundary of the server: it seeds a `defaults` object and then reads `../.env` through `existsSync`/`readFileSync`/`parse` and merges `process.env` per key (`PORT: process.env.PORT || fileConfig.PORT || defaults.PORT`, line 260). Importing or starting the server therefore requires environment/deployment configuration; the verified pure modules are loaded without it."
+    },
+    {
+      "path": "server/index.js",
+      "symbol": "createFileRoutes",
+      "start_line": 1040,
+      "end_line": 1042,
+      "observation": "`createFileRoutes(app)` (line 1041), imported from './handlers/files.js' at line 119 and grouped with the other `create*Routes(app)` registrations (lines 1030-1054), is the only wiring that exposes the generated-file download endpoint. This shows the frontend path fixture is served exclusively by the Express app assembled in this file — a component that cannot be exercised offline because the whole assembler pulls in express, cors, ws, better-sqlite3, node-pty and the OpenClaw gateway."
+    },
+    {
+      "path": "server/index.js",
+      "symbol": "server.listen",
+      "start_line": 2240,
+      "end_line": 2250,
+      "observation": "`server.listen(envConfig.PORT, () => {...})` (line 2240) is the runtime/bootstrap boundary: inside the callback the process binds a TCP port and starts `scheduleWattClawRetention()`, `startModelHealthMonitor(envConfig)`, `deduplicateSharedSessions()`, `syncAgentWorkspacesFromGateway()`, `initMessageStore()` and the session-title/external-projection repairs, and the file even schedules a forced `process.exit(0)`. Any verification that went through this path would need a database, gateway sockets and deployment env vars, so T08 stays strictly below it."
+    },
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 14,
+      "observation": "`resolveGeneratedFileCandidatePath(workspaceReal, requestedPath)` (lines 1-14) is the pure server-side core of the fixture: it trims trailing slashes from the workspace, normalizes backslashes to '/', returns `{candidatePath, pathMode: 'workspace-absolute'}` when the request already sits inside the workspace, and otherwise joins `${normalizedWorkspace}/${requested.replace(/^\\/+/, '')}` with pathMode `workspace-root-relative` for a leading '/' or `workspace-relative` otherwise. It has no imports and no I/O, so it is importable and executable by bare Node — the property T08 exploits."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "createFileRoutes",
+      "start_line": 72,
+      "end_line": 119,
+      "observation": "`createFileRoutes(app)` (line 72) registers `GET /api/chat/generated-file` behind `authMiddleware`; it validates `sessionKey`/agentId/`path` (lines 73-90), looks up the agent workspace, then at line 112 calls `resolveGeneratedFileCandidatePath(workspaceReal, requestedPath)` and logs the resulting `candidatePath`/`pathMode` before running `gatewayExec` realpath/stat/base64 checks and enforcing workspace containment and a 100 MB limit. It shows the fixture's exact input contract (a `path` query value normalized with `.replace(/\\\\/g, '/')`) and that the surrounding I/O work is separated from the pure resolution step."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 110,
+      "end_line": 119,
+      "observation": "The call site at line 112 is where the verified pure function is used: `const { candidatePath, pathMode } = resolveGeneratedFileCandidatePath(workspaceReal, requestedPath)`. It is preceded by `gatewayExec('realpath -e -- ...')` for the workspace, which is precisely the deployment-dependent step T08 avoids — the harness supplies the already-real workspace path (`/home/wattman/.wattclaw/user/agent`) as a plain string fixture instead of shelling out."
+    },
+    {
+      "path": "src/utils/generated-attachments.ts",
+      "symbol": "extractGeneratedAttachments",
+      "start_line": 93,
+      "end_line": 214,
+      "observation": "`extractGeneratedAttachments(content)` (line 93) is the frontend half of the fixture: a pure text parser that pulls attachment paths out of `MEDIA:` lines, delivery-cue lines and markdown tables/links, rejects non-file schemes and `..` traversal in `normalizeAttachmentPath` (lines 56-71), dedupes equivalent workspace paths (lines 79-91), and returns `{attachments, content}` with the consumed lines stripped. It imports nothing (only the erased `import type`/interface declarations), so Node 24's type stripping can load it with zero dependencies — no Vue, no Vite, no build."
+    },
+    {
+      "path": "src/views/workspace/components/GeneratedAttachment.vue",
+      "symbol": "download",
+      "start_line": 22,
+      "end_line": 44,
+      "observation": "`download()` (line 22) closes the contract loop: it builds `new URLSearchParams({sessionKey, path: props.attachment.path, traceId})` (line 29) and fetches `apiPath('/api/chat/generated-file?...')` (line 40), i.e. the frontend value produced by `extractGeneratedAttachments` is byte-for-byte the `path` that the server resolves through `resolveGeneratedFileCandidatePath`. This confirms the shared fixture used by the offline harness mirrors the real request shape while bypassing browser, auth token, fetch and gateway I/O."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "WattClaw's generated-deliverable handling is one narrow frontend/server contract with a pure middle: `extractGeneratedAttachments` (frontend) yields the attachment path that `GeneratedAttachment.vue#download` passes as the `path` query parameter, and `resolveGeneratedFileCandidatePath` (server, called from `createFileRoutes`) resolves that same path to a workspace-anchored candidate plus one of the three pathModes. Because both ends are pure string transforms, the contract can be verified end-to-end with only Node's stdlib, and the assertion for every fixture case is exact equality of parsed attachments and resolved `{candidatePath, pathMode}`.",
+      "evidence_paths": [
+        "src/utils/generated-attachments.ts",
+        "src/views/workspace/components/GeneratedAttachment.vue",
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js"
+      ]
+    },
+    {
+      "claim": "package.json proves the repository's own verification paths are dependency- or environment-bound: `test:server` requires the uninstalled `vitest` devDependency, and `dev:server`/`start` require `node --env-file=.env` plus the express/better-sqlite3 runtime. T08 therefore selects the narrowest check that survives with no installs — `node .prale-eval/verify-generated-deliverable.mjs` — which passed (exit 0) while `node --test server/utils/generated-file-path.test.js` and `npm run test:server` cannot even resolve `vitest` in this offline workspace.",
+      "evidence_paths": [
+        "package.json"
+      ]
+    },
+    {
+      "claim": "server/index.js is a deployment-bound application assembler, so it is the wrong granularity for an offline check: `loadEnvConfig()` merges process.env with the on-disk `.env` and feeds `envConfig.PORT`/gateway URLs, `createFileRoutes(app)` only mounts the endpoint inside the Express app, and `server.listen(envConfig.PORT, ...)` binds a port while starting SQLite message-store init, gateway workspace sync, cron/retention and model-health monitors (even arming a forced `process.exit(0)`). Importing it already fails offline with `ERR_MODULE_NOT_FOUND: Cannot find package 'express'`, which is why the verified modules are imported directly instead of through this entry point.",
+      "evidence_paths": [
+        "server/index.js",
+        "package.json"
+      ]
+    },
+    {
+      "claim": "The verification is offline-safe by construction because the two cited modules contain zero runtime imports: `server/utils/generated-file-path.js` imports nothing at all, and `src/utils/generated-attachments.ts` has only type-level declarations erased by Node's built-in type stripping. The harness asserts this invariant programmatically (it counts runtime `import` statements in both sources and reports `runtimeDependencies: {frontend: 0, server: 0}`), and the only I/O it performs is reading those two local files for that check — no network, no database, no port, no container, no npm install.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "src/utils/generated-attachments.ts",
+        "package.json"
+      ]
+    },
+    {
+      "claim": "The fixtures also pin the safety-relevant rejection behaviour: `normalizeAttachmentPath` drops `http(s)/data/mailto/javascript` targets, `..` traversal and extension-less paths, so the `rejected-unsafe-links` fixture yields zero attachments and nothing is ever sent to `/api/chat/generated-file`; on the server side `createFileRoutes` additionally re-checks workspace containment after `realpath`, and the pure resolver never escapes the workspace root. The offline harness covers all three resolver pathModes (workspace-absolute, workspace-relative, workspace-root-relative) plus the rejected case.",
+      "evidence_paths": [
+        "src/utils/generated-attachments.ts",
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js"
+      ]
+    }
+  ],
+  "conclusion": "Chosen verification: a single stdlib-only Node harness, `node .prale-eval/verify-generated-deliverable.mjs`, that drives four shared fixtures through the pure frontend parser `extractGeneratedAttachments` (src/utils/generated-attachments.ts) and the pure server resolver `resolveGeneratedFileCandidatePath` (server/utils/generated-file-path.js, used by server/handlers/files.js#createFileRoutes) and asserts exact attachment lists, cleaned content, candidate paths and pathMode values. It passed (exit 0, status pass, runtimeDependencies 0/0). It is the narrowest meaningful slice of the generated-file download feature that still crosses the frontend/server boundary, and it avoids runtime and deployment dependencies because it never imports server/index.js (whose loadEnvConfig/.env merge and server.listen bootstrap need express, better-sqlite3, a gateway and env vars — its import fails offline with ERR_MODULE_NOT_FOUND: express) and never executes the handler's gatewayExec/realpath/stat, HTTP, auth-token, database or Docker paths; both verified modules are pure string transforms with zero runtime imports, so the check needs no node_modules, no build step, no network and no services. The repository's own focused variant, server/utils/generated-file-path.test.js via the `test:server` npm script, was additionally attempted and could not run because the optional `vitest` dependency is not installed; that limitation is recorded in the deliverable and in validation.notes rather than worked around by installing packages.",
+  "validation": {
+    "command": "node .prale-eval/verify-generated-deliverable.mjs",
+    "status": "pass",
+    "notes": "Executed from the repository root; exit code 0. The harness reported status=pass with 4/4 fixtures green: media-absolute -> /home/wattman/.wattclaw/user/agent/downloads/report.pdf (workspace-absolute), table-relative -> /home/wattman/.wattclaw/user/agent/outputs/报告.xlsx (workspace-relative), cue-root-relative -> /home/wattman/.wattclaw/user/agent/downloads/东北旅游攻略.html (workspace-root-relative), rejected-unsafe-links -> [] (https link and ../.env traversal rejected before any server call); it also asserted runtimeDependencies={frontend:0,server:0} by scanning both module sources for runtime imports. Only Node 24 built-ins (node:assert/strict, node:fs, node:url) and the built-in TypeScript type stripping were used. LIMITATION (optional validation dependency unavailable): the repository's own focused check for this fixture, `server/utils/generated-file-path.test.js` run via the `test:server` npm script (package.json line 13), could NOT be executed because node_modules is absent and dependencies must not be installed: `node --test server/utils/generated-file-path.test.js` fails with ERR_MODULE_NOT_FOUND: Cannot find package 'vitest', and `import('./server/index.js')` fails with ERR_MODULE_NOT_FOUND: Cannot find package 'express'. For the same reason the Vite/vue-tsc build, Playwright and docker-compose deployment paths were not run. No packages were installed, no network or service access was used, and no task metadata, hidden-oracle file, package lock or git configuration was modified (git status shows only the new untracked .prale-eval/ directory)."
+  }
+}

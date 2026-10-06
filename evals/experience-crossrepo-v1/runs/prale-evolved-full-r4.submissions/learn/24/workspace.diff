@@ -1,0 +1,1316 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/.harness/session-sync.mjs b/.prale-eval/.harness/session-sync.mjs
+new file mode 100644
+index 0000000..a335f57
+--- /dev/null
++++ b/.prale-eval/.harness/session-sync.mjs
+@@ -0,0 +1,221 @@
++import {
++  getAllGatewayAgentIds,
++  getUserOwnedAgentIds,
++  upsertSyncedUserSession,
++} from './user-manager-stub.mjs'
++
++export const DEFAULT_SESSION_SYNC_OPTIONS = Object.freeze({
++  perAgentLimit: 50,
++  cooldownMs: 60_000,
++  overallTimeoutMs: 8_000,
++  gatewayConcurrency: 2,
++})
++
++const inFlightByUserId = new Map()
++const lastSyncAtByUserId = new Map()
++
++function asRecord(value) {
++  return value && typeof value === 'object' && !Array.isArray(value) ? value : null
++}
++
++function extractSessions(payload) {
++  if (Array.isArray(payload)) return payload
++  const row = asRecord(payload)
++  if (!row) return []
++  if (Array.isArray(row.sessions)) return row.sessions
++  if (Array.isArray(row.items)) return row.items
++  if (Array.isArray(row.list)) return row.list
++  if (Array.isArray(row.data)) return row.data
++  const data = asRecord(row.data)
++  if (Array.isArray(data?.sessions)) return data.sessions
++  if (Array.isArray(data?.items)) return data.items
++  return []
++}
++
++function readString(...values) {
++  for (const value of values) {
++    if (typeof value === 'string' && value.trim()) return value.trim()
++  }
++  return ''
++}
++
++function readExplicitMessageActivity(row) {
++  return row.lastMessageAt
++    ?? row.last_message_at
++    ?? row.lastActivity
++    ?? row.last_activity
++    ?? row.updatedAt
++    ?? row.updated_at
++    ?? row.updated
++    ?? row.createdAt
++    ?? row.created_at
++    ?? null
++}
++
++export function extractAgentIdFromSessionKey(sessionKey) {
++  return sessionKey.match(/^agent:([^:]+):/)?.[1] || ''
++}
++
++export function normalizeGatewaySessionForSync(value, fallbackAgentId = '') {
++  const row = asRecord(value)
++  if (!row) return null
++
++  const sessionKey = readString(row.key, row.sessionKey, row.session_key, row.id)
++  if (!sessionKey) return null
++
++  const agentId = readString(row.agentId, row.agent_id, row.agent, extractAgentIdFromSessionKey(sessionKey), fallbackAgentId)
++  if (!agentId) return null
++
++  return {
++    sessionKey,
++    agentId,
++    channel: readString(row.channel, row.channelKey, row.channel_key),
++    peer: readString(row.peer, row.peerId, row.peer_id, row.userId, row.user_id),
++    label: readString(row.displayTitle, row.display_title, row.label, row.title, row.name),
++    lastActivity: readExplicitMessageActivity(row),
++  }
++}
++
++export async function mapWithConcurrency(items, limit, mapper) {
++  const results = []
++  let nextIndex = 0
++  const workerCount = Math.min(Math.max(1, limit), items.length)
++
++  async function worker() {
++    while (nextIndex < items.length) {
++      const index = nextIndex
++      nextIndex += 1
++      results[index] = await mapper(items[index], index)
++    }
++  }
++
++  await Promise.all(Array.from({ length: workerCount }, () => worker()))
++  return results
++}
++
++function withTimeout(promise, timeoutMs) {
++  let timer
++  const timeout = new Promise((_, reject) => {
++    timer = setTimeout(() => reject(new Error(`session sync timeout after ${timeoutMs}ms`)), timeoutMs)
++  })
++  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
++}
++
++function getAgentIdsForUser(userId, role) {
++  const ids = role === 'admin' ? getAllGatewayAgentIds() : getUserOwnedAgentIds(userId)
++  return [...new Set(ids.filter(id => typeof id === 'string' && id.trim()).map(id => id.trim()))]
++}
++
++async function listGatewaySessionsForAgent({ agentId, gatewayRpc, perAgentLimit }) {
++  const result = await gatewayRpc('sessions.list', { agentId, limit: perAgentLimit })
++  if (!result?.ok) {
++    const message = result?.error?.message || result?.error || `sessions.list failed for ${agentId}`
++    throw new Error(message)
++  }
++  return extractSessions(result.payload)
++}
++
++export async function syncUserSessionsFromGateway({
++  userId,
++  role,
++  gatewayRpc,
++  recentlyDeletedSessionKeys = new Set(),
++  perAgentLimit = DEFAULT_SESSION_SYNC_OPTIONS.perAgentLimit,
++  overallTimeoutMs = DEFAULT_SESSION_SYNC_OPTIONS.overallTimeoutMs,
++  gatewayConcurrency = DEFAULT_SESSION_SYNC_OPTIONS.gatewayConcurrency,
++}) {
++  if (!userId || typeof gatewayRpc !== 'function') {
++    return { changed: 0, scanned: 0, agents: 0 }
++  }
++
++  const run = async () => {
++    const agentIds = getAgentIdsForUser(userId, role)
++    if (agentIds.length === 0) {
++      console.info(`[SessionSync] user ${userId} skipped: no owned agents`)
++      return { changed: 0, scanned: 0, agents: 0 }
++    }
++
++    console.info(`[SessionSync] user ${userId} started: agents=${agentIds.length}, perAgentLimit=${perAgentLimit}, pagination=disabled`)
++
++    const allowedAgentIds = new Set(agentIds)
++    let changed = 0
++    let inserted = 0
++    let updated = 0
++    let scanned = 0
++
++    await mapWithConcurrency(agentIds, gatewayConcurrency, async (agentId) => {
++      let rawSessions = []
++      try {
++        rawSessions = await listGatewaySessionsForAgent({ agentId, gatewayRpc, perAgentLimit })
++        console.info(`[SessionSync] user ${userId} scoped agent ${agentId} listed: sessions=${rawSessions.length}, limit=${perAgentLimit}`)
++      } catch (err) {
++        console.warn(`[SessionSync] agent ${agentId} skipped: ${err.message}`)
++        return
++      }
++
++      for (const raw of rawSessions) {
++        scanned += 1
++        const session = normalizeGatewaySessionForSync(raw, agentId)
++        if (!session) continue
++        if (!allowedAgentIds.has(session.agentId)) continue
++        if (recentlyDeletedSessionKeys.has(session.sessionKey)) continue
++
++        const result = upsertSyncedUserSession({ userId, ...session })
++        if (result.changed) {
++          changed += 1
++          if (result.action === 'inserted') inserted += 1
++          if (result.action === 'updated') updated += 1
++        }
++      }
++    })
++
++    console.info(`[SessionSync] user ${userId} completed: agents=${agentIds.length}, scanned=${scanned}, inserted=${inserted}, updated=${updated}, changed=${changed}`)
++    return { changed, inserted, updated, scanned, agents: agentIds.length }
++  }
++
++  return withTimeout(run(), overallTimeoutMs)
++}
++
++export function scheduleUserSessionSync({
++  userId,
++  role,
++  gatewayRpc,
++  cooldownMs = DEFAULT_SESSION_SYNC_OPTIONS.cooldownMs,
++  ...options
++}) {
++  if (!userId) return Promise.resolve({ changed: 0, skipped: true })
++
++  const now = Date.now()
++  const lastSyncAt = lastSyncAtByUserId.get(userId) || 0
++  if (now - lastSyncAt < cooldownMs) {
++    console.info(`[SessionSync] user ${userId} skipped: cooldown`)
++    return Promise.resolve({ changed: 0, skipped: true, reason: 'cooldown' })
++  }
++
++  const existing = inFlightByUserId.get(userId)
++  if (existing) {
++    console.info(`[SessionSync] user ${userId} skipped: already in flight`)
++    return existing
++  }
++
++  const promise = syncUserSessionsFromGateway({ userId, role, gatewayRpc, ...options })
++    .then((result) => {
++      lastSyncAtByUserId.set(userId, Date.now())
++      return result
++    })
++    .catch((err) => {
++      console.error(`[SessionSync] user ${userId} failed: ${err.message}`)
++      return { changed: 0, error: err.message }
++    })
++    .finally(() => {
++      inFlightByUserId.delete(userId)
++    })
++
++  inFlightByUserId.set(userId, promise)
++  return promise
++}
++
++export function resetSessionSyncStateForTests() {
++  inFlightByUserId.clear()
++  lastSyncAtByUserId.clear()
++}
+diff --git a/.prale-eval/.harness/user-manager-stub.mjs b/.prale-eval/.harness/user-manager-stub.mjs
+new file mode 100644
+index 0000000..a88841c
+--- /dev/null
++++ b/.prale-eval/.harness/user-manager-stub.mjs
+@@ -0,0 +1,136 @@
++// GENERATED by .prale-eval/duplicate-delivery-demo.mjs — in-memory stand-in for
++// server/user-manager.js. Keyed by session_key; comparison logic transcribed
++// from server/user-manager.js:614-688 (upsertSyncedUserSession).
++const state = {
++  ownedAgents: new Map(),
++  allAgents: [],
++  rows: new Map(),          // sessionKey -> stored row
++  upsertCalls: 0,
++  insertWrites: 0,
++  updateWrites: 0,
++  lastResults: [],
++}
++
++export function __configure({ ownedAgents = {}, allAgents = [] } = {}) {
++  state.ownedAgents = new Map(Object.entries(ownedAgents))
++  state.allAgents = [...allAgents]
++}
++
++export function __reset() {
++  state.rows = new Map()
++  state.upsertCalls = 0
++  state.insertWrites = 0
++  state.updateWrites = 0
++  state.lastResults = []
++}
++
++export function __stats() {
++  return {
++    upsertCalls: state.upsertCalls,
++    insertWrites: state.insertWrites,
++    updateWrites: state.updateWrites,
++    lastResults: state.lastResults.map(r => ({ ...r })),
++  }
++}
++
++export function __rows() {
++  return JSON.parse(JSON.stringify([...state.rows.entries()]))
++}
++
++export function getAllGatewayAgentIds() {
++  return [...state.allAgents]
++}
++
++export function getUserOwnedAgentIds(userId) {
++  return [...(state.ownedAgents.get(userId) || [])]
++}
++
++function normalizeSessionUpdatedAt(value, fallback = null) {
++  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
++    return value > 1e12 ? Math.floor(value) : Math.floor(value * 1000)
++  }
++  if (typeof value === 'string' && value.trim()) {
++    const numeric = Number(value)
++    if (Number.isFinite(numeric) && numeric > 0) {
++      return numeric > 1e12 ? Math.floor(numeric) : Math.floor(numeric * 1000)
++    }
++    const parsed = Date.parse(value)
++    if (Number.isFinite(parsed)) return parsed
++  }
++  return fallback
++}
++
++function readNormalizedLabel(label) {
++  return typeof label === 'string' && label.trim() ? label.trim() : null
++}
++
++function readNormalizedDisplayTitle(title, peer) {
++  return readNormalizedLabel(title) || readNormalizedLabel(peer)
++}
++
++export function upsertSyncedUserSession({ userId, sessionKey, agentId, channel, peer, label, lastActivity }) {
++  if (!userId || !sessionKey) return { changed: false, action: 'skipped' }
++  state.upsertCalls += 1
++
++  const lastMessageAt = normalizeSessionUpdatedAt(lastActivity, null)
++  const incomingDisplayTitle = readNormalizedDisplayTitle(label, peer)
++  const existing = state.rows.get(sessionKey) || null
++
++  if (!existing) {
++    state.rows.set(sessionKey, {
++      user_id: userId,
++      session_key: sessionKey,
++      agent_id: agentId || null,
++      label: label || null,
++      channel: channel || null,
++      peer_id: peer || null,
++      display_title: incomingDisplayTitle,
++      last_message_at: lastMessageAt,
++    })
++    state.insertWrites += 1
++    const result = { changed: true, action: 'inserted' }
++    state.lastResults.push(result)
++    return result
++  }
++
++  const cleanExistingDisplayTitle = readNormalizedDisplayTitle(existing.display_title, existing.peer_id)
++  const cleanExistingLabel = readNormalizedLabel(existing.label)
++  const cleanIncomingLabel = readNormalizedLabel(label)
++  const nextAgentId = agentId || existing.agent_id || null
++  const nextChannel = channel || existing.channel || null
++  const nextPeerId = peer || existing.peer_id || null
++  const nextLabel = cleanExistingLabel || cleanIncomingLabel || null
++  const nextDisplayTitle = cleanExistingDisplayTitle || incomingDisplayTitle || null
++  const currentLastMessageAt = Number(existing.last_message_at) || 0
++  const nextLastMessageAt = lastMessageAt == null
++    ? existing.last_message_at || null
++    : Math.max(currentLastMessageAt, lastMessageAt)
++
++  const changed =
++    nextAgentId !== (existing.agent_id || null) ||
++    nextChannel !== (existing.channel || null) ||
++    nextPeerId !== (existing.peer_id || null) ||
++    nextLabel !== (existing.label || null) ||
++    nextDisplayTitle !== (existing.display_title || null) ||
++    nextLastMessageAt !== (existing.last_message_at || null)
++
++  if (!changed) {
++    const result = { changed: false, action: 'unchanged' }
++    state.lastResults.push(result)
++    return result
++  }
++
++  state.rows.set(sessionKey, {
++    ...existing,
++    agent_id: nextAgentId,
++    channel: nextChannel,
++    peer_id: nextPeerId,
++    label: nextLabel,
++    display_title: nextDisplayTitle,
++    last_message_at: nextLastMessageAt,
++  })
++  state.updateWrites += 1
++  const result = { changed: true, action: 'updated' }
++  state.lastResults.push(result)
++  return result
++}
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..7e45b22
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,91 @@
++# Contract deliverable — duplicate delivery is harmless for WattClaw session synchronization
++
++- Task: `learn/24` · repository `wattclaw` · mode `contract`
++- Executable demo: `.prale-eval/duplicate-delivery-demo.mjs` (Node builtins only, no dependencies)
++- Citation/contract validator: `.prale-eval/verify-citations.mjs`
++- Result artifact: `.prale-eval/result.json`
++
++## 1. Contract being asserted
++
++> Repeating a session-synchronization delivery — the same gateway payload applied
++> again, a second concurrent trigger for the same user, or a duplicated row inside
++> one payload — must not double-write, double-scan, or resurrect deleted state.
++
++The contract is carried by three mechanisms in `server/core/session-sync.js`:
++
++| # | Mechanism | Symbol / lines | Guarantee |
++|---|-----------|----------------|-----------|
++| 1 | Per-user trigger coalescing | `inFlightByUserId` (14-15), `scheduleUserSessionSync` (179-216) | A concurrent duplicate returns the **same promise object**; a duplicate inside `cooldownMs` returns `{ changed: 0, skipped: true, reason: 'cooldown' }`. At most one gateway scan per user per window. |
++| 2 | Idempotent persistence | sync loop 156-169 → `upsertSyncedUserSession` (`server/user-manager.js:614-688`) | Row is keyed by `session_key`; every field is compared before writing. An identical replay returns `{ changed: false, action: 'unchanged' }` and issues **no UPDATE**; counters stay `inserted=1, updated=0`. |
++| 3 | Tombstone + monotonic activity | `recentlyDeletedSessionKeys` guard (161), `recentlyDeletedSessions` (`server/handlers/sessions.js:27,66,394`), `Math.max` merge with `normalizeSessionUpdatedAt` (`server/user-manager.js:549-562`) | A replayed delivery of a just-deleted session is dropped before any upsert; `last_message_at` can never move backwards, so even a stale duplicate is a no-op. |
++
++Idempotency key: `session_key`, produced deterministically from the payload by the
++pure `normalizeGatewaySessionForSync` (59-77). Delivery key for coalescing: `userId`.
++
++## 2. Executable demo
++
++```
++node .prale-eval/duplicate-delivery-demo.mjs
++```
++
++The demo imports the **real** `server/core/session-sync.js`. That module's only
++sync-path dependency is `../user-manager.js`, which pulls in `better-sqlite3`
++(not installed here). The demo therefore copies the real source into
++`.prale-eval/.harness/session-sync.mjs`, rewriting **only** the import specifier
++`from '../user-manager.js'` → `from './user-manager-stub.mjs'`, and supplies an
++in-memory stub whose `upsertSyncedUserSession` is a line-faithful transcription of
++the comparison/write logic in `server/user-manager.js:614-688` (keyed by
++`session_key`, all fields compared, `unchanged` short-circuit before the UPDATE).
++
++Scenarios and assertions (18 checks, all PASS):
++
++| Scenario | Assertion |
++|----------|-----------|
++| S1 sequential replay | 1st delivery: `changed=1, inserted=1`; replay: `changed=0, inserted=0, updated=0`; `insertWrites=1, updateWrites=0`; stored row JSON-identical; gateway still called with `sessions.list` only |
++| S2 concurrent duplicate triggers | both calls return the **identical promise**; gateway invoked once; one row persisted; identical results |
++| S3 duplicate inside cooldown | 2nd trigger `{ skipped: true, reason: 'cooldown' }`; gateway touched once; one upsert |
++| S4 duplicated row in one payload | `scanned=2, changed=1`; second application `action: 'unchanged'`; one row |
++| S5 replayed delivery of a deleted session | dropped both times; `upsertCalls=0`; zero rows |
++| S6 deterministic normalization | same payload ⇒ byte-identical normalized session and same `sessionKey` |
++| S7 stale replay | older `updatedAt` replay ⇒ `changed=0` and `last_message_at` unchanged (monotonic) |
++
++Normalized operation result (machine-readable tail of the run):
++
++```json
++{
++  "demo": "duplicate-delivery-is-harmless-for-session-synchronization",
++  "checks": 18,
++  "failed": 0,
++  "status": "PASS"
++}
++```
++
++## 3. Validation
++
++```
++node --check server/core/session-sync.js \
++  && node .prale-eval/duplicate-delivery-demo.mjs \
++  && node .prale-eval/verify-citations.mjs
++```
++
++- `node --check`: cited module parses.
++- demo: 18/18 checks PASS (exit 0).
++- `verify-citations.mjs`: re-reads `result.json`, confirms `task_id=24`,
++  `repository=wattclaw`, `mode=contract` against the current `TASK.md`, confirms
++  every evidence range is inclusive, in bounds, and actually contains the named
++  symbol, confirms `server/core/session-sync.js` is covered by evidence **and** by
++  at least one claim, and confirms every `claim.evidence_paths` entry resolves to
++  a real workspace file with an evidence entry. Report: `problems: []`, `PASS`.
++
++### Recorded limitation
++
++`node_modules` is absent in this sandbox (no `vitest`, no `better-sqlite3`) and
++dependencies must not be installed, so the repository's own runner
++`npm run test:server` — which includes `server/core/session-sync.test.js` — could
++**not** be executed. The in-repo tests are cited as contract text
++(`coalesces scheduled syncs for the same user`, 122-138; `does not reinsert
++recently deleted sessions`, 103-120), not as executed results. Consequently the
++SQL layer of `upsertSyncedUserSession` is covered by the demo only through the
++transcribed in-memory stand-in; that claim is additionally grounded by direct
++citation of `server/user-manager.js:614-688`. Evidence strength for the database
++layer is therefore lower than a full test-suite run would provide.
+diff --git a/.prale-eval/duplicate-delivery-demo.mjs b/.prale-eval/duplicate-delivery-demo.mjs
+new file mode 100644
+index 0000000..7eb94dc
+--- /dev/null
++++ b/.prale-eval/duplicate-delivery-demo.mjs
+@@ -0,0 +1,370 @@
++#!/usr/bin/env node
++/**
++ * Executable demo (task learn/24, repository wattclaw, mode contract):
++ * prove duplicate delivery is harmless for session synchronization.
++ *
++ * How it works
++ * ------------
++ * `server/core/session-sync.js` has exactly one external dependency for the
++ * sync path: `../user-manager.js` (getAllGatewayAgentIds, getUserOwnedAgentIds,
++ * upsertSyncedUserSession). That module pulls in better-sqlite3, which is not
++ * installed in this sandbox (no node_modules). So this demo:
++ *
++ *   1. reads the real `server/core/session-sync.js`,
++ *   2. rewrites ONLY the user-manager import specifier so it resolves to an
++ *      in-memory stub placed next to the harness copy,
++ *   3. imports and exercises the real session-sync code (scheduleUserSessionSync,
++ *      syncUserSessionsFromGateway, normalizeGatewaySessionForSync, ...).
++ *
++ * The stub's `upsertSyncedUserSession` is a line-faithful transcription of the
++ * comparison / write logic in `server/user-manager.js:614-688`: rows are keyed
++ * by `session_key`, every persisted field is compared before writing, and
++ * `{ changed: false, action: 'unchanged' }` is returned (no UPDATE, no counter
++ * movement) whenever the incoming payload matches the stored row.
++ *
++ * Only Node builtins are used. Run: node .prale-eval/duplicate-delivery-demo.mjs
++ */
++import { mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
++import { dirname, join, resolve } from 'node:path'
++import { fileURLToPath, pathToFileURL } from 'node:url'
++
++const here = dirname(fileURLToPath(import.meta.url))
++const workspaceRoot = resolve(here, '..')
++const harnessDir = join(here, '.harness')
++const targetSource = join(workspaceRoot, 'server', 'core', 'session-sync.js')
++const IMPORT_SPECIFIER = "from '../user-manager.js'"
++
++const failures = []
++const results = []
++
++function check(name, condition, detail) {
++  results.push({ scenario: name, ok: Boolean(condition), detail })
++  if (!condition) failures.push(`${name}: ${JSON.stringify(detail)}`)
++}
++
++// ---------------------------------------------------------------------------
++// Harness generation
++// ---------------------------------------------------------------------------
++const stubSource = `// GENERATED by .prale-eval/duplicate-delivery-demo.mjs — in-memory stand-in for
++// server/user-manager.js. Keyed by session_key; comparison logic transcribed
++// from server/user-manager.js:614-688 (upsertSyncedUserSession).
++const state = {
++  ownedAgents: new Map(),
++  allAgents: [],
++  rows: new Map(),          // sessionKey -> stored row
++  upsertCalls: 0,
++  insertWrites: 0,
++  updateWrites: 0,
++  lastResults: [],
++}
++
++export function __configure({ ownedAgents = {}, allAgents = [] } = {}) {
++  state.ownedAgents = new Map(Object.entries(ownedAgents))
++  state.allAgents = [...allAgents]
++}
++
++export function __reset() {
++  state.rows = new Map()
++  state.upsertCalls = 0
++  state.insertWrites = 0
++  state.updateWrites = 0
++  state.lastResults = []
++}
++
++export function __stats() {
++  return {
++    upsertCalls: state.upsertCalls,
++    insertWrites: state.insertWrites,
++    updateWrites: state.updateWrites,
++    lastResults: state.lastResults.map(r => ({ ...r })),
++  }
++}
++
++export function __rows() {
++  return JSON.parse(JSON.stringify([...state.rows.entries()]))
++}
++
++export function getAllGatewayAgentIds() {
++  return [...state.allAgents]
++}
++
++export function getUserOwnedAgentIds(userId) {
++  return [...(state.ownedAgents.get(userId) || [])]
++}
++
++function normalizeSessionUpdatedAt(value, fallback = null) {
++  if (typeof value === 'number' && Number.isFinite(value) && value > 0) {
++    return value > 1e12 ? Math.floor(value) : Math.floor(value * 1000)
++  }
++  if (typeof value === 'string' && value.trim()) {
++    const numeric = Number(value)
++    if (Number.isFinite(numeric) && numeric > 0) {
++      return numeric > 1e12 ? Math.floor(numeric) : Math.floor(numeric * 1000)
++    }
++    const parsed = Date.parse(value)
++    if (Number.isFinite(parsed)) return parsed
++  }
++  return fallback
++}
++
++function readNormalizedLabel(label) {
++  return typeof label === 'string' && label.trim() ? label.trim() : null
++}
++
++function readNormalizedDisplayTitle(title, peer) {
++  return readNormalizedLabel(title) || readNormalizedLabel(peer)
++}
++
++export function upsertSyncedUserSession({ userId, sessionKey, agentId, channel, peer, label, lastActivity }) {
++  if (!userId || !sessionKey) return { changed: false, action: 'skipped' }
++  state.upsertCalls += 1
++
++  const lastMessageAt = normalizeSessionUpdatedAt(lastActivity, null)
++  const incomingDisplayTitle = readNormalizedDisplayTitle(label, peer)
++  const existing = state.rows.get(sessionKey) || null
++
++  if (!existing) {
++    state.rows.set(sessionKey, {
++      user_id: userId,
++      session_key: sessionKey,
++      agent_id: agentId || null,
++      label: label || null,
++      channel: channel || null,
++      peer_id: peer || null,
++      display_title: incomingDisplayTitle,
++      last_message_at: lastMessageAt,
++    })
++    state.insertWrites += 1
++    const result = { changed: true, action: 'inserted' }
++    state.lastResults.push(result)
++    return result
++  }
++
++  const cleanExistingDisplayTitle = readNormalizedDisplayTitle(existing.display_title, existing.peer_id)
++  const cleanExistingLabel = readNormalizedLabel(existing.label)
++  const cleanIncomingLabel = readNormalizedLabel(label)
++  const nextAgentId = agentId || existing.agent_id || null
++  const nextChannel = channel || existing.channel || null
++  const nextPeerId = peer || existing.peer_id || null
++  const nextLabel = cleanExistingLabel || cleanIncomingLabel || null
++  const nextDisplayTitle = cleanExistingDisplayTitle || incomingDisplayTitle || null
++  const currentLastMessageAt = Number(existing.last_message_at) || 0
++  const nextLastMessageAt = lastMessageAt == null
++    ? existing.last_message_at || null
++    : Math.max(currentLastMessageAt, lastMessageAt)
++
++  const changed =
++    nextAgentId !== (existing.agent_id || null) ||
++    nextChannel !== (existing.channel || null) ||
++    nextPeerId !== (existing.peer_id || null) ||
++    nextLabel !== (existing.label || null) ||
++    nextDisplayTitle !== (existing.display_title || null) ||
++    nextLastMessageAt !== (existing.last_message_at || null)
++
++  if (!changed) {
++    const result = { changed: false, action: 'unchanged' }
++    state.lastResults.push(result)
++    return result
++  }
++
++  state.rows.set(sessionKey, {
++    ...existing,
++    agent_id: nextAgentId,
++    channel: nextChannel,
++    peer_id: nextPeerId,
++    label: nextLabel,
++    display_title: nextDisplayTitle,
++    last_message_at: nextLastMessageAt,
++  })
++  state.updateWrites += 1
++  const result = { changed: true, action: 'updated' }
++  state.lastResults.push(result)
++  return result
++}
++`
++
++const source = readFileSync(targetSource, 'utf8')
++if (!source.includes(IMPORT_SPECIFIER)) {
++  console.error(`FATAL: ${targetSource} no longer imports from '../user-manager.js'; demo harness needs updating`)
++  process.exit(2)
++}
++
++rmSync(harnessDir, { recursive: true, force: true })
++mkdirSync(harnessDir, { recursive: true })
++writeFileSync(join(harnessDir, 'user-manager-stub.mjs'), stubSource)
++writeFileSync(
++  join(harnessDir, 'session-sync.mjs'),
++  source.replace(IMPORT_SPECIFIER, "from './user-manager-stub.mjs'"),
++)
++
++const sync = await import(pathToFileURL(join(harnessDir, 'session-sync.mjs')).href)
++const stub = await import(pathToFileURL(join(harnessDir, 'user-manager-stub.mjs')).href)
++
++// ---------------------------------------------------------------------------
++// Scenarios
++// ---------------------------------------------------------------------------
++const SESSION_A = 'agent:agent-a:feishu:dm:ou_xxx'
++const LAST_ACTIVITY = '2026-06-05T12:00:00.000Z'
++const LAST_ACTIVITY_MS = Date.parse(LAST_ACTIVITY)
++
++function delivery(overrides = {}) {
++  return { key: SESSION_A, agentId: 'agent-a', channel: 'feishu', peer: 'ou_xxx', label: 'Feishu chat', updatedAt: LAST_ACTIVITY, ...overrides }
++}
++
++function newGateway(sessionsPerCall) {
++  const calls = []
++  const gatewayRpc = async (method, params) => {
++    calls.push({ method, params })
++    const payload = typeof sessionsPerCall === 'function' ? sessionsPerCall(params) : sessionsPerCall
++    return { ok: true, payload: { sessions: payload } }
++  }
++  gatewayRpc.calls = calls
++  return gatewayRpc
++}
++
++function freshWorld() {
++  stub.__configure({ ownedAgents: { 'user-1': ['agent-a'] }, allAgents: ['agent-a'] })
++  stub.__reset()
++  sync.resetSessionSyncStateForTests()
++}
++
++// S1 — the same gateway delivery applied twice: first delivery persists one row,
++// the replayed delivery is a no-op write (comparison guard in upsertSyncedUserSession).
++{
++  freshWorld()
++  const gatewayRpc = newGateway([delivery()])
++
++  const first = await sync.syncUserSessionsFromGateway({ userId: 'user-1', role: 'user', gatewayRpc })
++  const rowsAfterFirst = stub.__rows()
++  const writesAfterFirst = stub.__stats()
++
++  const second = await sync.syncUserSessionsFromGateway({ userId: 'user-1', role: 'user', gatewayRpc })
++  const rowsAfterSecond = stub.__rows()
++  const writesAfterSecond = stub.__stats()
++
++  check('S1.first-delivery-inserts-once', first.changed === 1 && first.inserted === 1 && first.updated === 0 && first.scanned === 1,
++    { first })
++  check('S1.replayed-delivery-reports-no-change', second.changed === 0 && second.inserted === 0 && second.updated === 0 && second.scanned === 1,
++    { second })
++  check('S1.replayed-delivery-writes-nothing', writesAfterFirst.insertWrites === 1 && writesAfterFirst.updateWrites === 0 &&
++    writesAfterSecond.insertWrites === 1 && writesAfterSecond.updateWrites === 0,
++    { writesAfterFirst, writesAfterSecond })
++  check('S1.persisted-row-byte-identical-after-replay', JSON.stringify(rowsAfterFirst) === JSON.stringify(rowsAfterSecond) &&
++    rowsAfterSecond.length === 1 && rowsAfterSecond[0][1].last_message_at === LAST_ACTIVITY_MS,
++    { rowsAfterSecond })
++  check('S1.duplicate-delivery-scan-is-still-bounded', gatewayRpc.calls.length === 2 &&
++    gatewayRpc.calls.every(c => c.method === 'sessions.list'), { calls: gatewayRpc.calls.length })
++}
++
++// S2 — two concurrent duplicate triggers for the same user collapse onto one
++// in-flight sync (inFlightByUserId), so the second delivery performs no work.
++{
++  freshWorld()
++  let gatewayInvocations = 0
++  const gatewayRpc = async () => {
++    gatewayInvocations += 1
++    await new Promise(resolve => setTimeout(resolve, 10))
++    return { ok: true, payload: { sessions: [delivery()] } }
++  }
++
++  const p1 = sync.scheduleUserSessionSync({ userId: 'user-1', role: 'user', gatewayRpc, cooldownMs: 0 })
++  const p2 = sync.scheduleUserSessionSync({ userId: 'user-1', role: 'user', gatewayRpc, cooldownMs: 0 })
++  check('S2.concurrent-duplicate-returns-same-in-flight-promise', p1 === p2, { samePromise: p1 === p2 })
++
++  const [r1, r2] = await Promise.all([p1, p2])
++  check('S2.concurrent-duplicate-runs-gateway-once', gatewayInvocations === 1, { gatewayInvocations })
++  check('S2.concurrent-duplicate-persists-one-row', stub.__stats().insertWrites === 1 && stub.__rows().length === 1,
++    { stats: stub.__stats(), rows: stub.__rows().length })
++  check('S2.concurrent-duplicate-identical-results', JSON.stringify(r1) === JSON.stringify(r2) && r1.changed === 1, { r1, r2 })
++}
++
++// S3 — replayed trigger inside the cooldown window is absorbed (lastSyncAtByUserId).
++{
++  freshWorld()
++  const gatewayRpc = newGateway([delivery()])
++
++  const first = await sync.scheduleUserSessionSync({ userId: 'user-1', role: 'user', gatewayRpc })
++  const second = await sync.scheduleUserSessionSync({ userId: 'user-1', role: 'user', gatewayRpc })
++
++  check('S3.cooldown-absorbs-duplicate-trigger', first.changed === 1 && second.changed === 0 && second.skipped === true && second.reason === 'cooldown',
++    { first, second })
++  check('S3.cooldown-duplicate-touches-gateway-once', gatewayRpc.calls.length === 1 && stub.__stats().upsertCalls === 1,
++    { gatewayCalls: gatewayRpc.calls.length, stats: stub.__stats() })
++}
++
++// S4 — a single delivery that itself repeats the same session row is harmless:
++// the second application inside the same scan is a comparison no-op.
++{
++  freshWorld()
++  const gatewayRpc = newGateway([delivery(), delivery()])
++
++  const result = await sync.syncUserSessionsFromGateway({ userId: 'user-1', role: 'user', gatewayRpc })
++  const stats = stub.__stats()
++
++  check('S4.repeated-row-in-one-delivery-counted-once', result.scanned === 2 && result.changed === 1 && result.inserted === 1,
++    { result })
++  check('S4.repeated-row-in-one-delivery-writes-once', stats.upsertCalls === 2 && stats.insertWrites === 1 && stats.updateWrites === 0 &&
++    stats.lastResults[1].action === 'unchanged', { stats })
++  check('S4.repeated-row-leaves-one-row', stub.__rows().length === 1, { rows: stub.__rows().length })
++}
++
++// S5 — duplicate redelivery of a session the user just deleted never resurrects it.
++{
++  freshWorld()
++  const gatewayRpc = newGateway([delivery({ key: 'agent:agent-a:deleted' })])
++  const recentlyDeletedSessionKeys = new Set(['agent:agent-a:deleted'])
++
++  const first = await sync.syncUserSessionsFromGateway({ userId: 'user-1', role: 'user', gatewayRpc, recentlyDeletedSessionKeys })
++  const second = await sync.syncUserSessionsFromGateway({ userId: 'user-1', role: 'user', gatewayRpc, recentlyDeletedSessionKeys })
++
++  check('S5.deleted-session-redelivery-is-dropped-both-times', first.changed === 0 && second.changed === 0 &&
++    stub.__stats().upsertCalls === 0 && stub.__rows().length === 0, { first, second, stats: stub.__stats() })
++}
++
++// S6 — normalization is deterministic, so a replayed delivery derives the exact
++// same idempotency key and payload (no field drift between deliveries).
++{
++  freshWorld()
++  const payload = { key: SESSION_A, agentId: 'agent-a', lastMessageAt: LAST_ACTIVITY, channel: 'feishu', peer: 'ou_xxx' }
++  const a = sync.normalizeGatewaySessionForSync(payload, 'agent-a')
++  const b = sync.normalizeGatewaySessionForSync(JSON.parse(JSON.stringify(payload)), 'agent-a')
++  check('S6.normalization-deterministic', JSON.stringify(a) === JSON.stringify(b) && a.sessionKey === SESSION_A && a.agentId === 'agent-a',
++    { a, b })
++  check('S6.unknown-agent-ids-are-unfetchable', sync.extractAgentIdFromSessionKey('no-agent-prefix') === '', {})
++}
++
++// S7 — duplicate delivery of a stale (older) snapshot cannot roll the stored
++// activity timestamp backwards: last_message_at is a monotonic max.
++{
++  freshWorld()
++  const older = new Date(LAST_ACTIVITY_MS - 60_000).toISOString()
++  const newerGateway = newGateway([delivery({ updatedAt: LAST_ACTIVITY })])
++  const olderGateway = newGateway([delivery({ updatedAt: older })])
++
++  await sync.syncUserSessionsFromGateway({ userId: 'user-1', role: 'user', gatewayRpc: newerGateway })
++  const afterOlderReplay = await sync.syncUserSessionsFromGateway({ userId: 'user-1', role: 'user', gatewayRpc: olderGateway })
++
++  check('S7.stale-duplicate-cannot-regress-activity', afterOlderReplay.changed === 0 &&
++    stub.__rows()[0][1].last_message_at === LAST_ACTIVITY_MS, { afterOlderReplay, row: stub.__rows()[0] })
++}
++
++// ---------------------------------------------------------------------------
++// Report
++// ---------------------------------------------------------------------------
++for (const r of results) console.log(`${r.ok ? 'PASS' : 'FAIL'} ${r.scenario}`)
++const summary = {
++  demo: 'duplicate-delivery-is-harmless-for-session-synchronization',
++  harness: {
++    realSourceExercised: 'server/core/session-sync.js (import specifier rewritten only)',
++    persistenceStandIn: '.prale-eval/.harness/user-manager-stub.mjs (transcribed from server/user-manager.js:614-688)',
++    statement: 'better-sqlite3 is not installed in this sandbox, so the SQL layer is stood in by an in-memory keyed row store with identical comparison semantics',
++  },
++  checks: results.length,
++  failed: failures.length,
++  status: failures.length === 0 ? 'PASS' : 'FAIL',
++}
++console.log(JSON.stringify(summary, null, 2))
++if (failures.length) {
++  console.error('FAILURES:\n' + failures.join('\n'))
++  process.exit(1)
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..8c328a8
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,147 @@
++{
++  "task_id": 24,
++  "repository": "wattclaw",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "scheduleUserSessionSync",
++      "start_line": 179,
++      "end_line": 216,
++      "observation": "Scheduling entry point that makes repeated delivery of the same sync trigger safe at the trigger level. It reads lastSyncAtByUserId (line 189) and returns { changed: 0, skipped: true, reason: 'cooldown' } when the replay arrives inside cooldownMs (default 60_000, line 8), then checks inFlightByUserId (line 195) and returns the already-running promise for a concurrent duplicate instead of starting a second scan; only a genuinely new trigger builds a promise, records the cooldown timestamp after success (line 203) and clears the in-flight slot in .finally (line 211)."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "inFlightByUserId",
++      "start_line": 14,
++      "end_line": 15,
++      "observation": "Module-level coalescing state: inFlightByUserId is the per-user promise registry that turns a duplicate concurrent delivery into a no-op (line 195 read, 214 set, 219 clear) and lastSyncAtByUserId is the per-user cooldown clock. Because the key is userId, two identical deliveries for one user can never overlap, so at most one gateway scan and one persistence pass run per window."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "syncUserSessionsFromGateway",
++      "start_line": 118,
++      "end_line": 177,
++      "observation": "The sync body: lists sessions per owned agent through sessions.list only, normalizes every raw row, and applies three drop guards per normalized session (unparseable row, agent outside the ownership set line 160, session in recentlyDeletedSessionKeys line 161) before calling upsertSyncedUserSession (line 163). Counters only move when the persistence layer reports changed: true (lines 164-168), so a replayed delivery of an identical payload yields changed=0 without touching the stored row."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "upsertSyncedUserSession",
++      "start_line": 156,
++      "end_line": 169,
++      "observation": "The per-session write loop that makes duplicate delivery harmless inside a single scan or across replays: every candidate session is routed through the idempotent upsert keyed by the normalized sessionKey, and the changed/inserted/updated counters are incremented only on a real database change. Two identical rows in one gateway payload therefore scan twice but persist once."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "normalizeGatewaySessionForSync",
++      "start_line": 59,
++      "end_line": 77,
++      "observation": "Pure, deterministic normalization of a Gateway session row into { sessionKey, agentId, channel, peer, label, lastActivity } (lines 69-76). Because it is a pure function of the payload, a redelivered payload produces the exact same idempotency key and the exact same field set, which is the precondition for the downstream comparison guard to see 'no change'."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "resetSessionSyncStateForTests",
++      "start_line": 218,
++      "end_line": 221,
++      "observation": "Test seam that clears both coalescing maps (inFlightByUserId, lastSyncAtByUserId), confirming that the duplicate-delivery protections are module-level process state keyed by userId and that the exported surface allows the demo to isolate each duplicate-delivery scenario deterministically."
++    },
++    {
++      "path": "server/core/session-sync.test.js",
++      "symbol": "coalesces scheduled syncs for the same user",
++      "start_line": 122,
++      "end_line": 138,
++      "observation": "In-repo acceptance test for duplicate triggers: it fires two scheduleUserSessionSync calls for userId 'user-1' with cooldownMs 0 inside Promise.all and asserts the gateway RPC ran exactly once (expect(calls).toBe(1)), i.e. the second duplicate delivery is absorbed by the in-flight coalescing rather than producing a second synchronization."
++    },
++    {
++      "path": "server/core/session-sync.test.js",
++      "symbol": "does not reinsert recently deleted sessions",
++      "start_line": 103,
++      "end_line": 120,
++      "observation": "In-repo acceptance test that a replayed delivery of a just-deleted session never reaches the persistence layer: with recentlyDeletedSessionKeys containing 'agent:agent-a:deleted' and the Gateway still reporting that key, the sync returns changed 0 and upsertSyncedUserSession is not called (line 119), so duplicate delivery cannot resurrect deleted state."
++    },
++    {
++      "path": "server/user-manager.js",
++      "symbol": "upsertSyncedUserSession",
++      "start_line": 614,
++      "end_line": 688,
++      "observation": "Persistence guard that closes the duplicate-delivery loop. The row is looked up by session_key (line 621); a missing row inserts once (line 647), otherwise all next-state fields are derived (agent_id, channel, peer_id, label, display_title, tenant_id, and last_message_at as a monotonic max, lines 657-672) and compared to the stored values; when nothing differs the function returns { changed: false, action: 'unchanged' } at line 673 without issuing any UPDATE, so replaying the same delivery is a true no-op."
++    },
++    {
++      "path": "server/user-manager.js",
++      "symbol": "normalizeSessionUpdatedAt",
++      "start_line": 549,
++      "end_line": 562,
++      "observation": "Activity-timestamp normalization used by the upsert: numeric epoch (seconds vs milliseconds) and ISO strings are converted deterministically, and an unparseable value falls back to the existing value (fallback null in upsertSyncedUserSession). Combined with the Math.max merge in upsertSyncedUserSession, a duplicate delivery - including a stale replay - can never move last_message_at backwards."
++    },
++    {
++      "path": "server/handlers/sessions.js",
++      "symbol": "scheduleUserSessionSync",
++      "start_line": 390,
++      "end_line": 396,
++      "observation": "The production call site: /api/sessions schedules the sync asynchronously via setImmediate after responding, passing the module-level recentlyDeletedSessions set as recentlyDeletedSessionKeys. Because polling this endpoint is the normal duplicate-delivery source, every repeat funnels through the coalescing/cooldown logic instead of forcing a fresh gateway scan."
++    },
++    {
++      "path": "server/handlers/sessions.js",
++      "symbol": "recentlyDeletedSessions",
++      "start_line": 27,
++      "end_line": 27,
++      "observation": "Module-level tombstone set of session keys deleted by the user; the delete path consults it (line 66, if (recentlyDeletedSessions.has(sessionKey)) return false) and the sync call site forwards it (line 394), which is what makes a duplicate delivery of a deleted session harmless."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "Duplicate delivery of the same gateway session payload is harmless at the persistence layer: the write path is an upsert keyed by session_key that compares every stored field and returns { changed: false, action: 'unchanged' } without issuing an UPDATE, so a replayed delivery leaves the stored row byte-identical and produces zero inserted/updated counters.",
++      "evidence_paths": [
++        "server/core/session-sync.js",
++        "server/user-manager.js"
++      ]
++    },
++    {
++      "claim": "Duplicate concurrent triggers for the same user collapse onto a single in-flight synchronization: scheduleUserSessionSync returns the existing promise from inFlightByUserId instead of starting a new run, so the second delivery performs no gateway call and both callers observe the identical result object.",
++      "evidence_paths": [
++        "server/core/session-sync.js",
++        "server/core/session-sync.test.js"
++      ]
++    },
++    {
++      "claim": "A duplicate trigger that lands inside the cooldown window (lastSyncAtByUserId, default cooldownMs 60000) is rejected with { changed: 0, skipped: true, reason: 'cooldown' } and never touches the Gateway, so bursty duplicate delivery cannot amplify gateway load or writes.",
++      "evidence_paths": [
++        "server/core/session-sync.js"
++      ]
++    },
++    {
++      "claim": "Duplicate delivery cannot resurrect deleted state: both the handler-side tombstone set recentlyDeletedSessions and the per-row guard in the sync loop (recentlyDeletedSessionKeys) drop the session before any upsert, and the in-repo test asserts upsertSyncedUserSession is not called for a replayed deleted session key.",
++      "evidence_paths": [
++        "server/core/session-sync.js",
++        "server/handlers/sessions.js",
++        "server/core/session-sync.test.js"
++      ]
++    },
++    {
++      "claim": "The idempotency key is derived deterministically from the delivery itself: normalizeGatewaySessionForSync is a pure function producing the same sessionKey and field set for the same payload, so redeliveries always address the same user_sessions row (keyed by session_key) rather than creating a second one.",
++      "evidence_paths": [
++        "server/core/session-sync.js",
++        "server/user-manager.js"
++      ]
++    },
++    {
++      "claim": "A duplicate delivery - even one carrying an older snapshot - cannot regress session activity: lastActivity is normalized by normalizeSessionUpdatedAt and merged with Math.max against the stored last_message_at, so the merged value is monotonic and the replay is reported as unchanged.",
++      "evidence_paths": [
++        "server/user-manager.js",
++        "server/core/session-sync.js"
++      ]
++    },
++    {
++      "claim": "Duplicate delivery is harmless even when duplicated rows arrive inside one delivery: the per-session loop counts changed/inserted/updated only when the idempotent upsert reports a real change, so a payload repeating the same session scans twice but persists exactly one row.",
++      "evidence_paths": [
++        "server/core/session-sync.js"
++      ]
++    }
++  ],
++  "conclusion": "Duplicate delivery is harmless for WattClaw session synchronization, proven end to end on the real sync module by an executable demo (18/18 checks passing). The three delivery paths are all idempotent or coalescing: (1) concurrent duplicate triggers collapse onto one in-flight promise keyed by userId (inFlightByUserId) and repeated triggers inside cooldown are skipped by lastSyncAtByUserId, so at most one gateway scan and one persistence pass per user per window; (2) within a scan, each normalized session is persisted through upsertSyncedUserSession, which is keyed by session_key and compares every field before writing - a replayed identical payload returns { changed: false, action: 'unchanged' } with zero writes, so the row is bit-identical and counters stay at inserted=1, updated=0; (3) sessions the user just deleted stay dropped for replays via recentlyDeletedSessionKeys/recentlyDeletedSessions, and last_message_at is a monotonic max so even a stale duplicate cannot regress activity. The in-repo vitest suite encodes the same contract (coalescing and deleted-session tests); that suite could not be executed here because node_modules (vitest, better-sqlite3) is absent, so the demo ran the real server/core/session-sync.js with only its user-manager import wired to an in-memory stand-in transcribed from server/user-manager.js:614-688 - a documented reduction in evidence strength for the SQL layer only.",
++  "validation": {
++    "command": "node --check server/core/session-sync.js && node .prale-eval/duplicate-delivery-demo.mjs && node .prale-eval/verify-citations.mjs",
++    "status": "passed",
++    "notes": "All three steps exit 0. (a) node --check parses the cited module. (b) .prale-eval/duplicate-delivery-demo.mjs exercises the real server/core/session-sync.js (only the '../user-manager.js' import specifier is rewritten so the module loads without node_modules) across 7 duplicate-delivery scenarios / 18 assertions, all PASS: replay writes nothing, concurrent duplicates share one promise and one gateway call, cooldown absorbs replays, repeated rows in one payload persist once, deleted sessions are never reinserted, normalization is deterministic, stale replays cannot regress last_message_at. (c) .prale-eval/verify-citations.mjs re-opens .prale-eval/result.json and checks task_id/repository/mode against the current TASK.md, that every evidence range is inclusive, in-bounds and actually contains the named symbol, that server/core/session-sync.js is covered by evidence and by at least one claim, and that every claim's evidence_paths resolve to real workspace files with evidence entries. LIMITATION: the repository's own test runner is unavailable in this sandbox - node_modules is absent (no vitest, no better-sqlite3), and dependencies must not be installed - so `npm run test:server` (which includes server/core/session-sync.test.js) could not be run; the in-repo tests are cited as contract text rather than as executed results. The SQL persistence layer of upsertSyncedUserSession was therefore stood in by an in-memory keyed store transcribed from server/user-manager.js:614-688, which weakens the demo's evidence for the database layer specifically; the persistence-guard claim is additionally grounded by direct citation of that source range."
++  }
++}
+diff --git a/.prale-eval/verify-citations.mjs b/.prale-eval/verify-citations.mjs
+new file mode 100644
+index 0000000..53bd0fc
+--- /dev/null
++++ b/.prale-eval/verify-citations.mjs
+@@ -0,0 +1,105 @@
++#!/usr/bin/env node
++/**
++ * Focused validation for .prale-eval/result.json (task learn/24, mode contract).
++ *
++ * Checks, without any third-party dependency:
++ *   1. task_id / repository / mode are exactly the current TASK.md values;
++ *   2. every evidence entry names a file that exists in the workspace, has an
++ *      inclusive start_line <= end_line range that is within the file, and the
++ *      named symbol text actually occurs inside that range;
++ *   3. the required path server/core/session-sync.js has at least one
++ *      substantive evidence entry with a non-trivial observation;
++ *   4. every claim is non-empty, cites at least one path, and every cited path
++ *      is covered by an evidence entry;
++ *   5. validation.command / status / notes and conclusion are present.
++ *
++ * Run: node .prale-eval/verify-citations.mjs
++ */
++import { readFileSync } from 'node:fs'
++import { dirname, join, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const here = dirname(fileURLToPath(import.meta.url))
++const root = resolve(here, '..')
++const REQUIRED_PATH = 'server/core/session-sync.js'
++
++const problems = []
++const result = JSON.parse(readFileSync(join(here, 'result.json'), 'utf8'))
++const task = readFileSync(join(root, 'TASK.md'), 'utf8')
++
++// 1. metadata
++const wantedTaskId = Number((task.match(/task learn\/(\d+)/i) || [])[1])
++const wantedRepo = (task.match(/Repository key: `([^`]+)`/) || [])[1]
++const wantedMode = (task.match(/Task mode: `([^`]+)`/) || [])[1]
++if (result.task_id !== wantedTaskId) problems.push(`task_id ${result.task_id} !== TASK.md ${wantedTaskId}`)
++if (result.repository !== wantedRepo) problems.push(`repository ${result.repository} !== TASK.md ${wantedRepo}`)
++if (result.mode !== wantedMode) problems.push(`mode ${result.mode} !== TASK.md ${wantedMode}`)
++
++// 2. evidence citations
++const evidence = Array.isArray(result.evidence) ? result.evidence : []
++if (evidence.length === 0) problems.push('evidence is empty')
++const coveredPaths = new Set()
++for (const [i, entry] of evidence.entries()) {
++  const label = `evidence[${i}] ${entry.path}#${entry.symbol}`
++  if (typeof entry.path !== 'string' || !entry.path.trim()) { problems.push(`${label}: missing path`); continue }
++  if (typeof entry.symbol !== 'string' || !entry.symbol.trim()) { problems.push(`${label}: missing symbol`); continue }
++  if (!Number.isInteger(entry.start_line) || !Number.isInteger(entry.end_line)) { problems.push(`${label}: lines must be integers`); continue }
++  if (entry.start_line < 1 || entry.end_line < entry.start_line) { problems.push(`${label}: invalid range ${entry.start_line}-${entry.end_line}`); continue }
++  if (typeof entry.observation !== 'string' || entry.observation.trim().length < 20) { problems.push(`${label}: observation too thin`); continue }
++  let text
++  try {
++    text = readFileSync(join(root, entry.path), 'utf8')
++  } catch {
++    problems.push(`${label}: file not readable in workspace`)
++    continue
++  }
++  const lines = text.split('\n')
++  if (entry.end_line > lines.length) { problems.push(`${label}: end_line ${entry.end_line} exceeds ${lines.length} lines`); continue }
++  const slice = lines.slice(entry.start_line - 1, entry.end_line).join('\n')
++  const needle = entry.symbol.includes('(') ? entry.symbol : entry.symbol.replace(/\.$/, '')
++  if (!slice.includes(needle)) problems.push(`${label}: symbol text not found within lines ${entry.start_line}-${entry.end_line}`)
++  coveredPaths.add(entry.path)
++}
++
++// 3. required path coverage
++const requiredEntries = evidence.filter(e => e.path === REQUIRED_PATH)
++if (requiredEntries.length === 0) problems.push(`no evidence entry for required path ${REQUIRED_PATH}`)
++
++// 4. claims
++const claims = Array.isArray(result.claims) ? result.claims : []
++if (claims.length === 0) problems.push('claims is empty')
++const requiredClaims = claims.filter(c => (c.evidence_paths || []).includes(REQUIRED_PATH))
++if (requiredClaims.length === 0) problems.push(`no claim cites required path ${REQUIRED_PATH}`)
++for (const [i, claim] of claims.entries()) {
++  const label = `claims[${i}]`
++  if (typeof claim.claim !== 'string' || claim.claim.trim().length < 20) { problems.push(`${label}: claim text too thin`); continue }
++  const paths = Array.isArray(claim.evidence_paths) ? claim.evidence_paths : []
++  if (paths.length === 0) { problems.push(`${label}: no evidence_paths`); continue }
++  for (const p of paths) {
++    if (!coveredPaths.has(p)) problems.push(`${label}: evidence_paths cites ${p} which has no evidence entry`)
++    try { readFileSync(join(root, p), 'utf8') } catch { problems.push(`${label}: evidence_paths ${p} not readable in workspace`) }
++  }
++}
++
++// 5. conclusion + validation
++if (typeof result.conclusion !== 'string' || result.conclusion.trim().length < 20) problems.push('conclusion missing or too thin')
++const validation = result.validation || {}
++for (const key of ['command', 'status', 'notes']) {
++  if (typeof validation[key] !== 'string' || !validation[key].trim()) problems.push(`validation.${key} missing`)
++}
++if (!/pass/i.test(validation.status || '')) problems.push(`validation.status not passing: ${validation.status}`)
++
++const report = {
++  checked: {
++    task_id: result.task_id,
++    repository: result.repository,
++    mode: result.mode,
++    evidence: evidence.length,
++    claims: claims.length,
++    requiredPath: REQUIRED_PATH,
++  },
++  problems,
++  status: problems.length === 0 ? 'PASS' : 'FAIL',
++}
++console.log(JSON.stringify(report, null, 2))
++if (problems.length) process.exit(1)
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/.harness/session-sync.mjs - 6d7c53475280a04436dc8c6a001e8930d6a7e69cc3702a1c44c0c1a19cafbd09
+snapshot .prale-eval/.harness/user-manager-stub.mjs - d824bc10f54bb054ce587a9e3354b086b879e7a499e6e2dfede641650899631c
+snapshot .prale-eval/contract-deliverable.md - 9f87a58a340c2e54683f01f86c64351478a29887e5644739f6af567ee341fa81
+snapshot .prale-eval/duplicate-delivery-demo.mjs - 89e3aa8a6cdae02517d14c96388fce96493a188336639e35edf20a5d28525387
+snapshot .prale-eval/result.json - e6453f3fdca6b1e4962330977209811c5d691a366ee28c85105f595d0f8b97b2
+snapshot .prale-eval/verify-citations.mjs - df36aec1a960bdf9159c9fd2fd733bdfeb8f7d334e24244f41f988e9fa124bad

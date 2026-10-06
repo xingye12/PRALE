@@ -1,0 +1,119 @@
+{
+  "task_id": 17,
+  "repository": "wattclaw",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "server/core/request-context.js",
+      "symbol": "runWithRequestContext",
+      "start_line": 5,
+      "end_line": 7,
+      "observation": "The request/task context is carried in an AsyncLocalStorage store. runWithRequestContext(context, fn) runs fn with an arbitrary context object (populated by authMiddleware with { user, tenant }), so the tenant identity is implicitly scoped to the whole async call chain of a request rather than passed as an argument."
+    },
+    {
+      "path": "server/core/request-context.js",
+      "symbol": "getRequestTenant",
+      "start_line": 17,
+      "end_line": 19,
+      "observation": "getRequestTenant() reads context.tenant off the AsyncLocalStorage store and returns null when no store exists. This is the single accessor that downstream tenant selection uses; getRequestUser() (lines 13-15) and getRequestContext() (lines 9-11) expose the sibling user/context fields. Because the store is ALS-based, a code path that runs outside the middleware (e.g. startup jobs, unhandled detached promises) sees tenant === null."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "MultiTenantGatewayProxy",
+      "start_line": 130,
+      "end_line": 152,
+      "observation": "The proxy that the rest of the backend talks to exposes call() (lines 148-151), which resolves the gateway via manager.getGatewayForCurrentRequest() rather than accepting a tenant argument. This makes the request-context tenant the routing key for all ordinary gateway RPC traffic: a handler cannot accidentally address another tenant through this entry point."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getGatewayForCurrentRequest",
+      "start_line": 397,
+      "end_line": 411,
+      "observation": "Primary tenant boundary enforcement. Selection precedence is: contextTenant (from request-context.js), else the tenant looked up/allocated for the authenticated user via ensureUserTenant(user), else getDefaultTenant(). It then reuses/creates that tenant's cached WS client and awaits ensureConnected before returning, so a request can only ever obtain the gateway of its own context tenant. The trace log records the selected tenantId/container/wsUrl."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "ensureUserTenant",
+      "start_line": 353,
+      "end_line": 395,
+      "observation": "Guarantees one tenant per user. It bootstraps the manager, returns the existing assignment from getTenantForUser(user.id) if present, otherwise enters withAllocationLock and re-checks the assignment after acquiring the lock (double-checked logic) before calling allocateTenant() and assignUserToTenant(). The re-check inside the lock prevents two concurrent first-requests from the same user being placed on two different tenants."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "callGatewayForTenant",
+      "start_line": 417,
+      "end_line": 424,
+      "observation": "Explicit, intentional bypass of the request-context tenant selection, documented as being for cross-tenant admin operations such as aggregating physically isolated collaboration projects. It requires an explicit tenantId, throws `Tenant <id> not found` when the DB row is missing, and otherwise calls that tenant's cached client directly. Because it ignores getRequestTenant(), callers must already be authorized for the target tenant."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "callGatewayForAllTenants",
+      "start_line": 429,
+      "end_line": 446,
+      "observation": "Fan-out failure behavior: RPCs to every tenant run under Promise.allSettled, so one tenant's connection error does not abort the batch. Results are mapped to { tenantId, ok, value | error } preserving the tenants array index, letting callers attribute each result (and route scoped follow-ups) back to the owning tenant."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "ensureConnected",
+      "start_line": 704,
+      "end_line": 780,
+      "observation": "Connection failure semantics for a tenant. Already-connected clients short-circuit; concurrent attempts are de-duplicated through this.connecting keyed by tenantId. Otherwise it arms a timeout of config.connectTimeoutMs that rejects with `Gateway for <tenantId> did not connect in time`, and an error handler that rejects with the underlying error unless it is a pairing/scope error and a pending backend device can be approved once, in which case it reconnects and retries. Both paths clean up listeners and remove the in-flight promise."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "allocateTenant",
+      "start_line": 538,
+      "end_line": 551,
+      "observation": "Capacity failure behavior. It first reuses any existing tenant with userCount < maxUsers, and only creates a new record when none is available; if tenants.length >= config.maxTenants it throws `OpenClaw tenant limit reached (<max>)` instead of over-provisioning. createTenantFromTemplate() (lines 553-575) applies the same maxTenants guard inside withAllocationLock."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "moveUserToTenant",
+      "start_line": 335,
+      "end_line": 351,
+      "observation": "Membership change enforcement. It looks up the target tenant and throws `Tenant <id> not found` if absent, counts existing members excluding the moving user and throws `Tenant <id> is full (count/max)` when at capacity, then runs an optional beforeAssign ownership/hook check before the upsert assignment is written. Full tenants and unknown tenants fail closed."
+    },
+    {
+      "path": "server/core/auth.js",
+      "symbol": "authMiddleware",
+      "start_line": 25,
+      "end_line": 36,
+      "observation": "Where the tenant boundary is established and where provisioning failure surfaces. After checkAuth() (401 on missing/invalid token), it awaits ensureTenantForUser(req.currentUser) and only then runs the rest of the request inside runWithRequestContext({ user, tenant }). If tenant provisioning/connection throws, it returns HTTP 503 with `OpenClaw tenant unavailable` before any route handler executes, so a request that cannot be bound to a tenant is never served."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The tenant boundary for ordinary gateway traffic is the AsyncLocalStorage request context: getGatewayForCurrentRequest() prefers getRequestTenant() from the context, then the authenticated user's assigned tenant, then the default tenant, and MultiTenantGatewayProxy.call() routes through that resolution, so a handler cannot address another tenant without an explicit tenantId.",
+      "evidence_paths": [
+        "server/core/request-context.js",
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "A user is pinned to exactly one tenant: ensureUserTenant() looks up the existing user_tenant_assignments row, and on a miss allocates inside withAllocationLock with a double-checked re-read of the assignment, while assignUserToTenant() upserts on the unique user_id key, so concurrent first requests cannot place one user on two tenants.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "Cross-tenant access is not implicit but an explicit, narrow bypass: callGatewayForTenant()/callGatewayForAllTenants()/getHttpTargetForTenantId() skip request-context selection and require a caller-supplied tenantId, throwing `<tenant> not found` for unknown tenants; the code comments scope them to admin aggregation of per-tenant isolated data.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "Failure behavior is fail-closed and per-tenant isolated: authMiddleware returns 503 before handlers run when tenant provisioning fails and only enters the tenant-scoped context on success; ensureConnected() rejects on websocket error or connectTimeoutMs timeout (with a single pairing-error retry); allocateTenant()/createTenantFromTemplate() throw at maxTenants capacity and moveUserToTenant() throws when the tenant is unknown or full; callGatewayForAllTenants() uses Promise.allSettled and reports ok:false with the error per tenant instead of failing the whole batch.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js",
+        "server/core/request-context.js",
+        "server/core/auth.js"
+      ]
+    }
+  ],
+  "conclusion": "Tenant isolation in WattClaw is enforced by composing three layers. (1) request-context.js provides an AsyncLocalStorage carrier ({ user, tenant }) that authMiddleware populates on every authenticated request before running the route. (2) multi-tenant-gateway.js resolves all ordinary gateway traffic through getGatewayForCurrentRequest(), which selects the context tenant first, else the authenticated user's one-and-only assigned tenant (ensureUserTenant, serialized by withAllocationLock and a re-check), else the default tenant; the exported MultiTenantGatewayProxy.call() uses exactly this path, so the tenant is not an attacker-controllable parameter. (3) Bypassing the context requires calling the explicit *ForTenantId / callGatewayForTenant / callGatewayForAllTenants APIs, which demand a tenantId and are documented as admin cross-tenant aggregation; they are the review focus because they intentionally skip context checks. Failure behavior is fail-closed: a request that cannot be bound to a healthy tenant gets HTTP 503 from authMiddleware before any handler runs, unknown tenants throw `Tenant <id> not found`, capacity limits throw `OpenClaw tenant limit reached`, full/unavailable tenants block assignment, per-tenant connection problems reject with a timeout or the underlying error (one pairing-error retry), and the all-tenants fan-out degrades to ok:false per tenant rather than failing the batch; a detached code path outside the ALS scope sees tenant === null and thus falls back to the user/default tenant rather than silently inheriting another tenant.",
+  "validation": {
+    "command": "node --check server/core/request-context.js && node --check server/core/multi-tenant-gateway.js",
+    "status": "passed",
+    "notes": "Both files parse cleanly under Node v24.14.0; the two cited files and server/core/auth.js were read in-repo to ground every symbol/line range. No test framework or linter is configured in this repository (see CLAUDE.md), and the hidden acceptance oracle is not runnable locally, so validation was limited to syntax checks plus direct source inspection of the cited ranges."
+  }
+}

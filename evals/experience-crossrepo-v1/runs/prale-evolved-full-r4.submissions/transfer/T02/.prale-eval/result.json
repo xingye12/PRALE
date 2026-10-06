@@ -1,0 +1,95 @@
+{
+  "task_id": "T02",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.__init__",
+      "start_line": 73,
+      "end_line": 88,
+      "observation": "The lifecycle helper's rest state is fully defined here: stop_event=None, watcher_thread=None, changed_files=set() and gitignore_spec=None when no gitignores are supplied. These three attributes are the observable state that the state-transition test classifies as 'idle', so the initial-state assertions (test_fresh_watcher_is_idle) are grounded in this constructor."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.start",
+      "start_line": 164,
+      "end_line": 170,
+      "observation": "start() implements the sole 'idle -> running' legal edge: it allocates a fresh threading.Event (stop_event), resets changed_files, and spawns a daemon thread running watch_files(). It does NOT guard against being called while already running, which is the illegal-edge hazard the transition test documents (double start abandons the previous session's thread and stop_event references)."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.stop",
+      "start_line": 172,
+      "end_line": 179,
+      "observation": "stop() implements the 'running -> idle' legal edge and is written defensively: both `if self.stop_event:` and `if self.watcher_thread:` guards make stop() a safe no-op when the helper was never started or is already stopped, and a second stop() is idempotent. This is exactly the tolerated-illegal-edge behaviour asserted by test_illegal_edge_stop_before_start_is_tolerated and test_illegal_edge_double_stop_is_idempotent."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.handle_changes",
+      "start_line": 135,
+      "end_line": 143,
+      "observation": "handle_changes() is the command edge of the session lifecycle. An empty/falsy batch is a legal no-op returning False; a non-empty batch normalizes each change to str(Path(change[1])), merges into changed_files, signals io.interrupt_input() and returns True, keeping the session in 'running'. A malformed change with no path component (change[1] missing) is rejected with IndexError/TypeError instead of silently recording a bogus file, which the illegal-edge test asserts."
+    },
+    {
+      "path": "aider/watch.py",
+      "symbol": "FileWatcher.watch_files",
+      "start_line": 145,
+      "end_line": 162,
+      "observation": "watch_files() is the thread body that consumes the watchfiles backend and composes the two edges: it calls handle_changes() on each change batch and returns as soon as handle_changes() reports True. test_watch_files_forwards_first_change_batch exercises this by driving a scripted 'watch' generator and asserting the batch is folded into changed_files and io.interrupt_input is signalled."
+    },
+    {
+      "path": "tests/basic/test_watch.py",
+      "symbol": "MinimalCoder",
+      "start_line": 8,
+      "end_line": 15,
+      "observation": "The existing acceptance test's fixture collaboration object shows how FileWatcher is driven in this repo: a minimal coder exposing io, root and abs_fnames and a get_rel_fname passthrough. The new state-transition test mirrors this shape (FakeCoder/FakeIO) so it stays faithful to the repository's established test contract while avoiding the heavy aider.io import."
+    },
+    {
+      "path": "tests/basic/test_watch.py",
+      "symbol": "test_get_roots_to_watch",
+      "start_line": 75,
+      "end_line": 96,
+      "observation": "This is the existing precedent for constructing a FileWatcher directly against a tmp_path root (FileWatcher(coder, root=tmp_path)) and asserting on its lifecycle-adjacent output. The new test reuses the same construction contract (root=tmp_path) for its idle/running transitions."
+    },
+    {
+      "path": "tests/basic/test_watch.py",
+      "symbol": "test_handle_changes",
+      "start_line": 99,
+      "end_line": 112,
+      "observation": "The repository's existing (single-edge) test for the command edge already pins handle_changes([]) -> False with unchanged changed_files and handle_changes([('modified', path)]) -> True with changed_files growing by one. The new state-transition test generalizes this exact contract into a full legal/illegal edge table and adds the running-session and interrupt_input assertions."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "FileWatcher.start() is the only legal 'idle -> running' transition: it installs a threading.Event into stop_event, clears changed_files, and spawns a daemon watcher thread, so the helper's observable state flips from idle to running.",
+      "evidence_paths": ["aider/watch.py"]
+    },
+    {
+      "claim": "FileWatcher.stop() implements the legal 'running -> idle' transition and also tolerates the illegal edges stop-before-start and double-stop as guarded, idempotent no-ops rather than raising.",
+      "evidence_paths": ["aider/watch.py"]
+    },
+    {
+      "claim": "FileWatcher.handle_changes() is the session's command edge: an empty batch is a legal no-op (False, state unchanged), a non-empty batch updates changed_files, signals io.interrupt_input and returns True while staying running, and a malformed change lacking a path component is deterministically rejected.",
+      "evidence_paths": ["aider/watch.py"]
+    },
+    {
+      "claim": "FileWatcher.watch_files() composes start()/stop() with handle_changes() by returning on the first handled batch, and FileWatcher.__init__ fixes the idle baseline state (stop_event/watch_thread None, changed_files empty) that the transition table starts from.",
+      "evidence_paths": ["aider/watch.py"]
+    },
+    {
+      "claim": "The repository already establishes the public contract for this helper through test_handle_changes (empty vs non-empty batch) and test_get_roots_to_watch/MinimalCoder (direct construction with root=tmp_path); the new state-transition test extends, rather than contradicts, that contract.",
+      "evidence_paths": ["tests/basic/test_watch.py"]
+    },
+    {
+      "claim": "The new executable demo tests/basic/test_watch_lifecycle_transitions.py drives the real FileWatcher source through a legal-edge table (start, stop, changes, nochange) and an illegal-edge table (stop-before-start, nochange-before-start, double-stop, double-start, malformed change), asserting document state and side effects on every edge.",
+      "evidence_paths": ["aider/watch.py", "tests/basic/test_watch.py"]
+    }
+  ],
+  "conclusion": "The watch/session lifecycle helper in aider/watch.py is FileWatcher. Its lifecycle is a two-state machine (idle <-> running) joined by the handle_changes() command edge. Legal edges are fully specified: start() enters running and resets per-session state, stop() returns to idle, and handle_changes() keeps the session running while folding detected paths into changed_files and signalling io.interrupt_input. Illegal edges split into two classes: tolerated ones (stop before start, double stop, empty/None batch, and even changes before start) which are guarded no-ops that preserve state, and one genuinely unsafe illegal edge -- a second start() while running abandons the prior session's thread and stop_event with no recovery path from stop() -- plus malformed change entries, which are deterministically rejected. The delivered state-transition test (tests/basic/test_watch_lifecycle_transitions.py) encodes this contract as executable assertions over both edge tables, 19 cases, all passing. Optional test dependencies (grep_ast, watchfiles, oslex) are absent in this workspace, so the demo stubs the two module-import-time watch dependencies and always scripts the watch() backend; this is recorded as the validation limitation rather than installed.",
+  "validation": {
+    "command": "python -m pytest tests/basic/test_watch_lifecycle_transitions.py -q",
+    "status": "passed",
+    "notes": "19 passed in 0.10s. Focused run of the new state-transition demo against the real FileWatcher source in aider/watch.py. LIMITATION: the optional dependencies grep_ast, watchfiles (needed to import aider/watch.py) and oslex (needed to import aider.io, hence tests/basic/test_watch.py) are NOT installed in this workspace and were deliberately not installed, per the no-install rule. Consequently (a) the demo injects minimal stubs for grep_ast/watchfiles only at import time and replaces the watch() backend with a deterministic scripted generator, so the lifecycle methods themselves run unmodified; and (b) the repository's own tests/basic/test_watch.py cannot be collected here (ImportError: oslex / grep_ast), so it is cited as the acceptance contract via static inspection rather than execution. Citation ranges were separately verified by an AST pass over both required files confirming each named symbol's def line falls inside its reported inclusive start_line/end_line (FileWatcher.__init__ 73-88, handle_changes 135-143, watch_files 145-162, start 164-170, stop 172-179; test_handle_changes 99-112, test_get_roots_to_watch 75-96, MinimalCoder 8-15)."
+  }
+}

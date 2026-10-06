@@ -1,0 +1,125 @@
+{
+  "task_id": "T03",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "search_and_replace",
+      "start_line": 434,
+      "end_line": 445,
+      "observation": "The exact-string primitive of the search/replace strategy. It counts occurrences (num = original_text.count(search_text), line 437) but the uniqueness guard is commented out (lines 438-439: '# if num > 1:  #    raise SearchTextNotUnique()'), so a non-unique SEARCH is not rejected: line 443 does original_text.replace(search_text, replace_text), i.e. str.replace with no count argument, which rewrites EVERY occurrence. Only num == 0 returns None (lines 440-441). Task-relevant: this is why the fixture contract must carry its own uniqueness precondition - a distinct (newline-carrying) SEARCH with count == 1 is applied exactly once, while the same text without the trailing newline (count == 2) would be applied to two sites by this primitive instead of failing. Executed: search_and_replace(('    log(\"done\")', REPLACE, ORIGINAL)) mutated 2 sites; the correctly-guarded case mutated 1."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "SearchTextNotUnique",
+      "start_line": 524,
+      "end_line": 525,
+      "observation": "The ambiguity exception type (class SearchTextNotUnique(ValueError)). It is imported and handled by aider/coders/udiff_coder.py (UnifiedDiffNotUnique report), but inside this module its only raise site is the commented-out line 439 inside search_and_replace, so it is unreachable on the search/replace path. Task-relevant: the requested property 'a non-unique edit fails' cannot be attributed to this type for the fixture; the failure has to come from an explicit count check (see try_dotdotdots) or from the contract boundary. Confirmed by grep: no '#raise SearchTextNotUnique' remains outside a comment."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "flexible_search_and_replace",
+      "start_line": 565,
+      "end_line": 577,
+      "observation": "The strategy ladder: for each (strategy, preprocs) pair it tries try_strategy and returns the first truthy result (lines 573-577). Because search_and_replace sits first in editblock_strategies/all_preprocs with the (False, False, False) preproc, a lenient attempt wins before any strictness check exists, so there is no point in the ladder where an ambiguous SEARCH is reported. Task-relevant: the fixture contract must decide uniqueness before entering this ladder; executed verification shows the ladder reproduces the single exact edit for the newline-carrying SEARCH (1 mutated site) and silently mutates both sites for the newline-less SEARCH (2 mutated sites)."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "try_strategy",
+      "start_line": 586,
+      "end_line": 608,
+      "observation": "Per-attempt driver: it applies the newline/whitespace preprocessing (strip_blank_lines, relative_indent, reverse_lines) to all three texts before calling the strategy, and returns None (not a partially transformed text) whenever the strategy yields nothing (line 596 simply returns the falsy res) or when the relative-indent back-conversion raises ValueError (lines 604-608 -> return). Task-relevant: a failed attempt contributes no mutation, which is the mechanism behind 'fails without partial mutation' on this path."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "strip_blank_lines",
+      "start_line": 611,
+      "end_line": 614,
+      "observation": "The whitespace/newline preprocessor used by the ladder: texts = [text.strip(\"\\n\") + \"\\n\" for text in texts], i.e. it rewrites the search, replace and original texts by dropping leading/trailing blank lines and forcing a trailing newline. Task-relevant to the fixture: under this preproc a distinction that lives only in leading/trailing blank lines disappears, and the EOF newline of the fixture is normalized (so the file without a trailing newline is compared as if it had one). Distinctness must therefore be judged on the exact SEARCH bytes against the original text (count on the unmassaged strings), which is what the contract operator does."
+    },
+    {
+      "path": "aider/coders/editblock_coder.py",
+      "symbol": "EditBlockCoder.apply_edits",
+      "start_line": 41,
+      "end_line": 124,
+      "observation": "The SEARCH/REPLACE application loop: new_content = do_replace(...) and the result is written only inside 'if new_content:' (line 65 -> self.io.write_text), otherwise the edit is collected in failed[] and reported as SearchReplaceNoExactMatch. Task-relevant: a rejected edit is therefore a no-write event, which is the layer at which 'no partial mutation' becomes observable on disk. Executed verification mirrors this policy: the failed non-unique chunked edit left the fixture file byte-identical (sha256 unchanged)."
+    },
+    {
+      "path": "aider/coders/editblock_coder.py",
+      "symbol": "do_replace",
+      "start_line": 364,
+      "end_line": 383,
+      "observation": "File-level entry point: it strips quoted wrapping and delegates to replace_most_similar_chunk(content, before_text, after_text) (line 382), returning its return value unchanged. Task-relevant: when the chunked SEARCH is non-unique, replace_most_similar_chunk returns None and do_replace propagates None, so nothing is written. Executed: do_replace(...) returned None for the non-unique chunked fixture and returned the updated text for the unique chunk."
+    },
+    {
+      "path": "aider/coders/editblock_coder.py",
+      "symbol": "replace_most_similar_chunk",
+      "start_line": 157,
+      "end_line": 187,
+      "observation": "Best-effort matcher: it tries perfect_or_whitespace first (line 162), then drops a spurious leading blank SEARCH line (lines 165-169), then calls try_dotdotdots inside try/except ValueError with the error swallowed (lines 171-179) and finally falls through to 'return' (line 181), which also makes the fuzzy fallback replace_closest_edit_distance dead code (lines 182-187). Task-relevant: this is the repository path that turns a non-unique chunk into a clean failure (None, no mutation) rather than a silently misplaced edit; it is also why a non-unique SEARCH that physically exists in the file is NOT reported when it does not use '...' - perfect_or_whitespace/perfect_replace would take the first match."
+    },
+    {
+      "path": "aider/coders/editblock_coder.py",
+      "symbol": "try_dotdotdots",
+      "start_line": 190,
+      "end_line": 240,
+      "observation": "The only live uniqueness check for SEARCH text in this checkout: for every '...'-separated chunk it raises ValueError when whole.count(part) == 0 (lines 233-234) and, crucially, when whole.count(part) > 1 (lines 235-236); only an exactly-once chunk is applied, via whole.replace(part, replace, 1) (line 238). Because the accumulated edits live in the local variable whole and the raise aborts the whole function, no partial result can escape; the caller catches the ValueError. Task-relevant: this is the executed evidence for the requested property 'a non-unique edit fails without partial mutation'. Executed: the fixture (chunk 1 unique, chunk 2 '    total = 0\\n' present twice) raised ValueError, and the mutation applied to chunk 1 before the raise never reached the file."
+    },
+    {
+      "path": "aider/coders/editblock_coder.py",
+      "symbol": "perfect_replace",
+      "start_line": 146,
+      "end_line": 154,
+      "observation": "Line-block matcher that scans whole_lines and returns at the FIRST position where the part lines match exactly (lines 151-154); it has no occurrence count and therefore no ambiguity report. Task-relevant hazard for the fixture: without '...' a non-unique SEARCH is silently resolved to the first site (verified separately in the demo: replace_most_similar_chunk applied the newline-less SEARCH at the first of two identical sites), which is exactly what the contract's 'reject non-unique' rule prevents."
+    },
+    {
+      "path": "aider/coders/editblock_coder.py",
+      "symbol": "prep",
+      "start_line": 127,
+      "end_line": 131,
+      "observation": "Content normalization used by the editblock matchers: if content does not end with a newline it appends one, then splits into keepends lines. Task-relevant to the newline/whitespace fixture: the EOF-newline difference that makes the fixture's SEARCH unique at the string level is neutralized here (both candidate lines end with '\\n' after prep), so on this path a difference of a single trailing newline at EOF is not by itself a distinguishing feature; the contract's distinctness check therefore runs on the raw texts. Executed: the editblock result equals the single exact edit plus one appended EOF newline."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "An exact, newline-distinct edit succeeds exactly once. With the fixture text 'def first():\\n    log(\"done\")\\n    return 1\\n\\n\\ndef second():\\n    log(\"done\")' (no EOF newline) and SEARCH '    log(\"done\")\\n', the SEARCH occurs once, the edit is applied once (applied_count == 1, one mutated site), the result equals original.replace(SEARCH, REPLACE, 1), the edited statement lands in first() and the second() site stays byte-identical.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py",
+        "aider/coders/editblock_coder.py"
+      ]
+    },
+    {
+      "claim": "A non-unique edit fails without partial mutation. Dropping only the trailing newline (SEARCH '    log(\"done\")') makes the same text occur twice in the fixture; the contract operator then returns status 'rejected_non_unique' with applied_count == 0 and returns the original text byte-identically (identical sha256, zero mutated sites), so no site is modified.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "The uniqueness precondition cannot be delegated to the search/replace primitive: the guard in search_and_replace is commented out (lines 438-439) while line 443 calls str.replace without a count, so the non-unique SEARCH mutates both sites (verified: 2 mutated sites, status 'applied_unguarded'); the ladder flexible_search_and_replace reports nothing either because it returns the first truthy lenient result. SearchTextNotUnique stays unreachable on this path.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "The repository path that does fail a non-unique chunk without partial mutation is try_dotdotdots: it raises ValueError when whole.count(part) > 1 (lines 235-236) after mutating only a local variable, replace_most_similar_chunk swallows that ValueError and returns None, do_replace propagates None, and apply_edits writes only when new_content is truthy - the fixture file on disk stayed byte-identical (sha256 unchanged) after the failed edit.",
+      "evidence_paths": [
+        "aider/coders/editblock_coder.py",
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "Newline/whitespace handling is what makes the fixture fixture-worthy and also what erodes it: strip_blank_lines (text.strip(\"\\n\") + \"\\n\") and prep() (append missing EOF newline) normalize newline differences before matching, and a whitespace-only variant of the SEARCH ('    log(\"done\") \\n') is a distinct, absent text (status 'no_match', zero mutation). Distinctness must therefore be decided on the exact SEARCH bytes against the original text, and a whitespace/newline difference must never be treated as 'close enough'.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py",
+        "aider/coders/editblock_coder.py"
+      ]
+    }
+  ],
+  "conclusion": "The contract holds for the distinct newline/whitespace edit fixture. (1) The exact edit succeeds exactly once: because the fixture's two log(\"done\") sites differ only by the trailing newline at EOF, the SEARCH '    log(\"done\")\\n' has exactly one occurrence, so the operation applies it once (applied_count == 1, one mutated site) and the result equals a single .replace(SEARCH, REPLACE, 1); the sibling site and the rest of the file are unchanged. (2) The non-unique edit fails without partial mutation: the newline-less SEARCH has two occurrences, the operation rejects it (status rejected_non_unique, applied_count == 0) and returns the input text byte-identically (sha256 equal, zero mutated sites), and the repository's own failing path - try_dotdotdots raising ValueError on count > 1, swallowed by replace_most_similar_chunk so that do_replace returns None and no write occurs - leaves the on-disk fixture byte-identical. Boundary condition that the contract encodes and the evidence exposes: this checkout provides NO uniqueness enforcement on the search/replace path (the raise at search_replace.py:438-439 is commented out and line 443 replaces every occurrence), and perfect_replace/perfect_or_whitespace silently pick the first match for a non-unique SEARCH without '...'; the only live count>1 guard is try_dotdotdots. Ambiguity must therefore be detected by the caller before the primitive runs, never by relying on an error - consistent with the repository's own prompt rule that a SEARCH section must be unique.",
+  "validation": {
+    "command": "python .prale-eval/edit_contract_demo.py",
+    "status": "pass",
+    "notes": "Executed inside the workspace with Python 3.12.3; exit code 0. Phase 1 (contract demo) ran 29 checks, all ok: the newline-carrying SEARCH was applied exactly once (1 mutated site, sibling site untouched), the newline-less SEARCH was rejected with 0 mutations and an unchanged content hash, the whitespace-variant SEARCH produced no_match, the unguarded primitive and the flexible ladder were shown to mutate 2 sites instead of failing, and the repository failure path (try_dotdotdots -> ValueError -> replace_most_similar_chunk/do_replace return None) left the on-disk fixture byte-identical. Phase 2 re-read .prale-eval/result.json and verified task_id == T03, repository == aider, mode == contract, all required keys (evidence/claims/conclusion/validation, validation.command/status/notes), and, by AST analysis of each cited file, that every cited symbol really is defined inside its reported inclusive start_line/end_line range (11/11 citations) and that every claim's evidence_paths are cited in the evidence array, including the required path aider/coders/search_replace.py. LIMITATION (recorded, not worked around): optional validation dependencies of this checkout are not installed and installing them is prohibited - json5 (imported by aider/models.py), litellm, diff_match_patch, GitPython and oslex are all missing, so 'aider.coders.*' cannot be imported normally and pytest cannot even collect tests/basic/test_editblock.py ('python -m pytest tests/basic/test_editblock.py -x -q' ends in 1 collection error). Substituted evidence: both modules under test were loaded directly from source with importlib.util.spec_from_file_location, with stubs for the unrelated Coder/prompt base classes and for diff_match_patch that raise if touched (they were never touched, since the contract only exercises exact-string strategies); consequently the diff_match_patch-based strategies (dmp_apply, dmp_lines_apply, diff_lines) of aider/coders/search_replace.py are out of scope for this contract and were not executed. No source file, task metadata, lock file or git configuration was modified; the only writes were inside .prale-eval/ plus the temporary fixture file .prale-eval/_contract_fixture.tmp, which the demo deletes in a finally block."
+  }
+}

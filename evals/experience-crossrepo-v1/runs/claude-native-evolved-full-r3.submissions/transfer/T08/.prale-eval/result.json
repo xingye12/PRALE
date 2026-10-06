@@ -1,0 +1,55 @@
+{
+  "task_id": "T08",
+  "repository": "wattclaw",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "package.json",
+      "symbol": "test:server",
+      "start_line": 13,
+      "end_line": 13,
+      "observation": "The repo's server test entrypoint `test:server` shells out to `vitest run` over a fixed list of server test files. Vitest is only a devDependency (line 77) and is not vendored, so this default path cannot execute without a full `node_modules` install. The same file declares `\"type\": \"module\"` (line 6), which is what lets a pure ESM server module be imported and exercised directly by Node with no bundler or test framework."
+    },
+    {
+      "path": "server/index.js",
+      "symbol": "createFileRoutes",
+      "start_line": 1041,
+      "end_line": 1041,
+      "observation": "The runtime entrypoint mounts the generated-file router with `createFileRoutes(app)` (imported at line 119 from `server/handlers/files.js`). Everything above this line is runtime/deployment-coupled: `loadEnvConfig()` (line 161) parses `.env`, `app.use(express.json(...))` (line 362) requires Express, `new OpenClawGateway(...)` (line 365) needs a live Gateway WebSocket, and `db` (line 17) opens SQLite. Importing index.js eagerly constructs all of these, so it is not itself an offline-safe verification target — but the route it mounts delegates to a pure helper."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 112,
+      "end_line": 112,
+      "observation": "Call site: the file router separates the runtime-dependent step (`gatewayExec(realpath -e ...)`, lines 107/124, which needs the Gateway) from the pure path-resolution step, calling `resolveGeneratedFileCandidatePath(workspaceReal, requestedPath)` with already-fetched strings. This means the resolution contract can be verified offline without the Gateway, DB, or env."
+    },
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 15,
+      "observation": "The fixture under test: a pure, dependency-free ESM function (only String methods, no imports) that maps a workspace root plus a requested path to a `{ candidatePath, pathMode }` result in three modes (`workspace-absolute`, `workspace-root-relative`, `workspace-relative`). Because it has no imports, no I/O, no network, and no DB access, it is fully deterministic and reproducible on any machine."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Chosen verification: the pure fixture `resolveGeneratedFileCandidatePath` in `server/utils/generated-file-path.js` is exercised by a Node built-in test file (`.prale-eval/verify-generated-file-path.test.mjs`, run via `node --test .prale-eval/verify-generated-file-path.test.mjs`). This avoids runtime/deployment dependencies because the fixture has zero imports and performs only String manipulation: no Gateway WebSocket, no SQLite via better-sqlite3, no Express server, no `.env` parsing, no network, and no installed packages. By contrast, `package.json`'s declared `test:server` script requires `vitest` (devDependency) plus the app's native/runtime deps to be installed, which is a heavier, less offline-safe path.",
+      "evidence_paths": ["package.json", "server/utils/generated-file-path.js"]
+    },
+    {
+      "claim": "`server/index.js` cannot be the verification target itself: it is the process entrypoint and eagerly initializes deployment-coupled resources at import time — `loadEnvConfig()` (line 161) reads `.env`, `db` (line 17) opens SQLite, `app.use(express.json(...))` (line 362) needs Express, and `new OpenClawGateway(...)` (line 365) dials the Gateway WebSocket. Those same resources are what a full `npm start` / vitest run would require. It does, however, wire the feature being verified: `createFileRoutes(app)` (line 1041) mounts `server/handlers/files.js`, whose handler calls the pure `resolveGeneratedFileCandidatePath` at line 112.",
+      "evidence_paths": ["server/index.js", "server/handlers/files.js", "server/utils/generated-file-path.js"]
+    },
+    {
+      "claim": "The verification is narrow and contract-shaped: it asserts the three documented `pathMode` outcomes (workspace-absolute, workspace-root-relative, workspace-relative) plus trailing-slash normalization of the workspace root, using Node's built-in `node:test` + `node:assert/strict` only. The pre-existing `server/utils/generated-file-path.test.js` expresses the same three cases but imports `vitest`, so it fails to load without node_modules; the offline demo mirrors those assertions using only the Node runtime, making it reproducible in this workspace with no install step.",
+      "evidence_paths": ["package.json", "server/utils/generated-file-path.js"]
+    }
+  ],
+  "conclusion": "The narrow, offline-safe verification for this frontend/server fixture is a direct unit check of the pure ESM helper `resolveGeneratedFileCandidatePath` (`server/utils/generated-file-path.js`), the same helper reached from the server route mounted by `createFileRoutes(app)` in `server/index.js:1041`. Running `node --test .prale-eval/verify-generated-file-path.test.mjs` exercises the path-resolution contract with 4/4 passing in ~56 ms. It avoids runtime/deployment dependencies because the fixture imports nothing and touches no I/O, so it never needs the Gateway WebSocket, SQLite, Express, `.env`, network access, or an installed `node_modules` — unlike the repo's `test:server` script (`package.json:13`), which requires `vitest` plus the application's native dependencies.",
+  "validation": {
+    "command": "node --test .prale-eval/verify-generated-file-path.test.mjs",
+    "status": "passed",
+    "notes": "4 tests, 4 pass, 0 fail (suites 1, duration ~56 ms), executed inside /tmp/prale-real-eval-vr_v0y22/workspace against the real server/utils/generated-file-path.js source. The default in-repo path `npx vitest run server/utils/generated-file-path.test.js` (and `npm run test:server`) could NOT be used: this workspace has no node_modules and dependency installation is out of scope, so `vitest` resolves with ERR_MODULE_NOT_FOUND and the existing vitest-style test file (`server/utils/generated-file-path.test.js`) cannot be loaded by `node --test` for the same missing-package reason. That limitation is why the demo re-expresses the identical assertions with Node's built-in test runner, which ships with the present Node v24.14.0 runtime. No packages were installed and no repository source, lockfile, or git configuration was modified."
+  }
+}

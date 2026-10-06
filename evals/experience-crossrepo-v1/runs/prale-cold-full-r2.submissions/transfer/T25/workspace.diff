@@ -1,0 +1,854 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/duplicate-event.contract.test.mjs b/.prale-eval/duplicate-event.contract.test.mjs
+new file mode 100644
+index 0000000..44cf374
+--- /dev/null
++++ b/.prale-eval/duplicate-event.contract.test.mjs
+@@ -0,0 +1,432 @@
++// Duplicate-event contract test (executable demo for T25 / wattclaw).
++//
++// Contract under test:
++//   Replaying ONE session update (at-least-once delivery / gateway replay) must not
++//   double-count usage and must not emit a duplicate state change.
++//
++// The demo runs the REAL repository code paths against an in-memory node:sqlite
++// database that is injected in place of server/database.js (better-sqlite3 is not
++// installable in this environment). Nothing else in the chain is re-implemented:
++//   * server/core/session-sync.js       (real)  -> schedule/cooldown + changed counters
++//   * server/user-manager.js            (real)  -> upsertSyncedUserSession idempotency
++//   * server/core/usage-sync.js         (real)  -> in-flight coalescing + broadcast
++//   * server/core/session-usage-cache.js(real)  -> absolute (non-additive) usage writes
++// Only the external edges (gateway RPC, SSE transport, multi-tenant lookup) are stubbed.
++//
++// Run: node --experimental-test-module-mocks --test .prale-eval/duplicate-event.contract.test.mjs
++
++import assert from 'node:assert/strict'
++import { readFileSync } from 'node:fs'
++import { DatabaseSync } from 'node:sqlite'
++import { after, before, beforeEach, describe, mock, test } from 'node:test'
++
++const FIXTURE = JSON.parse(
++  readFileSync(new URL('./fixtures/duplicate-session-event.json', import.meta.url), 'utf8'),
++)
++const EXPECTED = FIXTURE.expectedAfterSingleLogicalDelivery
++const FORBIDDEN = FIXTURE.forbiddenDoubleCount
++
++// ---------------------------------------------------------------------------
++// Fixture database (same DDL subset as server/database.js for the tables touched)
++// ---------------------------------------------------------------------------
++
++const fixtureDb = new DatabaseSync(':memory:')
++fixtureDb.exec(`
++  CREATE TABLE user_agents (
++    id TEXT PRIMARY KEY,
++    user_id TEXT NOT NULL,
++    gateway_agent_id TEXT,
++    workspace TEXT,
++    name TEXT NOT NULL,
++    description TEXT,
++    config TEXT DEFAULT '{}',
++    system_prompt TEXT,
++    model TEXT,
++    category TEXT,
++    template_id TEXT,
++    avatar TEXT,
++    status TEXT DEFAULT 'active',
++    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
++    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
++  );
++  CREATE TABLE user_tenant_assignments (
++    user_id TEXT PRIMARY KEY,
++    tenant_id TEXT NOT NULL,
++    assignment_mode TEXT NOT NULL DEFAULT 'auto',
++    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
++    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
++  );
++  CREATE TABLE user_sessions (
++    id TEXT PRIMARY KEY,
++    user_id TEXT NOT NULL,
++    session_key TEXT NOT NULL,
++    agent_id TEXT,
++    label TEXT,
++    channel TEXT,
++    peer_id TEXT,
++    display_title TEXT,
++    last_message_at INTEGER,
++    model TEXT,
++    model_provider TEXT,
++    token_input INTEGER DEFAULT 0,
++    token_output INTEGER DEFAULT 0,
++    token_cache_read INTEGER DEFAULT 0,
++    token_cache_write INTEGER DEFAULT 0,
++    token_total INTEGER DEFAULT 0,
++    cost_total REAL DEFAULT 0,
++    msg_total INTEGER DEFAULT 0,
++    msg_user INTEGER DEFAULT 0,
++    msg_assistant INTEGER DEFAULT 0,
++    msg_tool_calls INTEGER DEFAULT 0,
++    msg_tool_results INTEGER DEFAULT 0,
++    msg_errors INTEGER DEFAULT 0,
++    tool_usage_json TEXT DEFAULT '{}',
++    usage_synced_at INTEGER,
++    tenant_id TEXT,
++    created_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000),
++    updated_at INTEGER NOT NULL DEFAULT (strftime('%s', 'now') * 1000)
++  );
++  CREATE INDEX idx_user_sessions_session_key ON user_sessions(session_key);
++`)
++
++// better-sqlite3-compatible surface (prepare/exec/transaction) on top of node:sqlite.
++const fixtureDbHandle = {
++  prepare: (sql) => fixtureDb.prepare(sql),
++  exec: (sql) => fixtureDb.exec(sql),
++  pragma: () => {},
++  transaction: (fn) => (...args) => {
++    fixtureDb.exec('BEGIN')
++    try {
++      const result = fn(...args)
++      fixtureDb.exec('COMMIT')
++      return result
++    } catch (error) {
++      fixtureDb.exec('ROLLBACK')
++      throw error
++    }
++  },
++  close: () => fixtureDb.close(),
++}
++
++// ---------------------------------------------------------------------------
++// External-edge stubs + module injection (must happen before importing the code
++// under test, which would otherwise pull in better-sqlite3)
++// ---------------------------------------------------------------------------
++
++const broadcasts = []
++const gatewayUsageCalls = []
++
++mock.module(new URL('../server/database.js', import.meta.url).href, {
++  defaultExport: fixtureDbHandle,
++  namedExports: {
++    ensureDefaultAdmin: () => {},
++    initDatabase: () => fixtureDbHandle,
++  },
++})
++mock.module(new URL('../server/openclaw-config-sync.js', import.meta.url).href, {
++  namedExports: { syncAllTenantOpenClawConfigsFromDB: () => [] },
++})
++mock.module(new URL('../server/core/multi-tenant-gateway.js', import.meta.url).href, {
++  namedExports: {
++    getGatewayHttpTargetsForAllTenants: async () => null, // single-gateway mode
++    getGatewayHttpTargetForCurrentRequest: async () => null,
++  },
++})
++mock.module(new URL('../server/core/gateway-client.js', import.meta.url).href, {
++  namedExports: {
++    callGatewayUsage: async (params) => {
++      gatewayUsageCalls.push(params)
++      return { sessions: [structuredClone(FIXTURE.usageSnapshot)] }
++    },
++    callGatewayUsageForTarget: async () => {
++      throw new Error('unexpected tenant target: fixture is single-gateway')
++    },
++  },
++})
++mock.module(new URL('../server/core/sse.js', import.meta.url).href, {
++  namedExports: {
++    broadcastSSE: (data, payload) => {
++      broadcasts.push({ data, payload })
++    },
++  },
++})
++
++const sessionSync = await import('../server/core/session-sync.js')
++const usageCache = await import('../server/core/session-usage-cache.js')
++const usageSync = await import('../server/core/usage-sync.js')
++
++// ---------------------------------------------------------------------------
++// Helpers
++// ---------------------------------------------------------------------------
++
++function seedOwnership() {
++  fixtureDb.exec('DELETE FROM user_agents; DELETE FROM user_tenant_assignments;')
++  fixtureDb
++    .prepare(`INSERT INTO user_agents (id, user_id, gateway_agent_id, name, status, created_at, updated_at)
++              VALUES (?, ?, ?, ?, 'active', 1, 1)`)
++    .run('ua-duplicate-fixture', FIXTURE.userId, FIXTURE.agentId, 'Duplicate Event Agent')
++  fixtureDb
++    .prepare(`INSERT INTO user_tenant_assignments (user_id, tenant_id, assignment_mode, created_at, updated_at)
++              VALUES (?, ?, 'auto', 1, 1)`)
++    .run(FIXTURE.userId, FIXTURE.tenantId)
++}
++
++function clearSessions() {
++  fixtureDb.exec('DELETE FROM user_sessions')
++}
++
++function seedSessionRow() {
++  clearSessions()
++  fixtureDb
++    .prepare(`INSERT INTO user_sessions
++              (id, user_id, session_key, agent_id, channel, peer_id, label, display_title, last_message_at, created_at, updated_at)
++              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, 1)`)
++    .run(
++      'us-duplicate-fixture',
++      FIXTURE.userId,
++      FIXTURE.sessionKey,
++      FIXTURE.agentId,
++      FIXTURE.sessionUpdate.channel,
++      FIXTURE.sessionUpdate.peer,
++      FIXTURE.sessionUpdate.displayTitle,
++      FIXTURE.sessionUpdate.displayTitle,
++      FIXTURE.sessionUpdate.lastMessageAt,
++    )
++}
++
++function sessionRows() {
++  return fixtureDb.prepare('SELECT * FROM user_sessions WHERE session_key = ?').all(FIXTURE.sessionKey)
++}
++
++function sessionRow() {
++  return fixtureDb.prepare('SELECT * FROM user_sessions WHERE session_key = ?').get(FIXTURE.sessionKey)
++}
++
++// The duplicate delivery: the SAME update reaches the sync twice, in one batch
++// and again as a replayed event.
++function duplicatedSessionPayload() {
++  return { sessions: [structuredClone(FIXTURE.sessionUpdate), structuredClone(FIXTURE.sessionUpdate)] }
++}
++
++function assertNoDoubleCount(row, label) {
++  assert.equal(row.token_total, EXPECTED.tokenTotal, `${label}: token_total must equal the delivered snapshot`)
++  assert.equal(row.msg_total, EXPECTED.msgTotal, `${label}: msg_total must equal the delivered snapshot`)
++  assert.equal(row.msg_tool_calls, EXPECTED.msgToolCalls, `${label}: msg_tool_calls must equal the delivered snapshot`)
++  assert.notEqual(row.token_total, FORBIDDEN.tokenTotal, `${label}: tokens were summed twice`)
++  assert.notEqual(row.msg_total, FORBIDDEN.msgTotal, `${label}: messages were counted twice`)
++  assert.notEqual(row.msg_tool_calls, FORBIDDEN.msgToolCalls, `${label}: tool calls were counted twice`)
++  assert.equal(sessionRows().length, 1, `${label}: exactly one session row may exist`)
++}
++
++before(() => {
++  seedOwnership()
++})
++
++beforeEach(() => {
++  sessionSync.resetSessionSyncStateForTests()
++  usageSync.__resetUsageSyncForTests()
++  broadcasts.length = 0
++  gatewayUsageCalls.length = 0
++})
++
++after(() => {
++  fixtureDb.close()
++})
++
++// ---------------------------------------------------------------------------
++// Suite 1 — session metadata sync (server/core/session-sync.js)
++// ---------------------------------------------------------------------------
++
++describe('duplicate-event contract: session metadata sync', () => {
++  test('fixture is distinct from the repository test fixtures', () => {
++    const existingSuites = [
++      readFileSync(new URL('../server/core/session-sync.test.js', import.meta.url), 'utf8'),
++      readFileSync(new URL('../server/core/usage-sync.test.js', import.meta.url), 'utf8'),
++      readFileSync(new URL('../server/core/session-usage-cache.test.js', import.meta.url), 'utf8'),
++    ].join('\n')
++    assert.equal(FIXTURE.distinct, true)
++    assert.ok(
++      FIXTURE.sessionKey.includes(FIXTURE.distinctMarker),
++      'fixture session key carries its own distinct marker',
++    )
++    assert.ok(
++      !existingSuites.includes(FIXTURE.sessionKey),
++      'fixture session key must not collide with an existing suite fixture',
++    )
++    assert.ok(
++      !existingSuites.includes(FIXTURE.userId),
++      'fixture user id must not collide with an existing suite fixture',
++    )
++  })
++
++  test('fixture is sensitive: an additive writer would land on the forbidden double-count values', () => {
++    assert.equal(FIXTURE.usageSnapshot.usage.totalTokens * FIXTURE.deliveries, FORBIDDEN.tokenTotal)
++    assert.equal(FIXTURE.usageSnapshot.usage.messageCounts.total * FIXTURE.deliveries, FORBIDDEN.msgTotal)
++    assert.equal(FIXTURE.usageSnapshot.usage.messageCounts.toolCalls * FIXTURE.deliveries, FORBIDDEN.msgToolCalls)
++    assert.equal(EXPECTED.stateChangeRows + 1, FORBIDDEN.stateChangeRows)
++    assert.notEqual(FIXTURE.usageSnapshot.usage.totalTokens, FORBIDDEN.tokenTotal)
++  })
++
++  test('a duplicated session update produces exactly one state change and replays as unchanged', async () => {
++    seedOwnership()
++    clearSessions()
++    let rpcCalls = 0
++    const gatewayRpc = async (method) => {
++      rpcCalls += 1
++      assert.equal(method, 'sessions.list')
++      return { ok: true, payload: duplicatedSessionPayload() }
++    }
++
++    const first = await sessionSync.syncUserSessionsFromGateway({
++      userId: FIXTURE.userId,
++      role: 'user',
++      gatewayRpc,
++    })
++
++    assert.equal(first.scanned, FIXTURE.deliveries, 'both deliveries are scanned')
++    assert.equal(first.changed, EXPECTED.changed, 'the duplicated update yields ONE state change')
++    assert.equal(first.inserted, EXPECTED.inserted)
++    assert.equal(first.updated, EXPECTED.updated)
++    assert.equal(sessionRows().length, EXPECTED.stateChangeRows, 'exactly one row is materialized')
++
++    const afterFirst = sessionRow()
++    assert.equal(afterFirst.user_id, FIXTURE.userId)
++    assert.equal(afterFirst.agent_id, FIXTURE.agentId)
++    assert.equal(afterFirst.tenant_id, FIXTURE.tenantId)
++    assert.equal(afterFirst.last_message_at, FIXTURE.sessionUpdate.lastMessageAt)
++
++    // Replay of the same event after it was already applied.
++    const replay = await sessionSync.syncUserSessionsFromGateway({
++      userId: FIXTURE.userId,
++      role: 'user',
++      gatewayRpc,
++    })
++
++    assert.equal(replay.scanned, FIXTURE.deliveries)
++    assert.equal(replay.changed, 0, 'a replayed update is not a new state change')
++    assert.equal(replay.inserted, 0)
++    assert.equal(replay.updated, 0)
++
++    const afterReplay = sessionRow()
++    assert.equal(sessionRows().length, EXPECTED.stateChangeRows)
++    assert.equal(afterReplay.updated_at, afterFirst.updated_at, 'replay must not rewrite the row')
++    assert.equal(afterReplay.last_message_at, afterFirst.last_message_at)
++    assert.equal(rpcCalls, 2)
++  })
++
++  test('a replayed event inside the cooldown window is skipped instead of re-emitted', async () => {
++    seedOwnership()
++    clearSessions()
++    let rpcCalls = 0
++    let release
++    const gate = new Promise((resolve) => {
++      release = resolve
++    })
++    const gatewayRpc = async () => {
++      rpcCalls += 1
++      await gate
++      return { ok: true, payload: { sessions: [structuredClone(FIXTURE.sessionUpdate)] } }
++    }
++
++    const first = sessionSync.scheduleUserSessionSync({
++      userId: FIXTURE.userId,
++      role: 'user',
++      gatewayRpc,
++      cooldownMs: 60_000,
++    })
++    const duplicateWhileInFlight = sessionSync.scheduleUserSessionSync({
++      userId: FIXTURE.userId,
++      role: 'user',
++      gatewayRpc,
++      cooldownMs: 60_000,
++    })
++
++    assert.equal(rpcCalls, 1, 'the duplicate in-flight event is coalesced, not re-issued')
++    release()
++
++    const [a, b] = await Promise.all([first, duplicateWhileInFlight])
++    assert.equal(a.changed, EXPECTED.changed)
++    assert.equal(a, b, 'the duplicate event resolves to the same in-flight result')
++    assert.equal(sessionRows().length, EXPECTED.stateChangeRows)
++    const afterFirst = sessionRow()
++
++    const replayAfterCompletion = await sessionSync.scheduleUserSessionSync({
++      userId: FIXTURE.userId,
++      role: 'user',
++      gatewayRpc,
++      cooldownMs: 60_000,
++    })
++
++    assert.deepEqual(replayAfterCompletion, { changed: 0, skipped: true, reason: 'cooldown' })
++    assert.equal(rpcCalls, 1, 'no extra gateway round-trip for the replayed event')
++    assert.equal(sessionRow().updated_at, afterFirst.updated_at, 'replay emits no state change')
++    assert.equal(sessionRows().length, EXPECTED.stateChangeRows)
++  })
++})
++
++// ---------------------------------------------------------------------------
++// Suite 2 — usage sync (server/core/usage-sync.js + session-usage-cache.js)
++// ---------------------------------------------------------------------------
++
++describe('duplicate-event contract: session usage sync', () => {
++  test('replaying one usage event keeps the absolute totals (no double count)', async () => {
++    seedOwnership()
++    seedSessionRow()
++
++    const first = await usageSync.syncSessionUsageNow(FIXTURE.sessionKey)
++    assert.equal(first.scanned, 1)
++    assert.equal(first.updated, 1)
++    assert.deepEqual(gatewayUsageCalls, [{ key: FIXTURE.sessionKey, limit: 1 }])
++
++    const afterFirst = sessionRow()
++    assertNoDoubleCount(afterFirst, 'after first delivery')
++    const entryAfterFirst = usageCache.getSessionUsage(FIXTURE.sessionKey, FIXTURE.userId)
++    assert.equal(entryAfterFirst.tokenTotal, EXPECTED.tokenTotal)
++    assert.equal(entryAfterFirst.msgTotal, EXPECTED.msgTotal)
++    assert.equal(entryAfterFirst.model, 'gpt-4o')
++    assert.equal(entryAfterFirst.modelProvider, 'openai')
++    assert.deepEqual(entryAfterFirst.toolUsage, FIXTURE.usageSnapshot.usage.toolUsage.tools)
++
++    // Replay of the very same event.
++    const replay = await usageSync.syncSessionUsageNow(FIXTURE.sessionKey)
++    assert.equal(replay.updated, 1, 'the replayed event still matches exactly one owned session row')
++
++    const afterReplay = sessionRow()
++    assertNoDoubleCount(afterReplay, 'after replay')
++    assert.equal(afterReplay.msg_total, afterFirst.msg_total)
++    assert.equal(afterReplay.token_total, afterFirst.token_total)
++    assert.ok(
++      afterReplay.usage_synced_at >= afterFirst.usage_synced_at,
++      'replay refreshes the sync marker only',
++    )
++
++    assert.equal(broadcasts.length, 2)
++    for (const broadcast of broadcasts) {
++      assert.equal(broadcast.data.event, 'session.usage.updated')
++      assert.equal(
++        broadcast.payload.messageCount,
++        EXPECTED.messageCount,
++        'every emission carries the authoritative absolute count, never an accumulated delta',
++      )
++      assert.notEqual(broadcast.payload.messageCount, FORBIDDEN.messageCount)
++    }
++  })
++
++  test('concurrent duplicate deliveries collapse to one gateway fetch, one write, one emission', async () => {
++    seedOwnership()
++    seedSessionRow()
++
++    const results = await Promise.all(
++      Array.from({ length: FIXTURE.deliveries + 1 }, () => usageSync.syncSessionUsageNow(FIXTURE.sessionKey)),
++    )
++
++    assert.equal(gatewayUsageCalls.length, 1, 'duplicate in-flight events share one gateway fetch')
++    assert.deepEqual(gatewayUsageCalls[0], { key: FIXTURE.sessionKey, limit: 1 })
++    assert.equal(broadcasts.length, 1, 'duplicate in-flight events emit ONE state change')
++    assert.equal(broadcasts[0].payload.messageCount, EXPECTED.messageCount)
++    assert.equal(results[0], results[FIXTURE.deliveries], 'all deliveries resolve to the same report object')
++    assert.equal(results[0].updated, 1)
++
++    assertNoDoubleCount(sessionRow(), 'after concurrent duplicate deliveries')
++  })
++})
+diff --git a/.prale-eval/fixtures/duplicate-session-event.json b/.prale-eval/fixtures/duplicate-session-event.json
+new file mode 100644
+index 0000000..5b4644e
+--- /dev/null
++++ b/.prale-eval/fixtures/duplicate-session-event.json
+@@ -0,0 +1,63 @@
++{
++  "fixtureId": "duplicate-session-event-fixture",
++  "description": "One logical session update for a dedicated, collision-free session key delivered twice (at-least-once delivery / gateway replay). Used by .prale-eval/duplicate-event.contract.test.mjs to assert that replaying the update cannot double-count usage and cannot emit a duplicate state change.",
++  "distinct": true,
++  "distinctMarker": "duplicatefixture",
++  "userId": "user-duplicate-fixture",
++  "agentId": "agent-duplicate-fixture",
++  "tenantId": "tenant-duplicate-fixture",
++  "sessionKey": "agent:agent-duplicate-fixture:feishu:dm:ou_duplicatefixture",
++  "eventId": "evt-duplicate-fixture-0001",
++  "deliveries": 2,
++  "sessionUpdate": {
++    "key": "agent:agent-duplicate-fixture:feishu:dm:ou_duplicatefixture",
++    "agentId": "agent-duplicate-fixture",
++    "channel": "feishu",
++    "peer": "ou_duplicatefixture",
++    "displayTitle": "Feishu duplicate-event fixture",
++    "lastMessageAt": 1783507200000
++  },
++  "usageSnapshot": {
++    "key": "agent:agent-duplicate-fixture:feishu:dm:ou_duplicatefixture",
++    "agentId": "agent-duplicate-fixture",
++    "model": "openai/gpt-4o",
++    "usage": {
++      "input": 1200,
++      "output": 340,
++      "cacheRead": 64,
++      "cacheWrite": 0,
++      "totalTokens": 1604,
++      "totalCost": 0.0123,
++      "messageCounts": {
++        "total": 4,
++        "user": 2,
++        "assistant": 2,
++        "toolCalls": 1,
++        "toolResults": 1,
++        "errors": 0
++      },
++      "toolUsage": {
++        "tools": [
++          { "name": "exec", "count": 1 }
++        ]
++      }
++    }
++  },
++  "expectedAfterSingleLogicalDelivery": {
++    "changed": 1,
++    "inserted": 1,
++    "updated": 0,
++    "stateChangeRows": 1,
++    "tokenTotal": 1604,
++    "msgTotal": 4,
++    "msgToolCalls": 1,
++    "messageCount": 4
++  },
++  "forbiddenDoubleCount": {
++    "tokenTotal": 3208,
++    "msgTotal": 8,
++    "msgToolCalls": 2,
++    "messageCount": 8,
++    "stateChangeRows": 2
++  }
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..254bb7e
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,134 @@
++{
++  "task_id": "T25",
++  "repository": "wattclaw",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "syncUserSessionsFromGateway",
++      "start_line": 118,
++      "end_line": 178,
++      "observation": "Single sync pass for one user. It resolves the owned/admin agent ids, lists gateway sessions per agent through sessions.list (bounded by perAgentLimit, agents fetched with mapWithConcurrency), normalizes every raw delivery, drops keys whose agent is outside the ownership set or that are in recentlyDeletedSessionKeys, and then delegates each surviving delivery to upsertSyncedUserSession. The pass increments changed/inserted/updated ONLY when the upsert reports result.changed (lines 162-168), so replaying an already-applied session update adds nothing to the change counters even though scanned still counts each delivery. The returned report { changed, inserted, updated, scanned, agents } is therefore the idempotency surface: a duplicated event can only ever move 'scanned'."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "scheduleUserSessionSync",
++      "start_line": 179,
++      "end_line": 216,
++      "observation": "Duplicate-event guard around the sync pass. A replayed event that arrives inside cooldownMs returns { changed: 0, skipped: true, reason: 'cooldown' } without touching the gateway (lines 188-193), and a duplicate event that arrives while the same user's sync is still running receives the SAME in-flight promise from inFlightByUserId (lines 195-197, 214) instead of starting a second scan. The promise is registered synchronously (line 214) and removed in .finally (lines 210-212), and lastSyncAtByUserId is stamped only after success (lines 202-205), so a replayed event cannot produce a duplicate state change or a duplicate gateway round-trip."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "normalizeGatewaySessionForSync",
++      "start_line": 59,
++      "end_line": 77,
++      "observation": "Deterministic mapping from a raw gateway session envelope (key/sessionKey/session_key/id, agentId/agent_id/agent, displayTitle/label/title/name, lastMessageAt/last_message_at/updatedAt/...) to exactly { sessionKey, agentId, channel, peer, label, lastActivity }. Identical inputs always normalize to identical fields, which is what makes the replay comparison in upsertSyncedUserSession stable instead of flapping between 'inserted' and 'updated' for the same event."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "DEFAULT_SESSION_SYNC_OPTIONS",
++      "start_line": 7,
++      "end_line": 12,
++      "observation": "Frozen defaults for the sync contract: perAgentLimit 50, cooldownMs 60_000, overallTimeoutMs 8_000, gatewayConcurrency 2. The 60s cooldown is the concrete window in which a replayed session update is dropped by scheduleUserSessionSync, and gatewayConcurrency bounds how many agents (never how many times one session is applied) are listed concurrently."
++    },
++    {
++      "path": "server/user-manager.js",
++      "symbol": "upsertSyncedUserSession",
++      "start_line": 614,
++      "end_line": 689,
++      "observation": "The idempotent write behind the sync contract. First delivery inserts and returns { changed: true, action: 'inserted' }; an identical replay is detected by field-by-field comparison (nextAgentId/nextChannel/nextPeerId/nextLabel/nextDisplayTitle/nextTenantId/nextLastMessageAt) and returns { changed: false, action: 'unchanged' } BEFORE any UPDATE runs (lines 668-672), so a replayed update does not rewrite the row or bump updated_at. last_message_at is advanced with Math.max(currentLastMessageAt, lastMessageAt) (lines 662-665), so a re-delivered older snapshot can never move the watermark backwards or add a second timeline entry."
++    },
++    {
++      "path": "server/core/usage-sync.js",
++      "symbol": "syncSessionUsageNow",
++      "start_line": 111,
++      "end_line": 202,
++      "observation": "Usage counterpart of the duplicate-event contract. Duplicate concurrent deliveries of the same session.usage event are coalesced: inFlightSessionSyncs.get(sessionKey) returns the existing promise (lines 112-113) and the new promise is registered synchronously (lines 200-201), so exactly one gateway usage fetch (callGatewayUsage with { key, limit: 1 }) and exactly one write run. Path A resolves the owner, writes the snapshot through updateSessionUsageForUser, and calls broadcastSessionUsageUpdate once for a successful update (lines 148-170); the broadcast payload carries the authoritative absolute messageCount from the snapshot, never an accumulated delta."
++    },
++    {
++      "path": "server/core/session-usage-cache.js",
++      "symbol": "updateSessionUsageForUser",
++      "start_line": 89,
++      "end_line": 117,
++      "observation": "Absolute (non-additive) usage persistence: the entry is built from the delivered snapshot and _persistOwnerScopedUpdate issues 'token_total = ?, cost_total = ?, msg_total = ?, ...' (lines 122-156) - plain assignment, never 'x = x + ?'. Replaying the same usage update therefore rewrites the same numbers (1604 tokens, 4 messages) instead of double-counting them (3208, 8). The UPDATE is owner-scoped (WHERE user_id = ? AND session_key = ?) and returns updated only when changes === 1, so a duplicate event can neither invent a second row nor land on another user's row."
++    },
++    {
++      "path": "server/core/session-usage-cache.js",
++      "symbol": "batchUpdateMatchedGatewayUsage",
++      "start_line": 158,
++      "end_line": 225,
++      "observation": "Batch/fallback path used when a usage event is delivered without a resolvable single owner. It scans each delivered session once per event, skips keys with no matching row (skippedUnmatched) and skips ambiguous keys owned by more than one user (skippedConflict, lines 176-178), then applies the same absolute owner-scoped write. Because ambiguous keys are skipped rather than written twice, replaying a batch cannot multiply one gateway snapshot across several rows."
++    },
++    {
++      "path": ".prale-eval/fixtures/duplicate-session-event.json",
++      "symbol": "duplicate-session-event-fixture",
++      "start_line": 2,
++      "end_line": 2,
++      "observation": "The distinct duplicate-event fixture used by the executable demo: a dedicated user id (user-duplicate-fixture), agent id (agent-duplicate-fixture) and session key marked with the 'duplicatefixture' segment, one logical session update delivered twice (deliveries: 2, same eventId), the usage snapshot for that session, expected single-delivery totals (1604 tokens / 4 messages / 1 tool call / 1 state-change row) and the forbidden double-count totals (3208 / 8 / 2 / 2) that an additive implementation would produce."
++    },
++    {
++      "path": ".prale-eval/duplicate-event.contract.test.mjs",
++      "symbol": "assertNoDoubleCount",
++      "start_line": 211,
++      "end_line": 218,
++      "observation": "Assertion helper of the executable contract test: it asserts the stored row equals the delivered absolute snapshot and explicitly asserts it does NOT equal the forbidden double-count values, plus that exactly one session row exists for the fixture key. It is reused after the first delivery, after the sequential replay and after concurrent duplicate deliveries."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "A replayed session update produces zero state changes: session-sync counts an update only when upsertSyncedUserSession reports result.changed, and that upsert returns { changed: false, action: 'unchanged' } with an early return for an identical row, so no UPDATE is issued and updated_at is not bumped.",
++      "evidence_paths": [
++        "server/core/session-sync.js",
++        "server/user-manager.js"
++      ]
++    },
++    {
++      "claim": "Two deliveries of the same session update inside one gateway payload are materialized once: the fixture run reports scanned=2 but changed=1, inserted=1, updated=0, and exactly one user_sessions row for the fixture key; replaying the whole event reports changed=0 with the row's updated_at unchanged.",
++      "evidence_paths": [
++        "server/core/session-sync.js",
++        "server/user-manager.js",
++        ".prale-eval/duplicate-event.contract.test.mjs"
++      ]
++    },
++    {
++      "claim": "Duplicate concurrent session events are coalesced before any gateway work: scheduleUserSessionSync returns the same in-flight promise for the second caller and, once the pass completed, answers a replay inside cooldownMs with { changed: 0, skipped: true, reason: 'cooldown' } without a second sessions.list call.",
++      "evidence_paths": [
++        "server/core/session-sync.js"
++      ]
++    },
++    {
++      "claim": "Usage is stored as an absolute snapshot, so replaying one usage event cannot double-count: updateSessionUsageForUser writes token_total/msg_total/cost_total by assignment (not accumulation), leaving the fixture totals at 1604 tokens, 4 messages and 1 tool call after both the first delivery and the replay, instead of the forbidden 3208 / 8 / 2.",
++      "evidence_paths": [
++        "server/core/session-usage-cache.js",
++        "server/core/usage-sync.js",
++        ".prale-eval/duplicate-event.contract.test.mjs"
++      ]
++    },
++    {
++      "claim": "Duplicate concurrent usage deliveries emit exactly one state change: syncSessionUsageNow reuses the per-session in-flight promise, so three simultaneous deliveries of the same event cause one callGatewayUsage call, one owner-scoped write and one session.usage.updated broadcast whose messageCount equals the snapshot's absolute count (4, never 8).",
++      "evidence_paths": [
++        "server/core/usage-sync.js",
++        ".prale-eval/duplicate-event.contract.test.mjs"
++      ]
++    },
++    {
++      "claim": "The fixture is distinct and sensitive: it uses a dedicated session key/user id carrying the 'duplicatefixture' marker (absent from the existing session-sync, usage-sync and session-usage-cache suites) and pins both the expected absolute totals and the forbidden double-count totals, so a mutated additive writer fails the suite.",
++      "evidence_paths": [
++        ".prale-eval/fixtures/duplicate-session-event.json",
++        ".prale-eval/duplicate-event.contract.test.mjs"
++      ]
++    },
++    {
++      "claim": "The batch/fallback usage path cannot spread one replayed snapshot over several rows: batchUpdateMatchedGatewayUsage skips keys with no owning row and keys owned by more than one user before applying the same absolute, owner-scoped write.",
++      "evidence_paths": [
++        "server/core/session-usage-cache.js"
++      ]
++    }
++  ],
++  "conclusion": "The duplicate-event contract holds for the session sync path in wattclaw. Replaying one session update cannot double-count usage and cannot emit a duplicate state change: (1) session metadata is applied through an idempotent upsert that returns changed=false/action='unchanged' for an identical row and returns before writing, so a second delivery of the same payload (whether inside the same sessions.list batch or as a replayed event) contributes only to 'scanned' (scanned=2, changed=1 for two deliveries; changed=0 on full replay, one row, updated_at untouched); (2) duplicate concurrent session events are coalesced by the in-flight guard and post-completion replays are dropped by the 60s cooldown, so no second gateway scan or second state change is produced; (3) usage is persisted as an absolute owner-scoped snapshot (token_total = ?, msg_total = ? - never additive), so replaying the same usage event leaves 1604 tokens / 4 messages / 1 tool call rather than 3208 / 8 / 2; (4) duplicate concurrent usage events collapse onto one in-flight promise, yielding exactly one gateway fetch, one write and one session.usage.updated emission carrying the authoritative absolute messageCount. All six assertions of the executable fixture suite pass, and two mutation checks (removing the 'unchanged' early return in upsertSyncedUserSession, and making the usage write additive) each made the corresponding test fail, confirming the fixture actually detects double counting; both mutations were reverted and the working tree is unmodified apart from .prale-eval/.",
++  "validation": {
++    "command": "node --experimental-test-module-mocks --test .prale-eval/duplicate-event.contract.test.mjs",
++    "status": "passed",
++    "notes": "6/6 tests pass (2 suites): fixture distinctness, fixture sensitivity to double-count values, duplicated session update -> one state change plus unchanged replay, cooldown/in-flight replay skip, usage replay keeps absolute totals, concurrent duplicates -> one fetch/one write/one emission. Environment limits, recorded because the optional dependency is unavailable: node_modules is absent and dependencies must not be installed, so vitest (npm run test:server) and better-sqlite3 cannot run here. The demo therefore injects an in-memory node:sqlite database (sanctioned node --experimental-test-module-mocks module injection) in place of server/database.js and stubs only the external edges (gateway-client, multi-tenant-gateway, sse, openclaw-config-sync); all repository code under test - server/core/session-sync.js, server/user-manager.js, server/core/usage-sync.js, server/core/session-usage-cache.js - is the real, unmodified source. The module-mocking flag and the experimental SQLite module both emit ExperimentalWarning lines on stderr; they do not affect results. Mutation evidence: deleting the 'if (!changed) return { changed: false, action: \"unchanged\" }' guard in server/user-manager.js fails 'a duplicated session update produces exactly one state change and replays as unchanged'; changing token_total assignment to 'user_sessions.token_total + ?' in server/core/session-usage-cache.js fails 'replaying one usage event keeps the absolute totals (no double count)'. Both mutations were reverted (git status shows only the new .prale-eval/ directory)."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/duplicate-event.contract.test.mjs - 22aa7b108ca842ec687868133d9141e7ca67970cd77ad73b7019e6ebc902d09b
+snapshot .prale-eval/fixtures/duplicate-session-event.json - 4f5847c19362131ee9a779be0adec406b150e8d47801cb2c97e564335d1f1af2
+snapshot .prale-eval/result.json - 3363ce02232da8ec024c2e648eda6c1657343ccbbf98c3c4fd9ac68594c2e635

@@ -1,0 +1,129 @@
+{
+  "task_id": 14,
+  "repository": "tdam",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "parseFrontmatter",
+      "start_line": 42,
+      "end_line": 62,
+      "observation": "Splits a page into {frontmatter, body, hasFrontmatter} using FM_RE (L36) and the repository `yaml` dependency. Tolerant consumption: a missing '---' block (L44-46), a YAML parse throw (L51-53) or a non-object document (L54-56) all degrade to {type:\"other\"} with the body preserved, and a blank/non-string `type` is normalized to \"other\" (L60). This is what makes the demo's frontmatter-less corpus file produce type=other instead of failing."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "buildPage",
+      "start_line": 85,
+      "end_line": 102,
+      "observation": "Serializes frontmatter + body into a compliant page. Emits a fixed field order (type -> title -> description -> sources -> tags -> timestamp -> extras, L87-97), always writes a `type` (defaulting to \"other\", L87), never writes `locked` (explicitly excluded at L96), stringifies with the yaml dependency (L99) and normalizes the body by stripping surrounding whitespace (L100-101). The demo uses it to round-trip every corpus file and to prove the rebuilt page re-parses to the same fields."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "readSources",
+      "start_line": 71,
+      "end_line": 74,
+      "observation": "Reads the `sources` array from a page via parseFrontmatter, keeping only string members. The demo surfaces these per document (e.g. [\"redis-cluster.md\", \"vector-index.md\"]) as the cascade dependency list that links derived pages back to raw sources."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/chunker.ts",
+      "symbol": "splitIntoUnits",
+      "start_line": 27,
+      "end_line": 63,
+      "observation": "Builds the atomic split units: first cuts at markdown headings `^#{1,6}\\s+\\S` (L32, L35-42) so each section stays intact, then subdivides any unit longer than the target by blank-line paragraphs and finally hard-cuts it into `target`-sized slices (L45-61). This heading-first policy is why the demo's long-source.md splits cleanly into 8 section-aligned chunks rather than mid-sentence."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/chunker.ts",
+      "symbol": "chunkText",
+      "start_line": 70,
+      "end_line": 95,
+      "observation": "Aggregates units into chunks. Clamps targetChars to >= 1000 (L71; so the demo target 1000 is the effective floor) and overlapChars to [0, target/2] with default 400 (L72). Returns [] for blank input and a single trimmed element when the text fits (L74-76); otherwise it pushes a chunk whenever the next unit would exceed the target and seeds the next buffer with the previous chunk's last `overlap` chars plus \"\\n\\n\" (L82-90). That overlap seeding is exactly why the demo reports 522 then seven 901-char chunks, each <= target."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/chunker.ts",
+      "symbol": "estimateTokens",
+      "start_line": 98,
+      "end_line": 100,
+      "observation": "Cheap conservative token estimate `ceil(length / 3)`, used by ingest to decide whether a source needs chunking. The demo reports it per document (e.g. 1344 for the 4031-char long-source body) as a pre-chunk size signal."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "slugify",
+      "start_line": 30,
+      "end_line": 64,
+      "observation": "Deterministic entity-name -> file-slug normalization: a single left-to-right scan alternates CJK token runs (preserved as-is) with latin/alphanumeric runs (lower-cased), treats spaces and punctuation as token boundaries, then joins tokens with '-' and collapses/trims repeated dashes (L33-64). It yields \"redis-cluster\" for \"Redis Cluster\", \"hnsw-向量索引\" for the mixed-script \"HNSW 向量索引\", and \"\" for blank input. Re-running on the same title always gives the same slug, which is the invariant the dedup path relies on."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "dirForType",
+      "start_line": 84,
+      "end_line": 87,
+      "observation": "Maps a page type to its on-disk directory via the TYPE_DIR table (L72-81: source->sources, entity->entities, concept->concepts, ...). Unknown or blank types fall back to the lower-cased type string, so the demo's frontmatter-less page (type=other) lands in `other/`. Together with slugify this fixes the canonical path used as the document id."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "pageRelPath",
+      "start_line": 94,
+      "end_line": 98,
+      "observation": "Composes the canonical wiki-relative path `wiki/<dir>/<slug>.md` from (type, title) by calling slugify then dirForType. Because it is a pure function of type+title it is the stable dedup key the ingest path uses to hit an existing page instead of creating a duplicate; the demo emits it as each document's `docId` (e.g. wiki/entities/redis-cluster.md)."
+    },
+    {
+      "path": ".prale-eval/demo/run-demo.mjs",
+      "symbol": "ingestDoc",
+      "start_line": 42,
+      "end_line": 93,
+      "observation": "The demo driver for one corpus file: imports the real slug/frontmatter/chunker modules, reads the file, parses frontmatter with the index-builder title fallback, derives slug + docId via pageRelPath, computes a sha256[:12] content fingerprint, runs chunkText at both the demo target (1000) and the production SOURCE_CHAR_BUDGET (28000), and round-trips buildPage->parseFrontmatter. Emits the deterministic per-document record described in demo-deliverable.md."
+    },
+    {
+      "path": ".prale-eval/demo/run-demo.mjs",
+      "symbol": "run",
+      "start_line": 95,
+      "end_line": 147,
+      "observation": "Aggregates all documents and asserts the contract: every doc has a `wiki/**.md` docId, every doc round-trips, every chunk is <= target, each later chunk starts with the previous chunk's last 400 chars + \"\\n\\n\", blank input yields zero chunks and short input a single chunk. The final block runs the whole pipeline twice and compares the serialized JSON, setting deterministicAcrossRuns/allChecksPassed and exiting non-zero on failure."
+    },
+    {
+      "path": ".prale-eval/demo-output.json",
+      "symbol": "chunkingInvariants",
+      "start_line": 158,
+      "end_line": 190,
+      "observation": "Normalized operation result of the demo run: 4 documents, 11 chunks at the 1000-char demo target, 4 at the production 28000 budget, chunkLengths [522,901,901,901,901,901,901,901] for long-source.md, and every asserted invariant true (allChecksPassed true, failedChecks []). Regenerating it with the documented command reproduces the same bytes."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "frontmatter.ts is a tolerant YAML-frontmatter codec: parseFrontmatter never throws on missing or malformed frontmatter (degrading to {type:\"other\"} and keeping the body), normalizes a blank type to \"other\", and buildPage re-emits a compliant page with a fixed field order, a guaranteed `type`, no `locked` field, and a whitespace-trimmed body. In the demo all 4 corpus documents (including the frontmatter-less plain-notes.md) round-trip with type/title/tags/sources/body preserved.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+        ".prale-eval/demo/run-demo.mjs",
+        ".prale-eval/demo-output.json"
+      ]
+    },
+    {
+      "claim": "chunker.ts splits oversized sources on markdown heading boundaries, falls back to blank-line paragraphs and finally hard-cuts; chunkText clamps the target to >=1000 chars, limits overlap to <=target/2 (default 400) and seeds each subsequent chunk with the previous chunk's tail. Consequently the 4031-char long-source.md produces exactly 8 chunks (first 522 chars, then seven 901-char chunks = 400-char overlap + separator + one section), each within the target, while the same text at the production budget of 28000 chars yields 1 chunk.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/chunker.ts",
+        ".prale-eval/demo-output.json"
+      ]
+    },
+    {
+      "claim": "Document IDs are deterministic: slug.ts slugify normalizes latin to lower-case, preserves CJK, treats punctuation/space as boundaries and collapses dashes, and pageRelPath composes `wiki/<dirForType(type)>/<slug>.md` purely from (type, title). The corpus therefore maps to wiki/sources/ingest-design-notes.md, wiki/entities/redis-cluster.md, wiki/concepts/hnsw-向量索引.md and wiki/other/plain-notes.md, identical on every run.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+        ".prale-eval/demo-output.json"
+      ]
+    },
+    {
+      "claim": "The demo is reproducible and self-validating: run-demo.mjs imports the shipped .ts helpers unchanged, executes twice and compares serialized output, and every embedded check (docId shape, round-trip fidelity, per-chunk size, 400-char overlap seeding, blank/short input handling) passes, with the process exiting non-zero if any check fails.",
+      "evidence_paths": [
+        ".prale-eval/demo/run-demo.mjs",
+        ".prale-eval/demo-output.json"
+      ]
+    }
+  ],
+  "conclusion": "Delivered an executable, dependency-free demo of the wiki-ingest helpers on a 4-file local markdown corpus. The real modules slug.ts (slugify/dirForType/pageRelPath), frontmatter.ts (parseFrontmatter/buildPage/isLocked/readSources) and chunker.ts (chunkText/estimateTokens/splitIntoUnits) are imported unchanged and driven end-to-end: each document gets a deterministic docId derived from type+title (`wiki/entities/redis-cluster.md`, `wiki/concepts/hnsw-向量索引.md`, `wiki/sources/ingest-design-notes.md`, `wiki/other/plain-notes.md`) plus a sha256 content fingerprint, frontmatter round-trips faithfully (including the tolerant type=other fallback for the file with no frontmatter), and chunk counts are stable — 11 chunks total at the 1000-char demo target (long-source.md = 8 chunks, lengths 522 + 7x901) versus 4 chunks at the production 28000-char budget. Two consecutive runs serialize byte-identically and all in-process assertions pass. The only deviation from a fully production-faithful run is the missing `yaml` dependency, which is replaced by a documented minimal local shim because dependencies must not be installed; this limitation is recorded in both validation.notes and demo-deliverable.md.",
+  "validation": {
+    "command": "node --import ./.prale-eval/demo/register-loader.mjs ./.prale-eval/demo/run-demo.mjs",
+    "status": "passed",
+    "notes": "Exit code 0. Emitted allChecksPassed=true, failedChecks=[], deterministicAcrossRuns=true over 4 documents: everyDocHasDocId=true, everyDocRoundTrips=true, everyChunkWithinTarget=true, overlapSeeded=true, emptyInputYieldsNoChunks=true, shortInputYieldsSingleChunk=true. Observed: totalChunksAtDemoTarget=11, totalChunksAtProductionBudget=4, long-source.md chunkCountAtDemoTarget=8 with chunkLengths [522,901,901,901,901,901,901,901]. Environment: node v24.14.0, built-in TypeScript type-stripping, no build step. LIMITATION: the checkout has no node_modules and dependencies must not be installed, so the repository's `yaml` package (imported by frontmatter.ts) is unavailable; loader.mjs redirects that bare specifier to .prale-eval/demo/yaml-shim.mjs, a minimal local shim covering only flat scalars, booleans, flow sequences and block sequences. YAML features outside that subset (anchors, nested maps, multi-line scalars) are therefore not exercised; all other helper logic is the shipped repository code. No TypeScript compiler or vitest suite was run because MemoryKnowledge has no installed toolchain and contains no test files."
+  }
+}

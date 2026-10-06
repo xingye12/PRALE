@@ -1,0 +1,892 @@
+diff --git a/.prale-eval/fixtures/tiny-session-torn.jsonl b/.prale-eval/fixtures/tiny-session-torn.jsonl
+new file mode 100644
+index 0000000..8e87699
+--- /dev/null
++++ b/.prale-eval/fixtures/tiny-session-torn.jsonl
+@@ -0,0 +1,6 @@
++{"v":4,"kind":"header","id":"ses_tiny_lineage_04","storageVersion":1,"createdAt":1700000000000,"cwd":"/workspace"}
++[{"kind":"entry","id":"e1","parentId":null,"type":"message","message":{"role":"user","content":[{"type":"text","text":"root question"}],"timestamp":1700000000000},"seq":1,"timestamp":1700000000000},{"kind":"value","op":"set","seq":2,"namespace":"pi.branch.tip","key":"main","value":"e1"}]
++{"kind":"entry","id":"e2","parentId":"e1","type":"message","message":{"role":"assistant","content":[{"type":"text","text":"accepted answer"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":5,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1700000000000},"seq":3,"timestamp":1700000000000}
++[{"kind":"value","op":"set","seq":4,"namespace":"pi.branch.tip","key":"main","value":"e2"},{"kind":"value","op":"set","seq":5,"namespace":"pi.session.name","key":"","value":"tiny-lineage"}]
++{"kind":"entry","id":"e3","parentId":"e2","type":"message","message":{"role":"assistant","content":[{"type":"text","text":"filtered failure"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":5,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"error","timestamp":1700000000000},"seq":6,"timestamp":1700000000000}
++{"kind":"entry","id":"e4-torn","parentId":"e3","type":"message","message":{"role":"user","content":[{"type":"text","text":"must not survive replay"}],"timestamp":1700000000000},"seq":8,"timestamp":1700000000000}
+\ No newline at end of file
+diff --git a/.prale-eval/fixtures/tiny-session.jsonl b/.prale-eval/fixtures/tiny-session.jsonl
+new file mode 100644
+index 0000000..fe4759c
+--- /dev/null
++++ b/.prale-eval/fixtures/tiny-session.jsonl
+@@ -0,0 +1,6 @@
++{"v":4,"kind":"header","id":"ses_tiny_lineage_04","storageVersion":1,"createdAt":1700000000000,"cwd":"/workspace"}
++[{"kind":"entry","id":"e1","parentId":null,"type":"message","message":{"role":"user","content":[{"type":"text","text":"root question"}],"timestamp":1700000000000},"seq":1,"timestamp":1700000000000},{"kind":"value","op":"set","seq":2,"namespace":"pi.branch.tip","key":"main","value":"e1"}]
++{"kind":"entry","id":"e2","parentId":"e1","type":"message","message":{"role":"assistant","content":[{"type":"text","text":"accepted answer"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":5,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"stop","timestamp":1700000000000},"seq":3,"timestamp":1700000000000}
++[{"kind":"value","op":"set","seq":4,"namespace":"pi.branch.tip","key":"main","value":"e2"},{"kind":"value","op":"set","seq":5,"namespace":"pi.session.name","key":"","value":"tiny-lineage"}]
++{"kind":"entry","id":"e3","parentId":"e2","type":"message","message":{"role":"assistant","content":[{"type":"text","text":"filtered failure"}],"api":"anthropic-messages","provider":"anthropic","model":"claude-sonnet-4-5","usage":{"input":5,"output":7,"cacheRead":0,"cacheWrite":0,"totalTokens":12,"cost":{"input":0,"output":0,"cacheRead":0,"cacheWrite":0,"total":0}},"stopReason":"error","timestamp":1700000000000},"seq":6,"timestamp":1700000000000}
++{"kind":"value","op":"set","seq":7,"namespace":"pi.branch.tip","key":"main","value":"e3"}
+diff --git a/.prale-eval/lineage-demo.mjs b/.prale-eval/lineage-demo.mjs
+new file mode 100644
+index 0000000..52cbc5b
+--- /dev/null
++++ b/.prale-eval/lineage-demo.mjs
+@@ -0,0 +1,356 @@
++#!/usr/bin/env node
++// Self-contained "operate" demo for the JSONL/session lineage task learn/04.
++//
++// The repository's real JSONL/session test utilities live in TypeScript
++// (packages/agent/src/harness/session/jsonl/* + packages/agent/test/harness/*)
++// and require the monorepo's installed workspace dependencies (vitest, tsx,
++// @earendil-works/pi-ai, ...). Those dependencies are NOT present in this
++// sandbox (`node_modules` is absent) and may not be installed, so this script
++// reproduces the *same* replay algorithm and acceptance semantics using only
++// Node built-ins, then operates it on a supplied tiny fixture.
++//
++// Faithfully mirrors:
++//   packages/agent/src/harness/session/jsonl/io.ts
++//     - splitCompleteLines (torn-tail split), parseJsonlTransaction
++//   packages/agent/src/harness/session/jsonl/storage.ts
++//     - JsonlStorage.openV4 header check, per-line replay, torn-tail truncation
++//   packages/agent/src/harness/session/in-memory-storage-state.ts
++//     - applyValidated (entry/value/list/usage), values(), getStats()
++//   packages/agent/src/harness/session/context.ts
++//     - buildContextEntries + sessionEntryToContextMessages + buildSessionContext
++import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++
++const HERE = dirname(fileURLToPath(import.meta.url));
++const FIXTURE_DIR = join(HERE, "fixtures");
++const NOW = 1_700_000_000_000;
++const JSONL_FORMAT_VERSION = 4;
++const JSONL_STORAGE_VERSION = 1;
++
++// ---------------------------------------------------------------------------
++// Supplied tiny fixture (v4 on-disk JSONL session: header line + transactions).
++// A single-write transaction is serialized as an object; a multi-write
++// transaction as a JSON array (io.ts serializeJsonlTransaction).
++// ---------------------------------------------------------------------------
++const header = {
++	v: JSONL_FORMAT_VERSION,
++	kind: "header",
++	id: "ses_tiny_lineage_04",
++	storageVersion: JSONL_STORAGE_VERSION,
++	createdAt: NOW,
++	cwd: "/workspace",
++};
++
++const usagePayload = {
++	input: 5,
++	output: 7,
++	cacheRead: 0,
++	cacheWrite: 0,
++	totalTokens: 12,
++	cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++};
++
++function userMessage(text) {
++	return { role: "user", content: [{ type: "text", text }], timestamp: NOW };
++}
++function assistantMessage(stopReason, text) {
++	return {
++		role: "assistant",
++		content: stopReason === "toolUse" ? [{ type: "toolCall", id: "call", name: "read", arguments: {} }] : [{ type: "text", text }],
++		api: "anthropic-messages",
++		provider: "anthropic",
++		model: "claude-sonnet-4-5",
++		usage: usagePayload,
++		stopReason,
++		timestamp: NOW,
++	};
++}
++function entry(id, parentId, seq, message) {
++	return { kind: "entry", id, parentId, type: "message", message, seq, timestamp: NOW };
++}
++function setValue(seq, namespace, key, value) {
++	return { kind: "value", op: "set", seq, namespace, key, value };
++}
++
++const fixtureLines = [
++	JSON.stringify(header),
++	JSON.stringify([entry("e1", null, 1, userMessage("root question")), setValue(2, "pi.branch.tip", "main", "e1")]),
++	JSON.stringify(entry("e2", "e1", 3, assistantMessage("stop", "accepted answer"))),
++	JSON.stringify([setValue(4, "pi.branch.tip", "main", "e2"), setValue(5, "pi.session.name", "", "tiny-lineage")]),
++	JSON.stringify(entry("e3", "e2", 6, assistantMessage("error", "filtered failure"))),
++	JSON.stringify(setValue(7, "pi.branch.tip", "main", "e3")),
++];
++
++// Torn-tail variant: a complete prefix plus an unterminated (no trailing "\n")
++// final record. The utility must discard it and truncate before admitting writes.
++const tornLine = JSON.stringify(entry("e4-torn", "e3", 8, userMessage("must not survive replay")));
++const tornFixture = `${fixtureLines.slice(0, 5).join("\n")}\n${tornLine}`;
++
++// ---------------------------------------------------------------------------
++// Replay algorithm (mirrors JsonlStorage.openV4 + InMemoryStorageState).
++// ---------------------------------------------------------------------------
++function splitCompleteLines(content) {
++	if (content.endsWith("\n")) return { lines: content.slice(0, -1).split("\n"), torn: false };
++	const lastNewline = content.lastIndexOf("\n");
++	if (lastNewline === -1) return { lines: [], torn: true };
++	return { lines: content.slice(0, lastNewline).split("\n"), torn: true };
++}
++
++function isRecord(value) {
++	return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++function requireSafeInteger(value, field, minimum) {
++	if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`Invalid JSONL ${field}`);
++}
++function parseCommittedWrite(value) {
++	if (!isRecord(value)) throw new Error("Invalid JSONL transaction write");
++	requireSafeInteger(value.seq, "write seq", 1);
++	switch (value.kind) {
++		case "entry":
++			requireSafeInteger(value.timestamp, "entry timestamp", 0);
++			return value;
++		case "usage":
++			return value;
++		case "value":
++			if (value.op === "set" || value.op === "delete") return value;
++			throw new Error(`Invalid JSONL value operation: ${String(value.op)}`);
++		case "list":
++			if (value.op === "append" || value.op === "delete") return value;
++			throw new Error(`Invalid JSONL list operation: ${String(value.op)}`);
++		default:
++			throw new Error(`Invalid JSONL write kind: ${String(value.kind)}`);
++	}
++}
++function parseJsonlTransaction(line) {
++	let value;
++	try {
++		value = JSON.parse(line);
++	} catch (error) {
++		throw new Error("Invalid JSONL transaction: not valid JSON", { cause: error });
++	}
++	return (Array.isArray(value) ? value : [value]).map(parseCommittedWrite);
++}
++
++const physicalKey = (namespace, key) => `${namespace}\u0000${key}`;
++
++class ReplayState {
++	constructor() {
++		this.entries = new Map();
++		this.order = [];
++		this.scalarValues = new Map();
++		this.listValues = new Map();
++		this.usage = new Map();
++		this.nextSeq = 1;
++	}
++	apply(write) {
++		this.nextSeq = Math.max(this.nextSeq, write.seq + 1);
++		switch (write.kind) {
++			case "entry":
++				if (!this.entries.has(write.id)) this.order.push(write.id);
++				this.entries.set(write.id, write);
++				return;
++			case "usage":
++				this.usage.set(write.id, write);
++				return;
++			case "value":
++				if (write.op === "delete") {
++					this.scalarValues.delete(physicalKey(write.namespace, write.key));
++				} else {
++					this.scalarValues.set(physicalKey(write.namespace, write.key), {
++						address: { namespace: write.namespace, key: write.key },
++						value: write.value,
++						seq: write.seq,
++					});
++				}
++				return;
++			case "list":
++				if (write.op === "delete") {
++					this.listValues.delete(physicalKey(write.namespace, write.key));
++				} else {
++					const k = physicalKey(write.namespace, write.key);
++					const stored = this.listValues.get(k) ?? { address: { namespace: write.namespace, key: write.key }, elements: [] };
++					stored.elements.push({ seq: write.seq, value: write.value });
++					this.listValues.set(k, stored);
++				}
++				return;
++		}
++	}
++	getValue(namespace, key) {
++		return this.scalarValues.get(physicalKey(namespace, key));
++	}
++	getEntries(ids) {
++		const out = new Map();
++		for (const id of ids) if (this.entries.has(id)) out.set(id, this.entries.get(id));
++		return out;
++	}
++	getStats() {
++		return { messageCount: this.order.length, usage: usagePayload };
++	}
++}
++
++function openJsonl(content, path) {
++	const lines = splitCompleteLines(content);
++	if (lines.lines.length === 0) throw new Error(`Invalid JSONL storage ${path}: missing header`);
++	const parsedHeader = JSON.parse(lines.lines[0]);
++	if (parsedHeader.kind !== "header") throw new Error(`Invalid JSONL storage ${path}: invalid header`);
++	if (parsedHeader.storageVersion !== JSONL_STORAGE_VERSION) {
++		throw new Error(`Session ${parsedHeader.id} uses unsupported storage version ${parsedHeader.storageVersion}`);
++	}
++	const state = new ReplayState();
++	for (let index = 1; index < lines.lines.length; index++) {
++		try {
++			for (const write of parseJsonlTransaction(lines.lines[index])) state.apply(write);
++		} catch (error) {
++			throw new Error(`Invalid JSONL storage ${path}: line ${index + 1}`, { cause: error });
++		}
++	}
++	if (parsedHeader.nextSeq !== undefined) state.nextSeq = Math.max(state.nextSeq, parsedHeader.nextSeq);
++	return { header: parsedHeader, state, torn: lines.torn, truncatedContent: lines.torn ? `${lines.lines.join("\n")}\n` : content };
++}
++
++// ---------------------------------------------------------------------------
++// Context projection (mirrors context.ts).
++// ---------------------------------------------------------------------------
++function isContextMessage(message) {
++	return (
++		message.role !== "assistant" ||
++		(message.stopReason !== "error" && message.stopReason !== "aborted" && message.stopReason !== "deferred")
++	);
++}
++function buildContextEntries(pathEntries) {
++	let compactionIndex = -1;
++	for (let index = pathEntries.length - 1; index >= 0; index--) {
++		if (pathEntries[index]?.type === "compaction") {
++			compactionIndex = index;
++			break;
++		}
++	}
++	return compactionIndex === -1 ? [...pathEntries] : [pathEntries[compactionIndex], ...pathEntries.slice(compactionIndex + 1)];
++}
++function sessionEntryToContextMessages(e) {
++	switch (e.type) {
++		case "message":
++			return isContextMessage(e.message) ? [e.message] : [];
++		case "compaction":
++			return [
++				{ role: "compactionSummary", summary: e.summary, tokensBefore: e.tokensBefore, timestamp: e.timestamp },
++				...e.retainedTail.filter(isContextMessage),
++			];
++		case "branch_summary":
++			return e.summary ? [{ role: "branchSummary", summary: e.summary, fromId: e.fromId, timestamp: e.timestamp }] : [];
++		case "custom":
++			return [];
++	}
++}
++function buildSessionContext(pathEntries) {
++	const messages = [];
++	for (const e of buildContextEntries(pathEntries)) {
++		if (e.type !== "custom") messages.push(...sessionEntryToContextMessages(e));
++	}
++	return messages;
++}
++
++// ---------------------------------------------------------------------------
++// Lineage report
++// ---------------------------------------------------------------------------
++function runScenario(name, content) {
++	const path = `${name}.jsonl`;
++	const opened = openJsonl(content, path);
++	const { header: h, state } = opened;
++	const tipStored = state.getValue("pi.branch.tip", "main");
++	const tipId = tipStored?.value ?? null;
++
++	const parentRelation = [];
++	const seen = new Set();
++	let cursor = tipId;
++	while (cursor !== null && cursor !== undefined && !seen.has(cursor)) {
++		seen.add(cursor);
++		const e = state.entries.get(cursor);
++		if (e === undefined) {
++			parentRelation.push({ id: cursor, missing: true });
++			break;
++		}
++		parentRelation.push({ id: e.id, parentId: e.parentId, type: e.type, seq: e.seq });
++		cursor = e.parentId;
++	}
++	parentRelation.reverse(); // root -> tip
++
++	const pathEntries = parentRelation.filter((e) => !e.missing).map((e) => state.entries.get(e.id));
++	const contextMessages = buildSessionContext(pathEntries);
++
++	return {
++		scenario: name,
++		sessionId: h.id,
++		branch: "main",
++		branchTip: { address: "pi.branch.tip/main", value: tipId, seq: tipStored?.seq ?? null },
++		parentRelation,
++		replay: {
++			torn: opened.torn,
++			truncated: opened.torn,
++			nextSeq: state.nextSeq,
++			entries: state.order.map((id) => {
++				const e = state.entries.get(id);
++				return { id, parentId: e.parentId, type: e.type, seq: e.seq };
++			}),
++			values: [...state.scalarValues.entries()].map(([k, v]) => ({
++				namespace: v.address.namespace,
++				key: v.address.key,
++				value: v.value,
++				seq: v.seq,
++				physicalKey: k,
++			})),
++			usage: [...state.usage.values()].map((u) => ({ id: u.id, entryId: u.entryId, seq: u.seq })),
++			stats: state.getStats(),
++			contextMessages,
++		},
++	};
++}
++
++mkdirSync(FIXTURE_DIR, { recursive: true });
++writeFileSync(join(FIXTURE_DIR, "tiny-session.jsonl"), `${fixtureLines.join("\n")}\n`);
++writeFileSync(join(FIXTURE_DIR, "tiny-session-torn.jsonl"), tornFixture);
++
++const report = {
++	task_id: "04",
++	repository: "pi",
++	mode: "operate",
++	operation: "operate JSONL/session test utilities on a supplied tiny fixture -> lineage report",
++	fixtures: {
++		"tiny-session.jsonl": `${fixtureLines.join("\n")}\n`,
++		"tiny-session-torn.jsonl": tornFixture,
++	},
++	scenarios: [
++		runScenario("tiny-session", `${fixtureLines.join("\n")}\n`),
++		runScenario("tiny-session-torn", tornFixture),
++	],
++	note: "Replay logic mirrors packages/agent/src/harness/session/jsonl/{io,storage}.ts and packages/agent/src/harness/session/{in-memory-storage-state,context}.ts; the TypeScript harness could not be executed because workspace node_modules (vitest/tsx/pi-ai) are absent.",
++};
++
++console.log(JSON.stringify(report, null, 2));
++writeFileSync(join(HERE, "lineage-report.json"), `${JSON.stringify(report, null, 2)}\n`);
++
++// ---------------------------------------------------------------------------
++// Self-check: fails (non-zero exit) if the operated lineage is not what the
++// acceptance contract requires.
++// ---------------------------------------------------------------------------
++const [primary, torn] = report.scenarios;
++const checks = [
++	[primary.sessionId === "ses_tiny_lineage_04", "primary session id"],
++	[primary.branchTip.value === "e3", "primary branch tip is e3"],
++	[primary.branchTip.seq === 7, "primary branch tip seq is 7"],
++	[primary.parentRelation.map((e) => e.id).join(">") === "e1>e2>e3", "primary parent relation e1>e2>e3"],
++	[primary.replay.entries.length === 3, "primary replays 3 entries"],
++	[primary.replay.contextMessages.length === 2, "primary context filters the errored assistant entry"],
++	[primary.replay.nextSeq === 8, "primary nextSeq is 8"],
++	[torn.replay.entries.length === 3, "torn replays 3 complete entries"],
++	[torn.replay.truncated === true, "torn tail is truncated"],
++	[!torn.replay.entries.some((e) => e.id === "e4-torn"), "torn entry is discarded"],
++	[torn.branchTip.value === "e2", "torn branch tip is the last fully committed tip (e2)"],
++];
++const failed = checks.filter(([ok]) => !ok).map(([, name]) => name);
++if (failed.length > 0) {
++	console.error(`lineage self-check FAILED: ${failed.join(", ")}`);
++	process.exit(1);
++}
++console.error(`lineage self-check: OK (${checks.length} assertions)`);
+diff --git a/.prale-eval/lineage-report.json b/.prale-eval/lineage-report.json
+new file mode 100644
+index 0000000..c4595ec
+--- /dev/null
++++ b/.prale-eval/lineage-report.json
+@@ -0,0 +1,265 @@
++{
++  "task_id": "04",
++  "repository": "pi",
++  "mode": "operate",
++  "operation": "operate JSONL/session test utilities on a supplied tiny fixture -> lineage report",
++  "fixtures": {
++    "tiny-session.jsonl": "{\"v\":4,\"kind\":\"header\",\"id\":\"ses_tiny_lineage_04\",\"storageVersion\":1,\"createdAt\":1700000000000,\"cwd\":\"/workspace\"}\n[{\"kind\":\"entry\",\"id\":\"e1\",\"parentId\":null,\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"root question\"}],\"timestamp\":1700000000000},\"seq\":1,\"timestamp\":1700000000000},{\"kind\":\"value\",\"op\":\"set\",\"seq\":2,\"namespace\":\"pi.branch.tip\",\"key\":\"main\",\"value\":\"e1\"}]\n{\"kind\":\"entry\",\"id\":\"e2\",\"parentId\":\"e1\",\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"accepted answer\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":5,\"output\":7,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":12,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":1700000000000},\"seq\":3,\"timestamp\":1700000000000}\n[{\"kind\":\"value\",\"op\":\"set\",\"seq\":4,\"namespace\":\"pi.branch.tip\",\"key\":\"main\",\"value\":\"e2\"},{\"kind\":\"value\",\"op\":\"set\",\"seq\":5,\"namespace\":\"pi.session.name\",\"key\":\"\",\"value\":\"tiny-lineage\"}]\n{\"kind\":\"entry\",\"id\":\"e3\",\"parentId\":\"e2\",\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"filtered failure\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":5,\"output\":7,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":12,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"error\",\"timestamp\":1700000000000},\"seq\":6,\"timestamp\":1700000000000}\n{\"kind\":\"value\",\"op\":\"set\",\"seq\":7,\"namespace\":\"pi.branch.tip\",\"key\":\"main\",\"value\":\"e3\"}\n",
++    "tiny-session-torn.jsonl": "{\"v\":4,\"kind\":\"header\",\"id\":\"ses_tiny_lineage_04\",\"storageVersion\":1,\"createdAt\":1700000000000,\"cwd\":\"/workspace\"}\n[{\"kind\":\"entry\",\"id\":\"e1\",\"parentId\":null,\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"root question\"}],\"timestamp\":1700000000000},\"seq\":1,\"timestamp\":1700000000000},{\"kind\":\"value\",\"op\":\"set\",\"seq\":2,\"namespace\":\"pi.branch.tip\",\"key\":\"main\",\"value\":\"e1\"}]\n{\"kind\":\"entry\",\"id\":\"e2\",\"parentId\":\"e1\",\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"accepted answer\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":5,\"output\":7,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":12,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"stop\",\"timestamp\":1700000000000},\"seq\":3,\"timestamp\":1700000000000}\n[{\"kind\":\"value\",\"op\":\"set\",\"seq\":4,\"namespace\":\"pi.branch.tip\",\"key\":\"main\",\"value\":\"e2\"},{\"kind\":\"value\",\"op\":\"set\",\"seq\":5,\"namespace\":\"pi.session.name\",\"key\":\"\",\"value\":\"tiny-lineage\"}]\n{\"kind\":\"entry\",\"id\":\"e3\",\"parentId\":\"e2\",\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":[{\"type\":\"text\",\"text\":\"filtered failure\"}],\"api\":\"anthropic-messages\",\"provider\":\"anthropic\",\"model\":\"claude-sonnet-4-5\",\"usage\":{\"input\":5,\"output\":7,\"cacheRead\":0,\"cacheWrite\":0,\"totalTokens\":12,\"cost\":{\"input\":0,\"output\":0,\"cacheRead\":0,\"cacheWrite\":0,\"total\":0}},\"stopReason\":\"error\",\"timestamp\":1700000000000},\"seq\":6,\"timestamp\":1700000000000}\n{\"kind\":\"entry\",\"id\":\"e4-torn\",\"parentId\":\"e3\",\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":[{\"type\":\"text\",\"text\":\"must not survive replay\"}],\"timestamp\":1700000000000},\"seq\":8,\"timestamp\":1700000000000}"
++  },
++  "scenarios": [
++    {
++      "scenario": "tiny-session",
++      "sessionId": "ses_tiny_lineage_04",
++      "branch": "main",
++      "branchTip": {
++        "address": "pi.branch.tip/main",
++        "value": "e3",
++        "seq": 7
++      },
++      "parentRelation": [
++        {
++          "id": "e1",
++          "parentId": null,
++          "type": "message",
++          "seq": 1
++        },
++        {
++          "id": "e2",
++          "parentId": "e1",
++          "type": "message",
++          "seq": 3
++        },
++        {
++          "id": "e3",
++          "parentId": "e2",
++          "type": "message",
++          "seq": 6
++        }
++      ],
++      "replay": {
++        "torn": false,
++        "truncated": false,
++        "nextSeq": 8,
++        "entries": [
++          {
++            "id": "e1",
++            "parentId": null,
++            "type": "message",
++            "seq": 1
++          },
++          {
++            "id": "e2",
++            "parentId": "e1",
++            "type": "message",
++            "seq": 3
++          },
++          {
++            "id": "e3",
++            "parentId": "e2",
++            "type": "message",
++            "seq": 6
++          }
++        ],
++        "values": [
++          {
++            "namespace": "pi.branch.tip",
++            "key": "main",
++            "value": "e3",
++            "seq": 7,
++            "physicalKey": "pi.branch.tip\u0000main"
++          },
++          {
++            "namespace": "pi.session.name",
++            "key": "",
++            "value": "tiny-lineage",
++            "seq": 5,
++            "physicalKey": "pi.session.name\u0000"
++          }
++        ],
++        "usage": [],
++        "stats": {
++          "messageCount": 3,
++          "usage": {
++            "input": 5,
++            "output": 7,
++            "cacheRead": 0,
++            "cacheWrite": 0,
++            "totalTokens": 12,
++            "cost": {
++              "input": 0,
++              "output": 0,
++              "cacheRead": 0,
++              "cacheWrite": 0,
++              "total": 0
++            }
++          }
++        },
++        "contextMessages": [
++          {
++            "role": "user",
++            "content": [
++              {
++                "type": "text",
++                "text": "root question"
++              }
++            ],
++            "timestamp": 1700000000000
++          },
++          {
++            "role": "assistant",
++            "content": [
++              {
++                "type": "text",
++                "text": "accepted answer"
++              }
++            ],
++            "api": "anthropic-messages",
++            "provider": "anthropic",
++            "model": "claude-sonnet-4-5",
++            "usage": {
++              "input": 5,
++              "output": 7,
++              "cacheRead": 0,
++              "cacheWrite": 0,
++              "totalTokens": 12,
++              "cost": {
++                "input": 0,
++                "output": 0,
++                "cacheRead": 0,
++                "cacheWrite": 0,
++                "total": 0
++              }
++            },
++            "stopReason": "stop",
++            "timestamp": 1700000000000
++          }
++        ]
++      }
++    },
++    {
++      "scenario": "tiny-session-torn",
++      "sessionId": "ses_tiny_lineage_04",
++      "branch": "main",
++      "branchTip": {
++        "address": "pi.branch.tip/main",
++        "value": "e2",
++        "seq": 4
++      },
++      "parentRelation": [
++        {
++          "id": "e1",
++          "parentId": null,
++          "type": "message",
++          "seq": 1
++        },
++        {
++          "id": "e2",
++          "parentId": "e1",
++          "type": "message",
++          "seq": 3
++        }
++      ],
++      "replay": {
++        "torn": true,
++        "truncated": true,
++        "nextSeq": 7,
++        "entries": [
++          {
++            "id": "e1",
++            "parentId": null,
++            "type": "message",
++            "seq": 1
++          },
++          {
++            "id": "e2",
++            "parentId": "e1",
++            "type": "message",
++            "seq": 3
++          },
++          {
++            "id": "e3",
++            "parentId": "e2",
++            "type": "message",
++            "seq": 6
++          }
++        ],
++        "values": [
++          {
++            "namespace": "pi.branch.tip",
++            "key": "main",
++            "value": "e2",
++            "seq": 4,
++            "physicalKey": "pi.branch.tip\u0000main"
++          },
++          {
++            "namespace": "pi.session.name",
++            "key": "",
++            "value": "tiny-lineage",
++            "seq": 5,
++            "physicalKey": "pi.session.name\u0000"
++          }
++        ],
++        "usage": [],
++        "stats": {
++          "messageCount": 3,
++          "usage": {
++            "input": 5,
++            "output": 7,
++            "cacheRead": 0,
++            "cacheWrite": 0,
++            "totalTokens": 12,
++            "cost": {
++              "input": 0,
++              "output": 0,
++              "cacheRead": 0,
++              "cacheWrite": 0,
++              "total": 0
++            }
++          }
++        },
++        "contextMessages": [
++          {
++            "role": "user",
++            "content": [
++              {
++                "type": "text",
++                "text": "root question"
++              }
++            ],
++            "timestamp": 1700000000000
++          },
++          {
++            "role": "assistant",
++            "content": [
++              {
++                "type": "text",
++                "text": "accepted answer"
++              }
++            ],
++            "api": "anthropic-messages",
++            "provider": "anthropic",
++            "model": "claude-sonnet-4-5",
++            "usage": {
++              "input": 5,
++              "output": 7,
++              "cacheRead": 0,
++              "cacheWrite": 0,
++              "totalTokens": 12,
++              "cost": {
++                "input": 0,
++                "output": 0,
++                "cacheRead": 0,
++                "cacheWrite": 0,
++                "total": 0
++              }
++            },
++            "stopReason": "stop",
++            "timestamp": 1700000000000
++          }
++        ]
++      }
++    }
++  ],
++  "note": "Replay logic mirrors packages/agent/src/harness/session/jsonl/{io,storage}.ts and packages/agent/src/harness/session/{in-memory-storage-state,context}.ts; the TypeScript harness could not be executed because workspace node_modules (vitest/tsx/pi-ai) are absent."
++}
+diff --git a/.prale-eval/operate-deliverable.md b/.prale-eval/operate-deliverable.md
+new file mode 100644
+index 0000000..28f412c
+--- /dev/null
++++ b/.prale-eval/operate-deliverable.md
+@@ -0,0 +1,141 @@
++# Operate deliverable — JSONL/session lineage report (task 04, repo `pi`)
++
++## What was operated
++
++The repository's JSONL/session utilities replay a session from an on-disk v4 JSONL
++file and project a branch's entry path into context. This deliverable **operates**
++that algorithm on a supplied tiny fixture and emits a **lineage report**:
++
++- **session ID** — the `id` in the JSONL header line.
++- **branch tip** — the value stored at `pi.branch.tip` for the `main` branch
++  (`packages/agent/src/harness/session/values.ts` → `branchTip(branch)`).
++- **parent relation** — the chain recovered by walking `parentId` from the tip to
++  the `null` root.
++- **replay result** — the re-materialized entries, values, usage and the projected
++  context messages.
++
++## Executable demo
++
++```
++node .prale-eval/lineage-demo.mjs
++```
++
++The script is dependency-free (Node built-ins only). It:
++
++1. Writes the supplied fixtures to `.prale-eval/fixtures/`.
++2. Replays each fixture with the algorithm below.
++3. Prints the lineage report to stdout and writes `.prale-eval/lineage-report.json`.
++4. Runs 11 self-check assertions and exits non-zero on any mismatch.
++
++It exits `0` with `lineage self-check: OK (11 assertions)`.
++
++### Why the algorithm is re-implemented
++
++The real utilities are TypeScript under
++`packages/agent/src/harness/session/jsonl/*` and are exercised by
++`packages/agent/test/harness/jsonl-storage.test.ts` and
++`packages/agent/test/harness/session-context.test.ts`. Running those suites needs
++the monorepo's installed workspace dependencies (vitest, tsx,
++`@earendil-works/pi-ai`, …). This sandbox has **no `node_modules`**, and
++dependencies must not be installed, so the demo faithfully mirrors the production
++algorithm instead of importing it:
++
++| Demo function | Mirrors |
++| --- | --- |
++| `splitCompleteLines` | `jsonl/storage.ts` torn-tail split |
++| `parseJsonlTransaction` / `parseCommittedWrite` | `jsonl/io.ts` transaction parsing + validation |
++| `openJsonl` | `JsonlStorage.openV4` (header check, per-line replay, truncate torn tail) |
++| `ReplayState.apply` | `in-memory-storage-state.ts` `applyValidated` (entry/value/list/usage) |
++| `buildSessionContext` | `session/context.ts` `buildContextEntries` + `sessionEntryToContextMessages` |
++
++## Supplied fixtures
++
++`fixtures/tiny-session.jsonl` — v4 header plus four committed transactions
++(one multi-write array line, single-write object lines), holding entries
++`e1 → e2 → e3` on branch `main`:
++
++```
++{"v":4,"kind":"header","id":"ses_tiny_lineage_04",...}
++[ entry e1 (user, parent null, seq 1), value set pi.branch.tip/main = "e1" (seq 2) ]
++entry e2 (assistant stop, parent e1, seq 3)
++[ value set pi.branch.tip/main = "e2" (seq 4), value set pi.session.name = "tiny-lineage" (seq 5) ]
++entry e3 (assistant error, parent e2, seq 6)
++value set pi.branch.tip/main = "e3" (seq 7)
++```
++
++`fixtures/tiny-session-torn.jsonl` — the same first five lines plus an
++**unterminated** final record `e4-torn` (no trailing newline).
++
++## Operated lineage report (normalized)
++
++Primary scenario (`tiny-session`):
++
++```json
++{
++  "sessionId": "ses_tiny_lineage_04",
++  "branch": "main",
++  "branchTip": { "address": "pi.branch.tip/main", "value": "e3", "seq": 7 },
++  "parentRelation": [
++    { "id": "e1", "parentId": null,  "type": "message", "seq": 1 },
++    { "id": "e2", "parentId": "e1", "type": "message", "seq": 3 },
++    { "id": "e3", "parentId": "e2", "type": "message", "seq": 6 }
++  ],
++  "replay": {
++    "torn": false,
++    "nextSeq": 8,
++    "entries": ["e1@1", "e2@3", "e3@6"],
++    "values": ["pi.branch.tip/main = e3@7", "pi.session.name = tiny-lineage@5"],
++    "contextMessages": ["user:root question", "assistant(stop):accepted answer"]
++  }
++}
++```
++
++The tip entry `e3` has `stopReason: "error"`, so it is part of the lineage but is
++**filtered out of context** by the projection contract — the same behavior the
++`session-context.test.ts` "filters non-context assistant response entries"
++case asserts.
++
++Torn-tail scenario (`tiny-session-torn`):
++
++```json
++{
++  "sessionId": "ses_tiny_lineage_04",
++  "branchTip": { "value": "e2", "seq": 4 },
++  "parentRelation": ["e1@1", "e2@3"],
++  "replay": {
++    "torn": true, "truncated": true, "nextSeq": 7,
++    "entries": ["e1@1", "e2@3", "e3@6"],
++    "contextMessages": ["user:root question", "assistant(stop):accepted answer"]
++  }
++}
++```
++
++The unterminated `e4-torn` record is discarded and the file is truncated (mirrors
++`describe("JsonlStorage torn tail")`), while the complete `e3` entry survives; the
++branch tip stays at the last fully committed `pi.branch.tip` write (`e2`).
++
++## Contract
++
++- **Input:** a v4 JSONL session (header line + one transaction per line; a single
++  write serialized as an object, several as an array).
++- **Output:** the lineage report with `sessionId`, `branchTip`, `parentRelation`
++  (root → tip) and `replay` (torn flag, nextSeq, entries, values, usage, context).
++- **Failure modes:** missing/invalid header or a complete-but-malformed line
++  raises `Invalid JSONL storage <path>: line N`; an unterminated final line is
++  silently discarded and truncated, never replayed.
++
++## Validation
++
++```
++$ node .prale-eval/lineage-demo.mjs
++lineage self-check: OK (11 assertions)
++$ echo $?
++0
++```
++
++**Limitation (recorded):** the focused upstream suites
++`packages/agent/test/harness/jsonl-storage.test.ts` and
++`packages/agent/test/harness/session-context.test.ts` could not be run here
++because the workspace has no installed dependencies (`node_modules` absent,
++vitest/tsx unavailable) and installing dependencies is out of scope. The demo's
++self-check stands in for them and asserts the same documented contract.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..27acd1e
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,75 @@
++{
++  "task_id": "04",
++  "repository": "pi",
++  "mode": "operate",
++  "evidence": [
++    {
++      "path": "packages/agent/test/harness/jsonl-storage.test.ts",
++      "symbol": "describe(\"JsonlStorage persistence\", ...)",
++      "start_line": 23,
++      "end_line": 117,
++      "observation": "Public acceptance contract for JSONL replay. The suite drives JsonlStorage.create/commit/open over a temp filesystem and asserts that (a) one transaction is serialized as one JSONL line and a multi-write commit as one JSON array line (lines[1] has length 3, lines[2] is not an array), and (b) reopening replays stamped state: entries carry the commit-assigned seq/timestamp, the value at pi.branch.tip/main is re-read with the seq of its `value set` write, usage rows are scanned back, and getStats() reflects the replayed history. This is exactly the replay a lineage report must reproduce from a tiny fixture."
++    },
++    {
++      "path": "packages/agent/test/harness/jsonl-storage.test.ts",
++      "symbol": "describe(\"JsonlStorage torn tail\", ...)",
++      "start_line": 119,
++      "end_line": 248,
++      "observation": "Defines the torn-tail / corruption contract used by the demo's second scenario: an unterminated final object or array line is discarded wholesale and the file is truncated before new writes are admitted (firstSeq continues from the last complete seq), while a complete but malformed interior/final line is rejected with a `line N` error and the file is left byte-for-byte untouched. This grounds the torn-session replay assertion in lineage-report.json."
++    },
++    {
++      "path": "packages/agent/test/harness/session-context.test.ts",
++      "symbol": "describe(\"session context projection\", ...)",
++      "start_line": 50,
++      "end_line": 260,
++      "observation": "Public acceptance contract for projecting a branch's entry path into context messages. buildSessionContext is exercised over ordered parent-linked entries, proving branch order is preserved and that custom entries are only materialized through registered projectors."
++    },
++    {
++      "path": "packages/agent/test/harness/session-context.test.ts",
++      "symbol": "it(\"filters non-context assistant response entries while preserving valid messages\", ...)",
++      "start_line": 51,
++      "end_line": 75,
++      "observation": "Proves the context projection drops assistant entries whose stopReason is error/aborted/deferred while keeping user, stop and toolUse messages. The demo relies on this to show that the branch tip entry (an errored assistant message) is part of the lineage but is filtered from the replayed context."
++    },
++    {
++      "path": "packages/agent/test/harness/session-context.test.ts",
++      "symbol": "it(\"projects branch summaries in branch order\", ...)",
++      "start_line": 77,
++      "end_line": 101,
++      "observation": "Proves a branch_summary entry projects to a {role:'branchSummary', summary, fromId, timestamp} message in parent-chain order. This is the projection the lineage report applies when converting the tip-to-root parent relation into replay context, tying parentId ancestry to emitted context."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "The JSONL session headers and per-line transactions are replayed in file order with one transaction per line (object for a single write, array for several), which yields the session id from the header and the branch tip from the `pi.branch.tip` value write; the two required tests assert both the single-line/array framing and the stamped-entry/value/usage replay after reopen.",
++      "evidence_paths": [
++        "packages/agent/test/harness/jsonl-storage.test.ts"
++      ]
++    },
++    {
++      "claim": "A torn (unterminated) final transaction line is discarded and the file truncated before further writes, so a fixture whose last line is torn replays only complete entries and keeps the branch tip at the last fully committed `pi.branch.tip` write; complete-but-malformed lines are instead rejected without rewriting.",
++      "evidence_paths": [
++        "packages/agent/test/harness/jsonl-storage.test.ts"
++      ]
++    },
++    {
++      "claim": "Parent relation is recovered by walking `parentId` from the branch tip back to the null root, and replay context is produced in that root-to-tip (branch) order, filtering assistant entries whose stopReason is error/aborted/deferred and projecting branch_summary entries as branchSummary messages.",
++      "evidence_paths": [
++        "packages/agent/test/harness/session-context.test.ts"
++      ]
++    },
++    {
++      "claim": "Operating the replay + context projection on the supplied tiny fixture `ses_tiny_lineage_04` yields branch tip `e3` (seq 7), parent relation `e1 -> e2 -> e3`, three replayed entries at seqs 1/3/6, nextSeq 8, and two context messages because the tip entry e3 (stopReason error) is filtered out.",
++      "evidence_paths": [
++        "packages/agent/test/harness/jsonl-storage.test.ts",
++        "packages/agent/test/harness/session-context.test.ts"
++      ]
++    }
++  ],
++  "conclusion": "Operated the JSONL/session replay and context-projection utilities on a supplied tiny fixture and produced a lineage report. `ses_tiny_lineage_04` has branch tip `e3` (value write seq 7), a parent relation `e1 (root, null) -> e2 -> e3`, and replays to three stamped entries (seqs 1, 3, 6) with nextSeq 8 and replayed values `pi.branch.tip/main = e3` and `pi.session.name = \"tiny-lineage\"`. The replayed context contains the user root and the accepted `stop` assistant message; the errored tip entry e3 is present in the lineage but filtered from context by the projection contract. A torn-tail variant replays three complete entries, discards the unterminated `e4-torn` record, and keeps the branch tip at `e2`, matching the truncate-before-writes contract. Because the workspace has no `node_modules`, the TypeScript acceptance suites themselves could not be executed; the demo reimplements the same documented algorithm with Node built-ins and self-checks its output.",
++  "validation": {
++    "command": "node .prale-eval/lineage-demo.mjs",
++    "status": "passed",
++    "notes": "Exit code 0 with `lineage self-check: OK (11 assertions)`; the run also wrote .prale-eval/lineage-report.json and the fixtures .prale-eval/fixtures/tiny-session.jsonl and .prale-eval/fixtures/tiny-session-torn.jsonl. The focused upstream acceptance suites (`packages/agent/test/harness/jsonl-storage.test.ts` and `packages/agent/test/harness/session-context.test.ts`, normally run via `npm --prefix packages/agent run test:harness`) could NOT be executed: this sandbox has no installed workspace dependencies (`node_modules` and `packages/agent/node_modules` are absent, and vitest/tsx/`@earendil-works/pi-ai` are unavailable), and dependencies must not be installed. The self-contained demo therefore reproduces the same replay/projection algorithm using only Node built-ins and asserts the expected lineage values; this limitation is recorded here rather than hidden."
++  }
++}
+snapshot .prale-eval/fixtures/tiny-session-torn.jsonl - 984975657174197f84022a287c77230c6c32d0e4643d8dde9648a1fc6ffe4cb9
+snapshot .prale-eval/fixtures/tiny-session.jsonl - 7ed1e2d49719bb37c5dc5ee228d9ac23fa2d69a72548e9bdd6e62148d38a400d
+snapshot .prale-eval/lineage-demo.mjs - 14a64a48a4ae4f07d89db0945c3940f49efbf5a1a5a6810510b4052adf47c4a1
+snapshot .prale-eval/lineage-report.json - 70527826b51faa1a5469264f03178612c84002f30e4f5f04b4f370b1e8c992ce
+snapshot .prale-eval/operate-deliverable.md - 2d0d449a937e61e5473c3000ee71a9b13bbcac5c7630283dd632b37ff2505019
+snapshot .prale-eval/result.json - ffcf1a6e274e0572614c9f460beab6dc2d22bf54039c1927f3d0a9a3335bac61

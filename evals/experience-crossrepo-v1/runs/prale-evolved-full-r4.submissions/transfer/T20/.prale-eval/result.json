@@ -1,0 +1,108 @@
+{
+  "task_id": "T20",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "syncUserSessionsFromGateway",
+      "start_line": 118,
+      "end_line": 177,
+      "observation": "Exported metadata-sync entry point. It resolves the user's allowed agent ids, lists sessions per agent with the single Gateway call `sessions.list` (bounded by perAgentLimit, no pagination/history/detail calls), normalizes each raw row, drops sessions whose agentId is outside the ownership set and sessionKeys present in recentlyDeletedSessionKeys, then calls upsertSyncedUserSession({ userId, ...session }) per row. `changed` is only incremented when the upsert reports result.changed, so replaying the same listed session (whose upsert returns changed:false) adds nothing to the counters and emits no event — the metadata half of the duplicate-event contract."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "scheduleUserSessionSync",
+      "start_line": 179,
+      "end_line": 216,
+      "observation": "Scheduling-level dedup for metadata sync. Keyed on userId: a cooldown check against lastSyncAtByUserId (default cooldownMs 60000, DEFAULT_SESSION_SYNC_OPTIONS at lines 7-12) returns `{ changed: 0, skipped: true, reason: 'cooldown' }`, and the module-level `inFlightByUserId` map (lines 14-15) returns the existing promise for a concurrent duplicate so a second identical schedule never starts a second run. On settle the in-flight entry is deleted and lastSyncAtByUserId is stamped, so only the first of a pair of replayed updates performs work."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "_persistOwnerScopedUpdate",
+      "start_line": 122,
+      "end_line": 152,
+      "observation": "The single write path for usage. It issues `UPDATE user_sessions SET ... WHERE user_id = ? AND session_key = ?` and defines success as `result?.changes === 1`. Every counter (token_input/output/cache_read/cache_write/total, cost_total, msg_*, tool_usage_json) is assigned the Gateway's absolute value with SET — there is no `+=`, no SUM and no read-modify-write — so replaying the identical event converges to the same row values instead of double-counting. Zero matching rows yields changes 0 (callers report a skip/failure) and model/model_provider use a CASE guard so null/empty values do not overwrite existing ones."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "batchUpdateMatchedGatewayUsage",
+      "start_line": 158,
+      "end_line": 225,
+      "observation": "Batch/startup fan-in over gatewayResult.sessions. Each session key is resolved as `session.key || session.sessionKey || session.id`; the ownership lookup selects user_id/session_key rows for that key and zero matches are counted as skippedUnmatched while more than one match is counted as skippedConflict, so ambiguous ownership is never written. Only a single-owner match reaches _persistOwnerScopedUpdate, and report.updated counts writes that returned changes === 1 — replaying the same event therefore re-writes the same single row with identical absolute counters rather than creating a duplicate row or accumulating."
+    },
+    {
+      "path": "server/core/usage-sync.js",
+      "symbol": "syncSessionUsageNow",
+      "start_line": 111,
+      "end_line": 202,
+      "observation": "Event-driven single-session sync. It returns the existing promise from the module-level `inFlightSessionSyncs` map (line 14) when a sync for the same sessionKey is already running, so two concurrent replays of one session update collapse into one Gateway call and one report. Path A looks the key up with getSessionOwner(sessionKey) and writes through updateSessionUsageForUser (the owner-scoped UPDATE); the finally block deletes the in-flight entry keyed by sessionKey. This is what prevents duplicate state changes at the sync layer."
+    },
+    {
+      "path": "server/core/usage-sync.js",
+      "symbol": "scheduleSessionUsageSync",
+      "start_line": 91,
+      "end_line": 109,
+      "observation": "Debounce for repeated session-usage events. pendingSessionTimers is keyed by sessionKey; a pending timer for that key is cleared before a new one is armed, so N replayed events for one session collapse into a single fired sync — the reason a burst of duplicate events cannot multiply state changes. `broadcastSessionUsageUpdate` (lines 47-58) then emits at most one `session.usage.updated` SSE event and only when report.updated > 0 and a message count is resolvable."
+    },
+    {
+      "path": "server/user-manager.js",
+      "symbol": "upsertSyncedUserSession",
+      "start_line": 614,
+      "end_line": 689,
+      "observation": "Persistence-side idempotency for session metadata, keyed on session_key: an existing row is re-read, the merged values are compared against it, and when nothing differs the function returns `{ changed: false, action: 'unchanged' }` without issuing an UPDATE; last_message_at advances only via Math.max(current, incoming). Replaying the same session update can therefore neither insert a duplicate row nor report a duplicate change to syncUserSessionsFromGateway."
+    },
+    {
+      "path": ".prale-eval/duplicate-event-fixture.mjs",
+      "symbol": "REPLAYED_EVENT",
+      "start_line": 35,
+      "end_line": 48,
+      "observation": "The distinct duplicate-event fixture: one absolute-valued Gateway session update (input 100, output 50, totalTokens 150, totalCost 0.5, messageCounts.total 4) under the private markers fixture 'dup-event-fixture/T20' / key 'agent:agent-a:dup-fixture' / owner 'user-dup-owner'. It is replayed byte-for-byte through every entry point of the contract and never collides with another repository fixture."
+    },
+    {
+      "path": ".prale-eval/duplicate-event-fixture.mjs",
+      "symbol": "check",
+      "start_line": 54,
+      "end_line": 58,
+      "observation": "Assertion driver for the executable contract: 16 checks run against the real session-usage-cache/usage-sync/session-sync source (db, Gateway client, SSE sink and user-manager replaced by .prale-eval/harness/mocks.mjs via the .prale-eval/harness/loader.mjs resolve hook). The script exits non-zero on the first failed assertion, so its exit code is the contract verdict."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Replaying one session update cannot double-count usage: usage is written only through the owner-scoped, absolute-valued UPDATE user_sessions ... WHERE user_id = ? AND session_key = ? whose success test is changes === 1, so a repeated event rewrites the same single row with the same totals (150 tokens, 0.5 cost, 4 messages) instead of accumulating to 300/1.0/8.",
+      "evidence_paths": [
+        "server/core/session-usage-cache.js",
+        ".prale-eval/duplicate-event-fixture.mjs"
+      ]
+    },
+    {
+      "claim": "Replaying one session update cannot emit duplicate state changes: server/core/session-sync.js coalesces concurrent schedules per userId via inFlightByUserId plus a cooldown, and only counts a change when upsertSyncedUserSession reports changed; replaying the same listed session yields changed 0 because user-manager keys the upsert on session_key and returns action 'unchanged' when nothing differs.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/user-manager.js"
+      ]
+    },
+    {
+      "claim": "A duplicate session update cannot duplicate a sync run or a broadcast: usage-sync returns the existing in-flight promise per sessionKey and debounces pending timers per sessionKey, so a replayed event collapses to one Gateway call and at most one session.usage.updated SSE event.",
+      "evidence_paths": [
+        "server/core/usage-sync.js",
+        ".prale-eval/duplicate-event-fixture.mjs"
+      ]
+    },
+    {
+      "claim": "The duplicate-event fixture is executable and self-contained: `node .prale-eval/duplicate-event-fixture.mjs` runs the real session-sync, usage-sync and session-usage-cache source with only their db/Gateway/user-manager boundaries doubled, and its 16 assertions pass (exit code 0) covering batch replay, concurrent replay, debounce, metadata replay and per-user schedule coalescing.",
+      "evidence_paths": [
+        ".prale-eval/duplicate-event-fixture.mjs",
+        "server/core/session-usage-cache.js",
+        "server/core/usage-sync.js",
+        "server/core/session-sync.js"
+      ]
+    }
+  ],
+  "conclusion": "Contract satisfied. Replaying one session update is idempotent at all three layers: the usage write is an absolute-valued, owner-scoped UPDATE keyed on the composite (user_id, session_key) with changes === 1 as the success test, so identical replays converge on the same counters (150 tokens / 0.5 cost / 4 messages) and never create a second row; usage-sync coalesces concurrent runs and debounces pending timers per sessionKey so one replayed event yields one Gateway call and one session.usage.updated event; and session-sync's per-user in-flight coalescing plus the session_key-keyed upsert make a replayed metadata update report changed: 0. Ownership ambiguity (zero or multiple owner rows) is skipped rather than written, which also prevents a duplicate write from being attributed to a second owner. Verified by the executable duplicate-event fixture, 16/16 checks passing.",
+  "validation": {
+    "command": "node .prale-eval/duplicate-event-fixture.mjs",
+    "status": "passed",
+    "notes": "Executable Node v24.14.0 contract fixture (plain node:assert + node:module loader hooks, no new dependencies). Result: 'CONTRACT OK: 16 checks passed for dup-event-fixture/T20', exit code 0, stdout captured in .prale-eval/contract-deliverable.md section 3. LIMITATION: vitest and better-sqlite3 are not installed in this offline workspace and were deliberately not installed (no dependency or package-lock changes), so `npm run test:server` could not be executed; the fixture substitutes a minimal in-memory double for the SQLite handle and for the Gateway/SSE/user-manager boundaries while executing the real production modules. The double implements only the statements on the duplicate-event path (owner-scoped UPDATE, ownership SELECT, getSessionOwner), so read/aggregate paths are not covered by this run and this is weaker evidence than the repository suite. All cited symbols were re-verified against the checkout by asserting the symbol token occurs inside its inclusive line range, and no production file was modified."
+  }
+}

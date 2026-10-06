@@ -1,0 +1,1149 @@
+diff --git a/.prale-eval/demo-deliverable.md b/.prale-eval/demo-deliverable.md
+new file mode 100644
+index 0000000..9023a8d
+--- /dev/null
++++ b/.prale-eval/demo-deliverable.md
+@@ -0,0 +1,86 @@
++# Demo deliverable — fresh project extension is unavailable until an explicit trusted decision
++
++Task: `T17` (repository `pi`, mode `demo`).
++
++## What the demo shows
++
++A throwaway fixture project ships one fresh project extension at
++`<project>/.pi/extensions/fresh-project-extension.ts`, and the isolated agent
++directory ships one user extension at `<agentDir>/extensions/user-extension.ts`.
++Running the repository's real `DefaultResourceLoader` produces this normalized
++operation result:
++
++| Phase | Observed `getExtensions().extensions` |
++| --- | --- |
++| Bootstrap (`loadProjectTrustExtensions()`) | `[<agentDir>/extensions/user-extension.ts]` — the fresh project extension is **unavailable** |
++| `reload({ resolveProjectTrust: async () => true })` | `[<project>/.pi/extensions/fresh-project-extension.ts, <agentDir>/extensions/user-extension.ts]` — available **only after the explicit trusted decision** |
++| `reload({ resolveProjectTrust: async () => false })` | `[<agentDir>/extensions/user-extension.ts]` — an explicit denial keeps it unavailable |
++
++The `resolveProjectTrust` callback also asserts the contract from the inside: the
++`extensionsResult` it receives is the bootstrap snapshot, which never contains
++the project fixture extension.
++
++## Executable demo
++
++```
++# from the workspace root
++node --import ./.prale-eval/demo/register.mjs .prale-eval/demo/run-demo.mjs
++```
++
++Exit code `0` and `7/7 checks passed` on the current checkout. Captured output:
++`.prale-eval/demo/validation-output.txt`.
++
++Files:
++
++| Path | Role |
++| --- | --- |
++| `.prale-eval/demo/run-demo.mjs` | The demo: builds the fixture, runs the real `DefaultResourceLoader`, asserts the bootstrap / trusted / denied phases, cleans up the fixture in `finally`. |
++| `.prale-eval/demo/register.mjs` | `node --import` entry that registers the offline resolution hooks. |
++| `.prale-eval/demo/hooks.mjs` | Resolution hook: bare non-builtin specifiers → offline stubs; intercepts only `./virtual-modules.ts` (which would otherwise pull `packages/coding-agent/src/index.ts`); everything else, including all repository `.ts` sources, loads normally. |
++| `.prale-eval/demo/stub-overrides.json` | Small functional shims (`chalk`, `ignore`, `minimatch`, `semver`, `proper-lockfile`, `jiti`/`jiti/static` import bridge) and value overrides (e.g. `DEFAULT_MAX_AGENT_RETRY_DELAY_MS`). |
++| `.prale-eval/demo/stub-exports.json` + `scan-exports.mjs` | Generated export surface for stubbed packages (reproducible via `node .prale-eval/demo/scan-exports.mjs`). |
++
++The fixture itself is written and deleted at runtime under
++`.prale-eval/demo/.tmp/`; no repository source, task metadata, lockfile or git
++configuration is modified.
++
++## Contract exercised in the repository
++
++1. `DefaultResourceLoader.loadProjectTrustExtensions()`
++   (`packages/coding-agent/src/core/resource-loader.ts:435-441`) forces
++   `settingsManager.setProjectTrusted(false)`, reloads settings and calls
++   `loadCurrentExtensionSet({ includeInlineFactories: true })`. Project
++   settings are dropped and the package manager's auto-discovery skips
++   `.pi/extensions`, so the project fixture cannot appear in the bootstrap set.
++2. `DefaultResourceLoader.reload()`
++   (`packages/coding-agent/src/core/resource-loader.ts:443-455`) runs that
++   bootstrap pass, hands the bootstrap result to the caller's
++   `resolveProjectTrust` callback, and applies the returned boolean with
++   `setProjectTrusted(projectTrusted)` **before** resolving and loading the
++   final set.
++3. `DefaultPackageManager.addAutoDiscoveredResources`
++   (`packages/coding-agent/src/core/package-manager.ts:2382-2470`) gates the
++   `.pi/extensions` (and project skills/prompts/themes) discovery blocks behind
++   `if (projectTrusted)`, while user-scope auto-discovery runs unconditionally —
++   hence "user extension always visible, project extension only after trust".
++4. `SettingsManager.setProjectTrusted`
++   (`packages/coding-agent/src/core/settings-manager.ts:514-535`) is the state
++   transition: `false` clears project settings, `true` re-loads them.
++5. `DefaultResourceLoader.loadFinalExtensionSet`
++   (`packages/coding-agent/src/core/resource-loader.ts:639-687`) reuses the
++   pre-trust loaded extension by resolved path and loads only the remaining
++   (now trusted) paths, so the project extension appears exactly once.
++
++## Limitations recorded
++
++* This checkout has no `node_modules` and dependencies must not be installed, so
++  the npm packages imported transitively by the real sources
++  (`chalk`, `ignore`, `minimatch`, `semver`, `proper-lockfile`, `jiti`,
++  `@earendil-works/*` workspaces, `highlight.js`, `typebox`) cannot be resolved
++  natively. The demo substitutes deterministic offline stubs for those
++  specifiers only; every repository `.ts` file that participates in the trust
++  gate is loaded, type-stripped and executed unmodified by Node.
++* For the same reason the repository's own vitest suite
++  (`npm test --workspace=@earendil-works/pi-coding-agent`, which contains
++  `packages/coding-agent/test/resource-loader.test.ts` covering the same
++  bootstrap/trust flow) could not be executed here.
+diff --git a/.prale-eval/demo/hooks.mjs b/.prale-eval/demo/hooks.mjs
+new file mode 100644
+index 0000000..d8fd172
+--- /dev/null
++++ b/.prale-eval/demo/hooks.mjs
+@@ -0,0 +1,85 @@
++// Node module resolution hooks that let the demo run the real
++// packages/coding-agent sources in an offline checkout (no node_modules).
++//
++// Every bare (npm) specifier is mapped to a deterministic in-memory stub. A few
++// packages that the exercised code paths really call into get small faithful
++// implementations (chalk/ignore/minimatch/semver/proper-lockfile/jiti). Node
++// builtins and all relative imports are resolved normally, so the demo still
++// executes the repository's own code.
++import { readFileSync } from "node:fs";
++import { builtinModules } from "node:module";
++
++const builtins = new Set([...builtinModules, ...builtinModules.map((m) => `node:${m}`)]);
++
++const exportTable = JSON.parse(readFileSync(new URL("./stub-exports.json", import.meta.url), "utf-8"));
++const overrides = JSON.parse(readFileSync(new URL("./stub-overrides.json", import.meta.url), "utf-8"));
++
++const STUB_PREFIX = "stub:";
++
++const genericSource = `
++const generic = (() => {
++  const fn = function () { return proxy; };
++  const proxy = new Proxy(fn, {
++    get(target, prop) {
++      if (prop === "then") return undefined;
++      if (prop === Symbol.toPrimitive) return () => 0;
++      if (prop === Symbol.iterator) return function* () {};
++      if (prop === Symbol.asyncIterator) return function () { return { next: async () => ({ done: true, value: undefined }) }; };
++      if (prop === "toString") return () => "";
++      if (prop === "valueOf") return () => 0;
++      if (prop === "length") return 0;
++      if (prop === "name") return "stub";
++      if (prop === "prototype") return target.prototype;
++      if (prop === "__esModule") return true;
++      return proxy;
++    },
++    apply() { return proxy; },
++    construct() { return proxy; },
++    has() { return true; },
++  });
++  return proxy;
++})();
++`;
++
++function stubModuleSource(specifier) {
++  const override = overrides[specifier];
++  if (override?.source) return override.source;
++  const names = (exportTable[specifier] ?? []).filter((n) => !n.startsWith("__"));
++  const lines = [genericSource];
++  for (const name of names) {
++    lines.push(`export const ${name} = ${override?.[name] !== undefined ? JSON.stringify(override[name]) : "generic"};`);
++  }
++  lines.push(override?.defaultSource ?? "export default generic;");
++  if (override?.extra) lines.push(override.extra);
++  return lines.join("\n");
++}
++
++export async function resolve(specifier, context, nextResolve) {
++  // Shim the heavy `index.ts` (and the virtual module table) pulled in by
++  // extensions/loader.ts; the demo does not need bundled extension virtuals.
++  if (specifier === "./virtual-modules.ts" && context.parentURL?.endsWith("/core/extensions/loader.ts")) {
++    return { url: `${STUB_PREFIX}virtual-modules`, shortCircuit: true, format: "module" };
++  }
++  if (
++    specifier.startsWith(".") ||
++    specifier.startsWith("/") ||
++    specifier.startsWith("file:") ||
++    specifier.startsWith("data:") ||
++    specifier.startsWith("node:") ||
++    builtins.has(specifier)
++  ) {
++    return nextResolve(specifier, context);
++  }
++  return { url: `${STUB_PREFIX}${specifier}`, shortCircuit: true, format: "module" };
++}
++
++export async function load(url, context, nextLoad) {
++  if (url.startsWith(STUB_PREFIX)) {
++    const specifier = url.slice(STUB_PREFIX.length);
++    if (specifier === "virtual-modules") {
++      return { format: "module", shortCircuit: true, source: "export const VIRTUAL_MODULES = {};\n" };
++    }
++    return { format: "module", shortCircuit: true, source: stubModuleSource(specifier) };
++  }
++  return nextLoad(url, context);
++}
+diff --git a/.prale-eval/demo/register.mjs b/.prale-eval/demo/register.mjs
+new file mode 100644
+index 0000000..2b145e3
+--- /dev/null
++++ b/.prale-eval/demo/register.mjs
+@@ -0,0 +1,4 @@
++// Registers the offline stub hooks; used via `node --import ./.prale-eval/demo/register.mjs`.
++import { register } from "node:module";
++
++register("./hooks.mjs", import.meta.url);
+diff --git a/.prale-eval/demo/run-demo.mjs b/.prale-eval/demo/run-demo.mjs
+new file mode 100644
+index 0000000..89f848c
+--- /dev/null
++++ b/.prale-eval/demo/run-demo.mjs
+@@ -0,0 +1,116 @@
++// Demo: a fresh project extension is unavailable during bootstrap and becomes
++// available only after an explicit trusted decision.
++//
++// Runs the real packages/coding-agent source (DefaultResourceLoader) against a
++// throwaway fixture project. Offline npm stubs are installed by register.mjs.
++import { mkdirSync, rmSync, writeFileSync } from "node:fs";
++import { join } from "node:path";
++
++const demoDir = new URL(".", import.meta.url).pathname;
++const repoRoot = new URL("../../", new URL(".", import.meta.url)).pathname;
++const fixtureRoot = join(demoDir, ".tmp", `fixture-${process.pid}`);
++
++const results = [];
++const check = (label, condition, detail) => {
++	results.push({ label, ok: condition, detail });
++	console.log(`${condition ? "PASS" : "FAIL"} ${label}${detail ? ` — ${detail}` : ""}`);
++};
++
++const { DefaultResourceLoader } = await import(
++	new URL("../../packages/coding-agent/src/core/resource-loader.ts", new URL(".", import.meta.url)).href
++);
++
++const USER_EXTENSION = `export default function (pi) {
++	pi.registerCommand("user-extension", { description: "user extension", handler: async () => {} });
++}
++`;
++const PROJECT_EXTENSION = `export default function (pi) {
++	pi.registerCommand("fresh-project-extension", { description: "fresh project extension", handler: async () => {} });
++}
++`;
++
++function makeFixture(name) {
++	const root = join(fixtureRoot, name);
++	const agentDir = join(root, "agent");
++	const cwd = join(root, "project");
++	mkdirSync(join(agentDir, "extensions"), { recursive: true });
++	mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
++	writeFileSync(join(agentDir, "extensions", "user-extension.ts"), USER_EXTENSION);
++	writeFileSync(join(cwd, ".pi", "extensions", "fresh-project-extension.ts"), PROJECT_EXTENSION);
++	return { cwd, agentDir, projectExtensionPath: join(cwd, ".pi", "extensions", "fresh-project-extension.ts") };
++}
++
++const paths = (result) => result.extensions.map((extension) => extension.path);
++
++rmSync(fixtureRoot, { recursive: true, force: true });
++try {
++	// ---------------------------------------------------------------- fixture
++	const fixture = makeFixture("trusted");
++	console.log(`fixture project: ${fixture.cwd}`);
++	console.log(`fixture extension: ${fixture.projectExtensionPath}`);
++
++	// ------------------------------------------------- bootstrap (pre-trust)
++	const loader = new DefaultResourceLoader({ cwd: fixture.cwd, agentDir: fixture.agentDir });
++	const bootstrap = await loader.loadProjectTrustExtensions();
++	const bootstrapPaths = paths(bootstrap);
++
++	check(
++		"bootstrap keeps project extensions out",
++		!bootstrapPaths.includes(fixture.projectExtensionPath),
++		`bootstrap extensions: ${JSON.stringify(bootstrapPaths)}`,
++	);
++	check(
++		"bootstrap still loads user extensions",
++		bootstrapPaths.includes(join(fixture.agentDir, "extensions", "user-extension.ts")),
++		`bootstrap extensions: ${JSON.stringify(bootstrapPaths)}`,
++	);
++
++	// ------------------------------------------- explicit trusted decision
++	let observedDuringBootstrap;
++	const reloadLoader = new DefaultResourceLoader({ cwd: fixture.cwd, agentDir: fixture.agentDir });
++	await reloadLoader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			observedDuringBootstrap = paths(extensionsResult);
++			return true;
++		},
++	});
++	const afterTrust = paths(reloadLoader.getExtensions());
++
++	check(
++		"trust callback observes the project extension as unavailable",
++		!observedDuringBootstrap.includes(fixture.projectExtensionPath),
++		`callback saw: ${JSON.stringify(observedDuringBootstrap)}`,
++	);
++	check(
++		"explicit trusted decision makes the project extension available",
++		afterTrust.includes(fixture.projectExtensionPath),
++		`after trust: ${JSON.stringify(afterTrust)}`,
++	);
++	check(
++		"trusted pass keeps the user extension too",
++		afterTrust.includes(join(fixture.agentDir, "extensions", "user-extension.ts")),
++		`after trust: ${JSON.stringify(afterTrust)}`,
++	);
++
++	// ------------------------------------- negative control: explicit denial
++	const deniedFixture = makeFixture("denied");
++	const deniedLoader = new DefaultResourceLoader({ cwd: deniedFixture.cwd, agentDir: deniedFixture.agentDir });
++	await deniedLoader.reload({ resolveProjectTrust: async () => false });
++	const afterDenial = paths(deniedLoader.getExtensions());
++	check(
++		"explicit untrusted decision keeps the project extension unavailable",
++		!afterDenial.includes(deniedFixture.projectExtensionPath),
++		`after denial: ${JSON.stringify(afterDenial)}`,
++	);
++	check(
++		"explicit untrusted decision still loads user extensions",
++		afterDenial.includes(join(deniedFixture.agentDir, "extensions", "user-extension.ts")),
++		`after denial: ${JSON.stringify(afterDenial)}`,
++	);
++} finally {
++	rmSync(fixtureRoot, { recursive: true, force: true });
++}
++
++const failed = results.filter((result) => !result.ok);
++console.log(`\n${results.length - failed.length}/${results.length} checks passed`);
++process.exitCode = failed.length === 0 ? 0 : 1;
+diff --git a/.prale-eval/demo/scan-exports.mjs b/.prale-eval/demo/scan-exports.mjs
+new file mode 100644
+index 0000000..1d1642f
+--- /dev/null
++++ b/.prale-eval/demo/scan-exports.mjs
+@@ -0,0 +1,68 @@
++// Scans packages/coding-agent/src for bare (npm) import specifiers so the demo
++// harness can provide offline stubs. This never executes the scanned code.
++import { readdirSync, readFileSync, writeFileSync, statSync } from "node:fs";
++import { join } from "node:path";
++
++const ROOT = new URL("../../packages/coding-agent/src", import.meta.url).pathname;
++
++const files = [];
++(function walk(dir) {
++	for (const entry of readdirSync(dir)) {
++		const p = join(dir, entry);
++		const st = statSync(p);
++		if (st.isDirectory()) walk(p);
++		else if (entry.endsWith(".ts")) files.push(p);
++	}
++})(ROOT);
++
++const importRe = /import\s+(?:type\s+)?([\s\S]*?)\s+from\s+["']([^"']+)["']/g;
++const sideEffectRe = /import\s+["']([^"']+)["']/g;
++const exportRe = /export\s+(?:type\s+)?\{([\s\S]*?)\}\s+from\s+["']([^"']+)["']/g;
++
++const map = new Map();
++const add = (spec, name) => {
++	if (!name || name.startsWith("type ")) return;
++	const set = map.get(spec) ?? new Set();
++	set.add(name);
++	map.set(spec, set);
++};
++
++for (const file of files) {
++	const src = readFileSync(file, "utf-8");
++	for (const m of src.matchAll(importRe)) {
++		const [, clause, spec] = m;
++		if (spec.startsWith(".") || spec.startsWith("node:") || spec.startsWith("/")) continue;
++		const trimmed = clause.trim();
++		if (trimmed.startsWith("*")) {
++			add(spec, "");
++			continue;
++		}
++		if (trimmed.startsWith("{")) {
++			for (const part of trimmed.slice(1, -1).split(",")) {
++				const name = part.trim().split(/\s+as\s+/)[0].replace(/^type\s+/, "").trim();
++				if (name) add(spec, name);
++			}
++		} else {
++			add(spec, trimmed.replace(/^type\s+/, "").split(",")[0].trim());
++			const brace = trimmed.indexOf("{");
++			if (brace >= 0) {
++				for (const part of trimmed.slice(brace + 1, trimmed.lastIndexOf("}")).split(",")) {
++					const name = part.trim().split(/\s+as\s+/)[0].trim();
++					if (name) add(spec, name);
++				}
++			}
++		}
++	}
++	for (const m of src.matchAll(sideEffectRe)) {
++		if (!m[1].startsWith(".") && !m[1].startsWith("node:")) add(m[1], "__sideEffect");
++	}
++	for (const m of src.matchAll(exportRe)) {
++		if (!m[2].startsWith(".") && !m[2].startsWith("node:")) add(m[2], "__reexport");
++	}
++}
++
++const out = {};
++for (const [spec, names] of [...map.entries()].sort()) out[spec] = [...names].sort();
++writeFileSync(new URL("./stub-exports.json", import.meta.url), `${JSON.stringify(out, null, "\t")}\n`);
++console.log(`scanned ${files.length} files; ${Object.keys(out).length} bare specifiers`);
++for (const [spec, names] of Object.entries(out)) console.log(`  ${spec}: ${names.length}`);
+diff --git a/.prale-eval/demo/stub-exports.json b/.prale-eval/demo/stub-exports.json
+new file mode 100644
+index 0000000..cb6b20e
+--- /dev/null
++++ b/.prale-eval/demo/stub-exports.json
+@@ -0,0 +1,598 @@
++{
++	")) {\n\t\t\t\tawait this.handleImportCommand(text);\n\t\t\t\tthis.editor.setText(": [
++		"__sideEffect"
++	],
++	"@earendil-works/chord": [
++		"Context",
++		"Facet",
++		"FacetHost",
++		"FacetLoader",
++		"JsonValue",
++		"LoadedFacets",
++		"MutableReplicatedState",
++		"REMOTE_SERVICE_ERROR_CODES",
++		"RemoteServiceBinding",
++		"RemoteServiceEndpoint",
++		"RemoteServiceError",
++		"RemoteServiceErrorCode",
++		"RemoteServiceProvider",
++		"RemoteServiceSource",
++		"RemoteServiceTransport",
++		"RemoteServices",
++		"ReplicatedState",
++		"Service",
++		"ServiceCall",
++		"ServiceCatalogueEntry",
++		"ServiceProviderUpdate",
++		"combineFacetLoaders",
++		"createFacetHost",
++		"createRemoteServiceBinding",
++		"createRemoteServiceEndpoint",
++		"createServiceUnsubscribeCall",
++		"createStaticFacetLoader",
++		"decodeServiceControlCall",
++		"defineFacet",
++		"defineService",
++		"isJsonValue",
++		"parseServiceProviderUpdate",
++		"replicatedState"
++	],
++	"@earendil-works/chord/bundler": [
++		"bundleFacetPackage"
++	],
++	"@earendil-works/chord/context": [
++		"BACKGROUND_CONTEXT"
++	],
++	"@earendil-works/chord/node": [
++		"FACET_BUNDLE_MANIFEST_FILE",
++		"FacetBundleArtifact",
++		"createFacetBundleArtifactLoader",
++		"createFacetBundleLoader",
++		"readFacetBundleArtifact",
++		"readFacetBundleManifest"
++	],
++	"@earendil-works/pi-agent-core": [
++		"Agent",
++		"AgentContext",
++		"AgentEvent",
++		"AgentHarness",
++		"AgentHarnessTool",
++		"AgentHarnessToolInvocation",
++		"AgentLane",
++		"AgentMessage",
++		"AgentState",
++		"AgentTool",
++		"AgentToolResult",
++		"AgentToolUpdateCallback",
++		"BACKGROUND_CONTEXT",
++		"Context",
++		"Entry",
++		"ExecutionEnv",
++		"ExecutionToolContext",
++		"HarnessEvent",
++		"JsonlSessionMetadata",
++		"JsonlSessionRepo",
++		"LaneSnapshot",
++		"LaneTranscriptSnapshot",
++		"LaneWatchEvent",
++		"OperationResultRecord",
++		"PrepareNextTurnContext",
++		"Session",
++		"StreamFn",
++		"SuspendedRun",
++		"TODO_CONTEXT",
++		"ThinkingLevel",
++		"ToolExecutionMode",
++		"WatchHandle",
++		"createBashTool",
++		"createEditTool",
++		"createReadTool",
++		"createWriteTool",
++		"reduceLaneSnapshot",
++		"setDefaultStreamFn",
++		"withCancel"
++	],
++	"@earendil-works/pi-agent-core/experimental/pico3": [
++		"ConversationView",
++		"Entry",
++		"Envelope",
++		"Harness",
++		"JsonValue",
++		"JsonlStorage",
++		"ModelRef",
++		"Models",
++		"RequestOptions",
++		"SystemMessage",
++		"ToolDeclaration",
++		"ToolResult",
++		"ViewEvent",
++		"Watch",
++		"applyEnvelope",
++		"kinds",
++		"systemSections"
++	],
++	"@earendil-works/pi-agent-core/harness/context": [
++		"BACKGROUND_CONTEXT"
++	],
++	"@earendil-works/pi-agent-core/harness/env/nodejs": [
++		"NodeExecutionEnv"
++	],
++	"@earendil-works/pi-agent-core/harness/runtime/reducer": [
++		"reduceLaneSnapshot"
++	],
++	"@earendil-works/pi-agent-core/harness/session": [
++		"JsonlSessionRepo"
++	],
++	"@earendil-works/pi-agent-core/node": [
++		"NodeExecutionEnv"
++	],
++	"@earendil-works/pi-ai": [
++		"AnyModel",
++		"Api",
++		"ApiKeyAuth",
++		"ApiKeyCredential",
++		"ApiStreamOptions",
++		"AssistantImages",
++		"AssistantMessage",
++		"AssistantMessageEvent",
++		"AssistantMessageEventStream",
++		"AuthCheck",
++		"AuthContext",
++		"AuthEvent",
++		"AuthInfoLink",
++		"AuthInteraction",
++		"AuthOperationOptions",
++		"AuthPrompt",
++		"AuthResult",
++		"AuthType",
++		"ClassifierApi",
++		"ClassifierContext",
++		"ClassifierModel",
++		"ClassifierOptions",
++		"ClassifierResult",
++		"ConstrainedSamplingConfig",
++		"Context",
++		"Credential",
++		"CredentialInfo",
++		"CredentialStore",
++		"DEFAULT_MAX_AGENT_RETRY_DELAY_MS",
++		"DeferredCancelOptions",
++		"DeferredFetchOptions",
++		"DeferredHandle",
++		"ImageApi",
++		"ImageContent",
++		"ImageModel",
++		"ImagesContext",
++		"ImagesOptions",
++		"KnownProvider",
++		"Message",
++		"Model",
++		"ModelAuth",
++		"ModelImageResizeOptions",
++		"ModelThinkingLevel",
++		"ModelType",
++		"ModelTypeMap",
++		"Models",
++		"ModelsApiStreamOptions",
++		"ModelsClassifierOptions",
++		"ModelsDeferredCancelOptions",
++		"ModelsDeferredFetchOptions",
++		"ModelsError",
++		"ModelsImagesOptions",
++		"ModelsRefreshOptions",
++		"ModelsRefreshResult",
++		"ModelsRequestTransforms",
++		"ModelsSimpleStreamOptions",
++		"ModelsStore",
++		"ModelsStoreEntry",
++		"ModelsStoreOperationOptions",
++		"MutableModels",
++		"OAuthAuth",
++		"OAuthCredentials",
++		"OAuthDeviceCodeInfo",
++		"OAuthLoginCallbacks",
++		"Provider",
++		"ProviderClassifier",
++		"ProviderHeaders",
++		"ProviderId",
++		"ProviderImages",
++		"ProviderRequestOptions",
++		"ProviderStreamOptions",
++		"RefreshModelsContext",
++		"RetryCallbacks",
++		"RetryPolicy",
++		"SimpleStreamOptions",
++		"StreamOptions",
++		"SystemMessage",
++		"TextContent",
++		"Tool",
++		"ToolResultMessage",
++		"TranscriptContext",
++		"Transport",
++		"Usage",
++		"UserMessage",
++		"__reexport",
++		"calculateCost",
++		"clampThinkingLevel",
++		"contentText",
++		"createModels",
++		"getCurrentSystemMessage",
++		"getModel",
++		"getModelType",
++		"getSupportedThinkingLevels",
++		"getSystemMessageText",
++		"isModelType",
++		"lazyStream",
++		"modelsAreEqual",
++		"normalizeContext",
++		"retryAssistantCall",
++		"retryDelayMs",
++		"uuidv7"
++	],
++	"@earendil-works/pi-ai/bedrock-provider": [
++		"bedrockProviderModule"
++	],
++	"@earendil-works/pi-ai/bun-oauth": [
++		"registerBunOAuthFlows"
++	],
++	"@earendil-works/pi-ai/compat": [
++		"Api",
++		"AssistantMessage",
++		"AuthResult",
++		"ImageContent",
++		"Message",
++		"Model",
++		"Provider",
++		"ProviderHeaders",
++		"RetryCallbacks",
++		"SimpleStreamOptions",
++		"SystemMessage",
++		"TextContent",
++		"ToolResultMessage",
++		"TranscriptContext",
++		"Usage",
++		"clampThinkingLevel",
++		"cleanupSessionResources",
++		"completeSimple",
++		"getApiProvider",
++		"getSupportedThinkingLevels",
++		"isContextOverflow",
++		"isRecoverableLength",
++		"isRetryableAssistantError",
++		"modelsAreEqual",
++		"resetApiProviders",
++		"setBedrockProviderModule",
++		"stream",
++		"streamSimple"
++	],
++	"@earendil-works/pi-ai/providers/radius-config": [
++		"DEFAULT_RADIUS_GATEWAY",
++		"normalizeRadiusGatewayUrl"
++	],
++	"@earendil-works/pi-ai/utils/model-operations": [
++		"assertChatModel",
++		"assertClassifierModel",
++		"assertImageModel",
++		"classifierErrorResult",
++		"imageErrorResult"
++	],
++	"@earendil-works/pi-ai/utils/provider-env": [
++		"getProviderEnvValue"
++	],
++	"@earendil-works/pi-client": [
++		"ByteTransport",
++		"ByteTransportFactory",
++		"ByteTransportHandlers",
++		"Client",
++		"DisconnectedError",
++		"ServerError",
++		"createClientServiceTransport"
++	],
++	"@earendil-works/pi-client/unix": [
++		"UnixServerRoute",
++		"createUnixTransportFactory",
++		"discoverUnixServers"
++	],
++	"@earendil-works/pi-coding-agent": [
++		"CustomEditor"
++	],
++	"@earendil-works/pi-protocol": [
++		"DEFAULT_MAX_FRAME_LENGTH",
++		"ServerId",
++		"SessionTarget",
++		"isServerId"
++	],
++	"@earendil-works/pi-server": [
++		"RoutedServerServiceAttachment",
++		"RoutedServerServiceHost",
++		"RoutedSessionAttachment",
++		"RoutedSessionHandle",
++		"Server",
++		"ServerError",
++		"ServerHost",
++		"SessionAmbiguousError",
++		"SessionNotFoundError"
++	],
++	"@earendil-works/pi-server/unix": [
++		"createUnixServer",
++		"getUnixSocketPath"
++	],
++	"@earendil-works/pi-tui": [
++		"AutocompleteItem",
++		"AutocompleteProvider",
++		"Box",
++		"CancellableLoader",
++		"CombinedAutocompleteProvider",
++		"Component",
++		"Container",
++		"Editor",
++		"EditorComponent",
++		"EditorOptions",
++		"EditorTheme",
++		"Focusable",
++		"Image",
++		"Input",
++		"Key",
++		"KeyId",
++		"Keybinding",
++		"KeybindingDefinitions",
++		"KeybindingsConfig",
++		"KeybindingsManager",
++		"Loader",
++		"Markdown",
++		"MarkdownTheme",
++		"Marked",
++		"MouseRegion",
++		"OverlayHandle",
++		"OverlayOptions",
++		"ProcessTerminal",
++		"RgbColor",
++		"ScrollView",
++		"ScrollViewScrollbar",
++		"SelectItem",
++		"SelectList",
++		"SelectListLayoutOptions",
++		"SelectListTheme",
++		"SettingItem",
++		"SettingsList",
++		"SettingsListTheme",
++		"SlashCommand",
++		"Spacer",
++		"TUI",
++		"TUI_KEYBINDINGS",
++		"Terminal",
++		"TerminalCapabilities",
++		"Text",
++		"Token",
++		"TruncatedText",
++		"TuiAltScreen",
++		"TuiMainScreen",
++		"TuiMainScreenRenderState",
++		"TuiMode",
++		"TuiMouseEvent",
++		"VStack",
++		"fuzzyFilter",
++		"fuzzyMatch",
++		"getCapabilities",
++		"getImageDimensions",
++		"getKeybindings",
++		"getNativeClipboard",
++		"hyperlink",
++		"imageFallback",
++		"matchesKey",
++		"setCapabilityOverrides",
++		"setKeybindings",
++		"sliceByColumn",
++		"truncateToWidth",
++		"visibleWidth",
++		"wrapTextWithAnsi"
++	],
++	"@silvia-odwyer/photon-node": [
++		"__reexport"
++	],
++	"chalk": [
++		"chalk"
++	],
++	"child_process": [
++		"ExecFileException",
++		"SpawnSyncReturns",
++		"execFile",
++		"execSync",
++		"spawn",
++		"spawnSync"
++	],
++	"cross-spawn": [
++		"crossSpawn"
++	],
++	"crypto": [
++		"randomUUID"
++	],
++	"fs": [
++		"FSWatcher",
++		"PathOrFileDescriptor",
++		"Stats",
++		"accessSync",
++		"appendFileSync",
++		"chmodSync",
++		"closeSync",
++		"constants",
++		"createReadStream",
++		"createWriteStream",
++		"existsSync",
++		"mkdirSync",
++		"openSync",
++		"readFileSync",
++		"readSync",
++		"readdirSync",
++		"realpathSync",
++		"renameSync",
++		"rmSync",
++		"statSync",
++		"unlinkSync",
++		"unwatchFile",
++		"watchFile",
++		"writeFileSync"
++	],
++	"fs/promises": [
++		"access",
++		"mkdir",
++		"readFile",
++		"readdir",
++		"stat",
++		"writeFile"
++	],
++	"grok-mermaid": [
++		"MermaidArt",
++		"Span",
++		"render"
++	],
++	"highlight.js/lib/core.js": [
++		"hljs"
++	],
++	"highlight.js/lib/languages/bash.js": [
++		"bash"
++	],
++	"highlight.js/lib/languages/c.js": [
++		"c"
++	],
++	"highlight.js/lib/languages/cpp.js": [
++		"cpp"
++	],
++	"highlight.js/lib/languages/csharp.js": [
++		"csharp"
++	],
++	"highlight.js/lib/languages/dart.js": [
++		"dart"
++	],
++	"highlight.js/lib/languages/go.js": [
++		"go"
++	],
++	"highlight.js/lib/languages/groovy.js": [
++		"groovy"
++	],
++	"highlight.js/lib/languages/java.js": [
++		"java"
++	],
++	"highlight.js/lib/languages/javascript.js": [
++		"javascript"
++	],
++	"highlight.js/lib/languages/kotlin.js": [
++		"kotlin"
++	],
++	"highlight.js/lib/languages/lua.js": [
++		"lua"
++	],
++	"highlight.js/lib/languages/nix.js": [
++		"nix"
++	],
++	"highlight.js/lib/languages/perl.js": [
++		"perl"
++	],
++	"highlight.js/lib/languages/php.js": [
++		"php"
++	],
++	"highlight.js/lib/languages/python.js": [
++		"python"
++	],
++	"highlight.js/lib/languages/ruby.js": [
++		"ruby"
++	],
++	"highlight.js/lib/languages/rust.js": [
++		"rust"
++	],
++	"highlight.js/lib/languages/scala.js": [
++		"scala"
++	],
++	"highlight.js/lib/languages/swift.js": [
++		"swift"
++	],
++	"highlight.js/lib/languages/typescript.js": [
++		"typescript"
++	],
++	"hosted-git-info": [
++		"hostedGitInfo"
++	],
++	"ignore": [
++		"ignore"
++	],
++	"jiti": [
++		"__reexport",
++		"createJiti"
++	],
++	"jiti/static": [
++		"__reexport"
++	],
++	"minimatch": [
++		"minimatch"
++	],
++	"module": [
++		"createRequire"
++	],
++	"os": [
++		"arch",
++		"homedir",
++		"platform",
++		"tmpdir"
++	],
++	"path": [
++		"basename",
++		"dirname",
++		"join",
++		"nodePath",
++		"path",
++		"relative",
++		"resolve",
++		"sep",
++		"win32"
++	],
++	"proper-lockfile": [
++		"lockfile"
++	],
++	"readline": [
++		"createInterface"
++	],
++	"semver": [
++		"compare",
++		"gt",
++		"maxSatisfying",
++		"rcompare",
++		"satisfies",
++		"valid",
++		"validRange"
++	],
++	"stream": [
++		"Readable"
++	],
++	"stream/promises": [
++		"pipeline"
++	],
++	"string_decoder": [
++		"StringDecoder"
++	],
++	"timers/promises": [
++		"setTimeout"
++	],
++	"typebox": [
++		"Static",
++		"TSchema",
++		"Type"
++	],
++	"typebox/compile": [
++		"Compile"
++	],
++	"typebox/error": [
++		"TLocalizedValidationError"
++	],
++	"typebox/value": [
++		"Check"
++	],
++	"undici": [
++		"WebSocket"
++	],
++	"url": [
++		"fileURLToPath"
++	],
++	"yaml": [
++		"parse"
++	]
++}
+diff --git a/.prale-eval/demo/stub-overrides.json b/.prale-eval/demo/stub-overrides.json
+new file mode 100644
+index 0000000..4f3f8a7
+--- /dev/null
++++ b/.prale-eval/demo/stub-overrides.json
+@@ -0,0 +1,26 @@
++{
++	"chalk": {
++		"source": "const handler = { get: (t, p) => (p === 'then' ? undefined : make()), apply: () => make(), has: () => true }; function make() { const fn = (v) => String(v ?? ''); return new Proxy(fn, { ...handler, get: (t, p) => (p === Symbol.toPrimitive ? () => '' : handler.get(t, p)) }); } const chalk = make(); export default chalk;"
++	},
++	"ignore": {
++		"source": "export default function ignore() { return { add() {}, ignores() { return false; }, filter(list) { return list; }, test() { return false; }, createFilter() { return () => false; } }; }"
++	},
++	"minimatch": {
++		"source": "export function minimatch() { return false; } export default minimatch;"
++	},
++	"semver": {
++		"source": "export const gt = () => false; export const lt = () => false; export const satisfies = () => true; export const valid = (v) => (typeof v === 'string' ? v : null); export const validRange = (v) => (typeof v === 'string' ? v : null); export const maxSatisfying = (list) => list?.[0] ?? null; export const rcompare = () => 0; export const compare = () => 0; export const coerce = () => null; export const gte = () => true; export const lte = () => true; export const eq = () => true; export const prerelease = () => null; export const major = () => 0; export const minor = () => 0; export const patch = () => 0; export const inc = (v) => v; export const sort = (l) => l; export const rsort = (l) => l;"
++	},
++	"proper-lockfile": {
++		"source": "const release = async () => {}; const lock = async () => release; lock.lockSync = () => () => {}; lock.unlock = async () => {}; lock.check = async () => false; export default lock;"
++	},
++	"jiti": {
++		"source": "import { pathToFileURL } from 'node:url';\nexport function createJiti(base) { return { import: async (specifier, options) => { const url = specifier.startsWith('file:') ? specifier : pathToFileURL(specifier).href; const mod = await import(url); return options && options.default ? (mod.default ?? mod) : mod; } }; }\nexport default createJiti;"
++	},
++	"jiti/static": {
++		"source": "import { pathToFileURL } from 'node:url';\nexport function createJiti(base) { return { import: async (specifier, options) => { const url = specifier.startsWith('file:') ? specifier : pathToFileURL(specifier).href; const mod = await import(url); return options && options.default ? (mod.default ?? mod) : mod; } }; }\nexport default createJiti;"
++	},
++	"@earendil-works/pi-ai": {
++		"DEFAULT_MAX_AGENT_RETRY_DELAY_MS": 60000
++	}
++}
+diff --git a/.prale-eval/demo/validation-output.txt b/.prale-eval/demo/validation-output.txt
+new file mode 100644
+index 0000000..32e97a5
+--- /dev/null
++++ b/.prale-eval/demo/validation-output.txt
+@@ -0,0 +1,11 @@
++fixture project: /tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/project
++fixture extension: /tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/project/.pi/extensions/fresh-project-extension.ts
++PASS bootstrap keeps project extensions out — bootstrap extensions: ["/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/agent/extensions/user-extension.ts"]
++PASS bootstrap still loads user extensions — bootstrap extensions: ["/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/agent/extensions/user-extension.ts"]
++PASS trust callback observes the project extension as unavailable — callback saw: ["/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/agent/extensions/user-extension.ts"]
++PASS explicit trusted decision makes the project extension available — after trust: ["/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/project/.pi/extensions/fresh-project-extension.ts","/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/agent/extensions/user-extension.ts"]
++PASS trusted pass keeps the user extension too — after trust: ["/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/project/.pi/extensions/fresh-project-extension.ts","/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/trusted/agent/extensions/user-extension.ts"]
++PASS explicit untrusted decision keeps the project extension unavailable — after denial: ["/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/denied/agent/extensions/user-extension.ts"]
++PASS explicit untrusted decision still loads user extensions — after denial: ["/tmp/prale-real-eval-5xttjv3c/workspace/.prale-eval/demo/.tmp/fixture-868566/denied/agent/extensions/user-extension.ts"]
++
++7/7 checks passed
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..5108991
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,92 @@
++{
++	"task_id": "T17",
++	"repository": "pi",
++	"mode": "demo",
++	"evidence": [
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "DefaultResourceLoader.loadProjectTrustExtensions",
++			"start_line": 435,
++			"end_line": 441,
++			"observation": "Bootstrap pass: forces `settingsManager.setProjectTrusted(false)` and reloads settings before calling `loadCurrentExtensionSet({ includeInlineFactories: true })`. Because project trust is off, project-scoped resources (.pi/settings.json and .pi/extensions) are excluded from the returned extension set while user/global extensions and temporary CLI extensions still load. This is exactly the state a fresh extension fixture is observed in during bootstrap."
++		},
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "DefaultResourceLoader.reload",
++			"start_line": 443,
++			"end_line": 455,
++			"observation": "Trust-decision seam: when `ResourceLoaderReloadOptions.resolveProjectTrust` is provided, reload() first runs the untrusted bootstrap pass, hands that bootstrap result to the caller's callback (`const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions })`), and only then applies the explicit decision via `setProjectTrusted(projectTrusted)` before the final resolve/load pass. So the project extension set is a function of an explicit trusted decision, not of reload timing."
++		},
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "DefaultResourceLoader.loadCurrentExtensionSet",
++			"start_line": 606,
++			"end_line": 634,
++			"observation": "Builds the extension path list from `packageManager.resolve()` plus CLI-provided extension sources and loads them through `loadExtensionsCached`. `packageManager.resolve()` auto-discovers project extensions only while the project is trusted, so the bootstrap call inside `loadProjectTrustExtensions` returns a set that cannot contain the fresh `.pi/extensions` fixture."
++		},
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "DefaultResourceLoader.loadFinalExtensionSet",
++			"start_line": 639,
++			"end_line": 687,
++			"observation": "Final pass after the trust decision: extensions already loaded during the bootstrap pass are reused by resolved path (`preloadedByPath`) and only the remaining paths are loaded, then the ordered result is assembled. This is why the trusted fixture's project extension appears in the final result exactly once and alongside the user extension that was already available during bootstrap."
++		},
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "DefaultResourceLoader.getExtensions",
++			"start_line": 359,
++			"end_line": 361,
++			"observation": "Read accessor the demo uses to inspect the observed extension set at each phase (`loader.getExtensions().extensions`), which is the normalized operation result: bootstrap -> user extension only; after explicit trusted decision -> project fixture extension plus user extension."
++		},
++		{
++			"path": "packages/coding-agent/src/core/settings-manager.ts",
++			"symbol": "SettingsManager.setProjectTrusted",
++			"start_line": 514,
++			"end_line": 535,
++			"observation": "State transition behind the decision: setting trust to `false` clears project settings and merges only global settings; setting it to `true` re-loads project settings from storage. This is the switch the bootstrap pass flips off and the explicit trusted decision flips on."
++		},
++		{
++			"path": "packages/coding-agent/src/core/package-manager.ts",
++			"symbol": "DefaultPackageManager.addAutoDiscoveredResources",
++			"start_line": 2382,
++			"end_line": 2470,
++			"observation": "Discovery gate: `const projectTrusted = this.settingsManager.isProjectTrusted()` and the `.pi/extensions` auto-discovery block is wrapped in `if (projectTrusted)`. Auto-discovered user extensions are added unconditionally, which is why the bootstrap snapshot contains the user extension but never the project fixture extension."
++		}
++	],
++	"claims": [
++		{
++			"claim": "During bootstrap the fresh project extension fixture is unavailable: `loadProjectTrustExtensions()` forces project trust off, `packageManager.resolve()` therefore skips `.pi/extensions`, and the returned `LoadExtensionsResult` contains only the user/global extension. The demo asserts this on a real DefaultResourceLoader instance (bootstrap extensions = [<agentDir>/extensions/user-extension.ts]).",
++			"evidence_paths": [
++				"packages/coding-agent/src/core/resource-loader.ts",
++				"packages/coding-agent/src/core/settings-manager.ts",
++				"packages/coding-agent/src/core/package-manager.ts"
++			]
++		},
++		{
++			"claim": "The project extension becomes available only through an explicit trusted decision: reload() passes the bootstrap result to the `resolveProjectTrust` callback, applies its boolean via `setProjectTrusted(projectTrusted)`, and only a `true` decision makes `.pi/extensions/fresh-project-extension.ts` discoverable in the final extension set. The fixture is never loaded merely because reload() ran.",
++			"evidence_paths": [
++				"packages/coding-agent/src/core/resource-loader.ts",
++				"packages/coding-agent/src/core/settings-manager.ts"
++			]
++		},
++		{
++			"claim": "The trust decision is scoped: a callback returning `false` leaves the project extension unavailable after the full reload while the user extension remains loaded, showing the gate is the trust flag and not an environment/path accident (the same fixture loads when the callback returns `true`).",
++			"evidence_paths": [
++				"packages/coding-agent/src/core/resource-loader.ts",
++				"packages/coding-agent/src/core/package-manager.ts"
++			]
++		},
++		{
++			"claim": "The observable contract is the extension identity list from `DefaultResourceLoader.getExtensions()`: bootstrap -> [user extension]; after the trusted decision -> [project fixture extension, user extension]; after an explicit denial -> [user extension]. The final pass reuses the pre-trust loaded extension (`loadFinalExtensionSet` preloadedByPath) instead of loading it twice.",
++			"evidence_paths": [
++				"packages/coding-agent/src/core/resource-loader.ts"
++			]
++		}
++	],
++	"conclusion": "The demo executes the repository's real bootstrap and reload paths (packages/coding-agent/src/core/resource-loader.ts, backed by package-manager trust gating and settings-manager trust state) against a throwaway fixture project. Observed contract: a fresh `.pi/extensions/fresh-project-extension.ts` is absent from the bootstrap extension set produced by `loadProjectTrustExtensions()` (only the user extension is present); it appears in `getExtensions()` after `reload({ resolveProjectTrust })` applies an explicit `true` decision, and stays absent when the callback returns `false`. 7/7 demo checks pass with exit code 0.",
++	"validation": {
++		"command": "node --import ./.prale-eval/demo/register.mjs .prale-eval/demo/run-demo.mjs",
++		"status": "pass",
++		"notes": "Ran from the workspace root; exit code 0, 7/7 checks passed (output captured in .prale-eval/demo/validation-output.txt). Limitation: this fixture checkout has no installed dependencies and none may be installed, so the npm packages transitively imported by the real source (chalk, ignore, minimatch, semver, proper-lockfile, jiti, @earendil-works/* workspaces, highlight.js, typebox) are not resolvable. The demo therefore registers Node module-resolution hooks (register.mjs/hooks.mjs) that map bare, non-builtin specifiers to deterministic in-memory offline stubs (functional shims for chalk/ignore/minimatch/semver/proper-lockfile/jiti; `VIRTUAL_MODULES = {}` for extensions/loader.ts). All repository-relative `.ts` files are still loaded, type-stripped, and executed unmodified by Node, so the trust-gating behavior under test is the repository's own code. The standard vitest suite (`npm test --workspace=@earendil-works/pi-coding-agent`) could not be used for the same dependency reason."
++	}
++}
+snapshot .prale-eval/demo-deliverable.md - e92a971ae74dc4a43814e0c5128d0313b62efeaaefc28dc3a7293e3321935faa
+snapshot .prale-eval/demo/hooks.mjs - c729e892c152b4bed24caee2f4d327a305356c6519da5fafe8fe423d4114a727
+snapshot .prale-eval/demo/register.mjs - 25390ca9d8d38555bdfe4c1a2a93338a9baed29ed729e84f25bc617c6cafc076
+snapshot .prale-eval/demo/run-demo.mjs - 6ef810541569012d7c3925bda2ac44340a88047d4db28e341d6d6597afbe56cf
+snapshot .prale-eval/demo/scan-exports.mjs - 8728cb00cecc422b2b32cca3b60fd57d051756e100cc8bda90c808db6f214604
+snapshot .prale-eval/demo/stub-exports.json - 28406deb4f09003fdf18d58882c04f362f3bf50429fb30f570e059d7c489097f
+snapshot .prale-eval/demo/stub-overrides.json - 3a159b73ef701a55d09e64bf4633a9ffd9027f714c563f5f97c49c165e4ac877
+snapshot .prale-eval/demo/validation-output.txt - 107e9fafbea403d6044e7260e3f41ab054a94a3180a1253588b8f024511c91c7
+snapshot .prale-eval/result.json - 95ee73b94cb44982c9762c5ce8330db299c21645c77f4edceaec56a417d76ba9

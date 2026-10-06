@@ -1,0 +1,65 @@
+{
+  "task_id": "T16",
+  "repository": "pi",
+  "mode": "demo",
+  "request": "create a tiny local RPC/command adapter demo whose invalid input is rejected before the fake effect and uses one stable error shape",
+  "deliverables": [
+    ".prale-eval/result.json",
+    ".prale-eval/demo-deliverable.md"
+  ],
+  "demo_artifact": ".prale-eval/command-adapter-demo.mjs",
+  "evidence": [
+    {
+      "path": "packages/agent/src/proxy.ts",
+      "symbol": "streamProxy",
+      "start_line": 120,
+      "end_line": 265,
+      "observation": "streamProxy is the repository's request/response adapter: it builds one request (POST `${options.proxyUrl}/api/stream` with an Authorization header and a JSON body composed by buildProxyRequestOptions) and then funnels every failure through the same terminal error event. A non-OK response is converted into a message via `throw new Error(errorMessage)` (line 184), a mid-stream EOF without a terminal event pushes `{ type: \"error\", reason: \"error\", error: partial }` (lines 238-242), and the catch block pushes `{ type: \"error\", reason, error: partial }` with `reason` set to \"aborted\" or \"error\" (lines 251-255). The caller therefore observes exactly one stable error shape instead of ad-hoc thrown exceptions, which is the pattern the local command adapter demo generalizes."
+    },
+    {
+      "path": "packages/agent/src/proxy.ts",
+      "symbol": "ProxyAssistantMessageEvent",
+      "start_line": 36,
+      "end_line": 59,
+      "observation": "ProxyAssistantMessageEvent is the discriminated union that fixes the wire contract, including the single error variant `{ type: \"error\"; reason: Extract<StopReason, \"aborted\" | \"error\">; errorMessage?: string; usage: AssistantMessage[\"usage\"]; providerThinkingLevel?: string }` (lines 53-59). Because there is exactly one error member with a stable set of fields, consumers of the proxy stream handle one normalized error shape regardless of whether the failure was a transport error, an abort, or a server-reported error."
+    },
+    {
+      "path": "packages/agent/src/proxy.ts",
+      "symbol": "buildProxyRequestOptions",
+      "start_line": 104,
+      "end_line": 115,
+      "observation": "buildProxyRequestOptions normalizes the outgoing request by explicitly picking the serializable option fields, so the adapter's request payload has a fixed, allow-listed shape before it is sent. The local command adapter demo mirrors this by validating the request envelope and params before dispatching to a handler, instead of trusting arbitrary caller input."
+    },
+    {
+      "path": "packages/agent/src/proxy.ts",
+      "symbol": "processProxyEvent",
+      "start_line": 270,
+      "end_line": 405,
+      "observation": "processProxyEvent maps each incoming proxy event onto an AssistantMessageEvent and treats malformed sequencing as an error: for example `text_delta`/`text_end` for non-text content and `thinking_delta`/`thinking_end` for non-thinking content throw descriptive errors (for example \"Received text_delta for non-text content\"), and the default branch exhaustiveness-checks the union. Invalid inbound input is therefore rejected at the boundary with one error channel rather than silently mutating partial state, which grounds the demo's rule that invalid input must be rejected before any effect."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "packages/agent/src/proxy.ts's streamProxy is the in-repo request/response adapter precedent: it issues a single request and routes every failure (non-OK response, abort, mid-stream disconnect, thrown error) through the one terminal `{ type: \"error\", reason, error }` event, so callers see a single stable error shape.",
+      "evidence_paths": ["packages/agent/src/proxy.ts"]
+    },
+    {
+      "claim": "packages/agent/src/proxy.ts declares a single error variant in ProxyAssistantMessageEvent and normalizes the outgoing payload in buildProxyRequestOptions, showing the repository pattern of a fixed request envelope plus one error shape that the local command adapter demo reproduces.",
+      "evidence_paths": ["packages/agent/src/proxy.ts"]
+    },
+    {
+      "claim": "The demo in .prale-eval/command-adapter-demo.mjs implements a local command adapter whose dispatch() validates the request envelope and command params before invoking the fake effect, and builds every failure with a single fail() constructor returning `{ ok: false, id, result: null, error: { code, message } }`.",
+      "evidence_paths": ["packages/agent/src/proxy.ts", ".prale-eval/command-adapter-demo.mjs"]
+    },
+    {
+      "claim": "The demo is self-verifying: it asserts that rejected requests leave the fake effect log unchanged (rejected before the fake effect) and that all failure responses and error objects share identical key sets (one stable error shape).",
+      "evidence_paths": ["packages/agent/src/proxy.ts", ".prale-eval/command-adapter-demo.mjs"]
+    }
+  ],
+  "conclusion": "Created a tiny, dependency-free local RPC/command adapter demo at .prale-eval/command-adapter-demo.mjs. Its dispatch() validates the request envelope, resolves the command, and validates params before running the fake effect; every rejection is produced by the single fail() constructor and therefore uses one stable error shape `{ ok: false, id, result: null, error: { code, message } }` with codes INVALID_REQUEST, UNKNOWN_COMMAND, or INVALID_PARAMS. The self-verifying run reports effectsApplied=2 for two accepted requests and effectsAppliedAfterRejections=0 for four rejected requests, confirming invalid input is rejected before the fake effect. The design mirrors the cited precedent in packages/agent/src/proxy.ts, where streamProxy sends one request and funnels every failure through the single terminal error event declared by ProxyAssistantMessageEvent.",
+  "validation": {
+    "command": "node .prale-eval/command-adapter-demo.mjs",
+    "status": "passed",
+    "notes": "Exit code 0. Output ends with 'validation: PASS - invalid input rejected before fake effect, one stable error shape'. Assertions confirm: valid echo/add produce ok:true responses; add with a string operand yields INVALID_PARAMS; unknown command yields UNKNOWN_COMMAND; a request missing id and a null request yield INVALID_REQUEST; the effect log stays at 2 across all four rejections (effectsAppliedAfterRejections=0); every failure envelope has key set [error,id,ok,result] and every error has key set [code,message]. The repository's unit-test runner (vitest) is not installed in this workspace, so validation was performed with the dependency-free Node demo itself rather than the project test suite; no dependencies were installed."
+  }
+}

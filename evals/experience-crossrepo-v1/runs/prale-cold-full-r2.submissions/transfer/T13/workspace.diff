@@ -1,0 +1,1108 @@
+diff --git a/.prale-eval/demo-deliverable.md b/.prale-eval/demo-deliverable.md
+new file mode 100644
+index 0000000..ca1beac
+--- /dev/null
++++ b/.prale-eval/demo-deliverable.md
+@@ -0,0 +1,90 @@
++# Demo deliverable — aider code-map over a miniature repository
++
++Task `T13`, repository `aider`, mode `demo`.
++
++## What the demo is
++
++An executable, dependency-light reproduction of the code-map pipeline that
++`aider` uses, run against a supplied miniature repository
++(`.prale-eval/mini_repo/`). It proves the two properties the request asks for:
++
++1. **one relevant symbol is present** — `render_code_map` (defined in
++   `mini_repo/src/codemap.py`) shows up in the emitted map;
++2. **ignored/generated files are absent** — `generated/schema_pb2.py`,
++   `ignored_secret.py`, `build/artifact.py` and `notes.log` never reach the
++   map, even though all four exist on disk and each carries its own hidden
++   symbol.
++
++Run it with:
++
++```
++python3 .prale-eval/demo_code_map.py
++```
++
++Exit status is `0` when every check passes. The command prints the map plus a
++`PASS`/`FAIL` line per check, and writes the normalized operation result to
++`.prale-eval/demo-output.json`.
++
++## Contract implemented
++
++The demo mirrors the real code-map contract in `aider`:
++
++| Stage | Upstream reference | Demo behaviour |
++|---|---|---|
++| file discovery / ignore filtering | `aider/repo.py::Repo.get_tracked_files` (`ignored_file`, `git_ignored_file`) — tracked, non-ignored files only | walks `mini_repo/`, applies the fixture `.gitignore` through `pathspec.GitWildMatchPattern` (the same matcher `Repo.ignored_file_raw` uses) |
++| per-file symbol tags | `aider/repomap.py::RepoMap.get_tags_raw` (lines 279–363) — emits `def` / `ref` tags | Python `ast` yields `("def", name, line)` for functions/classes and `("ref", name, line)` for loads/imports |
++| ranking | `aider/repomap.py::RepoMap.get_ranked_tags` (lines 365–574) — ident graph + PageRank, tags filtered to identifiers with both defs and refs | same shape of graph; `networkx.pagerank` with a frequency fallback |
++| rendering | `aider/repomap.py::RepoMap.render_tree` (710–746) and `RepoMap.to_tree` (748–783) — `rel_fname:` blocks with lines of interest, then bare names for remaining files | renders `rel_fname:` followed by the definition lines, then bare relative names for files without ranked tags |
++
++Because discovery happens **before** the map is built, an ignored or generated
++file can never contribute a tag — this is exactly why `RepoMap` itself does not
++need gitignore logic: callers hand it the discoverable file list.
++
++## Normalized operation result
++
++`demo-output.json` records:
++
++- `discovered_files` — the source files that reached the map:
++  `README.md`, `src/__init__.py`, `src/app.py`, `src/codemap.py`;
++- `excluded_files` — files present on disk but filtered out:
++  `build/artifact.py`, `generated/schema_pb2.py`, `ignored_secret.py`,
++  `notes.log`;
++- `ranked_definitions` — `count_symbols`, `render_code_map`,
++  `tokenize_symbol` (all in `src/codemap.py`);
++- `code_map` — the rendered text:
++
++  ```
++  src/codemap.py:
++  def count_symbols(files):
++  def render_code_map(files, mentioned_idents=None):
++  def tokenize_symbol(name):
++
++  README.md
++
++  src/__init__.py
++
++  src/app.py
++  ```
++
++- `checks` — all five booleans `true`:
++  `relevant_file_present`, `relevant_symbol_present`,
++  `ignored_files_exist_on_disk`, `ignored_files_absent`,
++  `hidden_symbols_absent`;
++- `status` — `pass`.
++
++## Validation
++
++Command: `python3 .prale-eval/demo_code_map.py` → `pass` (exit 0).
++
++### Recorded limitation
++
++The real `aider.repomap.RepoMap` class cannot be instantiated in this
++environment: importing it fails with
++`ModuleNotFoundError: No module named 'diskcache'` (its runtime stack also
++needs `grep_ast`, which is not installed either). Dependencies were **not**
++installed. The demo therefore probes `aider.repomap` for importability
++(`upstream_repomap_importable: false`, `upstream_repomap_error` recorded in
++`demo-output.json`) and falls back to the dependency-free normalized operation
++described above, which preserves the contract's externally observable
++behaviour: ignored/generated files absent, relevant symbol present. All other
++dependencies used by the fallback (`pathspec`, `networkx`) are available.
+diff --git a/.prale-eval/demo-output.json b/.prale-eval/demo-output.json
+new file mode 100644
+index 0000000..23324d2
+--- /dev/null
++++ b/.prale-eval/demo-output.json
+@@ -0,0 +1,46 @@
++{
++  "operation": "build_code_map",
++  "mode": "demo",
++  "repository": {
++    "upstream": "aider",
++    "mini_repo": "mini_repo"
++  },
++  "ignore_source": "mini_repo/.gitignore",
++  "discovered_files": [
++    "README.md",
++    "src/__init__.py",
++    "src/app.py",
++    "src/codemap.py"
++  ],
++  "excluded_files": [
++    "build/artifact.py",
++    "generated/schema_pb2.py",
++    "ignored_secret.py",
++    "notes.log"
++  ],
++  "ranked_definitions": [
++    {
++      "file": "src/codemap.py",
++      "symbol": "count_symbols"
++    },
++    {
++      "file": "src/codemap.py",
++      "symbol": "render_code_map"
++    },
++    {
++      "file": "src/codemap.py",
++      "symbol": "tokenize_symbol"
++    }
++  ],
++  "code_map": "src/codemap.py:\ndef count_symbols(files):\ndef render_code_map(files, mentioned_idents=None):\ndef tokenize_symbol(name):\n\nREADME.md\n\nsrc/__init__.py\n\nsrc/app.py\n",
++  "checks": {
++    "relevant_file_present": true,
++    "relevant_symbol_present": true,
++    "ignored_files_exist_on_disk": true,
++    "ignored_files_absent": true,
++    "hidden_symbols_absent": true
++  },
++  "upstream_repomap_importable": false,
++  "upstream_repomap_error": "ModuleNotFoundError: No module named 'diskcache'",
++  "status": "pass"
++}
+diff --git a/.prale-eval/demo_code_map.py b/.prale-eval/demo_code_map.py
+new file mode 100755
+index 0000000..a3f6873
+--- /dev/null
++++ b/.prale-eval/demo_code_map.py
+@@ -0,0 +1,356 @@
++#!/usr/bin/env python3
++"""Executable demo: build an aider-style code-map from a miniature repository.
++
++The demo mirrors the code-map contract implemented in ``aider/repomap.py`` and
++the ignore contract implemented in ``aider/repo.py``:
++
++* candidate files come from walking the repository while dropping everything
++  matched by the repository ignore rules (``Repo.ignored_file`` /
++  ``git_ignored_file`` -> untracked, ignored, or generated files never reach a
++  ``RepoMap`` instance, because the caller only hands it discoverable files);
++* the remaining source files are parsed into ``def``/``ref`` tags
++  (``RepoMap.get_tags_raw``);
++* the tags are turned into a ranked symbol graph (``RepoMap.get_ranked_tags``);
++* the winner tags are rendered as ``rel_fname:`` blocks whose lines of interest
++  are the definitions (``RepoMap.render_tree`` / ``RepoMap.to_tree``).
++
++It then proves two properties of the resulting map:
++
++1. the relevant symbol ``render_code_map`` (``src/codemap.py``) is present;
++2. the ignored/generated files ``generated/schema_pb2.py``, ``ignored_secret.py``,
++   ``build/artifact.py`` and ``notes.log`` are absent, even though they exist on
++   disk with their own hidden symbols.
++
++The real ``aider.repomap.RepoMap`` class is probed first.  When its optional
++runtime dependencies (``diskcache``, ``grep_ast``) are missing, the demo falls
++back to the dependency-free normalized operation below and records that
++limitation in the emitted ``demo-output.json``.
++
++Usage:  python3 .prale-eval/demo_code_map.py
++"""
++
++import ast
++import json
++import sys
++from pathlib import Path
++
++HERE = Path(__file__).resolve().parent
++MINI_REPO = HERE / "mini_repo"
++OUTPUT = HERE / "demo-output.json"
++
++RELEVANT_FILE = "src/codemap.py"
++RELEVANT_SYMBOL = "render_code_map"
++
++HIDDEN_FILES = [
++    "generated/schema_pb2.py",
++    "ignored_secret.py",
++    "build/artifact.py",
++    "notes.log",
++]
++HIDDEN_SYMBOLS = [
++    "generated_symbol_should_be_hidden",
++    "ignored_symbol_should_be_hidden",
++    "build_artifact_symbol_should_be_hidden",
++]
++
++SOURCE_SUFFIXES = {".py", ".md"}
++
++
++# --------------------------------------------------------------------------
++# fixture
++# --------------------------------------------------------------------------
++FIXTURE = {
++    ".gitignore": "__pycache__/\n*.pyc\nbuild/\ngenerated/\n*.log\nignored_secret.py\n",
++    "README.md": "# Miniature repository\n\nFixture for the aider code-map demo.\n",
++    "src/__init__.py": '"""Miniature package."""\n',
++    "src/codemap.py": (
++        '"""Miniature code-map helper used by the demo fixture."""\n'
++        "\n"
++        "from collections import Counter\n"
++        "\n"
++        "\n"
++        "def tokenize_symbol(name):\n"
++        '    """Split a snake_case symbol name into its parts."""\n'
++        '    return [part for part in name.split("_") if part]\n'
++        "\n"
++        "\n"
++        "def render_code_map(files, mentioned_idents=None):\n"
++        '    """Return a ``path:`` listing of the symbols found in ``files``."""\n'
++        "    mentioned_idents = mentioned_idents or set()\n"
++        "    lines = []\n"
++        "    for path, symbols in sorted(files.items()):\n"
++        "        lines.append(f\"{path}:\")\n"
++        "        for symbol in sorted(symbols):\n"
++        "            marker = \"*\" if symbol in mentioned_idents else \" \"\n"
++        "            lines.append(f\"{marker} {symbol}\")\n"
++        "    return \"\\n\".join(lines)\n"
++        "\n"
++        "\n"
++        "def count_symbols(files):\n"
++        '    """Count how often each symbol appears across all files."""\n'
++        "    counter = Counter()\n"
++        "    for symbols in files.values():\n"
++        "        counter.update(symbols)\n"
++        "    return counter\n"
++    ),
++    "src/app.py": (
++        '"""Entry point that ranks and renders the miniature code-map."""\n'
++        "\n"
++        "from src.codemap import count_symbols, render_code_map, tokenize_symbol\n"
++        "\n"
++        "\n"
++        "def main(files):\n"
++        "    summary = count_symbols(files)\n"
++        "    for ident in list(summary):\n"
++        "        tokenize_symbol(ident)\n"
++        "    return render_code_map(files, mentioned_idents=set(summary))\n"
++    ),
++    "generated/schema_pb2.py": (
++        '"""Generated protocol-buffer module (must never reach the code-map)."""\n'
++        "\n"
++        "\n"
++        "def generated_symbol_should_be_hidden():\n"
++        '    return "generated/schema_pb2.py"\n'
++    ),
++    "ignored_secret.py": (
++        '"""Locally ignored file (must never reach the code-map)."""\n'
++        "\n"
++        "\n"
++        "def ignored_symbol_should_be_hidden():\n"
++        '    return "ignored_secret.py"\n'
++    ),
++    "build/artifact.py": (
++        '"""Build artifact (must never reach the code-map)."""\n'
++        "\n"
++        "\n"
++        "def build_artifact_symbol_should_be_hidden():\n"
++        '    return "build/artifact.py"\n'
++    ),
++    "notes.log": "generated by the build; ignored via *.log\n",
++}
++
++
++def ensure_fixture():
++    """Materialize the supplied miniature repository if it is missing."""
++    for rel, text in FIXTURE.items():
++        path = MINI_REPO / rel
++        if not path.exists():
++            path.parent.mkdir(parents=True, exist_ok=True)
++            path.write_text(text)
++
++
++# --------------------------------------------------------------------------
++# step 1: discovery with ignore filtering (aider/repo.py contract)
++# --------------------------------------------------------------------------
++def load_ignore_matchers():
++    """Return a predicate implementing the fixture's .gitignore rules."""
++    ignore_file = MINI_REPO / ".gitignore"
++    lines = ignore_file.read_text().splitlines()
++    try:
++        import pathspec
++
++        spec = pathspec.PathSpec.from_lines(
++            pathspec.patterns.GitWildMatchPattern, lines
++        )
++        return lambda rel: bool(spec.match_file(rel))
++    except Exception:  # pragma: no cover - pathspec is present in this env
++        import fnmatch
++
++        patterns = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
++
++        def matches(rel):
++            rel = rel.replace("\\", "/")
++            for pat in patterns:
++                if pat.endswith("/"):
++                    if rel == pat[:-1] or rel.startswith(pat):
++                        return True
++                elif fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(Path(rel).name, pat):
++                    return True
++            return False
++
++        return matches
++
++
++def discover_files(is_ignored):
++    """Walk the repo, dropping ignored/generated files (git ls-files semantics)."""
++    found, excluded = [], []
++    for path in sorted(MINI_REPO.rglob("*")):
++        rel = path.relative_to(MINI_REPO).as_posix()
++        if path.is_dir():
++            if rel == ".git" or is_ignored(rel) or is_ignored(rel + "/"):
++                continue
++            continue
++        if is_ignored(rel) or is_ignored(rel + "/"):
++            excluded.append(rel)
++            continue
++        if path.suffix.lower() in SOURCE_SUFFIXES:
++            found.append(rel)
++    return found, excluded
++
++
++# --------------------------------------------------------------------------
++# step 2: tags (RepoMap.get_tags_raw) -- ast stands in for tree-sitter
++# --------------------------------------------------------------------------
++def tags_for_file(rel):
++    """Yield (kind, name, lineno) tags, mirroring get_tags_raw's def/ref split."""
++    source = (MINI_REPO / rel).read_text()
++    if rel.endswith(".md"):
++        return
++    tree = ast.parse(source)
++    for node in ast.walk(tree):
++        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
++            yield ("def", node.name, node.lineno)
++        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
++            yield ("ref", node.id, node.lineno)
++        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
++            yield ("ref", node.attr, node.lineno)
++        elif isinstance(node, ast.Import):
++            for alias in node.names:
++                yield ("ref", alias.name.split(".")[0], node.lineno)
++        elif isinstance(node, ast.ImportFrom):
++            for alias in node.names:
++                yield ("ref", alias.name, node.lineno)
++
++
++# --------------------------------------------------------------------------
++# step 3: ranking (RepoMap.get_ranked_tags)
++# --------------------------------------------------------------------------
++def rank(files):
++    from collections import defaultdict
++
++    defines = defaultdict(set)
++    definitions = {}
++    references = defaultdict(list)
++    for rel in files:
++        for kind, name, lineno in tags_for_file(rel) or []:
++            if kind == "def":
++                defines[name].add(rel)
++                definitions[(rel, name)] = lineno
++            else:
++                references[name].append(rel)
++    if not references:
++        references = {k: list(v) for k, v in defines.items()}
++
++    idents = set(defines).intersection(references)
++    ordered = [(rel, name) for (rel, name) in definitions if name in idents]
++    try:
++        import networkx as nx
++
++        graph = nx.MultiDiGraph()
++        for ident in idents:
++            for referencer in references[ident]:
++                for definer in defines[ident]:
++                    graph.add_edge(referencer, definer, weight=1.0, ident=ident)
++        if graph.number_of_nodes() == 0:
++            raise ValueError("empty graph")
++        ranked = nx.pagerank(graph, weight="weight")
++        ordered.sort(key=lambda item: (-ranked.get(item[0], 0.0), item))
++    except Exception:
++        counts = {ident: len(references[ident]) for ident in idents}
++        ordered.sort(key=lambda item: (-counts.get(item[1], 0), item))
++    return ordered
++
++
++# --------------------------------------------------------------------------
++# step 4: render (RepoMap.render_tree / RepoMap.to_tree)
++# --------------------------------------------------------------------------
++def render_map(ordered, files, max_defs=12):
++    selected = ordered[:max_defs]
++    lines, cur = [], None
++    files_with_defs = set()
++    for rel, name in selected:
++        lineno = None
++        for kind, tag_name, tag_line in tags_for_file(rel) or []:
++            if kind == "def" and tag_name == name:
++                lineno = tag_line
++                break
++        if lineno is None:
++            continue
++        if rel != cur:
++            if cur is not None:
++                lines.append("")
++            lines.append(f"{rel}:")
++            cur = rel
++        files_with_defs.add(rel)
++        source_line = (MINI_REPO / rel).read_text().splitlines()[lineno - 1]
++        lines.append(source_line.rstrip())
++
++    # RepoMap.to_tree() also emits bare relative names for other files that carry
++    # no ranked tags, so the map still accounts for every discoverable file.
++    for rel in files:
++        if rel not in files_with_defs:
++            lines.append("")
++            lines.append(rel)
++    return "\n".join(lines) + "\n"
++
++
++# --------------------------------------------------------------------------
++# demo driver
++# --------------------------------------------------------------------------
++def probe_upstream():
++    """Check whether the real aider RepoMap can be imported/used here."""
++    repo_root = str(HERE.parent)
++    if repo_root not in sys.path:
++        sys.path.insert(0, repo_root)
++    try:
++        from aider.repomap import RepoMap  # noqa: F401
++
++        return True, ""
++    except Exception as err:  # optional runtime dependency missing
++        return False, f"{type(err).__name__}: {err}"
++
++
++def main():
++    ensure_fixture()
++    is_ignored = load_ignore_matchers()
++    files, excluded = discover_files(is_ignored)
++    ordered = rank(files)
++    code_map = render_map(ordered, files)
++
++    missing_on_disk = [rel for rel in HIDDEN_FILES if not (MINI_REPO / rel).exists()]
++
++    checks = {
++        "relevant_file_present": RELEVANT_FILE in code_map,
++        "relevant_symbol_present": RELEVANT_SYMBOL in code_map,
++        "ignored_files_exist_on_disk": not missing_on_disk,
++        "ignored_files_absent": not any(rel in code_map for rel in HIDDEN_FILES),
++        "hidden_symbols_absent": not any(sym in code_map for sym in HIDDEN_SYMBOLS),
++    }
++    status = "pass" if all(checks.values()) else "fail"
++
++    repomap_importable, repomap_error = probe_upstream()
++    result = {
++        "operation": "build_code_map",
++        "mode": "demo",
++        "repository": {"upstream": "aider", "mini_repo": "mini_repo"},
++        "ignore_source": "mini_repo/.gitignore",
++        "discovered_files": files,
++        "excluded_files": excluded,
++        "ranked_definitions": [
++            {"file": rel, "symbol": name} for rel, name in ordered
++        ],
++        "code_map": code_map,
++        "checks": checks,
++        "upstream_repomap_importable": repomap_importable,
++        "upstream_repomap_error": repomap_error,
++        "status": status,
++    }
++    OUTPUT.write_text(json.dumps(result, indent=2) + "\n")
++
++    print(code_map)
++    print("---")
++    print(f"discovered : {files}")
++    print(f"excluded   : {excluded}")
++    for name, ok in checks.items():
++        print(f"{'PASS' if ok else 'FAIL'} {name}")
++    if not repomap_importable:
++        print(
++            "LIMITATION: aider.repomap.RepoMap unavailable "
++            f"({repomap_error}); used the dependency-free normalized operation."
++        )
++    print(f"status: {status}")
++    return 0 if status == "pass" else 1
++
++
++if __name__ == "__main__":
++    sys.exit(main())
+diff --git a/.prale-eval/mini_repo/.gitignore b/.prale-eval/mini_repo/.gitignore
+new file mode 100644
+index 0000000..90cd8f3
+--- /dev/null
++++ b/.prale-eval/mini_repo/.gitignore
+@@ -0,0 +1,6 @@
++__pycache__/
++*.pyc
++build/
++generated/
++*.log
++ignored_secret.py
+diff --git a/.prale-eval/mini_repo/README.md b/.prale-eval/mini_repo/README.md
+new file mode 100644
+index 0000000..bf7adca
+--- /dev/null
++++ b/.prale-eval/mini_repo/README.md
+@@ -0,0 +1,5 @@
++# Miniature repository
++
++Small fixture used by the `demo` mode task to prove that a code-map built the
++way `aider` builds one excludes ignored and generated files while still keeping
++the symbols of real source files.
+diff --git a/.prale-eval/mini_repo/build/artifact.py b/.prale-eval/mini_repo/build/artifact.py
+new file mode 100644
+index 0000000..2d4390f
+--- /dev/null
++++ b/.prale-eval/mini_repo/build/artifact.py
+@@ -0,0 +1,5 @@
++"""Build artifact (must never reach the code-map)."""
++
++
++def build_artifact_symbol_should_be_hidden():
++    return "build/artifact.py"
+diff --git a/.prale-eval/mini_repo/generated/schema_pb2.py b/.prale-eval/mini_repo/generated/schema_pb2.py
+new file mode 100644
+index 0000000..70ccd78
+--- /dev/null
++++ b/.prale-eval/mini_repo/generated/schema_pb2.py
+@@ -0,0 +1,5 @@
++"""Generated protocol-buffer module (must never reach the code-map)."""
++
++
++def generated_symbol_should_be_hidden():
++    return "generated/schema_pb2.py"
+diff --git a/.prale-eval/mini_repo/ignored_secret.py b/.prale-eval/mini_repo/ignored_secret.py
+new file mode 100644
+index 0000000..0fc2649
+--- /dev/null
++++ b/.prale-eval/mini_repo/ignored_secret.py
+@@ -0,0 +1,5 @@
++"""Locally ignored file (must never reach the code-map)."""
++
++
++def ignored_symbol_should_be_hidden():
++    return "ignored_secret.py"
+diff --git a/.prale-eval/mini_repo/notes.log b/.prale-eval/mini_repo/notes.log
+new file mode 100644
+index 0000000..f76b751
+--- /dev/null
++++ b/.prale-eval/mini_repo/notes.log
+@@ -0,0 +1 @@
++generated by the build; ignored via *.log
+diff --git a/.prale-eval/mini_repo/src/__init__.py b/.prale-eval/mini_repo/src/__init__.py
+new file mode 100644
+index 0000000..61ad1c1
+--- /dev/null
++++ b/.prale-eval/mini_repo/src/__init__.py
+@@ -0,0 +1 @@
++"""Miniature package."""
+diff --git a/.prale-eval/mini_repo/src/app.py b/.prale-eval/mini_repo/src/app.py
+new file mode 100644
+index 0000000..cfc6557
+--- /dev/null
++++ b/.prale-eval/mini_repo/src/app.py
+@@ -0,0 +1,10 @@
++"""Entry point that ranks and renders the miniature code-map."""
++
++from src.codemap import count_symbols, render_code_map, tokenize_symbol
++
++
++def main(files):
++    summary = count_symbols(files)
++    for ident in list(summary):
++        tokenize_symbol(ident)
++    return render_code_map(files, mentioned_idents=set(summary))
+diff --git a/.prale-eval/mini_repo/src/codemap.py b/.prale-eval/mini_repo/src/codemap.py
+new file mode 100644
+index 0000000..8d18a03
+--- /dev/null
++++ b/.prale-eval/mini_repo/src/codemap.py
+@@ -0,0 +1,28 @@
++"""Miniature code-map helper used by the demo fixture."""
++
++from collections import Counter
++
++
++def tokenize_symbol(name):
++    """Split a snake_case symbol name into its parts."""
++    return [part for part in name.split("_") if part]
++
++
++def render_code_map(files, mentioned_idents=None):
++    """Return a ``path:`` listing of the symbols found in ``files``."""
++    mentioned_idents = mentioned_idents or set()
++    lines = []
++    for path, symbols in sorted(files.items()):
++        lines.append(f"{path}:")
++        for symbol in sorted(symbols):
++            marker = "*" if symbol in mentioned_idents else " "
++            lines.append(f"{marker} {symbol}")
++    return "\n".join(lines)
++
++
++def count_symbols(files):
++    """Count how often each symbol appears across all files."""
++    counter = Counter()
++    for symbols in files.values():
++        counter.update(symbols)
++    return counter
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..2745ab6
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,104 @@
++{
++  "task_id": "T13",
++  "repository": "aider",
++  "mode": "demo",
++  "evidence": [
++    {
++      "path": "aider/repomap.py",
++      "symbol": "RepoMap.get_ranked_tags_map_uncached",
++      "start_line": 629,
++      "end_line": 708,
++      "observation": "End-to-end map builder: it ranks the def/ref tags from get_ranked_tags, prepends important files, then binary-searches how many top-ranked tags fit in the token budget and returns the best rendered tree. It only ever sees the file lists handed to it, so any file that discovery already dropped as ignored/generated can never appear in the produced map - exactly the property the demo checks."
++    },
++    {
++      "path": "aider/repomap.py",
++      "symbol": "RepoMap.get_ranked_tags",
++      "start_line": 365,
++      "end_line": 574,
++      "observation": "Builds the identifier graph: for every candidate file it calls Path(fname).is_file() (skipping missing files), extracts def/ref tags, records defines/references, builds a networkx MultiDiGraph and ranks definitions with pagerank. Relevant because symbol presence in the final map is driven by this def/ref (defines/references) intersection - the demo's relevant symbol render_code_map is a def that is referenced by src/app.py, so it survives ranking."
++    },
++    {
++      "path": "aider/repomap.py",
++      "symbol": "RepoMap.get_tags_raw",
++      "start_line": 279,
++      "end_line": 363,
++      "observation": "Extracts tags per file with tree-sitter queries, classifying captures as kind='def' (name.definition.*) or kind='ref' (name.reference.*), with a pygments backfill for defs-only files. It is the source of the symbols a code-map can contain; the demo's normalized operation reproduces this def/ref split using Python ast on the miniature repository."
++    },
++    {
++      "path": "aider/repomap.py",
++      "symbol": "RepoMap.render_tree",
++      "start_line": 710,
++      "end_line": 746,
++      "observation": "Renders a single file's lines of interest (lois) into the elided code-map snippet, reading the file through self.io and caching by mtime. This is the function that emits the 'path:' plus definition lines that the demo asserts contains render_code_map and contains none of the ignored/generated file paths."
++    },
++    {
++      "path": "aider/repomap.py",
++      "symbol": "RepoMap.get_repo_map",
++      "start_line": 103,
++      "end_line": 167,
++      "observation": "Public entry point that computes the max map token budget (wider when no chat files are present) and returns the rendered files_listing prefixed with repo_content_prefix. It defines the observable code-map contract the demo exercises: a text listing of files and their symbols."
++    },
++    {
++      "path": "aider/repo.py",
++      "symbol": "Repo.get_tracked_files",
++      "start_line": 433,
++      "end_line": 486,
++      "observation": "Produces the discoverable file list from git (ls-files at HEAD plus staged files, cached per commit) and filters it with self.ignored_file(fname), so untracked/ignored/generated files never become map candidates. This is the ignore contract the demo's discovery step mirrors with mini_repo/.gitignore."
++    },
++    {
++      "path": "aider/repo.py",
++      "symbol": "Repo.ignored_file",
++      "start_line": 532,
++      "end_line": 540,
++      "observation": "Memoized ignore predicate delegating to ignored_file_raw, whose gitwildmatch spec (pathspec GitWildMatchPattern) is the matcher the demo reuses to drop generated/, build/, *.log and ignored_secret.py from the miniature repository."
++    },
++    {
++      "path": ".prale-eval/demo_code_map.py",
++      "symbol": "main",
++      "start_line": 303,
++      "end_line": 352,
++      "observation": "Executable demo driver: ensures the miniature repository, discovers non-ignored files, ranks tags, renders the code-map, evaluates the five presence/absence checks, writes demo-output.json and returns exit status 0 on pass."
++    },
++    {
++      "path": ".prale-eval/mini_repo/src/codemap.py",
++      "symbol": "render_code_map",
++      "start_line": 11,
++      "end_line": 20,
++      "observation": "The relevant symbol required to survive into the code-map: it is defined in the miniature repository, referenced by src/app.py, and therefore appears in the rendered map while all ignored/generated files are excluded."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "aider builds a code-map by ranking def/ref tags into a rendered files_listing, and files never handed to RepoMap cannot appear in that listing; get_ranked_tags_map_uncached and get_ranked_tags implement this ranking pipeline.",
++      "evidence_paths": [
++        "aider/repomap.py"
++      ]
++    },
++    {
++      "claim": "Symbols enter a code-map only through tags produced by get_tags_raw, which classifies tree-sitter captures as def or ref, and are rendered per file by render_tree/to_tree; running the demo makes the def render_code_map present in the map text.",
++      "evidence_paths": [
++        "aider/repomap.py"
++      ]
++    },
++    {
++      "claim": "Ignored/generated files are excluded from aider's file discovery upstream of RepoMap via Repo.get_tracked_files and Repo.ignored_file; the demo reuses the same pathspec GitWildMatchPattern matcher and confirms those files are absent from the map even though they exist on disk.",
++      "evidence_paths": [
++        "aider/repo.py",
++        "aider/repomap.py"
++      ]
++    },
++    {
++      "claim": "The executable demo (.prale-eval/demo_code_map.py) over the miniature repository (.prale-eval/mini_repo/) passes all checks: relevant symbol render_code_map present, and build/artifact.py, generated/schema_pb2.py, ignored_secret.py, notes.log all absent.",
++      "evidence_paths": [
++        ".prale-eval/demo_code_map.py",
++        ".prale-eval/mini_repo/src/codemap.py"
++      ]
++    }
++  ],
++  "conclusion": "Executable demo mode is satisfied: building the code-map over the supplied miniature repository yields the relevant symbol render_code_map (src/codemap.py) while the ignored and generated files build/artifact.py, generated/schema_pb2.py, ignored_secret.py and notes.log are absent from the map despite existing on disk with their own hidden symbols. All five checks pass (exit 0). Because the environment lacks the optional runtime dependencies diskcache and grep_ast, aider.repomap.RepoMap itself cannot be imported; the demo records that limitation in demo-output.json and validation notes and uses a dependency-free normalized operation that preserves the contract's observable behaviour.",
++  "validation": {
++    "command": "python3 .prale-eval/demo_code_map.py",
++    "status": "pass",
++    "notes": "Exit status 0; all five checks printed PASS (relevant_file_present, relevant_symbol_present, ignored_files_exist_on_disk, ignored_files_absent, hidden_symbols_absent). The discovered files were README.md, src/__init__.py, src/app.py and src/codemap.py; the excluded files were build/artifact.py, generated/schema_pb2.py, ignored_secret.py and notes.log. LIMITATION: the real aider.repomap.RepoMap could not be imported because optional dependencies are unavailable (ModuleNotFoundError: No module named 'diskcache'; grep_ast is also missing). No dependencies were installed, so the demo probes importability (upstream_repomap_importable=false, upstream_repomap_error recorded in .prale-eval/demo-output.json) and uses the dependency-free normalized operation documented in .prale-eval/demo-deliverable.md instead."
++  }
++}
+diff --git a/aider/__pycache__/__init__.cpython-312.pyc b/aider/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..dc5a20113580669a16d9b969db07abeb7e714077
+GIT binary patch
+literal 751
+zcmZ`$&ubb%82x5vb$4A&typa={gv7hUDQBAe?U_Z=_!zN<7HXgsTfyXW{pNqwkHFD
+z9-CuM#ZYMbFL>_BdXa@dpr=A9+vZa2r88Dra_Dz>JKy)-yzjB|F%${_tFK0Q*FylG
+zd9x^SemMWe4zIxk6IoD0MTEc<iUJXeSm9G_i8a<E5P<lJ@Rs@TBGMkB3c;qY%Q~(v
+zqoUH06|O_O;hE?H{JZ;K1zxyU1pw+}?*5DJcYyekKxG7s6aR2KaJb!ueY^v0H0RYB
+zFD>{*wuLICeBsGb$dy`zI+aGf8(7Oeyq{gqnxw_Xs;<uoUGGX-rDiv1v+L8E9h<O^
+zMI5K=*KC72WIGjb727CPjdG=4rkMFs{%hT!V>~Ad8+Xa5n1p8k_R7=!60w_XwJUO0
+z7duVr`ev4{r0a%d>G}zr^PJO1xn|AI+0?K|h7!ZdkQM`Ko5bvFlydC`tvW0M$<3DJ
+zbiGoqG<7{|cc${=TEpD4$P>z6guk8hj)8{}LZ@*3Y$?%GCzlevpeJIaor>x2GKg|t
+z9pmUxVT5l^A~%lXqsVG+%L_v=-p{;{ypZV2PSmUY2d_2{Hjl22)w_exKzbiK34O4}
+ztA$T$VUoBvh>sF${Vh+P-}>n-gM9f1Af$26<xwR4a*M~%et8iHUSSM#jjbF%8^tmQ
+q>X{mw?ULAZ>a4KHhyHvN-lX$M7)As6+jw{jaZCpC8+f>m82$!53cu3;
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/repomap.cpython-312.pyc b/aider/__pycache__/repomap.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..6470572330c8caf14351c433759db65fefac908e
+GIT binary patch
+literal 31264
+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
+LHK*~idH8<;I*gr0
+
+literal 0
+HcmV?d00001
+
+snapshot .prale-eval/demo-deliverable.md - 58d6ec53e53f3a6434f7b1f9a4b3a9b0f3e2b7bb92ac60b787c98e379231910c
+snapshot .prale-eval/demo-output.json - 305163c7bfbb9830eced6aacb05364c6d3e8b683bd2717c39a4c28ef501839a2
+snapshot .prale-eval/demo_code_map.py - bf562954b6cb26bc6f44baf4aa8301277d9174fffbc518b4cf80ac885eb80c1b
+snapshot .prale-eval/mini_repo/.gitignore - bf8e56388aeaabe534d2a7b866986687ce64b2920569a207eb7beb0d9571b91f
+snapshot .prale-eval/mini_repo/README.md - 6b86eb499e34027a07c1be34d2c02b07d57afa0aa5ccae90787e168c0ec72b29
+snapshot .prale-eval/mini_repo/build/artifact.py - 89586c84900d0387868f113b31b9a203d85cf36802af0316ac7da7e1faca6db6
+snapshot .prale-eval/mini_repo/generated/schema_pb2.py - 174a49dbe871ff5b744793d6224b4cce18329fd67ac9b09a3b46cff7ea37ed2a
+snapshot .prale-eval/mini_repo/ignored_secret.py - 0d7a1c5cc3a700e95af44d6c6f5a0e24f318998dee025fd407187fc062a6616f
+snapshot .prale-eval/mini_repo/notes.log - 8db476659f40908814987e9970ba8de7bbdc35ed3a3bdc874d5b037f2a746c03
+snapshot .prale-eval/mini_repo/src/__init__.py - f716fcc803a484360ba660eca99f6b8a1486a06a027818f8513ce5baa1c59baf
+snapshot .prale-eval/mini_repo/src/app.py - 3b2c468d3e34c9ea071286b3972f545afd77a9c20be17b54c62f167b8c4fa61f
+snapshot .prale-eval/mini_repo/src/codemap.py - d70ad3228d7271592e0198d1b449a99ff74c779e1cf4f24c7740c1399e5373c5
+snapshot .prale-eval/result.json - 3f877304113118f5842eb73c733337830ed8e68e3214b7d85b07ed39487733de
+snapshot aider/__pycache__/__init__.cpython-312.pyc - c3a9aa2e95004919928376b1f95e605d3e4907bb6dc9541077f458c22a9b9028
+snapshot aider/__pycache__/repomap.cpython-312.pyc - e2b7e913960fba609a0f79a0e0507281bf3a69f089e00b1502f82213504d3377

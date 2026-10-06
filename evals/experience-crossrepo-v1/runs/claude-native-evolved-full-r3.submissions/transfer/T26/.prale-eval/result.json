@@ -1,0 +1,62 @@
+{
+  "task_id": "T26",
+  "repository": "pi",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "validateBundle",
+      "start_line": 85,
+      "end_line": 176,
+      "observation": "validateBundle(inputDir) reads models.json, models.all.json, providers.json and the per-provider shard files from a local directory and validates them purely with node:fs and isDeepStrictEqual; it performs no network or S3 access, so it is the core offline-safe validation the dry-run path executes. It enforces REQUIRED_PROVIDERS, MINIMUM_MODEL_COUNT=500, valid MODEL_TYPES, and that the legacy models.json is exactly the chat projection of models.all.json, then returns counts plus a sha256 revision digest computed from the local bytes."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "main",
+      "start_line": 263,
+      "end_line": 325,
+      "observation": "main() resolves --input, calls validateBundle, writes publication.json, and then returns early when options.dryRun is set (lines 285-288), printing 'no objects uploaded' before ever constructing uploads or calling downloadIndex/uploadJson. This early return is what makes the documented `node scripts/publish-model-catalog.mjs --dry-run` check offline-safe: the aws/S3 helpers (aws, downloadIndex, uploadJson) are only reached on the non-dry-run publish branch."
+    },
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "scripts.generate-model-catalog",
+      "start_line": 54,
+      "end_line": 64,
+      "observation": "The package scripts define the offline/local model-data pipeline: 'generate-model-catalog' emits the catalog bundle to ../../.artifacts/model-catalog, 'check:model-data' validates local provider data, and 'build:offline' runs only local steps (check:model-data, tsgo, shx file copies) with no network fetch. These scripts are the source of the .artifacts/model-catalog input consumed by the root `check:model-catalog` dry-run check, and they operate entirely on repository-local files."
+    },
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "scripts.build:offline",
+      "start_line": 61,
+      "end_line": 61,
+      "observation": "The build:offline script chains only local validation and compilation commands, confirming the package intentionally supports a no-network build path; this is the contract the dry-run catalog check relies on when network data (the generated .artifacts bundle) is absent."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The narrowest valid local check for the offline fixture is the self-contained Node test scripts/publish-model-catalog.test.mjs, which constructs its own catalog fixture in a tmpdir and invokes publish-model-catalog.mjs with --dry-run; it is offline-safe because the dry-run branch returns before main() calls the aws/S3 helpers.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs",
+        "packages/ai/package.json"
+      ]
+    },
+    {
+      "claim": "validateBundle performs all validation through local filesystem reads and value comparison only, so the fixture validation does not require network access or the missing .artifacts/model-catalog bundle produced by the package's generate-model-catalog script.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs"
+      ]
+    },
+    {
+      "claim": "packages/ai declares local-only build/check scripts (generate-model-catalog, check:model-data, build:offline) that operate on repository-local provider data, which is why running the offline-safe check does not need the network data the fixture intentionally lacks.",
+      "evidence_paths": [
+        "packages/ai/package.json"
+      ]
+    }
+  ],
+  "conclusion": "Operated the offline fixture by running the narrowest valid local check, `node --test scripts/publish-model-catalog.test.mjs`. It passed (1 test, 0 failures). The check is offline-safe because it generates its own catalog fixture under os.tmpdir(), and the script under test takes the --dry-run early-return path in main() (scripts/publish-model-catalog.mjs:285-288) before any aws/S3 call is made; validation happens entirely in validateBundle via local node:fs reads. The repository's network-dependent fixture .artifacts/model-catalog is intentionally absent, which is why this self-contained test rather than the root check:model-catalog script is the narrowest valid check.",
+  "validation": {
+    "command": "node --test scripts/publish-model-catalog.test.mjs",
+    "status": "passed",
+    "notes": "1 test passed, 0 failed (node v24.14.0). Only Node builtins and repository-local TypeScript sources are used; no node_modules install, no network, and no aws CLI invocation. The test spawns `node scripts/publish-model-catalog.mjs --input <tmpdir> --source-commit test-commit --dry-run`, exercising validateBundle against a locally written fixture and asserting publication counts (chatModelCount 500, imageModelCount 1, classifierModelCount 1, totalModelCount 502). Optional network/validations depending on the generated .artifacts/model-catalog bundle (root `npm run check:model-catalog`) were not run because that fixture is intentionally absent."
+  }
+}

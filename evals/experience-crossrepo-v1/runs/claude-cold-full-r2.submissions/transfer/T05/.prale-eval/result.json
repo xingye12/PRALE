@@ -1,0 +1,79 @@
+{
+  "task_id": "T05",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "loadPanelConfig",
+      "start_line": 43,
+      "end_line": 68,
+      "observation": "The single panel-config resolution point. Every field is produced by env()/envInt()/envBool() with a hard-coded literal fallback, which establishes the two lower precedence layers: panel config (process.env, populated by dotenv) wins over the default literal. loadPanelConfig() reads process.env at call time, so config-vs-default conflicts are directly observable without restarting the process."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "envInt",
+      "start_line": 10,
+      "end_line": 15,
+      "observation": "The config/default conflict rule in concrete form: an env value that is undefined, empty string, or non-finite does NOT win over the default; it falls through to the fallback. Same shape in env() (line 6-8, ?? fallback) and envBool() (line 37-41, only 'true'/'1' count). This is the tie-break when config is present-but-degenerate."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "PanelConfig",
+      "start_line": 17,
+      "end_line": 35,
+      "observation": "Declares the config surface. The knowledge block (lines 23-24) documents the top precedence layer: 'serviceId 按请求 instanceId 注入' — the per-request instance id is injected as the Knowledge Service serviceId, overriding/selecting the instance the panel talks to, while baseUrl/authToken/timeoutMs come from panel config."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/panel-config.ts",
+      "symbol": "env",
+      "start_line": 6,
+      "end_line": 8,
+      "observation": "The config-over-default primitive: `process.env[key] ?? fallback`. Independent of envInt/envBool, it proves the middle layer (config) beats the lowest layer (default) for string fields such as HOST, KNOWLEDGE_SERVICE_URL and METADATA_INSTANCES_CONFIG."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+      "symbol": "resolve",
+      "start_line": 96,
+      "end_line": 102,
+      "observation": "The explicit-request-input layer for instances: the per-request instanceId (from the x-tdai-service-id header) is looked up in the registry. A miss throws InstanceRegistryError(400, 'INVALID_INSTANCE') — request input is never silently reconciled with a default instance, so an unknown request id outranks the fallback instead of degrading to it."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+      "symbol": "listPublic",
+      "start_line": 104,
+      "end_line": 112,
+      "observation": "Default-layer fallback for instance config: when a configured entry has no proxy_endpoint the field is omitted from the public payload (not set to explicit undefined), documented as the frontend falling back to gateway_endpoint via `??`. So explicit config (proxy_endpoint present) beats the gateway_endpoint default, and api_key never leaves the process."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "MemoryPanel instance/panel configuration resolves conflicts in the order explicit request input > panel config > default. Config (process.env, loaded by dotenv) overrides the hard-coded fallback literals in loadPanelConfig, and a per-request x-tdai-service-id selects the configured instance (and is injected as the knowledge serviceId) rather than being merged with a default.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/config/panel-config.ts",
+        "MemoryPanel/src/panel/config/instance-registry.ts"
+      ]
+    },
+    {
+      "claim": "When panel config and default conflict, a present-but-degenerate config value does not win: env() falls back via `??`, envInt() rejects undefined/empty/non-finite and returns the fallback, and envBool() accepts only 'true'/'1'. Only a well-formed env value outranks the default.",
+      "evidence_paths": ["MemoryPanel/src/panel/config/panel-config.ts"]
+    },
+    {
+      "claim": "When explicit request input and instance config conflict, the request wins: resolve() returns the requested entry's configured gateway_endpoint/api_key, and an instance id absent from config is rejected with InstanceRegistryError code 400 'INVALID_INSTANCE' instead of falling back to any default instance.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/config/instance-registry.ts",
+        "MemoryPanel/src/panel/config/panel-config.ts"
+      ]
+    },
+    {
+      "claim": "At the default layer inside instance config, an absent proxy_endpoint falls back to gateway_endpoint: listPublic() omits the field entirely so the consumer's `??` yields gateway_endpoint, while an explicitly configured proxy_endpoint wins; api_key is never exposed in the public listing.",
+      "evidence_paths": ["MemoryPanel/src/panel/config/instance-registry.ts"]
+    }
+  ],
+  "conclusion": "The precedence contract for MemoryPanel instance/panel configuration is explicit request input > panel config > default, verified executably against the repository's real modules. In an intentional three-way conflict: (1) a per-request instance id (x-tdai-service-id) selects the configured InstanceEntry and is injected as the knowledge serviceId, and an unknown id is hard-rejected (400 INVALID_INSTANCE) with no default fallback; (2) process.env values consumed by loadPanelConfig (PORT=9000 vs default 8123, KNOWLEDGE_TIMEOUT_MS=7777 vs 15000, LOG_LEVEL=debug vs info) beat the hard-coded defaults, while empty/non-numeric/out-of-set config values fall back to the default; (3) default-layer fallbacks apply only when neither of the higher layers supplies a value, with proxy_endpoint falling back to gateway_endpoint. All 23 demo assertions passed.",
+  "validation": {
+    "command": "node --experimental-transform-types --import ./.prale-eval/register-stubs.mjs ./.prale-eval/precedence-demo.mjs",
+    "status": "pass",
+    "notes": "23/23 assertions passed (exit 0) against the real MemoryPanel/src/panel/config/panel-config.ts and instance-registry.ts modules: 7 default-layer, 6 config-over-default, 10 request-input/instance assertions. LIMITATION: the workspace has no node_modules and dependency installation is disallowed, so the Vitest suite (MemoryPanel/tests/panel/config/panel-config-precedence.test.ts, run via `npm test`) could not be executed here; the demo instead executes the same real modules under Node's TS transform, satisfying only the two bare specifiers dotenv and zod with in-memory resolution stubs (.prale-eval/stub-hooks.mjs) that are load-time only and are never consulted by the asserted logic. Node required --experimental-transform-types because instance-registry.ts uses a constructor parameter property, which strip-only type stripping rejects."
+  }
+}

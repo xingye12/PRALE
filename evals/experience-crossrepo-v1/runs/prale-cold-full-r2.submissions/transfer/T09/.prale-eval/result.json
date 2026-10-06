@@ -1,0 +1,62 @@
+{
+  "task_id": "T09",
+  "repository": "aider",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd",
+      "start_line": 11,
+      "end_line": 23,
+      "observation": "run_cmd() is the repository's single entry point for executing a shell command. It returns a (returncode, output) tuple and, when stdin is a TTY on a non-Windows platform and pexpect.spawn exists, delegates to run_cmd_pexpect; otherwise it delegates to run_cmd_subprocess. On OSError it reports the message via error_print (or stdout) and returns (1, error_message). This is the exact (exit_status, output) shape an operate-mode harness must normalize: a nonzero status is a normal, expected outcome carried in the tuple rather than an exception."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd_subprocess",
+      "start_line": 42,
+      "end_line": 86,
+      "observation": "run_cmd_subprocess() is the non-interactive execution path and the one aider/linter.py uses. It builds the subprocess with shell=True and crucially stderr=subprocess.STDOUT, so stderr is folded into stdout: the caller receives one merged stream plus process.returncode, and stream identity is lost. It reads the pipe one character at a time, echoes each chunk to stdout in real time, accumulates it, then returns (process.returncode, \"\".join(output)). Because of the merge, a normalizer that must report stdout and stderr separately cannot use this helper alone; the demo therefore also captures with subprocess.run(stdout=PIPE, stderr=PIPE) and verifies the merged text is the interleaved union of the two separated streams."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd_pexpect",
+      "start_line": 89,
+      "end_line": 132,
+      "observation": "run_cmd_pexpect() handles the interactive (TTY) case by spawning $SHELL -i -c command (falling back to spawning the command directly when the shell path does not exist), capturing output through an output_filter callback into a BytesIO buffer, and returning (child.exitstatus, decoded output). It shows the same contract as the subprocess path - a (status, text) pair with stderr merged into the captured text - and it is the reason run_cmd.py imports pexpect at module scope, which is an optional interactive dependency in this environment."
+    },
+    {
+      "path": "aider/linter.py",
+      "symbol": "Linter.run_cmd",
+      "start_line": 47,
+      "end_line": 70,
+      "observation": "Linter.run_cmd() is the in-repo operation this task mirrors: it quotes the relative filename onto the lint command, runs it through run_cmd_subprocess with cwd=self.root and the configured encoding, treats returncode == 0 as 'no problems' and returns early, and otherwise prefixes the (already stderr-merged) output with '## Running: <cmd>' before parsing it into a lint result. This confirms the real contract the fake linter imitates - findings on stdout, diagnostics on stderr, nonzero exit meaning problems - and confirms that the repository's own observation of that command is a merged stream plus return code."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "aider/run_cmd.py exposes a (returncode, output) contract in which a nonzero exit is a normal observed value, not an exception: run_cmd() catches OSError and returns (1, message), run_cmd_subprocess() returns (process.returncode, joined_output), and run_cmd_pexpect() returns (child.exitstatus, decoded_output). A normalizer must therefore map the observed nonzero status into a 'failed' status field rather than treating it as a harness error.",
+      "evidence_paths": [
+        "aider/run_cmd.py"
+      ]
+    },
+    {
+      "claim": "run_cmd_subprocess() merges stderr into stdout via stderr=subprocess.STDOUT, so stream separation is not recoverable from its return value; the operate demo confirms this empirically by showing that its merged output reproduces the union of the separately captured stdout and stderr lines but carries no stream identity.",
+      "evidence_paths": [
+        "aider/run_cmd.py"
+      ]
+    },
+    {
+      "claim": "The repository's lint operation (aider/linter.py Linter.run_cmd) consumes exactly the run_cmd_subprocess contract - quote the file argument, run the command, treat exit code 0 as clean, otherwise treat the captured text as the error report - so the fake linter's stdout/stderr/nonzero-exit behavior faithfully reproduces the operation that T09 asks to be exercised and normalized.",
+      "evidence_paths": [
+        "aider/run_cmd.py",
+        "aider/linter.py"
+      ]
+    }
+  ],
+  "conclusion": "The fake linter tools/fake_linter.py was operated against tools/demo_target.py: it emitted two findings on stdout ('tools/demo_target.py:3:1: E501 line too long (101 > 79 characters)' and 'tools/demo_target.py:5:9: E231 missing whitespace after \\':\\''), three diagnostics on stderr ('fake-linter: warning: no config file found; using defaults', 'fake-linter: 2 problem(s) found in 1 file(s)', 'fake-linter: exit status 1 (problems reported)'), and exited 1. tools/normalize_lint.py captured that run twice - once through the repository helper aider.run_cmd.run_cmd_subprocess (merged stream, return shape tuple[int, str]) and once through a stream-preserving subprocess.run capture - and normalized the observation into .prale-eval/linter-result.json with exit_code 1, status 'failed', separated stdout/stderr line arrays, two parsed findings (rules E501 and E231, severity 'error'), and a summary of 2 problems in 1 file. The normalization itself exited 0, keeping 'normalization succeeded' distinct from the linter's nonzero 'failed' status.",
+  "validation": {
+    "command": "python3 tools/validate_lint_normalize.py -v",
+    "status": "pass",
+    "notes": "Focused unittest suite (8 tests) covering: the fake linter CLI contract (2 stdout findings, 3 stderr diagnostic lines, exit code 1, no cross-contamination between streams); the normalized record (exit_code 1, status 'failed', streams.separated true, 2 stdout + 3 stderr lines, rules ['E501','E231'] all parsed, summary.errors 2, merged union == separated union); the result.json metadata contract (task_id T09, repository aider, mode operate, required top-level keys, validation.command/status/notes); every evidence citation (each declared path exists, start_line <= end_line, end_line within file length, and the named symbol really occurs inside the declared inclusive range); every claim's evidence_paths being a subset of the cited evidence paths; and the presence of .prale-eval/operate-deliverable.md with the demo, the normalized result and the run_cmd.py limitation. Limitation recorded rather than hidden: the optional interactive dependencies pexpect and psutil are not installed in this environment, so aider/run_cmd.py cannot be imported unmodified (they are module-scope imports). tools/normalize_lint.py injects inert stand-ins into sys.modules and records 'optional dependency ... not installed; stubbed for import only' in the normalized record's validation_limitations; consequently only the non-interactive run_cmd_subprocess path could actually be executed, while the TTY/pexpect path was verified by reading aider/run_cmd.py (lines 89-132) instead of running it. No dependencies were installed and no repository source, task metadata, hidden-oracle files, package locks or git configuration were modified."
+  }
+}

@@ -1,0 +1,717 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..58fa2a3
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,130 @@
++# Contract deliverable — ConfigQueue: first job fails, next job still settles
++
++Task: `T02` · Repository: `wattclaw` · Mode: `contract`
++Module under contract: `server/core/config-queue.js` (`ConfigQueue`, `configQueueExecute`)
++
++## 1. The contract being pinned
++
++`ConfigQueue` is the single serial FIFO queue through which every Gateway config
++modification goes (`server/handlers/channels.js`, `server/handlers/system.js`,
++`server/handlers/agent-team.js` all call `configQueueExecute`). The behaviour this
++task contracts is the failure-isolation rule of that queue:
++
++1. A job that fails settles **only itself** — its promise rejects.
++2. Any job already queued behind it **still gets dequeued and settles**, even though
++   it was enqueued *before* the failure happened.
++3. The failure does **not** wedge the queue: `_process()` releases `_running` and
++   later jobs still run.
++4. Settlement values are deterministic and distinguishable:
++   * patch + apply success → resolves `undefined`
++   * `transformFn` returns falsy (no-op) → resolves `null`, **no** `config.patch` / `config.apply` RPC
++   * non-retryable failure → rejects with the original gateway error message, on the first attempt
++5. A failed job leaves **no partial configuration** behind (it fails before
++   `_recordPatch()` / `config.apply`), so the next job's `config.get` sees a clean state.
++
++## 2. Executable demo
++
++```
++node server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs
++```
++
++Exit code `0` = contract holds; `1` = assertion failure (the driver prints the failing
++assertion). No dependencies, no network, no gateway: plain Node ESM (`node:assert/strict`,
++`node:module`, `node:child_process`). Verified on Node v24.14.0.
++
++### Files
++
++| File | Role |
++|---|---|
++| `server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs` | Fixture + assertions + determinism replay driver |
++| `server/core/contract-fixtures/gateway-client-loader.mjs` | ESM `resolve` hook: redirects **only** the `./gateway-client.js` specifier of `server/core/config-queue.js` |
++| `server/core/contract-fixtures/gateway-client-stub.mjs` | Deterministic in-memory Gateway (`config.get` / `config.patch` / `config.set` / `config.apply`, OCC `baseHash` checks, scripted one-shot failures, RPC trace) |
++
++The module under contract is imported **unmodified** and never copied or patched. The
++hook exists only because `gateway-client.js → multi-tenant-gateway.js` needs runtime
++dependencies that are not installed in this checkout (`node_modules` is absent); without
++the hook the import fails with `ERR_MODULE_NOT_FOUND` (used as a control, see §4).
++
++### The fixture
++
++Base config (`BASE_CONFIG`): one Feishu account, one model provider and a version marker —
++i.e. a small, *different* configuration fixture from the ones the repo's handlers build:
++
++```js
++{ channels: { feishu: { accounts: { a1: { appId: 'cli_a1' } } } },
++  models:   { providers: { alpha: { id: 'alpha' } } },
++  meta:     { version: 1 } }
++```
++
++| Scenario | Scripted gateway behaviour | Jobs (enqueued together, before anything settles) | Pinned outcome |
++|---|---|---|---|
++| **1** `first-job-fails-at-write-next-job-settles` | first `config.patch` fails with `rpc transport closed` (non-retryable) | A `fixture-A-write-fails` (adds account `a2`), B `fixture-B-settles` (bumps `meta.version` to 2) | A → `REJECTED:rpc transport closed`; B → `RESOLVED:undefined`; RPC trace `config.get, config.patch, config.get, config.patch, config.get, config.apply`; `patchCount=1`, `applyCount=1`; final config has `meta.version=2` and **no** account `a2` |
++| **2** `first-job-fails-at-read-next-job-settles` | first `config.get` fails with `gateway offline: econnrefused` (non-retryable) | C `fixture-C-read-fails`, D `fixture-D-settles` (adds provider `beta`) | C → `REJECTED:gateway offline: econnrefused`; D → `RESOLVED:undefined`; RPC trace `config.get, config.get, config.patch, config.get, config.apply`; `meta.version` still `1` (C never landed) |
++| **3** `queue-still-alive-after-failures` | none | E `fixture-E-noop`, F `fixture-F-noop` (both `transformFn → null`) | both → `RESOLVED:null`; RPC trace `config.get, config.get`; `patchCount=0`; queue drained and live after the two earlier failures |
++
++Every scenario also asserts **FIFO settlement order** (A before B, C before D, E before F) and
++that exactly one `config.get` is consumed by a job that fails at the read stage.
++
++### Determinism evidence
++
++Each job is awaited through a 5 s `withTimeout` guard, so a job that would never settle
++(the wedge failure mode) fails loudly instead of hanging. The driver then re-runs the
++**entire fixture in a fresh child process** (`CONTRACT_REPLAY=1`) and asserts
++`deepStrictEqual(childSnapshot, parentSnapshot)`; the printed snapshot contains only
++normalized data (settle states, RPC method names, patch/apply counts, final config, hash
++labels, unhandled-rejection list) — no timestamps or durations. A `process.on('unhandledRejection')`
++collector asserts that the failing jobs leak **zero** unhandled rejections.
++
++## 3. Normalized result (from the passing run)
++
++```json
++{
++  "first-job-fails-at-write-next-job-settles": {
++    "jobA": "REJECTED:rpc transport closed",
++    "jobB": "RESOLVED:undefined",
++    "calls": ["config.get","config.patch","config.get","config.patch","config.get","config.apply"],
++    "gateway": { "patchCount": 1, "applyCount": 1, "hash": "hash-1" }
++  },
++  "first-job-fails-at-read-next-job-settles": {
++    "jobC": "REJECTED:gateway offline: econnrefused",
++    "jobD": "RESOLVED:undefined",
++    "calls": ["config.get","config.get","config.patch","config.get","config.apply"],
++    "gateway": { "patchCount": 1, "applyCount": 1, "hash": "hash-1" }
++  },
++  "queue-still-alive-after-failures": {
++    "jobE": "RESOLVED:null",
++    "jobF": "RESOLVED:null",
++    "calls": ["config.get","config.get"],
++    "gateway": { "patchCount": 0, "applyCount": 0, "hash": "hash-0" }
++  },
++  "unhandledRejections": [],
++  "determinism": { "replay": "identical-snapshot", "comparedAt": "child-process" }
++}
++```
++
++## 4. Validation
++
++| Command | Status |
++|---|---|
++| `node server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs` | passed (exit 0, re-run 3× stable) |
++| negative control (a): `node -e "import('./server/core/config-queue.js')"` without the loader | `ERR_MODULE_NOT_FOUND` — confirms the loader hook is what makes the fixture runnable here |
++| negative control (b): same fixture but the stub fails the **second** job's patch | second job becomes `REJECTED:boom-b` — confirms the "next job still settles" assertions discriminate |
++
++**Limitations recorded (optional validation dependency unavailable):** `node_modules` is not
++installed in this checkout, so the devDependency `vitest` and the repository script
++`npm run test:server` could not be executed, and the real
++`gateway-client.js → multi-tenant-gateway.js` chain could not be loaded (hence the stub, which
++is confined to that one import edge). The fixture itself needs no packages, so the contract
++above was validated end-to-end with the stock Node binary.
++
++## 5. Source evidence (see `.prale-eval/result.json`)
++
++* `server/core/config-queue.js` — `_process` (L24–37): FIFO drain loop, per-item
++  `resolve`/`reject`, `_running` guard released only after the queue empties.
++* `server/core/config-queue.js` — `_execute` (L60–100): all errors become
++  `{ ok:false, error }` values instead of throws → the drain loop cannot be aborted;
++  retry branch limited to OCC / rate-limit messages.
++* `server/core/config-queue.js` — `enqueue` (L15–21): pushes the job *with its
++  resolve/reject* onto the shared array, so a pre-failure job is still owned and settled.
++* `server/core/config-queue.js` — `configQueueExecute` (L104–106): the single shared
++  singleton entry point used by every caller, which is what the fixture drives.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..2dd8aa1
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,59 @@
++{
++  "task_id": "T02",
++  "repository": "wattclaw",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "_process",
++      "start_line": 24,
++      "end_line": 37,
++      "observation": "Serial FIFO drain loop and the only place job promises settle. `_running` guards against concurrent drains, `this._queue.shift()` takes the oldest job, `await this._execute(item)` is awaited, and the outcome is routed per-item: `result.ok === true` -> `item.resolve(result.data)` else `item.reject(result.error)`. Because the rejection is scoped to the single `item`, the `while (this._queue.length > 0)` loop continues into the next job, so a job enqueued before the failure still runs and settles; `this._running = false` is only reached after the queue is drained, so a failing job cannot wedge the queue."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "_execute",
++      "start_line": 60,
++      "end_line": 100,
++      "observation": "Per-job execution body, and the reason `_process` can never be aborted by a failing job: every `throw` raised by a bad gateway response is caught and converted into a value `{ ok: false, error: err }` (line 96); `_execute` therefore resolves instead of rejecting. Non-retryable errors (anything whose message is neither 'config changed since last load' nor 'rate limit') reject the job immediately on the first attempt, whereas OCC/rate-limit errors wait and re-run the fresh `config.get` up to `maxRetries = 3`. The success shape is also deterministic: a patch/apply success returns `{ ok: true, data: undefined }`, while a `transformFn` that returns a falsy value short-circuits to `{ ok: true, data: null }` (line 69) without any patch or apply call. A job failing at `config.get` (line 65-66) or at the patch call (line 73-74) never reaches `_recordPatch()`/`config.apply`, so the failed job leaves no mutation behind."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "enqueue",
++      "start_line": 15,
++      "end_line": 21,
++      "observation": "Entry point that wraps each config modification in a Promise, pushes `{ transformFn, label, method, resolve, reject }` onto the shared `_queue` array, and fires `_process()` (a no-op while `_running`). Because resolve/reject are parked in the queue entry, a job that is enqueued *before* an earlier job fails is still owned by the queue and will be settled later by the drain loop - this is exactly the 'first job fails, next job must still settle' contract the fixture pins."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "configQueueExecute",
++      "start_line": 104,
++      "end_line": 106,
++      "observation": "Module-level export used by all callers (server/handlers/channels.js, system.js, agent-team.js). It delegates to the single `configQueue` singleton created at line 102, so every caller shares one FIFO queue and therefore the same settle ordering; the contract fixture calls `configQueueExecute` (not the private class) to exercise that shared path, including the fact that a rejection is delivered only to the enqueuing caller."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "A queued job that fails settles only itself while the shared FIFO queue keeps draining: `_process` catches the failure as a result value and calls `item.reject(result.error)` for that item alone, then continues its `while (this._queue.length > 0)` loop, so the next job - enqueued before the failure happened - is still dequeued and settled.",
++      "evidence_paths": ["server/core/config-queue.js"]
++    },
++    {
++      "claim": "The failure cannot abort the drain: `_execute` converts every gateway error into `{ ok: false, error: err }` instead of throwing, and non-retryable messages skip the OCC/rate-limit retry branch, so the failing job rejects on the first attempt and `_running` is still released at the end of `_process`, leaving the queue live for later jobs (proved by the post-failure no-op liveness probes).",
++      "evidence_paths": ["server/core/config-queue.js"]
++    },
++    {
++      "claim": "Settlement values are deterministic and distinguishable per outcome, which is what makes the fixture a contract rather than a smoke test: patch+apply success resolves `undefined`, a no-op transform resolves `null` without any `config.patch`/`config.apply` RPC, and a failure rejects with the original gateway error message (no wrapper, no retry delay for non-retryable errors).",
++      "evidence_paths": ["server/core/config-queue.js"]
++    },
++    {
++      "claim": "A failed job leaves no partial configuration behind: the failure is raised before `_recordPatch()` and before `config.apply`, so the gateway config the next job reads is exactly the pre-failure config plus the next job's own transform - the stub's recorded gateway state shows job A's mutation absent and job B's applied.",
++      "evidence_paths": ["server/core/config-queue.js"]
++    }
++  ],
++  "conclusion": "Contract pinned and executable. The fixture at server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs drives the unmodified ConfigQueue from server/core/config-queue.js and covers three scenarios of the requested 'first job fails, next job must still settle deterministically' contract: (1) the first job fails at the write stage (`config.patch` returns 'rpc transport closed') and is rejected while the second job, enqueued before the failure, still runs the full config.get -> patch -> config.get -> config.apply sequence and resolves `undefined` with exactly one patch and one apply recorded; (2) the first job fails at the read stage (`config.get` returns 'gateway offline: econnrefused') and the second job still settles, again with one patch/apply and the failed job's mutation absent from the gateway state; (3) two post-failure no-op jobs resolve `null` in FIFO order without patching, proving `_process` released `_running` and the queue is not wedged. Settlement order, RPC trace, rejection messages, resolve values and the final gateway config are asserted exactly, no unhandled rejection leaks, and a clean child-process replay of the whole fixture produces a byte-identical snapshot, which is the determinism evidence. Validation ran with the stock Node 24 binary: the run passed (exit 0) and exited cleanly; a negative control in which the stub is programmed to fail the second job's patch showed the second job is then `REJECTED:boom-b`, confirming the 'next job settles' assertions discriminate. node_modules is absent in this checkout, so the repository's vitest suites could not be run and the fixture instead uses node:test-free plain-node assertions plus a narrow ESM resolve hook that redirects only config-queue.js's `./gateway-client.js` edge to a deterministic in-memory gateway stub; the module under contract itself is never modified or copied.",
++  "validation": {
++    "command": "node server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs",
++    "status": "passed",
++    "notes": "Executed from the repository root with the workspace Node v24.14.0 binary; exit code 0, console output '[contract] PASS - first job failed, subsequent jobs settled deterministically; replay snapshot identical.'. The same command was re-run three times to confirm stability (exit 0 each time). Scope of what was exercised: the fixture imports the real server/core/config-queue.js unmodified via a node:module register() hook (server/core/contract-fixtures/gateway-client-loader.mjs) that redirects the single `./gateway-client.js` specifier - and only that edge - to server/core/contract-fixtures/gateway-client-stub.mjs, a deterministic in-memory gateway implementing config.get/config.patch/config.set/config.apply with OCC baseHash checks and scripted one-shot failures; method-level RPC traces, patch/apply counts and the resulting gateway config are asserted. Determinism check: the driver spawns itself in a child process with CONTRACT_REPLAY=1 and asserts deepStrictEqual between the two snapshots (identical). Negative controls run separately (not persisted as files): (a) running `node -e \"import('./server/core/config-queue.js')\"` without the loader fails with ERR_MODULE_NOT_FOUND, confirming the hook is what makes the fixture runnable in this dependency-less checkout; (b) scripting the stub to fail the second job's patch yields REJECTED:boom-b, confirming the 'next job still settles' assertions fail when the behaviour is broken. Limitations: node_modules is not installed, so vitest (devDependency) and the repo's `npm run test:server` suite were unavailable and could not be used as an additional harness; the real gateway-client.js -> multi-tenant-gateway.js chain therefore could not be loaded, which is why the dependency is stubbed rather than exercised. The fixture is dependency-free plain Node ESM and does not depend on the unavailable packages."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+diff --git a/server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs b/server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs
+new file mode 100644
+index 0000000..2702486
+--- /dev/null
++++ b/server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs
+@@ -0,0 +1,193 @@
++// ============================================================================
++// Contract fixture: "first job fails, next job still settles deterministically"
++// ----------------------------------------------------------------------------
++// Executable, dependency-free demo that drives the REAL `ConfigQueue`
++// implementation from `server/core/config-queue.js` (the module is imported
++// unmodified; only its `./gateway-client.js` edge is redirected to the
++// deterministic in-process stub by ./gateway-client-loader.mjs).
++//
++// Contract under test (see docs/config-queue-architecture.md):
++//   ConfigQueue is a FIFO serial queue. Every enqueued job must settle exactly
++//   once - the failing job is rejected and the NEXT job in the same queue must
++//   still be dequeued, executed and settled (resolved), even though it was
++//   enqueued before the failure happened. A failure must not wedge `_process()`
++//   (i.e. `_running` must be released) and must not leak an unhandled rejection.
++//
++// Run:  node server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs
++// Exit: 0 = all contract assertions hold, 1 = contract violated.
++// ============================================================================
++
++import assert from 'node:assert/strict'
++import { spawnSync } from 'node:child_process'
++import { register } from 'node:module'
++
++register(new URL('./gateway-client-loader.mjs', import.meta.url))
++
++const { configQueueExecute } = await import('../config-queue.js')
++const gateway = await import('./gateway-client-stub.mjs')
++
++const REPLAY = process.env.CONTRACT_REPLAY === '1'
++const SETTLE_TIMEOUT_MS = 5000
++
++const unhandled = []
++process.on('unhandledRejection', (err) => { unhandled.push(String(err && err.message ? err.message : err)) })
++
++// ---------------------------------------------------------------- helpers ---
++const settleOrder = []
++
++function withTimeout (promise, label) {
++  return Promise.race([
++    promise.then(
++      (value) => { settleOrder.push(label); return { state: 'fulfilled', value } },
++      (error) => { settleOrder.push(label); return { state: 'rejected', error } }
++    ),
++    new Promise((_, reject) => setTimeout(() => reject(new Error(`job ${label} never settled within ${SETTLE_TIMEOUT_MS}ms`)), SETTLE_TIMEOUT_MS))
++  ])
++}
++
++const encode = (outcome) => outcome.state === 'rejected'
++  ? `REJECTED:${outcome.error.message}`
++  : `RESOLVED:${outcome.value === undefined ? 'undefined' : JSON.stringify(outcome.value)}`
++
++// --------------------------------------------------------------- fixture ----
++const BASE_CONFIG = {
++  channels: { feishu: { accounts: { a1: { appId: 'cli_a1' } } } },
++  models: { providers: { alpha: { id: 'alpha' } } },
++  meta: { version: 1 }
++}
++
++async function runFixture () {
++  const report = { scenarios: {}, unhandledRejections: [], settlementOrder: [] }
++
++  // ---- Scenario 1: first job fails at the write stage (config.patch) --------
++  gateway.__configure({
++    config: BASE_CONFIG,
++    failures: [{ method: 'config.patch', message: 'rpc transport closed' }]
++  })
++  settleOrder.length = 0
++
++  const jobA = withTimeout(
++    configQueueExecute(
++      (sourceConfig) => ({ ...sourceConfig, channels: { feishu: { accounts: { ...sourceConfig.channels.feishu.accounts, a2: { appId: 'cli_a2' } } } } }),
++      'fixture-A-write-fails'
++    ),
++    'fixture-A-write-fails'
++  )
++  const jobB = withTimeout(
++    configQueueExecute(
++      (sourceConfig) => ({ ...sourceConfig, meta: { ...sourceConfig.meta, version: 2 } }),
++      'fixture-B-settles'
++    ),
++    'fixture-B-settles'
++  )
++
++  const [outA, outB] = await Promise.all([jobA, jobB])
++  const snap1 = gateway.__snapshot()
++
++  assert.equal(encode(outA), 'REJECTED:rpc transport closed', 'job A must reject with the transport error')
++  assert.equal(encode(outB), 'RESOLVED:undefined', 'job B must settle with the config.patch success value')
++  assert.deepEqual(settleOrder, ['fixture-A-write-fails', 'fixture-B-settles'], 'jobs must settle in FIFO order')
++  assert.deepEqual(snap1.calls, ['config.get', 'config.patch', 'config.get', 'config.patch', 'config.get', 'config.apply'],
++    'job A stops at its failed patch; job B then runs the full read/patch/read/apply sequence')
++  assert.equal(snap1.patchCount, 1, 'only job B may land a patch')
++  assert.equal(snap1.applyCount, 1, 'only job B may land an apply')
++  assert.deepEqual(snap1.state.config, {
++    channels: { feishu: { accounts: { a1: { appId: 'cli_a1' } } } },
++    models: { providers: { alpha: { id: 'alpha' } } },
++    meta: { version: 2 }
++  }, 'failed job A must leave no trace; job B mutation is applied')
++
++  report.scenarios['first-job-fails-at-write-next-job-settles'] = {
++    jobA: encode(outA),
++    jobB: encode(outB),
++    calls: snap1.calls,
++    gateway: { patchCount: snap1.patchCount, applyCount: snap1.applyCount, hash: snap1.state.hash, config: snap1.state.config }
++  }
++
++  // ---- Scenario 2: first job fails at the read stage (config.get) ----------
++  gateway.__configure({
++    config: BASE_CONFIG,
++    failures: [{ method: 'config.get', message: 'gateway offline: econnrefused' }]
++  })
++  settleOrder.length = 0
++
++  const jobC = withTimeout(
++    configQueueExecute(() => ({ ...BASE_CONFIG, meta: { version: 99 } }), 'fixture-C-read-fails'),
++    'fixture-C-read-fails'
++  )
++  const jobD = withTimeout(
++    configQueueExecute(
++      (sourceConfig) => ({ ...sourceConfig, models: { providers: { ...sourceConfig.models.providers, beta: { id: 'beta' } } } }),
++      'fixture-D-settles'
++    ),
++    'fixture-D-settles'
++  )
++
++  const [outC, outD] = await Promise.all([jobC, jobD])
++  const snap2 = gateway.__snapshot()
++
++  assert.equal(encode(outC), 'REJECTED:gateway offline: econnrefused', 'job C must reject with the read error')
++  assert.equal(encode(outD), 'RESOLVED:undefined', 'job D must settle despite job C failing first')
++  assert.deepEqual(settleOrder, ['fixture-C-read-fails', 'fixture-D-settles'], 'FIFO settlement holds for the read-stage failure too')
++  assert.deepEqual(snap2.calls, ['config.get', 'config.get', 'config.patch', 'config.get', 'config.apply'],
++    'the failed read consumes one config.get and the next job proceeds with a fresh read')
++  assert.equal(snap2.patchCount, 1, 'job D lands exactly one patch')
++  assert.equal(snap2.state.config.meta.version, 1, 'job C mutation was never applied')
++  assert.deepEqual(snap2.state.config.models.providers, { alpha: { id: 'alpha' }, beta: { id: 'beta' } })
++
++  report.scenarios['first-job-fails-at-read-next-job-settles'] = {
++    jobC: encode(outC),
++    jobD: encode(outD),
++    calls: snap2.calls,
++    gateway: { patchCount: snap2.patchCount, applyCount: snap2.applyCount, hash: snap2.state.hash, config: snap2.state.config }
++  }
++
++  // ---- Scenario 3: liveness probe - queue is not wedged by the failures ----
++  gateway.__configure({ config: BASE_CONFIG })
++  settleOrder.length = 0
++
++  const [outE, outF] = await Promise.all([
++    withTimeout(configQueueExecute(() => null, 'fixture-E-noop'), 'fixture-E-noop'),
++    withTimeout(configQueueExecute(() => null, 'fixture-F-noop'), 'fixture-F-noop')
++  ])
++  const snap3 = gateway.__snapshot()
++
++  assert.equal(encode(outE), 'RESOLVED:null', 'no-op job E must settle with null (transform returned null)')
++  assert.equal(encode(outF), 'RESOLVED:null', 'no-op job F must settle with null')
++  assert.deepEqual(settleOrder, ['fixture-E-noop', 'fixture-F-noop'], 'probes settle in FIFO order')
++  assert.deepEqual(snap3.calls, ['config.get', 'config.get'], 'no-op jobs read but never patch')
++  assert.equal(snap3.patchCount, 0, 'no-op jobs must not patch')
++  assert.equal(snap3.state.config.meta.version, 1, 'no-op jobs must not mutate the gateway config')
++
++  report.scenarios['queue-still-alive-after-failures'] = {
++    jobE: encode(outE),
++    jobF: encode(outF),
++    calls: snap3.calls,
++    gateway: { patchCount: snap3.patchCount, applyCount: snap3.applyCount, hash: snap3.state.hash, config: snap3.state.config }
++  }
++
++  report.unhandledRejections = [...unhandled]
++  report.settlementOrder = [...settleOrder]
++  assert.deepEqual(report.unhandledRejections, [], 'no unhandled rejection may leak from a failing queued job')
++  return report
++}
++
++// ---------------------------------------------------------------- driver ----
++const first = await runFixture()
++
++if (REPLAY) {
++  process.stdout.write(`${JSON.stringify(first)}\n`)
++} else {
++  const child = spawnSync(process.execPath, [new URL(import.meta.url).pathname], {
++    env: { ...process.env, CONTRACT_REPLAY: '1' },
++    encoding: 'utf8'
++  })
++  assert.equal(child.status, 0, `replay run failed: ${child.stderr}`)
++  const second = JSON.parse(child.stdout)
++
++  assert.deepStrictEqual(second, first, 'a clean re-run of the same fixture must produce an identical snapshot')
++
++  first.determinism = { replay: 'identical-snapshot', comparedAt: 'child-process' }
++  console.log(JSON.stringify(first, null, 2))
++  console.error('\n[contract] PASS - first job failed, subsequent jobs settled deterministically; replay snapshot identical.')
++}
+diff --git a/server/core/contract-fixtures/gateway-client-loader.mjs b/server/core/contract-fixtures/gateway-client-loader.mjs
+new file mode 100644
+index 0000000..09a68d2
+--- /dev/null
++++ b/server/core/contract-fixtures/gateway-client-loader.mjs
+@@ -0,0 +1,17 @@
++// ESM resolve hook: redirect `server/core/config-queue.js`'s single dependency
++// (`./gateway-client.js`) to the deterministic in-process stub used by the contract
++// fixture. Only that one edge is rewritten; `config-queue.js` itself is loaded unmodified.
++//
++// The heavy real module chain (gateway-client.js -> multi-tenant-gateway.js) needs
++// runtime dependencies that are not installed in this checkout, so this hook keeps the
++// fixture executable with a stock `node` binary.
++
++const STUB_URL = new URL('./gateway-client-stub.mjs', import.meta.url).href
++
++export async function resolve (specifier, context, nextResolve) {
++  const parent = context.parentURL || ''
++  if (specifier === './gateway-client.js' && parent.endsWith('/server/core/config-queue.js')) {
++    return { url: STUB_URL, shortCircuit: true }
++  }
++  return nextResolve(specifier, context)
++}
+diff --git a/server/core/contract-fixtures/gateway-client-stub.mjs b/server/core/contract-fixtures/gateway-client-stub.mjs
+new file mode 100644
+index 0000000..c2d98f6
+--- /dev/null
++++ b/server/core/contract-fixtures/gateway-client-stub.mjs
+@@ -0,0 +1,79 @@
++// Deterministic in-memory Gateway stub for the ConfigQueue contract fixture.
++//
++// It replaces `server/core/gateway-client.js` (see ./gateway-client-loader.mjs) so the
++// real `ConfigQueue` implementation in `server/core/config-queue.js` can be driven
++// end-to-end without a live OpenClaw Gateway and without installed dependencies.
++
++let callLog = []
++let scriptedFailures = []
++let state = { hash: 'hash-0', version: 0, config: {} }
++let patchCount = 0
++let applyCount = 0
++
++function isPlainObject (value) {
++  return value !== null && typeof value === 'object' && !Array.isArray(value)
++}
++
++function deepMerge (base, patch) {
++  const out = { ...base }
++  for (const [key, value] of Object.entries(patch)) {
++    out[key] = isPlainObject(value) && isPlainObject(base?.[key])
++      ? deepMerge(base[key], value)
++      : value
++  }
++  return out
++}
++
++/** Program the fake gateway before a scenario runs. */
++export function __configure ({ config = {}, failures = [] } = {}) {
++  callLog = []
++  scriptedFailures = failures.map(f => ({ ...f }))
++  state = { hash: 'hash-0', version: 0, config: structuredClone(config) }
++  patchCount = 0
++  applyCount = 0
++}
++
++/** Ordered list of rpc method names observed by the fake gateway. */
++export function __calls () {
++  return callLog.map(c => c.method)
++}
++
++/** Full rpc trace including params (params are JSON-normalised for stability). */
++export function __trace () {
++  return callLog.map(c => ({ method: c.method, params: JSON.parse(JSON.stringify(c.params ?? {})) }))
++}
++
++export function __snapshot () {
++  return { calls: __calls(), state: structuredClone(state), patchCount, applyCount }
++}
++
++export async function gatewayAdminRpc (method, params = {}) {
++  callLog.push({ method, params })
++
++  if (scriptedFailures.length > 0 && scriptedFailures[0].method === method) {
++    const { message } = scriptedFailures.shift()
++    return { ok: false, error: message }
++  }
++
++  if (method === 'config.get') {
++    return { ok: true, payload: { sourceConfig: state.config, config: state.config, parsed: state.config, hash: state.hash } }
++  }
++
++  if (method === 'config.patch' || method === 'config.set') {
++    if (params.baseHash !== state.hash) return { ok: false, error: 'config changed since last load' }
++    const raw = JSON.parse(params.raw)
++    state.config = method === 'config.set' ? raw : deepMerge(state.config, raw)
++    state.version += 1
++    state.hash = `hash-${state.version}`
++    patchCount += 1
++    return { ok: true, payload: {} }
++  }
++
++  if (method === 'config.apply') {
++    if (params.baseHash !== state.hash) return { ok: false, error: 'config changed since last load' }
++    applyCount += 1
++    return { ok: true, payload: {} }
++  }
++
++  return { ok: false, error: `stub: unknown method ${method}` }
++}
+snapshot .prale-eval/contract-deliverable.md - 73f1457453a18d01dddb289393377b6fcba1f7134b6ba83c040877a9dff936aa
+snapshot .prale-eval/result.json - 20386aadffff50fb010ee456f6478fa15c669f2922e465264af4638f8d680dec
+snapshot server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs - bdbe756654aef72b4ea7f58529fca5a876c6499c869671b4ca7a6879521d86bc
+snapshot server/core/contract-fixtures/gateway-client-loader.mjs - eb0e70de6dd27584f2f972820311a033f2a8096f9ad452249eb25c171bbb952d
+snapshot server/core/contract-fixtures/gateway-client-stub.mjs - 918fec599d9aff358eed8719fe3ff2c494fb56d4cba1cfb65bf64ba7c5c6006c

@@ -1,0 +1,66 @@
+{
+  "task_id": 27,
+  "repository": "tdam",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/engines/code/normalize.ts",
+      "symbol": "normalizeRepoUrl",
+      "start_line": 13,
+      "end_line": 35,
+      "observation": "normalizeRepoUrl is the repo's canonicalization primitive: an anchored SSH pattern (line 18) and an anchored HTTPS pattern (line 26) both reduce to `host/path`, the `.git` suffix is stripped (lines 22, 30, 34), and already-canonical `host/namespace/project` input is returned unchanged. The function is total (every input returns a string, no throw) and idempotent, so it can be applied as a pre-index normalization pass over page `sources` refs without first detecting which spelling the caller used. The demo imports and executes this exact module to collapse five spellings of the same repository to one identity."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/code/normalize.ts",
+      "symbol": "sourceKey",
+      "start_line": 40,
+      "end_line": 42,
+      "observation": "sourceKey defines the stable identity of an indexed source as `normalizeRepoUrl(repo) + ':' + (branch || 'main')`, and parseSourceKey (lines 47-53) splits it back apart on the last colon. Because the key is built on top of the canonical form, normalizing before indexing is what makes source identity independent of input spelling; the demo asserts both that all spellings produce the same key and that parseSourceKey round-trips it."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "parseFrontmatter",
+      "start_line": 42,
+      "end_line": 62,
+      "observation": "parseFrontmatter is deliberately tolerant: no matching block (line 45), a YAML parse throw (line 53), or a document that parses to a non-object (line 56) all return `{type:'other', hasFrontmatter:false}` instead of throwing, and line 60 coerces a missing or non-string `type` to `'other'`. The coercion applies to the *already parsed* value, so a malformed field such as `type: [concept]` becomes indistinguishable from an absent one. That is precisely why a pre-indexing gate cannot rely on `hasFrontmatter`/`type` alone and must validate the raw mapping before coercion; FM_RE (line 36) is the block-splitting regex the demo reuses, and the tolerant parser is also what index-builder.ts:68 relies on when it silently skips bad pages."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "buildPage",
+      "start_line": 85,
+      "end_line": 102,
+      "observation": "buildPage is the canonical write-back step: it emits fields in a fixed order (type, title, description, sources, tags, timestamp, then pass-through extras), always materializes `type` with the `'other'` default (line 87), explicitly omits `locked` (line 95) because only page/write injects it, trims the body (line 100), and re-emits a well-formed `---` delimited block. Running accepted pages through this contract is what turns the normalized in-memory form into a page that downstream consumers (index-builder, BM25, graph) can read back deterministically; the demo also re-parses its own output and rejects with E_ROUNDTRIP if the canonical form does not validate."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "normalizeRepoUrl is a total and idempotent canonicalizer: SSH (`git@host:path.git`), `ssh://`, HTTPS and bare `host/path` spellings of the same repository all reduce to a single `host/namespace/project` string with any `.git` suffix removed, and re-normalizing an already-canonical value is a pass-through. This is what allows normalization to run unconditionally before indexing rather than being special-cased per input spelling.",
+      "evidence_paths": ["MemoryKnowledge/src/engines/code/normalize.ts"]
+    },
+    {
+      "claim": "Source identity is derived from the canonical form: sourceKey builds `normalizeRepoUrl(repo):branch` and parseSourceKey inverts it, so applying normalization before indexing makes a page's source identity stable across spellings and safe to de-duplicate. The demo verifies that five spellings collapse to one canonical string, that normalization is idempotent, and that sourceKey/parseSourceKey round-trip.",
+      "evidence_paths": ["MemoryKnowledge/src/engines/code/normalize.ts"]
+    },
+    {
+      "claim": "parseFrontmatter is tolerant by design — absent block, YAML parse error, and non-object documents all degrade to `{type:'other', hasFrontmatter:false}` — and it coerces a missing or non-string `type` to `'other'` on the parsed value. Consequently malformed metadata is silently normalized away unless the ingest gate inspects the raw mapping before that coercion, which is why the demo validates `type`/`title`/`description`/`sources`/`tags`/`timestamp` on the pre-coercion value and rejects (`E_TYPE_INVALID`, `E_YAML_INVALID`, `E_YAML_NOT_MAPPING`, …) instead of indexing under the placeholder type.",
+      "evidence_paths": ["MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"]
+    },
+    {
+      "claim": "buildPage is the canonical serialization contract for accepted pages: fixed field order, `type` always materialized, `locked` never written, body trimmed, delimiters re-emitted. Re-serializing accepted input through buildPage yields an idempotent fixed point that is re-validated by the demo (E_ROUNDTRIP guard), so normalized pages remain readable by the existing consumers that call parseFrontmatter (index-builder.ts, merge.ts, cascade.ts).",
+      "evidence_paths": ["MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"]
+    },
+    {
+      "claim": "The two contracts compose into the requested ingest behavior: canonicalize structure (BOM/CRLF/whitespace/field order) and canonicalize repo-like source refs using normalizeRepoUrl's semantics from normalize.ts, then validate the raw metadata and reject with a typed code before any page reaches the index. The executable demo implements this and reports 2 accepted (normalized, indexed) versus 6 rejected documents, with rejected documents asserted to be absent from the rendered index.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/code/normalize.ts",
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"
+      ]
+    }
+  ],
+  "conclusion": "The repository already contains both halves of the requested behavior, in two different engines: normalize.ts provides a total, idempotent canonicalizer plus a canonical-form-derived source key, and ingest-v2/frontmatter.ts provides a tolerant parse/canonical-build contract whose type coercion intentionally hides malformed metadata. The demo composes them into a pre-indexing gate that normalizes markdown structure and source references to canonical form and rejects malformed metadata with typed codes (E_NO_FRONTMATTER, E_YAML_INVALID, E_YAML_NOT_MAPPING, E_TYPE_INVALID, E_SOURCES_NOT_ARRAY, E_TIMESTAMP_NOT_ISO, …) before anything is indexed. Running `node .prale-eval/demo/normalize-ingest-demo.mjs` passes 25/25 assertions (exit 0): 2 documents normalized and indexed, 6 rejected and kept out of the index, normalization idempotent, and all five repo-URL spellings collapsing to one identity. normalize.ts is imported and executed for real; frontmatter.ts could not be imported because its `yaml` dependency is not installed in this checkout, so a contract-equivalent dependency-free adapter was used for the tolerant parse/build path and is labelled as such in the run output.",
+  "validation": {
+    "command": "node .prale-eval/demo/normalize-ingest-demo.mjs",
+    "status": "pass",
+    "notes": "Exit code 0; 25/25 assertions passed (accepted=2, rejected=6, failed=0). The normalized operation result is written to .prale-eval/demo/output/demo-run.json and summarized in .prale-eval/demo-deliverable.md. MemoryKnowledge/src/engines/code/normalize.ts was imported and executed directly (Node v24.14.0 TypeScript type stripping; no build or install step). LIMITATION: MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts could not be imported because its runtime dependency `yaml` is not installed (node_modules/ is absent; import fails with ERR_MODULE_NOT_FOUND: Cannot find package 'yaml'), so those cases exercise a dependency-free adapter that reproduces the module's exported contract (same FM_RE, same tolerant parseFrontmatter including type coercion to 'other', same fixed-order buildPage without `locked`). The adapter substitution is recorded in demo-run.json under `frontmatterSource`. No dependencies were installed and no package, lockfile, task metadata, or git configuration was modified; the only files added are the .prale-eval demo, deliverable, and result artifacts."
+  }
+}

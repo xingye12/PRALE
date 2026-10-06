@@ -1,7 +1,8 @@
 from dataclasses import dataclass
 
 from agent_harness.domain.context_management import ContextManagementConfig, ContextReductionReport
-from agent_harness.domain.types import OperationKind, OperationStatus
+from agent_harness.domain.operations import OperationResult as OperationResult
+from agent_harness.domain.types import OperationKind
 
 __all__ = [
     "AbortResult",
@@ -18,19 +19,6 @@ class OperationAdmission:
     operation_id: str
     kind: OperationKind
     started_at: int
-
-
-@dataclass(frozen=True, slots=True)
-class OperationResult:
-    operation_id: str
-    kind: OperationKind
-    status: OperationStatus
-    from_tip_id: str | None
-    tip_id: str | None
-    started_at: int
-    ended_at: int
-    error_code: str | None = None
-    error_message: str | None = None
 
 
 @dataclass(frozen=True, slots=True)

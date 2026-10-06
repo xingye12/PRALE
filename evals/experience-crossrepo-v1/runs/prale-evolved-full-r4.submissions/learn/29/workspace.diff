@@ -1,0 +1,461 @@
+diff --git a/.prale-eval/operation-contract-demo.mjs b/.prale-eval/operation-contract-demo.mjs
+new file mode 100644
+index 0000000..efe5b8a
+--- /dev/null
++++ b/.prale-eval/operation-contract-demo.mjs
+@@ -0,0 +1,200 @@
++// Dependency-free executable model of pi's durable operation contract:
++// durable intent -> effect -> settlement, including failed-effect handling.
++//
++// Section 1 replays the lifecycle using the exact field names and invariants
++// defined by packages/agent/src/harness/session/types.ts and enforced by
++// packages/agent/src/harness/runtime/drive/terminal.ts.
++// Section 2 statically verifies that every evidence citation in
++// .prale-eval/result.json names a real symbol inside its inclusive range in the
++// cited source file, so no claim rests on an unverified reference.
++//
++// Run: node .prale-eval/operation-contract-demo.mjs
++
++import assert from "node:assert/strict";
++import { readFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++
++const here = dirname(fileURLToPath(import.meta.url));
++const root = join(here, "..");
++
++// ---------------------------------------------------------------------------
++// Section 1: modeled operation lifecycle.
++// ---------------------------------------------------------------------------
++
++const TERMINAL_STATUSES = ["completed", "declined", "aborted", "failed"];
++
++function clock() {
++	let tick = 1;
++	return () => tick++;
++}
++
++// Mirror of runtime/drive/terminal.ts#operationResultRecord: a failed result is
++// the only result allowed to carry an error.
++function operationResultRecord(meta, status, tipId, endedAt, error) {
++	if ((status === "failed") !== (error !== undefined)) {
++		throw new Error("Only a failed operation result may carry an error");
++	}
++	return {
++		operationId: meta.operationId,
++		kind: meta.intent.kind,
++		status,
++		...(error === undefined ? {} : { error }),
++		fromTipId: meta.sourceTipId,
++		tipId,
++		startedAt: meta.startedAt,
++		endedAt,
++	};
++}
++
++// Durable intent, mirroring session/types.ts#OperationMeta.
++function admitRun(operationId, sourceTipId, promptEntryIds, startedAt) {
++	const meta = {
++		operationId,
++		lane: "main",
++		sourceTipId,
++		startedAt,
++		intent: { kind: "run", promptEntryIds },
++	};
++	const state = {
++		at: "starting",
++		control: { status: "running" },
++		settings: {},
++		latestAssistantEntryId: null,
++	};
++	// accept() commits meta + state and nothing else; the intent is durable
++	// before any effect is admitted.
++	return { meta, state, durable: { intent: meta, effect: null, settled: null } };
++}
++
++// Mirror of runtime/drive/generation.ts#publishGenerationIntent: the effect is
++// recorded (with reserved ids) before the provider call is performed.
++function publishEffectIntent(op, responseEntryId, usageId) {
++	assert.equal(op.state.at, "starting", "effect intent requires a durable starting state");
++	op.state = {
++		...op.state,
++		at: "assistant.effect_pending",
++		responseEntryId,
++		usageId,
++	};
++	op.durable.effect = { at: op.state.at, responseEntryId, usageId };
++	return op.state;
++}
++
++// Mirror of runtime/drive/boundary.ts#finishRunBoundary / lane.ts#settleOperation:
++// one terminal transaction writes the normalized record and clears operation state.
++function settle(op, status, tipId, endedAt, error) {
++	const record = operationResultRecord(op.meta, status, tipId, endedAt, error);
++	op.durable.settled = record;
++	op.state = null;
++	return record;
++}
++
++function scenarioHappyPath() {
++	const now = clock();
++	const op = admitRun("op-happy", "tip-0", ["prompt-1"], now());
++	publishEffectIntent(op, "resp-1", "usage-1");
++	assert.equal(op.durable.effect.at, "assistant.effect_pending", "effect admitted after intent");
++	return settle(op, "completed", "resp-1", now());
++}
++
++// Mirror of runtime/drive/response.ts#publishResponse error branch: retry while
++// attempts remain, otherwise a failed record carrying providerError(...).
++function scenarioFailedEffect(attemptsLeft) {
++	const now = clock();
++	const op = admitRun("op-failed", "tip-0", ["prompt-1"], now());
++	publishEffectIntent(op, "resp-1", "usage-1");
++	if (attemptsLeft > 0) {
++		op.state = { ...op.state, at: "assistant.retry_wait", nextAttempt: 2 };
++		publishEffectIntent(op, "resp-1", "usage-1");
++	}
++	return settle(op, "failed", "resp-1", now(), {
++		code: "assistant_error",
++		message: "provider request ended with error",
++	});
++}
++
++// Mirror of runtime/drive/recovery.ts#recoverAssistantGeneration: an orphaned
++// effect is settled from committed frames without another provider call.
++function scenarioRecoveredOrphan() {
++	const now = clock();
++	const op = admitRun("op-orphan", "tip-0", ["prompt-1"], now());
++	publishEffectIntent(op, "resp-1", "usage-1");
++	const recovered = { role: "assistant", stopReason: "error", errorMessage: "Assistant request was interrupted." };
++	assert.equal(recovered.stopReason, "error", "recovered orphan is an explicit error message");
++	return settle(op, "completed", "resp-1", now());
++}
++
++// Mirror of runtime/drive/reconcile.ts#reconcileOperation: cancellation
++// reconciles the admitted effect and publishes an aborted terminal record.
++function scenarioCancelledEffect() {
++	const now = clock();
++	const op = admitRun("op-cancel", "tip-0", ["prompt-1"], now());
++	publishEffectIntent(op, "resp-1", "usage-1");
++	op.state = { ...op.state, control: { status: "cancel_requested" } };
++	return settle(op, "aborted", "resp-1", now());
++}
++
++const happy = scenarioHappyPath();
++const failed = scenarioFailedEffect(1);
++const recovered = scenarioRecoveredOrphan();
++const cancelled = scenarioCancelledEffect();
++
++assert.equal(happy.status, "completed");
++assert.equal(happy.error, undefined);
++assert.equal(failed.status, "failed");
++assert.equal(failed.error.code, "assistant_error");
++assert.equal(recovered.status, "completed");
++assert.equal(recovered.error, undefined);
++assert.equal(cancelled.status, "aborted");
++assert.equal(cancelled.error, undefined);
++for (const record of [happy, failed, recovered, cancelled]) {
++	assert.ok(TERMINAL_STATUSES.includes(record.status), "status is terminal");
++	assert.equal(record.status === "failed", record.error !== undefined, "failed <=> error");
++	assert.ok(record.endedAt >= record.startedAt, "settlement is ordered after intent");
++	assert.equal(record.fromTipId, "tip-0");
++}
++assert.throws(
++	() => operationResultRecord({ operationId: "x", intent: { kind: "run" }, sourceTipId: null, startedAt: 1 }, "completed", "t", 2, { code: "x", message: "y" }),
++	/may carry an error/,
++	"non-failed record rejects an error",
++);
++
++console.log("section 1: lifecycle model passed");
++console.log(`  normalized results: ${[happy, failed, recovered, cancelled].map((r) => r.status).join(", ")}`);
++console.log(`  failed result: ${JSON.stringify(failed)}`);
++
++// ---------------------------------------------------------------------------
++// Section 2: verify every result.json evidence citation against real source.
++// ---------------------------------------------------------------------------
++
++const result = JSON.parse(readFileSync(join(here, "result.json"), "utf8"));
++assert.equal(result.task_id, 29);
++assert.equal(result.repository, "pi");
++assert.equal(result.mode, "contract");
++
++let verified = 0;
++for (const entry of result.evidence) {
++	const text = readFileSync(join(root, entry.path), "utf8");
++	const lines = text.split("\n");
++	assert.ok(
++		Number.isInteger(entry.start_line) && Number.isInteger(entry.end_line) && entry.start_line >= 1,
++		`range present for ${entry.path}#${entry.symbol}`,
++	);
++	assert.ok(entry.start_line <= entry.end_line, `ordered range for ${entry.path}#${entry.symbol}`);
++	assert.ok(entry.end_line <= lines.length, `range in bounds for ${entry.path}#${entry.symbol}`);
++	const slice = lines.slice(entry.start_line - 1, entry.end_line).join("\n");
++	assert.ok(
++		slice.includes(entry.symbol),
++		`${entry.path}:${entry.start_line}-${entry.end_line} must contain symbol ${entry.symbol}`,
++	);
++	verified += 1;
++}
++assert.ok(verified >= 1, "at least one citation");
++const requiredPath = "packages/agent/src/harness/agent-harness.ts";
++assert.ok(
++	result.evidence.some((entry) => entry.path === requiredPath),
++	`required evidence path ${requiredPath} cited`,
++);
++console.log(`section 2: ${verified} evidence citations verified against source`);
++console.log("operation contract demo passed");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..1bcf064
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,247 @@
++{
++  "task_id": 29,
++  "repository": "pi",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "packages/agent/src/harness/agent-harness.ts",
++      "symbol": "OperationAdmission",
++      "start_line": 119,
++      "end_line": 123,
++      "observation": "Public admission handle returned by AgentLane.accept(): { operationId, kind: run|compaction|navigation, startedAt }. OperationAdmissionResult boxes it (line 134) once the durable intent is committed, and deliberately carries no effect result, so admitting intent is separate from performing or settling the effect."
++    },
++    {
++      "path": "packages/agent/src/harness/agent-harness.ts",
++      "symbol": "DriveOutcome",
++      "start_line": 165,
++      "end_line": 168,
++      "observation": "drive() terminal protocol: either { kind: 'settled', outcome: OperationResultRecord } or a durable { kind: 'waiting' } for retry (notBefore) or deferred (handle). Proves one drive pass need not settle: unfinished effects resume from persisted state."
++    },
++    {
++      "path": "packages/agent/src/harness/agent-harness.ts",
++      "symbol": "HarnessEventPayload",
++      "start_line": 255,
++      "end_line": 373,
++      "observation": "Public event contract: run_end (lines 259-263), compaction_end (365-370) and navigation_end (371-373) carry a terminal status and attach OperationError only on the failed variant; run_suspend/run_resume (257-258) model deferred effects. Failed-effect handling is observable in the event stream."
++    },
++    {
++      "path": "packages/agent/src/harness/agent-harness.ts",
++      "symbol": "AgentLane",
++      "start_line": 538,
++      "end_line": 580,
++      "observation": "Per-lane operation surface: accept(request) admits durable intent (line 546), drive(options) advances it toward settlement (547), getResult(operationId) reads the persisted OperationResultRecord (545), requestAbort(operationId) drives reconciliation (548). The whole intent -> effect -> settlement contract in one interface."
++    },
++    {
++      "path": "packages/agent/src/harness/agent-harness.ts",
++      "symbol": "AgentHarness",
++      "start_line": 586,
++      "end_line": 612,
++      "observation": "Harness factory surface; AgentHarnessConstructor.create returns { harness, open: OpenOperation[] } (lines 614-619), where OpenOperation[] reports operations restored from storage. This evidences that an admitted operation's intent and in-flight effect state survive process restart."
++    },
++    {
++      "path": "packages/agent/src/harness/session/types.ts",
++      "symbol": "OperationMeta",
++      "start_line": 75,
++      "end_line": 90,
++      "observation": "Durable intent record: operationId, lane, sourceTipId, startedAt, and a discriminated intent (run promptEntryIds | compaction customInstructions | navigation target/summarize). It is persisted before any effect, so a restart can reconstruct what was intended."
++    },
++    {
++      "path": "packages/agent/src/harness/session/types.ts",
++      "symbol": "OperationResultRecord",
++      "start_line": 108,
++      "end_line": 116,
++      "observation": "Immutable settlement record written by one terminal transaction: operationId, kind derived from intent, TerminalStatus, optional error, fromTipId/tipId, startedAt/endedAt. This is the normalized operation result for every family (run/compaction/navigation)."
++    },
++    {
++      "path": "packages/agent/src/harness/session/types.ts",
++      "symbol": "TerminalStatus",
++      "start_line": 105,
++      "end_line": 105,
++      "observation": "Closed set of terminal outcomes: completed | declined | aborted | failed, including an explicit failed status for failed effects."
++    },
++    {
++      "path": "packages/agent/src/harness/session/types.ts",
++      "symbol": "AssistantEffectPendingOperation",
++      "start_line": 263,
++      "end_line": 270,
++      "observation": "Effect-pending leaf carrying reserved responseEntryId and usageId committed before the provider call. Recovery reads these reserved ids after a crash instead of re-invoking the model, so the effect boundary is durable."
++    },
++    {
++      "path": "packages/agent/src/harness/session/types.ts",
++      "symbol": "ToolCall",
++      "start_line": 157,
++      "end_line": 163,
++      "observation": "Tool call state machine: planned -> effect_pending(replay never|safe) -> outcome_ready -> completed. The replay policy recorded at effect admission decides whether an interrupted tool effect may be re-executed."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/lane.ts",
++      "symbol": "settleOperation",
++      "start_line": 388,
++      "end_line": 445,
++      "observation": "The settlement command: it writes the successor OperationState, or on a finish decision writes OperationResultRecord at operationResultValue, clears lane.currentOperationId and moves lastOperationId (lines 430-444). One commit keeps effect bookkeeping and the result consistent."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/terminal.ts",
++      "symbol": "operationResultRecord",
++      "start_line": 63,
++      "end_line": 82,
++      "observation": "Constructs the normalized settlement record and enforces the invariant (status === 'failed') === (error !== undefined) (lines 70-72); endedAt is taken at settlement and fromTipId comes from the persisted intent's sourceTipId."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/terminal.ts",
++      "symbol": "operationCleanupWrites",
++      "start_line": 26,
++      "end_line": 60,
++      "observation": "Mechanical cleanup of all operation-owned durable data: op.meta, op.state, tool arguments/memos, preparations, pending assistant frames and pending tool outputs (lines 47-55). It runs in the same terminal transaction as the result, so a settled operation leaves no partial effect state behind."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/response.ts",
++      "symbol": "publishResponse",
++      "start_line": 182,
++      "end_line": 485,
++      "observation": "Classifies one settled assistant/deferred effect result and atomically settles it: cancellation -> aborted, error -> assistant.retry_wait within policy or a failed record via providerError (300-322), context overflow -> compaction recovery (279-299), deferred -> suspended (323-345), tool calls -> tools leaf (346-364), otherwise checkpoint. This is where failed effects become failed records."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/response.ts",
++      "symbol": "publishConfigurationFailure",
++      "start_line": 106,
++      "end_line": 138,
++      "observation": "Non-retryable pre-effect configuration failure (model_unavailable / configured_tools_unavailable) settles as failed before reserving response ids, so an effect that never started leaves no orphaned effect state."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/recovery.ts",
++      "symbol": "recoverAssistantGeneration",
++      "start_line": 44,
++      "end_line": 84,
++      "observation": "Crash recovery for an assistant.effect_pending leaf: rebuilds the partial message from committed frames, synthesizes an interrupted assistant message with stopReason 'error' and a warning that the external outcome is unknown (interruptedAssistantMessage, lines 22-41), then settles it without a new provider call."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/recovery.ts",
++      "symbol": "recoverCancelledAssistantEffect",
++      "start_line": 87,
++      "end_line": 126,
++      "observation": "Cancellation path for an admitted-but-orphaned effect: synthesizes the interrupted result under the reserved responseEntryId and settles it through publishResponse, so cancellation does not drop an admitted effect."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/reconcile.ts",
++      "symbol": "reconcileOperation",
++      "start_line": 132,
++      "end_line": 173,
++      "observation": "Once durable control is cancel_requested the drive loop runs reconciliation instead of new work: effect_pending -> recoverCancelledAssistantEffect, tools -> runTools, deferred -> best-effort remote cancel (17-53) then aborted terminal (55-129), all other leaves -> publishAbortedTerminal."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/tools.ts",
++      "symbol": "publishToolIntent",
++      "start_line": 187,
++      "end_line": 227,
++      "observation": "Commits a tool call from planned to effect_pending and persists its resolved args (operationToolArgs) before invocation. The tool effect is now durable and independently recoverable."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/tools.ts",
++      "symbol": "recoverToolInvocation",
++      "start_line": 515,
++      "end_line": 540,
++      "observation": "Interrupted tool effects: replay-safe calls re-execute from the persisted checkpoint, otherwise the committed partial checkpoint becomes an interrupted tool result marked isError (interruptedOutcome, lines 158-168)."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive/generation.ts",
++      "symbol": "publishGenerationIntent",
++      "start_line": 132,
++      "end_line": 172,
++      "observation": "Commits assistant.effect_pending with freshly reserved responseEntryId and usageId, then returns; performGeneration runs the provider call afterward. Intent (including reserved effect ids) is durable before the effect."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/drive.ts",
++      "symbol": "driveOperation",
++      "start_line": 29,
++      "end_line": 106,
++      "observation": "The drive loop dispatches each durable leaf to its procedure until settled or waiting, converts AbortRequested into a reconcile pass, and rejects a procedure that makes no progress (lines 100-103). Failed effects are classified by the procedures it invokes."
++    },
++    {
++      "path": "packages/agent/src/harness/execution/effect-gate.ts",
++      "symbol": "createGate",
++      "start_line": 31,
++      "end_line": 64,
++      "observation": "Per-pass effect gate: admit() invokes an effect only while control is running and throws AbortRequested once cancellation wins admission (check, lines 40-43); close() poisons the gate. This is how failed or cancelled effects are prevented or unwound at the effect boundary."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/reducer.ts",
++      "symbol": "reduceLaneSnapshot",
++      "start_line": 22,
++      "end_line": 232,
++      "observation": "Public snapshot reducer mirrors settlement: run_end (lines 179-198) and compaction_end (199-217) build an OperationResultRecord with error only when failed, store it as snapshot.lastResult and clear snapshot.operation."
++    },
++    {
++      "path": "packages/agent/src/harness/runtime/restore.ts",
++      "symbol": "restoreLaneState",
++      "start_line": 131,
++      "end_line": 171,
++      "observation": "Restores a lane's in-flight operation from persisted op.meta + op.state and validates that the state matches the recorded intent (stateMatchesIntent, lines 25-47). Durable intent and effect state are what make an interrupted operation resumable."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "pi separates durable intent from execution: AgentLane.accept() commits OperationMeta (intent, sourceTipId, startedAt) and the initial OperationState leaf in one lane command and returns only an OperationAdmission handle, so the admitted intent is restorable before any effect runs.",
++      "evidence_paths": [
++        "packages/agent/src/harness/agent-harness.ts",
++        "packages/agent/src/harness/session/types.ts",
++        "packages/agent/src/harness/runtime/lane.ts",
++        "packages/agent/src/harness/runtime/restore.ts"
++      ]
++    },
++    {
++      "claim": "Effects are made durable before they are performed: assistant generation commits assistant.effect_pending with reserved responseEntryId/usageId and only then calls the provider, and tool calls commit effect_pending with a replay policy before invocation.",
++      "evidence_paths": [
++        "packages/agent/src/harness/session/types.ts",
++        "packages/agent/src/harness/runtime/drive/generation.ts",
++        "packages/agent/src/harness/runtime/drive/tools.ts"
++      ]
++    },
++    {
++      "claim": "Settlement is a single terminal transaction that produces an immutable OperationResultRecord (completed | declined | aborted | failed) and clears all operation-owned durable state; error is present exactly when status is failed.",
++      "evidence_paths": [
++        "packages/agent/src/harness/session/types.ts",
++        "packages/agent/src/harness/runtime/drive/terminal.ts",
++        "packages/agent/src/harness/runtime/lane.ts"
++      ]
++    },
++    {
++      "claim": "Failed effect handling is explicit and layered: pre-effect configuration failures settle as failed before ids are reserved, provider errors retry within policy or produce a failed record, overflow triggers compaction recovery, and orphaned effect_pending leaves are recovered from committed frames into an interrupted assistant message with stopReason 'error'.",
++      "evidence_paths": [
++        "packages/agent/src/harness/runtime/drive/response.ts",
++        "packages/agent/src/harness/runtime/drive/recovery.ts",
++        "packages/agent/src/harness/agent-harness.ts"
++      ]
++    },
++    {
++      "claim": "drive() distinguishes settled from waiting: retry and deferred leaves return a durable waiting outcome and are resumed later from persisted state rather than held in memory.",
++      "evidence_paths": [
++        "packages/agent/src/harness/agent-harness.ts",
++        "packages/agent/src/harness/runtime/drive.ts",
++        "packages/agent/src/harness/runtime/drive/generation.ts",
++        "packages/agent/src/harness/session/types.ts"
++      ]
++    },
++    {
++      "claim": "Cancellation does not discard admitted effects: reconcileOperation routes effect_pending to synthetic recovery, tools to runTools, deferred to best-effort remote cancel, and otherwise publishes an aborted terminal record; the effect gate turns cancellation that wins admission into AbortRequested.",
++      "evidence_paths": [
++        "packages/agent/src/harness/runtime/drive/reconcile.ts",
++        "packages/agent/src/harness/runtime/drive/recovery.ts",
++        "packages/agent/src/harness/execution/effect-gate.ts"
++      ]
++    },
++    {
++      "claim": "The public acceptance contract surfaces failed effects: run_end, compaction_end and navigation_end carry a terminal status with error only on the failed variant, and the lane snapshot reducer stores lastResult and clears the operation when such an event arrives.",
++      "evidence_paths": [
++        "packages/agent/src/harness/agent-harness.ts",
++        "packages/agent/src/harness/runtime/reducer.ts"
++      ]
++    }
++  ],
++  "conclusion": "pi models an operation as three separately durable stages. Intent: AgentLane.accept() commits OperationMeta (discriminated run/compaction/navigation intent plus sourceTipId) together with the initial OperationState leaf and returns only an OperationAdmission handle. Effect: before touching the outside world, the drive procedure commits an effect_pending leaf that reserves the identifiers and replay policy it will need (assistant responseEntryId/usageId, tool args plus replay never|safe), then the effect gate admits and runs the provider call or tool. Settlement: exactly one terminal transaction writes an immutable OperationResultRecord (operationId, kind, TerminalStatus completed|declined|aborted|failed, error only when failed, fromTipId/tipId/startedAt/endedAt) and deletes all operation-owned durable bookkeeping. Failure is a first-class settlement path: pre-effect configuration failures settle failed before reserving ids; provider errors retry within policy or become a failed record with a providerError; context overflow is converted into compaction recovery; cancellation reconciles admitted effects and publishes an aborted record; and an effect left pending by a crash is recovered from its committed frame prefix into an interrupted assistant message with stopReason 'error' rather than being replayed blindly. The contract is exercised end to end by .prale-eval/operation-contract-demo.mjs and described in .prale-eval/contract-deliverable.md.",
++  "validation": {
++    "command": "node .prale-eval/operation-contract-demo.mjs",
++    "status": "passed",
++    "notes": "The dependency-free demo replays intent -> effect -> settlement plus the failed, recovered-orphan and cancelled effect paths against the exact field names and the failed<=>error invariant from the cited sources, then statically verifies that every result.json evidence citation resolves to the named symbol inside its inclusive line range in the cited repository-relative file (25 citations, including the required packages/agent/src/harness/agent-harness.ts). Limitation: the repository's own harness suite (from packages/agent: `npm run test:harness`, i.e. vitest --run --config vitest.harness.config.ts) could not be executed because node_modules is absent and installing dependencies is out of scope, so no dynamic run of the TypeScript modules was performed; the executable model plus static citation verification are the reduced-strength substitute."
++  }
++}
+snapshot .prale-eval/operation-contract-demo.mjs - b435a97963e708a9e054683efb22d1299b35b39e7f38337963c8a24b3cb33a69
+snapshot .prale-eval/result.json - 710ffdf1178c5f5f5f53ed71c8ded2d3bde03fc0bd56a3dd9f7be885eadf2097

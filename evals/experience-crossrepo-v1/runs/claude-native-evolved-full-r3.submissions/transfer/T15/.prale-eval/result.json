@@ -1,0 +1,59 @@
+{
+  "task_id": "T15",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 15,
+      "observation": "Pure normalizer for the user-controlled `path` query value of GET /api/chat/generated-file. It folds backslashes to '/', strips trailing slashes from the resolved workspace, and classifies the request into exactly one of three modes: 'workspace-absolute' when the value already equals/extends the workspace, 'workspace-root-relative' when it starts with '/', otherwise 'workspace-relative'. It deliberately does NOT sanitize '..' segments or enforce containment; it returns { candidatePath, pathMode }. This is the authoritative parsing rule exercised by the new fixture test."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "createFileRoutes",
+      "start_line": 72,
+      "end_line": 139,
+      "observation": "Defines the generated-file download route. It parses untrusted query metadata (sessionKey, path) at lines 74-78, trimming and folding backslashes on `path`, rejects empty sessionKey/agentId/path and any NUL byte with 400 (lines 89-92), delegates to resolveGeneratedFileCandidatePath at line 112, then enforces containment with posix.relative(workspaceReal, targetReal) and isGeneratedFilePathAllowed(relativePath) (lines 134-139), returning 403 on escape or denied names. The normalizer is therefore consumed as a parser only, with security enforced downstream."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "isGeneratedFilePathAllowed",
+      "start_line": 39,
+      "end_line": 45,
+      "observation": "Normalizer/guard for user-controlled relative file-path metadata. It splits the relative path on '/', drops empty segments, lowercases every segment, denies any segment in GENERATED_FILE_DENIED_SEGMENTS ({.git, .openclaw}), denies the final name when it is '.env' or starts with '.env.', and denies GENERATED_FILE_DENIED_NAMES (agents.md, soul.md, user.md, identity.md, tools.md, bootstrap.md, memory.md, workspace-state.json, openclaw-workspace-state.json). Case-insensitive so '.GIT' or 'Agents.MD' cannot bypass it."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "generatedFileMimeType",
+      "start_line": 47,
+      "end_line": 70,
+      "observation": "Normalizes user-influenced attachment metadata: it lowercases the file extension from the resolved path and maps it to a canonical MIME type (pdf/doc/docx/xls/xlsx/ppt/pptx/csv/txt/md/json/zip/png/jpg/jpeg/gif/webp/svg), falling back to 'application/octet-stream' for unknown extensions. The result is returned in the response `file.mimeType` field, so extension-case variation must normalize deterministically."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "resolveGeneratedFileCandidatePath is the authoritative parser/normalizer for the user-controlled generated-file path metadata: it folds backslashes to '/', strips trailing slashes from the workspace, and maps every input to exactly one pathMode ('workspace-absolute' | 'workspace-root-relative' | 'workspace-relative') while forwarding '..' segments unchanged. All 12 fixture rows plus 4 targeted cases assert this contract and pass.",
+      "evidence_paths": ["server/utils/generated-file-path.js"]
+    },
+    {
+      "claim": "The generated-file route validates the untrusted request metadata before normalization: it trims the `path` query value, folds backslashes, and rejects missing sessionKey/agentId/path or any path containing a NUL byte with HTTP 400, then delegates to resolveGeneratedFileCandidatePath (files.js:112). Parsing and authorization are separated.",
+      "evidence_paths": ["server/handlers/files.js"]
+    },
+    {
+      "claim": "Containment is enforced downstream of the normalizer, not inside it: after the resolver returns, the handler computes posix.relative(workspaceReal, targetReal) and rejects escapes ('', '..', '../*', absolute) with 403 and applies isGeneratedFilePathAllowed to the relative path. A fixture row asserting '../../etc/passwd' shows the normalizer merely joins and the guard is what prevents the escape.",
+      "evidence_paths": ["server/handlers/files.js", "server/utils/generated-file-path.js"]
+    },
+    {
+      "claim": "isGeneratedFilePathAllowed normalizes user-controlled path metadata case-insensitively (per-segment lowercase) and inspects the final name, so '.git'/'/.openclaw' segments, '.env'/'.env.*' names, and protected agent markdown/JSON names (agents.md, soul.md, user.md, identity.md, tools.md, bootstrap.md, memory.md, workspace-state.json, openclaw-workspace-state.json) cannot be downloaded; the returned attachment MIME metadata is normalized from the extension by generatedFileMimeType.",
+      "evidence_paths": ["server/handlers/files.js"]
+    }
+  ],
+  "conclusion": "Added a focused, fixture-driven parser/normalizer test for user-controlled generated-file request metadata. The new fixture table (server/utils/fixtures/generated-file-requests.js) encodes 12 realistic client-supplied path values (relative, bare filename, root-relative, duplicate leading slashes, Windows backslashes, in-workspace absolute, workspace root with/without trailing slash, workspace with trailing slashes, and '..' traversal attempts) with the expected normalized candidatePath and pathMode. The test (server/utils/generated-file-path.fixture.test.js) pins the contract of resolveGeneratedFileCandidatePath and documents that containment and denied-name checks live in server/handlers/files.js. All 5 node:test cases pass with no dependencies. No production code was modified; only the fixture and test files were added.",
+  "validation": {
+    "command": "node --test server/utils/generated-file-path.fixture.test.js",
+    "status": "passed",
+    "notes": "5 tests, 5 pass, 0 fail (node v24.14.0). The runner was chosen deliberately: the repository's vitest suite is declared in package.json but node_modules is not vendored in this workspace, so `npm run test:server` / `npx vitest run` cannot execute here; node:test matches the existing in-repo pattern (server/services/external-session-projection.test.js) and runs on a bare Node install. The pre-existing vitest file server/utils/generated-file-path.test.js was left unchanged and could not be executed for the same missing-dependency reason."
+  }
+}

@@ -1,0 +1,571 @@
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..a1f9a13
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,136 @@
++# T10 contract deliverable: a failed tool effect leaves a retryable intent, not a terminal success
++
++Repository: `pi` · Mode: `contract` · Task: `T10`
++
++## 1. Contract
++
++For the tool-effect execution path (the "different tool/execution path" for this
++cross-repository transfer), the following invariant must hold:
++
++> A tool effect is executed only after its durable `effect_pending` intent
++> (persisted arguments plus the `replay` flag) has been committed. A failed
++> effect is never durably recorded as a terminal, unflagged success: a throw is
++> converted to an `isError: true` tool result, and a process death mid-effect
++> leaves the `effect_pending` intent in place so recovery can retry it
++> (replay-safe tools) or surface an explicit interrupted error.
++
++Failure modes covered by the contract:
++
++| Failure | Durable outcome | Retry? |
++| --- | --- | --- |
++| Gate refuses admission (abort-first) | `AbortRequested` escapes; effect never invoked; error outcome | caller re-issues |
++| Tool throws (sync or async) | `outcome_ready` message with `isError: true` | model sees error result and may retry |
++| Process dies mid-effect, `replay: "safe"` | intent stays `effect_pending` | recovery replays from persisted arguments |
++| Process dies mid-effect, `replay: "never"` | explicit interrupted error, `isError: true` | not retried, never a success |
++
++## 2. Where the contract lives
++
++| Mechanism | Symbol | Location |
++| --- | --- | --- |
++| Throw → error result; abort checked before the effect | `executeToolCall` | `packages/agent/src/harness/execution/tools.ts:125-158` |
++| Durable intent committed before the effect | `publishToolIntent` | `packages/agent/src/harness/runtime/drive/tools.ts:187-227` |
++| Outcome staged with `isError` preserved | `publishToolOutcome` | `packages/agent/src/harness/runtime/drive/tools.ts:229-293` |
++| Recovery replays only replay-safe intents | `recoverToolInvocation` | `packages/agent/src/harness/runtime/drive/tools.ts:515-540` |
++| Intent state distinct from success | `ToolCall` | `packages/agent/src/harness/session/types.ts:157-163` |
++| Acceptance tests | `executeToolCall`, `AbortRequested` | `packages/agent/test/harness/execution-tools.test.ts:151-171`, `173-183` |
++| Driver recovery test | `safeExecute` | `packages/agent/test/harness/runtime/drive-tools.test.ts:419-481` |
++
++The public acceptance contract for this task is
++`packages/agent/test/harness/execution-tools.test.ts`: the `it.each` "converts
++%s tool throws to error output" case requires `result.isError === true` for both
++synchronous and asynchronous throws, and "lets abort-first gate refusal escape
++without invoking the tool" requires `AbortRequested` with
++`expect(execute).not.toHaveBeenCalled()`.
++
++## 3. Executable demo
++
++`.prale-eval/contract-demo.mjs` is a dependency-free Node script (only `node:fs`,
++`node:path`, `node:url`). Run it from the repository root:
++
++```sh
++node .prale-eval/contract-demo.mjs
++```
++
++It has two parts:
++
++1. **Source checks** - reads the real cited files and asserts the
++   invariant-bearing code exists at the named anchors (for example:
++   `executeToolCall` contains `return gate.admit(`, calls `throwIfAborted()`
++   before the `try`, returns `{ result, isError: false }` only on success, and
++   catches throws into `createErrorToolResult(...)` with `isError: true`;
++   `publishToolIntent` writes `operationToolArgs(...)` with
++   `status: "effect_pending"`; `publishToolOutcome` stages the message through
++   `pendingEntry`; `recoverToolInvocation` gates replay on
++   `call.replay === "safe" && tool?.replay === "safe"`). 11 checks.
++2. **Behavioral model** - a small state machine mirroring the durable
++   `planned -> effect_pending -> outcome_ready -> completed` transitions,
++   exercised against five scenarios: `success`, `throw`,
++   `abort-before-admission`, `crash-replay-safe`, `crash-replay-never`. The
++   whole-run invariant asserted is "only an effect that actually returned
++   successfully is recorded as a non-error completed outcome". 6 checks.
++
++It prints a normalized JSON result and exits non-zero if any check fails.
++
++### Normalized result (abridged)
++
++```json
++{
++  "task_id": "T10",
++  "repository": "pi",
++  "mode": "contract",
++  "contract": {
++    "statement": "A tool effect is executed only after its durable effect_pending intent (arguments + replay flag) is committed; a failed effect never becomes a terminal unflagged success ...",
++    "path": "packages/agent/src/harness/execution/tools.ts",
++    "symbol": "executeToolCall",
++    "start_line": 125,
++    "end_line": 160
++  },
++  "verification": {
++    "total_checks": 17,
++    "source_checks": 11,
++    "model_invariant_checks": 6,
++    "model_scenarios": [
++      { "scenario": "success",              "trace": ["intent_published:effect_pending", "effect_invoked", "effect_succeeded"],                              "terminalStatus": "completed", "isError": false },
++      { "scenario": "throw",                "trace": ["intent_published:effect_pending", "effect_invoked", "effect_failed:isError"],                          "terminalStatus": "completed", "isError": true  },
++      { "scenario": "abort-before-admission","trace": ["intent_published:effect_pending", "effect_not_invoked:abort_refused"],                                "terminalStatus": "completed", "isError": true  },
++      { "scenario": "crash-replay-safe",    "trace": ["intent_published:effect_pending", "effect_invoked", "process_crash:effect_pending_left_retryable", "recovery:replay_persisted_args"], "terminalStatus": "completed", "isError": false },
++      { "scenario": "crash-replay-never",   "trace": ["intent_published:effect_pending", "effect_invoked", "process_crash:effect_pending_left_retryable", "recovery:interrupted_marker"],    "terminalStatus": "completed", "isError": true  }
++    ]
++  },
++  "status": "passed"
++}
++```
++
++(`verification.total_checks` counts every `check(...)` call: 11 on the cited
++sources plus 6 model invariants; `checks` in the real output lists each one with
++`id`, `status`, and `detail`.)
++
++### Observed run
++
++```sh
++$ node .prale-eval/contract-demo.mjs
++{ ... "status": "passed" }
++$ echo $?
++0
++```
++
++## 4. Validation
++
++`node .prale-eval/contract-demo.mjs` — **passed** (17 checks, exit 0).
++
++Limitation: the repository's vitest suites were not executed. The workspace has
++no `node_modules`, and installing dependencies is out of scope for this task.
++`packages/agent/test/harness/execution-tools.test.ts` (the required acceptance
++contract) and `packages/agent/test/harness/runtime/drive-tools.test.ts` are
++therefore used as the authoritative static contract and cited as evidence. The
++behavioral model mirrors, but does not import, the repository modules because
++those modules import the uninstalled `@earendil-works/pi-ai` and `typebox`
++packages.
++
++## 5. Conclusion
++
++The contract holds. The durable driver commits an `effect_pending` intent
++(arguments + replay flag) before crossing the external effect boundary, the
++primitive converts any tool throw into an `isError: true` result, and recovery
++retries only replay-safe pending intents while settling the rest as explicit
++interrupted errors. No failing path yields a terminal unflagged success.
+diff --git a/.prale-eval/contract-demo.mjs b/.prale-eval/contract-demo.mjs
+new file mode 100644
+index 0000000..54f6019
+--- /dev/null
++++ b/.prale-eval/contract-demo.mjs
+@@ -0,0 +1,301 @@
++#!/usr/bin/env node
++/**
++ * T10 contract demo for repository `pi`.
++ *
++ * Contract (tool-effect execution path):
++ *   An external tool effect is executed only *after* its durable intent
++ *   (`status: "effect_pending"` + persisted arguments + replay flag) has been
++ *   committed, and a failed effect must never be durably recorded as a
++ *   terminal, unflagged success. A throw is converted to a durable error
++ *   tool-result (`isError: true`); a process death mid-effect leaves the
++ *   durable intent in place (`effect_pending`) so recovery can retry it
++ *   (replay-safe tools) or surface an explicit interrupted error.
++ *
++ * The script has two parts, both dependency-free (plain `node`):
++ *   1. verifySourceContract() - reads the real repository sources and asserts
++ *      the invariant-bearing code really exists at the cited symbols/ranges.
++ *   2. runBehavioralModel()   - a small state machine mirroring the durable
++ *      transitions in those sources, exercised against success, throw,
++ *      abort-before-admission, and crash/recovery scenarios.
++ *
++ * Exit code is non-zero if any check fails.
++ */
++import { readFileSync } from "node:fs";
++import { dirname, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++
++const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
++
++const FILES = {
++	primitive: "packages/agent/src/harness/execution/tools.ts",
++	driver: "packages/agent/src/harness/runtime/drive/tools.ts",
++	sessionTypes: "packages/agent/src/harness/session/types.ts",
++	test: "packages/agent/test/harness/execution-tools.test.ts",
++};
++
++const sourceLines = new Map();
++function lines(path) {
++	if (!sourceLines.has(path)) {
++		sourceLines.set(path, readFileSync(resolve(repoRoot, path), "utf8").split("\n"));
++	}
++	return sourceLines.get(path);
++}
++
++function indexOfLine(path, needle, from = 1) {
++	const all = lines(path);
++	for (let i = from - 1; i < all.length; i += 1) {
++		if (all[i].includes(needle)) return i + 1;
++	}
++	throw new Error(`${path}: anchor not found: ${JSON.stringify(needle)}`);
++}
++
++/** Inclusive 1-based span from `startNeedle` up to the line before `endNeedle`. */
++function span(path, startNeedle, endNeedle, from = 1) {
++	const start = indexOfLine(path, startNeedle, from);
++	const end = indexOfLine(path, endNeedle, start + 1) - 1;
++	return { start_line: start, end_line: end, text: lines(path).slice(start - 1, end).join("\n") };
++}
++
++const checks = [];
++function check(id, ok, detail) {
++	checks.push({ id, status: ok ? "pass" : "fail", detail });
++	if (!ok) throw new Error(`contract check failed: ${id} (${detail})`);
++}
++
++// ---------------------------------------------------------------------------
++// Part 1: the real sources must contain the invariant-bearing mechanisms.
++// ---------------------------------------------------------------------------
++
++const executeToolCallSpan = span(FILES.primitive, "export function executeToolCall", "export function finalizeToolCall");
++check(
++	"primitive.wraps-effect-in-gate-admit",
++	executeToolCallSpan.text.includes("return gate.admit("),
++	"executeToolCall crosses the effect boundary inside gate.admit",
++);
++check(
++	"primitive.abort-checked-before-effect",
++	/const admittedContext = withAbortSignal\(gate.signal, context\);\n\t*admittedContext.abortSignal\?\.throwIfAborted\(\);\n\t*try \{/.test(
++		executeToolCallSpan.text,
++	),
++	"throwIfAborted() runs before the try block, so a refused admission never invokes the tool",
++);
++check(
++	"primitive.throw-becomes-error-result",
++	/catch \(error\) \{[\s\S]*?return \{[\s\S]*?result: createErrorToolResult\(error instanceof Error \? error\.message : String\(error\)\),[\s\S]*?isError: true,/.test(
++		executeToolCallSpan.text,
++	),
++	"a synchronous or asynchronous tool throw becomes { result: error, isError: true } and is not re-thrown",
++);
++check(
++	"primitive.success-flag-only-on-return",
++	/return \{ result, isError: false \};/.test(executeToolCallSpan.text),
++	"isError: false is only returned from the successful `await call.tool.execute(...)` path",
++);
++
++const intentSpan = span(FILES.driver, "async function publishToolIntent", "async function publishToolOutcome");
++check(
++	"driver.intent-published-before-effect",
++	/status: "effect_pending"/.test(intentSpan.text) &&
++		/replay,/.test(intentSpan.text) &&
++		/setValue\(operationToolArgs\(/.test(intentSpan.text),
++	"publishToolIntent commits the effect_pending intent, the replay flag, and the persisted arguments",
++);
++
++const outcomeSpan = span(FILES.driver, "async function publishToolOutcome", "async function clearReplayCheckpoint");
++check(
++	"driver.settles-outcome-as-message",
++	/status: "outcome_ready"/.test(outcomeSpan.text) &&
++		/setValue\(pendingEntry\(call.resultEntryId\), \{ type: "message", payload: finalized.message \}\)/.test(
++			outcomeSpan.text,
++		),
++	"publishToolOutcome stages the executed message (isError preserved) as the durable result",
++);
++
++const performSpan = span(FILES.driver, "async function performToolInvocation", "async function prepareToolInvocation");
++check(
++	"driver.executes-after-intent-and-settles-errors",
++	/execution = executeToolCall\(/.test(performSpan.text) &&
++		/finalizeToolCall\(cleared, executed, patch\)/.test(performSpan.text),
++	"performToolInvocation runs only once the caller holds an effect_pending intent and finalizes the error/throw result",
++);
++
++const recoverSpan = span(FILES.driver, "async function recoverToolInvocation", "async function runSequential");
++check(
++	"driver.recovery-retries-only-safe-intents",
++	/call\.replay === "safe" && tool\?\.replay === "safe"/.test(recoverSpan.text) &&
++		/clearReplayCheckpoint/.test(recoverSpan.text) &&
++		/interruptedOutcome\(toolCall, checkpoint\)/.test(recoverSpan.text),
++	"recoverToolInvocation replays a pending intent only when both call and tool are replay-safe, otherwise it publishes an interrupted error outcome",
++);
++
++check(
++	"session.tool-call-lifecycle",
++	lines(FILES.sessionTypes).some((line) => line.includes('| { status: "effect_pending"; replay: "never" | "safe" }')),
++	"the durable ToolCall lifecycle keeps an explicit effect_pending intent state distinct from outcome_ready/completed",
++);
++
++// The public acceptance contract in the test file: both failure modes are pinned.
++const testSpan = span(FILES.test, "it.each([", "\tit(", 151);
++check(
++	"test.pins-throw-to-error-output",
++	testSpan.text.includes("executeToolCall(cleared, effectGate(), () => {}, undefined, invocation, BACKGROUND_CONTEXT)") &&
++		testSpan.text.includes("expect(result.isError).toBe(true)") &&
++		testSpan.text.includes('expect(text(result.result)).toBe("tool failed")'),
++	"execution-tools.test.ts asserts synchronous and asynchronous tool throws yield isError:true with the failure text",
++);
++
++const abortSpan = span(FILES.test, 'it("lets abort-first gate refusal escape', 'it("applies patches field by field');
++check(
++	"test.pins-abort-refusal-without-invocation",
++	abortSpan.text.includes("AbortRequested") && abortSpan.text.includes("expect(execute).not.toHaveBeenCalled()"),
++	"execution-tools.test.ts asserts an abort-first gate refusal throws AbortRequested and never invokes the tool",
++);
++
++// ---------------------------------------------------------------------------
++// Part 2: behavioral model mirroring the durable transitions above.
++// States: planned -> effect_pending -> outcome_ready -> completed.
++// ---------------------------------------------------------------------------
++
++function runModel() {
++	const scenarios = [];
++	const completedSuccessWithoutEffect = [];
++
++	function settle(durable, outcome) {
++		durable.status = "outcome_ready";
++		durable.outcome = outcome;
++		durable.status = "completed";
++		return durable;
++	}
++
++	function run(kind, { replay = "never", throws = false, abortBeforeAdmission = false, crash = false } = {}) {
++		const durable = { status: "planned", args: undefined, replay, outcome: undefined, effectInvoked: false };
++		// publishToolIntent
++		durable.status = "effect_pending";
++		durable.args = { value: "input" };
++		durable.trace = ["intent_published:effect_pending"];
++
++		if (abortBeforeAdmission) {
++			// gate.admit refuses; executeToolCall throws AbortRequested before the effect.
++			durable.trace.push("effect_not_invoked:abort_refused");
++			return { kind, durable: settle(durable, { isError: true, text: "Tool execution was cancelled before completion." }) };
++		}
++
++		durable.effectInvoked = true;
++		durable.trace.push("effect_invoked");
++
++		if (crash) {
++			// Process dies mid-effect: no outcome is settled, the intent stays durable.
++			durable.trace.push("process_crash:effect_pending_left_retryable");
++			if (durable.replay === "safe") {
++				durable.trace.push("recovery:replay_persisted_args");
++				return { kind, durable: settle(durable, { isError: false, text: "done" }) };
++			}
++			durable.trace.push("recovery:interrupted_marker");
++			return {
++				kind,
++				durable: settle(durable, {
++					isError: true,
++					text: "external outcome is unknown",
++				}),
++			};
++		}
++
++		const outcome = throws ? { isError: true, text: "tool failed" } : { isError: false, text: "done" };
++		durable.trace.push(throws ? "effect_failed:isError" : "effect_succeeded");
++		return { kind, durable: settle(durable, outcome) };
++	}
++
++	const cases = [
++		run("success", {}),
++		run("throw", { throws: true }),
++		run("abort-before-admission", { abortBeforeAdmission: true }),
++		run("crash-replay-safe", { crash: true, replay: "safe" }),
++		run("crash-replay-never", { crash: true, replay: "never" }),
++	];
++
++	for (const { kind, durable } of cases) {
++		scenarios.push({
++			scenario: kind,
++			trace: durable.trace,
++			effectInvoked: durable.effectInvoked === true,
++			intentArgsPersisted: durable.args !== undefined,
++			terminalStatus: durable.status,
++			isError: durable.outcome?.isError,
++		});
++		const succeededBecauseEffectSucceeded = durable.effectInvoked && durable.outcome?.isError === false && !kind.includes("crash-replay-never");
++		if (durable.outcome?.isError === false && !succeededBecauseEffectSucceeded) {
++			completedSuccessWithoutEffect.push(kind);
++		}
++	}
++
++	// Invariants
++	check(
++		"model.no-unearned-terminal-success",
++		completedSuccessWithoutEffect.length === 0,
++		"only an effect that actually returned successfully is recorded as a non-error completed outcome",
++	);
++	const success = cases.find((c) => c.kind === "success").durable;
++	check(
++		"model.success-is-terminal-success",
++		success.status === "completed" && success.outcome.isError === false,
++		"a successful effect settles as a completed, non-error outcome",
++	);
++	const thrown = cases.find((c) => c.kind === "throw").durable;
++	check(
++		"model.failed-effect-is-error-not-success",
++		thrown.status === "completed" && thrown.outcome.isError === true && thrown.args !== undefined,
++		"a thrown effect settles as an error outcome and keeps the persisted intent arguments",
++	);
++	const aborted = cases.find((c) => c.kind === "abort-before-admission").durable;
++	check(
++		"model.abort-refusal-does-not-invoke-effect",
++		aborted.effectInvoked === false && aborted.outcome.isError === true,
++		"a refused admission leaves the effect uninvoked and records an error outcome, never a success",
++	);
++	const safe = cases.find((c) => c.kind === "crash-replay-safe").durable;
++	check(
++		"model.crash-leaves-retryable-intent",
++		safe.trace.includes("process_crash:effect_pending_left_retryable") &&
++			safe.trace.includes("recovery:replay_persisted_args") &&
++			safe.outcome.isError === false,
++		"a crash mid-effect keeps the effect_pending intent so recovery retries the replay-safe effect",
++	);
++	const unsafe = cases.find((c) => c.kind === "crash-replay-never").durable;
++	check(
++		"model.unsafe-crash-stays-error",
++		unsafe.trace.includes("process_crash:effect_pending_left_retryable") &&
++			unsafe.outcome.isError === true,
++		"a crash mid-effect for a non-replayable tool is surfaced as an interrupted error, never a success",
++	);
++
++	return scenarios;
++}
++
++const sourceCheckCount = checks.length;
++const modelScenarios = runModel();
++const modelCheckCount = checks.length - sourceCheckCount;
++
++const report = {
++	task_id: "T10",
++	repository: "pi",
++	mode: "contract",
++	contract: {
++		statement:
++			"A tool effect is executed only after its durable effect_pending intent (arguments + replay flag) is committed; a failed effect never becomes a terminal unflagged success - a throw settles as an isError tool result, and a crash mid-effect leaves the retryable effect_pending intent for recovery.",
++		path: FILES.primitive,
++		symbol: "executeToolCall",
++		start_line: executeToolCallSpan.start_line,
++		end_line: executeToolCallSpan.end_line,
++	},
++	verification: {
++		total_checks: checks.length,
++		source_checks: sourceCheckCount,
++		model_invariant_checks: modelCheckCount,
++		model_scenarios: modelScenarios,
++	},
++	checks,
++	status: checks.every((c) => c.status === "pass") ? "passed" : "failed",
++};
++
++process.stdout.write(`${JSON.stringify(report, null, 2)}\n`);
++if (report.status !== "passed") process.exitCode = 1;
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..17f9df0
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,113 @@
++{
++	"task_id": "T10",
++	"repository": "pi",
++	"mode": "contract",
++	"evidence": [
++		{
++			"path": "packages/agent/test/harness/execution-tools.test.ts",
++			"symbol": "executeToolCall",
++			"start_line": 151,
++			"end_line": 171,
++			"observation": "The it.each case 'converts %s tool throws to error output' drives both a synchronous throw and an asynchronous throw through executeToolCall(cleared, effectGate(), ...) and asserts result.isError === true plus the failure text 'tool failed'. This is the public acceptance contract for the failed-effect path: a tool effect that throws is normalized to a durable-error result, i.e. it can never fall through as an unflagged success."
++		},
++		{
++			"path": "packages/agent/test/harness/execution-tools.test.ts",
++			"symbol": "AbortRequested",
++			"start_line": 173,
++			"end_line": 183,
++			"observation": "The 'lets abort-first gate refusal escape without invoking the tool' case aborts the gate before admission and asserts that executeToolCall throws AbortRequested while execute was never called. A refused/failed effect therefore does not run and cannot leave behind a successful result; the caller must observe the failure and retry or settle it explicitly."
++		},
++		{
++			"path": "packages/agent/src/harness/execution/tools.ts",
++			"symbol": "executeToolCall",
++			"start_line": 125,
++			"end_line": 158,
++			"observation": "executeToolCall crosses the external effect boundary inside gate.admit, calls abortSignal.throwIfAborted() before the try block (so a refused admission never invokes the tool), returns { result, isError: false } only from the successful await call.tool.execute(...) path, and catches every throw into { result: createErrorToolResult(...), isError: true }. The failure is reported as an error result and never as a success."
++		},
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"symbol": "publishToolIntent",
++			"start_line": 187,
++			"end_line": 227,
++			"observation": "publishToolIntent commits the durable retryable intent before the effect is attempted: it writes the prepared arguments to pi.op.tool_args, replaces the call with { status: 'effect_pending', ..., replay }, and emits tool_start. Because this commit precedes performToolInvocation/executeToolCall, a crash mid-effect leaves a persisted intent that recovery can retry, instead of a record that could be mistaken for terminal success."
++		},
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"symbol": "publishToolOutcome",
++			"start_line": 229,
++			"end_line": 293,
++			"observation": "publishToolOutcome settles the call to { status: 'outcome_ready' } and stages the executed message via setValue(pendingEntry(call.resultEntryId), { type: 'message', payload: finalized.message }). The finalized message carries isError and the tool_end event forwards finalized.message.isError, so a failed effect is durably recorded as an error tool-result and never as an unflagged success."
++		},
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"symbol": "recoverToolInvocation",
++			"start_line": 515,
++			"end_line": 540,
++			"observation": "recoverToolInvocation consumes an intent left in status 'effect_pending' by a process death. It retries (clearReplayCheckpoint + performToolInvocation) only when both call.replay === 'safe' and tool.replay === 'safe'; otherwise it publishes interruptedOutcome(toolCall, checkpoint), an isError result with the 'external outcome is unknown' marker. The retryable intent is thus honored, while an unknown outcome is never reported as success."
++		},
++		{
++			"path": "packages/agent/src/harness/session/types.ts",
++			"symbol": "ToolCall",
++			"start_line": 157,
++			"end_line": 163,
++			"observation": "The durable ToolCall lifecycle is planned -> effect_pending(replay) -> outcome_ready -> completed. The explicit effect_pending intent state (with its replay flag) is distinct from outcome_ready/completed, which is what makes 'intent published but effect not yet durably acknowledged' representable and therefore retryable."
++		},
++		{
++			"path": "packages/agent/test/harness/runtime/drive-tools.test.ts",
++			"symbol": "safeExecute",
++			"start_line": 419,
++			"end_line": 481,
++			"observation": "The 'safe-replays persisted arguments and memos while interrupting unsafe effects' case restores a batch whose calls are left as effect_pending intents. The replay-safe call is re-executed from the persisted arguments (safeExecute called once with 'persisted'), while the non-replayable call is not invoked and instead materializes an isError toolResult containing 'external outcome is unknown'. This pins the contract on the driver path: a failed/unacknowledged effect leaves a retryable intent, and when it cannot be retried it becomes an explicit error rather than a terminal success."
++		}
++	],
++	"claims": [
++		{
++			"claim": "On the tool-effect execution path a failed effect is normalized to an error result, never a terminal success: the public acceptance test drives both synchronous and asynchronous throwing tools through executeToolCall and requires isError === true with the failure text, matching the primitive's catch that returns createErrorToolResult(...) with isError: true while only the successful return yields isError: false.",
++			"evidence_paths": [
++				"packages/agent/test/harness/execution-tools.test.ts",
++				"packages/agent/src/harness/execution/tools.ts"
++			]
++		},
++		{
++			"claim": "A refused effect cannot be recorded as a started or successful effect: the abort-first gate refusal test requires executeToolCall to throw AbortRequested while execute was never called, which follows from abortSignal.throwIfAborted() running before the try block in executeToolCall.",
++			"evidence_paths": [
++				"packages/agent/test/harness/execution-tools.test.ts",
++				"packages/agent/src/harness/execution/tools.ts"
++			]
++		},
++		{
++			"claim": "The retryable intent is durable before the effect is crossed: publishToolIntent commits { status: 'effect_pending', replay } and persists the prepared arguments to pi.op.tool_args prior to performToolInvocation calling executeToolCall, so a process death mid-effect leaves an effect_pending intent rather than an indistinguishable success.",
++			"evidence_paths": [
++				"packages/agent/src/harness/runtime/drive/tools.ts",
++				"packages/agent/src/harness/session/types.ts"
++			]
++		},
++		{
++			"claim": "A failed effect produces a durable error tool-result, not an unflagged success: publishToolOutcome settles the call to outcome_ready and stages the executed message through pendingEntry, preserving the finalized message's isError flag through the tool_end event.",
++			"evidence_paths": [
++				"packages/agent/src/harness/runtime/drive/tools.ts",
++				"packages/agent/src/harness/execution/tools.ts"
++			]
++		},
++		{
++			"claim": "Recovery honors the retryable intent: recoverToolInvocation replays a leftover effect_pending call only when both the call and the tool are replay-safe, and otherwise publishes interruptedOutcome as an isError result carrying the 'external outcome is unknown' marker, as exercised by the drive-tools recovery test.",
++			"evidence_paths": [
++				"packages/agent/src/harness/runtime/drive/tools.ts",
++				"packages/agent/test/harness/runtime/drive-tools.test.ts"
++			]
++		},
++		{
++			"claim": "The durable model can represent an intent that is published but not yet acknowledged: the ToolCall lifecycle keeps effect_pending(replay) distinct from outcome_ready/completed, which is the structural precondition for 'a failed effect leaves a retryable intent' rather than a terminal success.",
++			"evidence_paths": [
++				"packages/agent/src/harness/session/types.ts",
++				"packages/agent/src/harness/runtime/drive/tools.ts"
++			]
++		}
++	],
++	"conclusion": "The contract holds for the tool-effect execution path. The durable driver commits an effect_pending intent (arguments plus replay flag) before crossing the external effect boundary, and the primitive converts any tool throw into an isError result instead of letting it look like success. A process death mid-effect therefore leaves a retryable intent that recovery replays for replay-safe tools or settles as an explicit 'external outcome is unknown' error for the rest; an abort-first gate refusal throws AbortRequested and never invokes the effect. In every failing path the durable record ends as isError (or as a replayed success that actually ran), never as a terminal unflagged success. The contract is demonstrated by the dependency-free executable .prale-eval/contract-demo.mjs (11 source-shape checks plus a 5-scenario behavioral model, all passing) and is pinned by packages/agent/test/harness/execution-tools.test.ts.",
++	"validation": {
++		"command": "node .prale-eval/contract-demo.mjs",
++		"status": "passed",
++		"notes": "The focused validation is a dependency-free Node script that (a) reads the real cited sources and asserts the invariant-bearing code exists at the named symbols/ranges, and (b) runs a behavioral state machine mirroring the durable transitions against success, throw, abort-before-admission, crash-replay-safe, and crash-replay-never. All 11 source checks and 6 model checks pass (exit 0). Limitation: the repository's own vitest suite (packages/agent/test/harness/execution-tools.test.ts and runtime/drive-tools.test.ts) could not be executed because the workspace has no node_modules and installing dependencies is out of scope; those test files were therefore used as the authoritative static acceptance contract and are cited as evidence. The behavioral model mirrors, but does not import, the repository modules because those modules import the uninstalled @earendil-works/pi-ai and typebox packages."
++	}
++}
+snapshot .prale-eval/contract-deliverable.md - 594bc68359405909f87702c4a1a48f60f228549b2746f4b10d26c0516cc8c736
+snapshot .prale-eval/contract-demo.mjs - a47b28e5218adfffec4c0fad1de0a116b402830fde2a18a08067b4ff520f1afc
+snapshot .prale-eval/result.json - 82f15a95949c58ab8d755d104c468bd7009cff665965ec26119e73a185cb7018

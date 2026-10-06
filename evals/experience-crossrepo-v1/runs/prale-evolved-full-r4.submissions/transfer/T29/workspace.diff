@@ -1,0 +1,451 @@
+diff --git a/.prale-eval/demo-deliverable.md b/.prale-eval/demo-deliverable.md
+new file mode 100644
+index 0000000..5537ff8
+--- /dev/null
++++ b/.prale-eval/demo-deliverable.md
+@@ -0,0 +1,104 @@
++# T29 demo — project extension trust gate
++
++**Repository:** `pi` (`packages/coding-agent`)
++**Mode:** demo
++**Deliverable:** `.prale-eval/result.json`, this document, and the executable demo
++`.prale-eval/demo/project-trust-bootstrap.test.ts`.
++
++## What is being demonstrated
++
++A *fresh* project extension fixture (a `.pi/extensions/project.ts` created on the fly)
++is **unavailable during the bootstrap pass** and becomes **available only after an
++explicit trusted decision**.
++
++The demo drives the production loader rather than re-implementing it:
++
++- `DefaultResourceLoader.reload({ resolveProjectTrust })`
++  (`packages/coding-agent/src/core/resource-loader.ts:443`)
++- → `DefaultResourceLoader.loadProjectTrustExtensions()` (`:435`), the bootstrap pass
++- → `resolveProjectTrust` callback (`ResourceLoaderReloadOptions`, `:36`)
++- → `DefaultResourceLoader.loadFinalExtensionSet()` (`:639`)
++
++## Contract
++
++`ResourceLoaderReloadOptions.resolveProjectTrust` is the explicit-decision seam:
++
++```ts
++export interface ResourceLoaderReloadOptions {
++	resolveProjectTrust?: (input: { extensionsResult: LoadExtensionsResult }) => Promise<boolean>;
++}
++```
++
++`reload` implements the gate:
++
++1. **Bootstrap (untrusted).** When `resolveProjectTrust` is supplied,
++   `loadProjectTrustExtensions()` calls `settingsManager.setProjectTrusted(false)` and
++   reloads settings, then loads the current extension set. Project-local extensions are
++   filtered out of that result by the untrusted settings scope; user/global and temporary
++   CLI extensions still load.
++2. **Explicit decision.** `reload` awaits
++   `options.resolveProjectTrust({ extensionsResult: preTrustExtensions })` and applies the
++   returned boolean with `settingsManager.setProjectTrusted(projectTrusted)`.
++3. **Final resolution.** `loadFinalExtensionSet()` indexes the bootstrap extensions by
++   resolved path, loads only the `remainingPaths` (which now include the project extension
++   when trusted), reuses the bootstrap `runtime`, and returns the ordered final set.
++
++Therefore the project extension appears in `loader.getExtensions()` **only** when the
++explicit decision was `true`.
++
++## Normalized operation result
++
++The suite emits one JSON record per decision. Shape:
++
++```json
++{
++  "operation": "resource-loader.reload.resolveProjectTrust",
++  "decision": "trusted | untrusted",
++  "bootstrapExtensions": ["<agentDir>/extensions/user.ts"],
++  "finalExtensions": ["<cwd>/.pi/extensions/project.ts", "<agentDir>/extensions/user.ts"],
++  "projectExtensionAvailableAfterDecision": true
++}
++```
++
++- `decision: "trusted"` → `bootstrapExtensions` contains only the user extension;
++  `finalExtensions` additionally contains the project extension;
++  `projectExtensionAvailableAfterDecision` is `true`.
++- `decision: "untrusted"` → `bootstrapExtensions` and `finalExtensions` both omit the
++  project extension; `projectExtensionAvailableAfterDecision` is `false`.
++
++The assertions in the suite check exactly these facts, plus that the project extension
++registers its `project-only` command in the trusted case.
++
++## How to run the demo
++
++From the repository root (dependencies installed):
++
++```sh
++npx vitest --run --config packages/coding-agent/vitest.config.ts \
++  .prale-eval/demo/project-trust-bootstrap.test.ts
++```
++
++The demo is self-contained: it creates the fresh fixture in a temp directory and removes
++it in `afterEach`. No repository files are modified.
++
++## Validation status
++
++- **Passed:** `.prale-eval/validate-citations.mjs` (dependency-free Node) verified that
++  every `evidence` entry's inclusive `[start_line, end_line]` range in
++  `packages/coding-agent/src/core/resource-loader.ts` actually contains the named symbol,
++  that the required path is cited, and that every `claims` entry references a cited
++  evidence path.
++- **Blocked in this sandbox:** the vitest demo could not execute because the workspace has
++  no `node_modules` and installing dependencies is out of scope. `npx --no-install vitest`
++  reports `vitest@5.0.3` missing, and importing the loader directly fails with
++  `ERR_MODULE_NOT_FOUND: Cannot find package 'chalk'`. Re-run the vitest command above with
++  dependencies present to exercise the demo end-to-end.
++
++## Evidence
++
++| path | symbol | lines |
++| --- | --- | --- |
++| `packages/coding-agent/src/core/resource-loader.ts` | `resolveProjectTrust` | 36–38 |
++| `packages/coding-agent/src/core/resource-loader.ts` | `loadProjectTrustExtensions` | 435–440 |
++| `packages/coding-agent/src/core/resource-loader.ts` | `reload` | 443–457 |
++| `packages/coding-agent/src/core/resource-loader.ts` | `loadFinalExtensionSet` | 639–691 |
+diff --git a/.prale-eval/demo/project-trust-bootstrap.test.ts b/.prale-eval/demo/project-trust-bootstrap.test.ts
+new file mode 100644
+index 0000000..209b710
+--- /dev/null
++++ b/.prale-eval/demo/project-trust-bootstrap.test.ts
+@@ -0,0 +1,163 @@
++/**
++ * T29 demo: a fresh project extension is unavailable during the bootstrap pass and
++ * becomes available only after an explicit trusted decision.
++ *
++ * This drives the real `DefaultResourceLoader`
++ * (packages/coding-agent/src/core/resource-loader.ts):
++ *
++ *   1. `reload({ resolveProjectTrust })` first calls `loadProjectTrustExtensions()`,
++ *      which forces `SettingsManager.setProjectTrusted(false)` for the bootstrap pass,
++ *      so project-local extensions/packages stay out while user/global extensions load.
++ *   2. The explicit `resolveProjectTrust` callback receives that bootstrap result.
++ *      Only when it returns `true` does `reload()` set the project trusted and let
++ *      `loadFinalExtensionSet()` add the project extension to the final set.
++ *
++ * Run from the repository root:
++ *   npx vitest --run --config packages/coding-agent/vitest.config.ts \
++ *     .prale-eval/demo/project-trust-bootstrap.test.ts
++ *
++ * The repository uses vitest; this file is a normal vitest suite so it exercises the
++ * production loader rather than a re-implementation.
++ */
++import { mkdirSync, rmSync, writeFileSync } from "node:fs";
++import { tmpdir } from "node:os";
++import { join } from "node:path";
++import { afterEach, describe, expect, it } from "vitest";
++import { DefaultResourceLoader } from "../../packages/coding-agent/src/core/resource-loader.ts";
++
++interface Fixture {
++	tempDir: string;
++	agentDir: string;
++	cwd: string;
++	userExtensionPath: string;
++	projectExtensionPath: string;
++}
++
++const cleanups: string[] = [];
++
++function makeFixture(label: string): Fixture {
++	const tempDir = join(tmpdir(), `pi-t29-demo-${label}-${Date.now()}-${Math.random().toString(36).slice(2)}`);
++	cleanups.push(tempDir);
++	const agentDir = join(tempDir, "agent");
++	const cwd = join(tempDir, "project");
++	const userExtensionPath = join(agentDir, "extensions", "user.ts");
++	const projectExtensionPath = join(cwd, ".pi", "extensions", "project.ts");
++
++	mkdirSync(join(agentDir, "extensions"), { recursive: true });
++	mkdirSync(join(cwd, ".pi", "extensions"), { recursive: true });
++
++	// Fresh user/global extension: always eligible, no trust required.
++	writeFileSync(
++		userExtensionPath,
++		`export default function (pi) {
++	pi.registerCommand("user-only", { description: "user extension", handler() {} });
++}
++`,
++	);
++
++	// Fresh project extension fixture: command name is a unique sentinel for this demo.
++	writeFileSync(
++		projectExtensionPath,
++		`export default function (pi) {
++	pi.registerCommand("project-only", { description: "project extension", handler() {} });
++}
++`,
++	);
++
++	return { tempDir, agentDir, cwd, userExtensionPath, projectExtensionPath };
++}
++
++afterEach(() => {
++	for (const dir of cleanups.splice(0)) {
++		rmSync(dir, { recursive: true, force: true });
++	}
++});
++
++describe("T29 project extension trust gate", () => {
++	it("keeps the project extension out of bootstrap and adds it only after an explicit trusted decision", async () => {
++		const fx = makeFixture("trusted");
++		const loader = new DefaultResourceLoader({ cwd: fx.cwd, agentDir: fx.agentDir });
++
++		let bootstrapPaths: string[] = [];
++		let finalPaths: string[] = [];
++		const decisions: boolean[] = [];
++
++		await loader.reload({
++			resolveProjectTrust: async ({ extensionsResult }) => {
++				// This is the untrusted bootstrap set produced by loadProjectTrustExtensions().
++				bootstrapPaths = extensionsResult.extensions.map((extension) => extension.path);
++				decisions.push(true);
++				return true;
++			},
++		});
++
++		finalPaths = loader.getExtensions().extensions.map((extension) => extension.path);
++
++		// Bootstrap pass: user extension only, project extension deliberately absent.
++		expect(bootstrapPaths).toContain(fx.userExtensionPath);
++		expect(bootstrapPaths).not.toContain(fx.projectExtensionPath);
++
++		// After the explicit trusted decision: the project extension is now available.
++		expect(decisions).toEqual([true]);
++		expect(finalPaths).toContain(fx.userExtensionPath);
++		expect(finalPaths).toContain(fx.projectExtensionPath);
++
++		const projectExtension = loader
++			.getExtensions()
++			.extensions.find((extension) => extension.path === fx.projectExtensionPath);
++		expect(Array.from(projectExtension?.commands.keys() ?? [])).toContain("project-only");
++
++		// eslint-disable-next-line no-console
++		console.log(
++			JSON.stringify(
++				{
++					operation: "resource-loader.reload.resolveProjectTrust",
++					decision: "trusted",
++					bootstrapExtensions: bootstrapPaths,
++					finalExtensions: finalPaths,
++					projectExtensionAvailableAfterDecision: finalPaths.includes(fx.projectExtensionPath),
++				},
++				null,
++				2,
++			),
++		);
++	});
++
++	it("keeps the project extension unavailable when the explicit decision is not trusted", async () => {
++		const fx = makeFixture("untrusted");
++		const loader = new DefaultResourceLoader({ cwd: fx.cwd, agentDir: fx.agentDir });
++
++		let bootstrapPaths: string[] = [];
++
++		await loader.reload({
++			resolveProjectTrust: async ({ extensionsResult }) => {
++				bootstrapPaths = extensionsResult.extensions.map((extension) => extension.path);
++				return false;
++			},
++		});
++
++		const finalPaths = loader.getExtensions().extensions.map((extension) => extension.path);
++
++		expect(bootstrapPaths).not.toContain(fx.projectExtensionPath);
++		expect(finalPaths).toContain(fx.userExtensionPath);
++		expect(finalPaths).not.toContain(fx.projectExtensionPath);
++		expect(loader.getExtensions().extensions.some((extension) => extension.path === fx.projectExtensionPath)).toBe(
++			false,
++		);
++
++		// eslint-disable-next-line no-console
++		console.log(
++			JSON.stringify(
++				{
++					operation: "resource-loader.reload.resolveProjectTrust",
++					decision: "untrusted",
++					bootstrapExtensions: bootstrapPaths,
++					finalExtensions: finalPaths,
++					projectExtensionAvailableAfterDecision: finalPaths.includes(fx.projectExtensionPath),
++				},
++				null,
++				2,
++			),
++		);
++	});
++});
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..f9e09bd
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,55 @@
++{
++	"task_id": "T29",
++	"repository": "pi",
++	"mode": "demo",
++	"evidence": [
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "resolveProjectTrust",
++			"start_line": 36,
++			"end_line": 38,
++			"observation": "`ResourceLoaderReloadOptions.resolveProjectTrust`, the explicit trusted-decision hook on the reload options. The optional callback receives the bootstrap `LoadExtensionsResult` (loaded while the project is forced untrusted) and asynchronously returns whether the project is trusted. This is the only opt-in seam through which a project extension can become eligible during the same reload."
++		},
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "loadProjectTrustExtensions",
++			"start_line": 435,
++			"end_line": 440,
++			"observation": "`DefaultResourceLoader.loadProjectTrustExtensions`, the bootstrap pass. It calls `settingsManager.setProjectTrusted(false)` then `reload()` before loading the current extension set, so project-local extensions and packages are deliberately excluded while user/global and temporary CLI extensions still load. Its return value is the pre-trust set handed to `resolveProjectTrust`."
++		},
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "reload",
++			"start_line": 443,
++			"end_line": 457,
++			"observation": "`DefaultResourceLoader.reload`. The trust gate. When `options.resolveProjectTrust` is supplied, `reload` first awaits `loadProjectTrustExtensions()` (untrusted bootstrap), passes that result to the explicit decision callback, then applies `settingsManager.setProjectTrusted(projectTrusted)` before the final package/extension resolution. Without this branch no untrusted bootstrap pass occurs and project extensions are resolved under the current trust state."
++		},
++		{
++			"path": "packages/coding-agent/src/core/resource-loader.ts",
++			"symbol": "loadFinalExtensionSet",
++			"start_line": 639,
++			"end_line": 691,
++			"observation": "`DefaultResourceLoader.loadFinalExtensionSet`. Builds the final extension set with the resolved trust state. It indexes the bootstrap extensions by resolved path (`preloadedByPath`), loads only the `remainingPaths` (which can now include the previously filtered project extension), reuses the bootstrap `runtime`, and returns the ordered final list. A project extension therefore appears in `getExtensions()` only when the explicit decision was trusted."
++		}
++	],
++	"claims": [
++		{
++			"claim": "During bootstrap the loader is forced into the untrusted trust state and returns an extension set that excludes the project extension while still including user/global extensions, so a fresh project extension is unavailable at that point.",
++			"evidence_paths": ["packages/coding-agent/src/core/resource-loader.ts"]
++		},
++		{
++			"claim": "Availability of the project extension is decided by the explicit `resolveProjectTrust` callback: `reload` runs the untrusted bootstrap pass, feeds its `extensionsResult` to the callback, and applies the returned boolean via `setProjectTrusted` before resolving the final set.",
++			"evidence_paths": ["packages/coding-agent/src/core/resource-loader.ts"]
++		},
++		{
++			"claim": "`loadFinalExtensionSet` reuses the bootstrap-loaded extensions and loads the remaining paths (including the project extension) under the applied trust state, so the project extension becomes available in the final result only after, and only because of, a trusted decision.",
++			"evidence_paths": ["packages/coding-agent/src/core/resource-loader.ts"]
++		}
++	],
++	"conclusion": "A fresh project extension is unavailable during bootstrap and becomes available only after an explicit trusted decision. `DefaultResourceLoader.reload` calls `loadProjectTrustExtensions()`, which forces `setProjectTrusted(false)` so the bootstrap result contains user/global and CLI extensions but not the project extension. The explicit `resolveProjectTrust` callback receives that pre-trust result; `reload` applies its boolean return via `setProjectTrusted` and only then does `loadFinalExtensionSet` load the remaining project path. The demo's trusted scenario shows the project extension in the final set, and the untrusted scenario shows it remains absent.",
++	"validation": {
++		"command": "node .prale-eval/validate-citations.mjs && npx vitest --run --config packages/coding-agent/vitest.config.ts .prale-eval/demo/project-trust-bootstrap.test.ts",
++		"status": "partial",
++		"notes": "Citation/structure validation passed via `node .prale-eval/validate-citations.mjs`: every evidence entry's inclusive [start_line, end_line] range actually contains the named symbol, and every claim references an existing evidence path. The executable vitest demo could not run in this sandbox because the workspace has no node_modules and dependency installation is out of scope: `npx --no-install vitest` reports `vitest@5.0.3` missing, and importing the loader directly fails with `ERR_MODULE_NOT_FOUND: Cannot find package 'chalk'`. With dependencies installed, run the same vitest command to execute the demo end-to-end (trusted scenario: project extension present after the decision; untrusted scenario: project extension absent)."
++	}
++}
+diff --git a/.prale-eval/validate-citations.mjs b/.prale-eval/validate-citations.mjs
+new file mode 100644
+index 0000000..ebc8d71
+--- /dev/null
++++ b/.prale-eval/validate-citations.mjs
+@@ -0,0 +1,101 @@
++#!/usr/bin/env node
++/**
++ * Focused validation for T29's `.prale-eval/result.json`.
++ *
++ * Programmatically verifies the evidence contract:
++ *  - required top-level fields exist with the expected values,
++ *  - every evidence object has path/symbol/start_line/end_line/observation,
++ *  - the inclusive [start_line, end_line] slice of the cited file actually contains
++ *    the named symbol,
++ *  - every claim names at least one evidence path that exists in `evidence`.
++ *
++ * This runs with the plain Node.js runtime (no dependencies) so it works even when the
++ * repository's node_modules are unavailable.
++ */
++import { readFileSync } from "node:fs";
++import { dirname, join, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++
++const here = dirname(fileURLToPath(import.meta.url));
++const workspace = resolve(here, "..");
++
++const failures = [];
++const check = (condition, message) => {
++	if (!condition) failures.push(message);
++};
++
++const resultPath = join(workspace, ".prale-eval", "result.json");
++const result = JSON.parse(readFileSync(resultPath, "utf-8"));
++
++check(result.task_id === "T29", `task_id must be "T29", got ${JSON.stringify(result.task_id)}`);
++check(result.repository === "pi", `repository must be "pi", got ${JSON.stringify(result.repository)}`);
++check(result.mode === "demo", `mode must be "demo", got ${JSON.stringify(result.mode)}`);
++check(Array.isArray(result.evidence) && result.evidence.length > 0, "evidence must be a non-empty array");
++check(Array.isArray(result.claims) && result.claims.length > 0, "claims must be a non-empty array");
++check(typeof result.conclusion === "string" && result.conclusion.length > 0, "conclusion must be a non-empty string");
++check(result.validation && typeof result.validation.command === "string", "validation.command must be a string");
++check(result.validation && typeof result.validation.status === "string", "validation.status must be a string");
++check(result.validation && typeof result.validation.notes === "string", "validation.notes must be a string");
++
++const requiredPaths = ["packages/coding-agent/src/core/resource-loader.ts"];
++const evidencePaths = new Set();
++
++for (const [index, entry] of (result.evidence ?? []).entries()) {
++	const label = `evidence[${index}]`;
++	for (const field of ["path", "symbol", "start_line", "end_line", "observation"]) {
++		check(entry[field] !== undefined && entry[field] !== null, `${label} is missing ${field}`);
++	}
++	if (entry.path === undefined || entry.symbol === undefined) continue;
++
++	evidencePaths.add(entry.path);
++
++	const absolute = join(workspace, entry.path);
++	let lines;
++	try {
++		lines = readFileSync(absolute, "utf-8").split(/\r?\n/);
++	} catch (error) {
++		failures.push(`${label} cannot read ${entry.path}: ${error.message}`);
++		continue;
++	}
++
++	const start = entry.start_line;
++	const end = entry.end_line;
++	check(
++		Number.isInteger(start) && Number.isInteger(end),
++		`${label} start_line/end_line must be integers`,
++	);
++	check(start >= 1 && end >= start, `${label} invalid range ${start}-${end}`);
++	check(end <= lines.length, `${label} end_line ${end} exceeds file length ${lines.length}`);
++
++	const slice = lines.slice(Math.max(start - 1, 0), end).join("\n");
++	// Accept a bare identifier or a dotted qualified name whose final segment appears.
++	const leaf = String(entry.symbol).split(".").pop() ?? String(entry.symbol);
++	check(
++		slice.includes(entry.symbol) || slice.includes(leaf),
++		`${label} range ${start}-${end} in ${entry.path} does not contain symbol ${JSON.stringify(entry.symbol)}`,
++	);
++}
++
++for (const required of requiredPaths) {
++	check(evidencePaths.has(required), `missing required evidence entry for ${required}`);
++}
++
++for (const [index, claim] of (result.claims ?? []).entries()) {
++	const label = `claims[${index}]`;
++	check(typeof claim.claim === "string" && claim.claim.length > 0, `${label}.claim must be a non-empty string`);
++	check(Array.isArray(claim.evidence_paths) && claim.evidence_paths.length > 0, `${label}.evidence_paths must be non-empty`);
++	for (const path of claim.evidence_paths ?? []) {
++		check(evidencePaths.has(path), `${label} references evidence path ${path} that is not cited in evidence[]`);
++	}
++}
++
++if (failures.length > 0) {
++	console.error("VALIDATION FAILED");
++	for (const failure of failures) console.error(` - ${failure}`);
++	process.exit(1);
++}
++
++console.log("VALIDATION PASSED");
++console.log(` - task_id/repository/mode: ${result.task_id}/${result.repository}/${result.mode}`);
++console.log(` - evidence entries: ${result.evidence.length} (verified ranges contain their symbols)`);
++console.log(` - claims: ${result.claims.length} (all evidence_paths resolve)`);
+snapshot .prale-eval/demo-deliverable.md - cdd94ef54e792eda1bc8b9564506c306601764c0099fe6ff67a56b6dfa921754
+snapshot .prale-eval/demo/project-trust-bootstrap.test.ts - 8a09608c37af1746fb9281dd6759f043a8368ed53b26183afec53ecced063678
+snapshot .prale-eval/result.json - 0db4e684bd1c9a37cd2d70530f0a76e76a5246b7959371bfc7b56cb925672702
+snapshot .prale-eval/validate-citations.mjs - 84ca7bc030e243732958c8988699362c8dfd84017d6766f05e676a26a3f71109

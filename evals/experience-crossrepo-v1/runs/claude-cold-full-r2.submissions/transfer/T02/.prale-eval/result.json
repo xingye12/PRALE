@@ -1,0 +1,75 @@
+{
+  "task_id": "T02",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_process",
+      "start_line": 24,
+      "end_line": 37,
+      "observation": "ConfigQueue#_process is the serialized drain loop. A re-entrancy guard (this._running) makes enqueue() fire-and-forget safe: the first caller becomes the sole drainer and later enqueues just append to this._queue. The loop shifts one item at a time, awaits _execute, and settles it exactly once — item.resolve(result.data) on ok, item.reject(result.error) otherwise. Because the reject happens inside the loop and the loop condition is only this._queue.length > 0, a rejected job neither breaks the while loop nor leaves _running stuck true, so the next enqueued job is still executed and settled. This is precisely the 'first job fails, next job still settles' contract."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_execute",
+      "start_line": 60,
+      "end_line": 99,
+      "observation": "_execute is where a job's failure is classified and made deterministic. It runs a bounded for-loop of maxRetries = 3 attempts. Each attempt reads config.get, applies transformFn to the source config (a falsy transform result short-circuits to { ok: true, data: null }), then does config.patch -> config.get -> config.apply. Errors are caught and split by message: 'config changed since last load' (optimistic-concurrency) and 'rate limit' are retryable and only retried while attempt < maxRetries - 1, with back-off of (attempt + 1) * 2000 ms or min(retryAfterMs || 60000, 65000) ms; anything else is terminal on the first attempt. On the final attempt the retry branch is unreachable, so every path returns { ok: false, error: err } — the function can never fall out of the loop with undefined, which keeps the rejection value and call sequence reproducible across runs."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "enqueue",
+      "start_line": 15,
+      "end_line": 20,
+      "observation": "enqueue() is the promise-per-job boundary: it wraps { transformFn, label, method, resolve, reject } in a new Promise, pushes onto the FIFO queue and kicks _process(). Callers observe job outcome solely through settlement, so 'the next job still settles' is an observable, awaitable contract (allSettled over the enqueued promises) rather than a side effect of internal logging."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "configQueueExecute",
+      "start_line": 104,
+      "end_line": 106,
+      "observation": "configQueueExecute is the module's public surface and the only thing handlers import (server/handlers/system.js:3, server/handlers/channels.js:7, server/handlers/agent-team.js:9). It delegates to the module-level singleton configQueue, so all config mutations across those handlers share one FIFO drain and one failure domain — a failure raised by one handler's job cannot bypass the queue's settlement guarantee for another handler's later job."
+    },
+    {
+      "path": ".prale-eval/fixtures/config-queue-first-failure.mjs",
+      "symbol": "scenarios",
+      "start_line": 88,
+      "end_line": 194,
+      "observation": "The executable fixture. It uses node:module registerHooks to short-circuit only the specifier server/core/gateway-client.js with a scripted gatewayAdminRpc, so the ConfigQueue class body under test is the unmodified repository source. Scenario 'terminal-failure-then-success' fails the first config.get of job 1, enqueues a second job, and asserts: job 1 rejects with the gateway's message, job 2 still fulfils, each promise settles exactly once, the failed job never reaches its transform, and the next job drives the full config.get,config.patch,config.get,config.apply sequence. Scenario 'retries-exhausted-then-success' returns 'config changed since last load' for the first three reads and asserts the rejected job is retried exactly maxRetries=3 times with 2000/4000 ms back-off recorded, that the next job settles, and that a third job enqueued afterwards also settles (proving _running was released and the queue is not wedged)."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "A ConfigQueue job that fails is rejected while the remaining queued jobs are still executed and settled, so the first job's failure cannot strand the next one. _process settles each shifted item exactly once via resolve/reject and only terminates on this._queue.length === 0, so a rejection never breaks the drain loop and never leaves the this._running guard set.",
+      "evidence_paths": [
+        "server/core/config-queue.js"
+      ]
+    },
+    {
+      "claim": "The failure mode is deterministic rather than incidental. _execute bounds itself to maxRetries = 3 attempts, retries only the two recognised transient messages ('config changed since last load', 'rate limit') with a 2s/4s linear back-off on the concurrency path, treats every other error as terminal on the first attempt, and returns { ok: false, error } on all exit paths — so the same scripted gateway responses always produce the same rejection and the same bounded call sequence.",
+      "evidence_paths": [
+        "server/core/config-queue.js"
+      ]
+    },
+    {
+      "claim": "ConfigQueue is a single shared FIFO for all Gateway config mutations: configQueueExecute is the only exported entry point and it forwards to a module-level singleton, which the system, channels and agent-team handlers all import. The settlement guarantee therefore holds across handlers, not just within one caller's job list.",
+      "evidence_paths": [
+        "server/core/config-queue.js"
+      ]
+    },
+    {
+      "claim": "The contract is demonstrated executably and reproducibly: .prale-eval/fixtures/config-queue-first-failure.mjs runs 14 assertions over two first-job-fails fixtures against the unmodified server/core/config-queue.js (only the gateway RPC dependency is stubbed), passes with exit code 0, and emits byte-identical RPC call traces and back-off delays across repeated runs.",
+      "evidence_paths": [
+        ".prale-eval/fixtures/config-queue-first-failure.mjs",
+        "server/core/config-queue.js"
+      ]
+    }
+  ],
+  "conclusion": "ConfigQueue satisfies the contracted behaviour: when the first job fails, the queued next job still settles deterministically. The guarantee is structural — enqueue() reduces every job to a single-settlement promise (server/core/config-queue.js:15-20), _process() serialises settlement in a drain loop that continues past a rejected item and clears its re-entrancy guard only when the queue is empty (24-37), and _execute() bounds failure to a deterministic 3-attempt retry policy that always returns a verdict instead of escaping the loop (60-99). The executable fixture installs a scripted gateway responses via node:module registerHooks, so the ConfigQueue source executed in the demo is the repository's own code, unmodified; it exercises both a terminal first-job failure and a retryable first-job failure that exhausts its retries, and in both cases the following jobs settle exactly once and the queue is not wedged. All 14 checks pass with exit code 0 and reproduce identically across repeated runs.",
+  "validation": {
+    "command": "node .prale-eval/fixtures/config-queue-first-failure.mjs",
+    "status": "pass",
+    "notes": "14/14 checks pass, exit code 0, repeated three times with byte-identical RPC call traces per scenario. Scenario 'terminal-failure-then-success' call trace: config.get,config.get,config.patch,config.get,config.apply (job 1 rejected on its first read, job 2 completed its full cycle). Scenario 'retries-exhausted-then-success' records back-off delays [2000,4000] and rejects job 1 after exactly 3 attempts, then settles both the next job and a third job enqueued after the failure. LIMITATION: the repository's installed test tooling is unavailable in this environment — node_modules is absent (vitest, @vue/test-utils etc. cannot be resolved) and importing server/core/gateway-client.js fails with \"Cannot find package 'better-sqlite3' imported from server/database.js\", so `npm run test:server` and any vitest-based harness could not be run. The fixture therefore stubs only the gateway-client specifier through Node's built-in synchronous module hooks (module.registerHooks, Node v24.14.0) rather than mocking the queue itself; no repository source file was modified. Retry back-off timer durations are recorded but compressed to 0 ms in scenario 2 to keep the run fast and deterministic; the requested delay values themselves are asserted (2000, 4000)."
+  }
+}

@@ -1,0 +1,964 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..e0c0f4c
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,109 @@
++# T20 — duplicate-event contract: replaying one session update
++
++Repository: `wattclaw` · Task mode: `contract`
++
++## 1. Contract statement
++
++**Replaying the same session update cannot double-count usage and cannot emit a
++duplicate state change.**
++
++The contract is enforced by three independent mechanisms, each verified by the
++fixture below:
++
++| Layer | Idempotency key | Replay behaviour | Source |
++| --- | --- | --- | --- |
++| Usage write | composite `(user_id, session_key)` | `UPDATE user_sessions ... WHERE user_id = ? AND session_key = ?`, success defined as `changes === 1`; every counter is **SET** to the Gateway's absolute value, never accumulated | `server/core/session-usage-cache.js` → `_persistOwnerScopedUpdate` |
++| Per-session sync scheduling | `sessionKey` | `scheduleSessionUsageSync` clears the pending timer and re-arms a single one; `syncSessionUsageNow` coalesces concurrent runs onto one in-flight promise, so one key → one Gateway call → one `session.usage.updated` SSE event | `server/core/usage-sync.js` → `scheduleSessionUsageSync`, `syncSessionUsageNow`, `broadcastSessionUsageUpdate` |
++| Metadata sync | `userId` (schedule) / `sessionKey` (persist) | `inFlightByUserId` collapses concurrent schedules; `upsertSyncedUserSession` re-reads the row keyed on `session_key` and returns `{ changed: false, action: 'unchanged' }` when the replayed metadata is identical | `server/core/session-sync.js` → `scheduleUserSessionSync`, `syncUserSessionsFromGateway`; `server/user-manager.js` → `upsertSyncedUserSession` |
++
++Ownership guard: the write is scoped by `user_id + session_key`; a key that
++matches zero owner rows is reported as `skippedUnmatched` and a key matching more
++than one owner row as `skippedConflict` — neither is written. Replay therefore
++can neither create a second physical row nor attribute usage to a second owner.
++
++## 2. Executable demo (duplicate-event fixture)
++
++```bash
++node .prale-eval/duplicate-event-fixture.mjs
++```
++
++Files:
++
++- `.prale-eval/duplicate-event-fixture.mjs` — the fixture and its assertions.
++- `.prale-eval/harness/loader.mjs` — a `module.register()` resolve hook that
++  redirects *only* the module boundaries of the three production modules.
++- `.prale-eval/harness/mocks.mjs` — in-memory doubles: the SQLite handle
++  (owner-scoped `UPDATE`, ownership `SELECT`, `getSessionOwner` lookup), the
++  Gateway client, SSE broadcast sink, and an `upsertSyncedUserSession` double that
++  mirrors the real `session_key`-keyed, `Math.max`-on-`last_message_at`,
++  `{ changed: false, action: 'unchanged' }` semantics.
++
++The **real** production source of `session-sync.js`, `usage-sync.js` and
++`session-usage-cache.js` is loaded and executed; only the db / gateway /
++user-manager boundaries are doubled.
++
++Distinctness of the fixture: it owns the marker `dup-event-fixture/T20`, the
++owner `user-dup-owner`, the session keys `agent:agent-a:dup-fixture` and
++`agent:agent-a:dup-fixture-meta`, and its own private doubles. It does not
++import, patch, disable, or depend on any other test/fixture in the repository.
++
++## 3. Normalized operation result
++
++The single replayed event is a Gateway session update with absolute counters
++(`input 100`, `output 50`, `totalTokens 150`, `totalCost 0.5`, `messageCounts.total 4`,
++`toolCalls 1`). Replaying it, in every entry point, normalizes to:
++
++```
++scanned         1        updated         1
++skippedUnmatched 0       skippedConflict 0        failed 0
++
++user_sessions row (user_id = user-dup-owner, session_key = agent:agent-a:dup-fixture)
++  token_input   100   (not 200)
++  token_output   50   (not 100)
++  token_total   150   (not 300)
++  cost_total    0.5   (not 1.0)
++  msg_total       4   (not 8)
++  rows for this composite key: 1
++```
++
++Fixture output (16 checks, exit code 0):
++
++```
++ok  1 metadata insert reports changed=inserted
++ok  2 usage row is unstamped before the first usage sync (usage_synced_at IS NULL)
++ok  3 both replays write to exactly one owner-matched row
++ok  4 replay does not double-count tokens (SET, not accumulate)
++ok  5 replay does not double-count cost or messages
++ok  6 replay never inserts a second physical row for the composite key
++ok  7 the write statement is owner-scoped and additive-free
++ok  8 the second in-flight replay is coalesced onto the in-flight sync
++ok  9 exactly one state-change (SSE) event is emitted
++ok 10 concurrent replay still does not double-count usage
++ok 11 two scheduled events produce exactly one Gateway sync and one event
++ok 12 debounced replay leaves counters unchanged
++ok 13 first metadata sync inserts the session once via sessions.list only
++ok 14 replayed metadata update reports changed=0 (no duplicate state change)
++ok 15 replay did not create a duplicate row for the session key
++ok 16 concurrent scheduled syncs for the same user issue one Gateway list call
++
++CONTRACT OK: 16 checks passed for dup-event-fixture/T20
++```
++
++Phase coverage: `batchUpdateMatchedGatewayUsage` (batch/startup replay),
++`syncSessionUsageNow` (concurrent event-driven replay), `scheduleSessionUsageSync`
++(debounce), `syncUserSessionsFromGateway` (metadata replay → `changed: 0`),
++`scheduleUserSessionSync` (per-user in-flight coalescing).
++
++## 4. Boundaries and limitations
++
++- `vitest` and `better-sqlite3` are not installed in this offline workspace and
++  were **not** installed (no dependency changes, no lockfile changes). The
++  repository suite (`npm run test:server`) could therefore not be executed.
++- Substitution: the fixture is an executable Node (v24) script using `node:assert`
++  and `node:module` loader hooks. It runs real module logic and asserts the real
++  SQL text and real report fields. The db double implements only the statements
++  on the duplicate-event path; a full SQLite engine is not emulated, so this is
++  weaker evidence than the repository test suite for untouched read/aggregate
++  paths. All asserted values were independently re-read from the checkout.
++- No production source file was modified; the change set is additive
++  (`.prale-eval/**` only).
+diff --git a/.prale-eval/duplicate-event-fixture.mjs b/.prale-eval/duplicate-event-fixture.mjs
+new file mode 100644
+index 0000000..7eb3258
+--- /dev/null
++++ b/.prale-eval/duplicate-event-fixture.mjs
+@@ -0,0 +1,239 @@
++// Executable duplicate-event contract fixture (task T20, repository wattclaw).
++//
++//   node .prale-eval/duplicate-event-fixture.mjs
++//
++// Contract under test: replaying ONE session update (the same Gateway event,
++// byte-for-byte) must not double-count usage and must not emit duplicate state
++// changes. The fixture drives the real modules
++//   server/core/session-usage-cache.js
++//   server/core/usage-sync.js
++//   server/core/session-sync.js
++// with only their db/gateway/user-manager boundaries replaced by in-memory
++// doubles (see .prale-eval/harness/loader.mjs and harness/mocks.mjs).
++//
++// Distinctness: the fixture uses its own fixture markers
++// (`FIXTURE_ID`, session key `agent:agent-a:dup-fixture*`, owner `user-dup-owner`)
++// and its own in-memory doubles, so it cannot collide with, disable, or be
++// satisfied by any other fixture in the repository.
++
++import assert from 'node:assert/strict'
++import { register } from 'node:module'
++
++register(new URL('./harness/loader.mjs', import.meta.url))
++
++const mocks = await import('./harness/mocks.mjs')
++const usageCache = await import('../server/core/session-usage-cache.js')
++const usageSync = await import('../server/core/usage-sync.js')
++const sessionSync = await import('../server/core/session-sync.js')
++
++const FIXTURE_ID = 'dup-event-fixture/T20'
++const OWNER = 'user-dup-owner'
++const AGENT = 'agent-a'
++const KEY = 'agent:agent-a:dup-fixture'
++const KEY_META = 'agent:agent-a:dup-fixture-meta'
++
++// The single replayed event. Values are absolute totals reported by the
++// Gateway, never deltas.
++const REPLAYED_EVENT = {
++  fixture: FIXTURE_ID,
++  key: KEY,
++  agentId: AGENT,
++  model: 'anthropic/claude-sonnet-4-6',
++  usage: {
++    input: 100,
++    output: 50,
++    cacheRead: 0,
++    cacheWrite: 0,
++    totalTokens: 150,
++    totalCost: 0.5,
++    messageCounts: { total: 4, user: 2, assistant: 2, toolCalls: 1, toolResults: 1, errors: 0 },
++  },
++}
++
++const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
++
++let checks = 0
++function check(description, fn) {
++  fn()
++  checks += 1
++  console.log(`  ok ${checks} - ${description}`)
++}
++
++function clone(value) {
++  return JSON.parse(JSON.stringify(value))
++}
++
++console.log(`duplicate-event fixture: ${FIXTURE_ID}`)
++
++// ---------------------------------------------------------------------------
++// Phase 0 — metadata sync creates the row; usage columns start unstamped.
++// ---------------------------------------------------------------------------
++console.log('\nphase 0: metadata row exists, usage not yet stamped')
++mocks.setOwnedAgents(OWNER, [AGENT])
++const inserted = mocks.upsertSyncedUserSession({
++  userId: OWNER,
++  sessionKey: KEY,
++  agentId: AGENT,
++  channel: 'feishu',
++  peer: 'ou_dup',
++  label: 'duplicate-event fixture',
++  lastActivity: Date.parse('2026-06-05T12:00:00.000Z'),
++})
++check('metadata insert reports changed=inserted', () => {
++  assert.equal(inserted.action, 'inserted')
++  assert.equal(inserted.changed, true)
++})
++check('usage row is unstamped before the first usage sync (usage_synced_at IS NULL)', () => {
++  const row = mocks.getUsageRow(OWNER, KEY)
++  assert.ok(row)
++  assert.equal(row.usage_synced_at, null)
++})
++
++// ---------------------------------------------------------------------------
++// Phase 1 — batch/startup path: replay the identical event twice.
++// ---------------------------------------------------------------------------
++console.log('\nphase 1: batchUpdateMatchedGatewayUsage replayed twice with the same event')
++const batch1 = usageCache.batchUpdateMatchedGatewayUsage({ sessions: [clone(REPLAYED_EVENT)] })
++const afterFirst = clone(mocks.getUsageRow(OWNER, KEY))
++const batch2 = usageCache.batchUpdateMatchedGatewayUsage({ sessions: [clone(REPLAYED_EVENT)] })
++const afterReplay = clone(mocks.getUsageRow(OWNER, KEY))
++
++check('both replays write to exactly one owner-matched row', () => {
++  assert.equal(batch1.scanned, 1)
++  assert.equal(batch1.updated, 1)
++  assert.equal(batch1.skippedConflict, 0)
++  assert.equal(batch2.scanned, 1)
++  assert.equal(batch2.updated, 1)
++})
++check('replay does not double-count tokens (SET, not accumulate)', () => {
++  assert.equal(afterFirst.token_input, 100)
++  assert.equal(afterFirst.token_output, 50)
++  assert.equal(afterFirst.token_total, 150)
++  assert.equal(afterReplay.token_input, 100, 'token_input must stay 100, not 200')
++  assert.equal(afterReplay.token_output, 50, 'token_output must stay 50, not 100')
++  assert.equal(afterReplay.token_total, 150, 'token_total must stay 150, not 300')
++})
++check('replay does not double-count cost or messages', () => {
++  assert.equal(afterReplay.cost_total, 0.5, 'cost_total must stay 0.5, not 1.0')
++  assert.equal(afterReplay.msg_total, 4, 'msg_total must stay 4, not 8')
++  assert.equal(afterReplay.msg_user, 2)
++  assert.equal(afterReplay.msg_assistant, 2)
++  assert.equal(afterReplay.msg_tool_calls, 1)
++})
++check('replay never inserts a second physical row for the composite key', () => {
++  assert.equal(mocks.usageRowsForSession(KEY).length, 1)
++})
++check('the write statement is owner-scoped and additive-free', () => {
++  const updates = mocks.updateStatements()
++  assert.ok(updates.length >= 2)
++  for (const stmt of updates) {
++    assert.match(stmt.sql, /WHERE user_id = \? AND session_key = \?/)
++    assert.doesNotMatch(stmt.sql, /[+-]=|SUM\(|token_total = token_total/)
++  }
++})
++
++// ---------------------------------------------------------------------------
++// Phase 2 — event-driven path: two concurrent replays of the same key.
++// ---------------------------------------------------------------------------
++console.log('\nphase 2: syncSessionUsageNow replayed concurrently for one session key')
++usageSync.__resetUsageSyncForTests()
++mocks.gatewayState.usageCalls.length = 0
++mocks.sseBroadcasts.length = 0
++mocks.gatewayState.usageResponse = { sessions: [clone(REPLAYED_EVENT)] }
++
++const p1 = usageSync.syncSessionUsageNow(KEY)
++const p2 = usageSync.syncSessionUsageNow(KEY)
++const [r1, r2] = await Promise.all([p1, p2])
++const afterConcurrent = clone(mocks.getUsageRow(OWNER, KEY))
++
++check('the second in-flight replay is coalesced onto the in-flight sync', () => {
++  // syncSessionUsageNow is `async`, so each caller gets its own wrapper promise;
++  // coalescing means both resolve to the ONE report produced by the single run.
++  assert.equal(r1, r2)
++  assert.equal(mocks.gatewayState.usageCalls.length, 1)
++})
++check('exactly one state-change (SSE) event is emitted', () => {
++  assert.equal(mocks.sseBroadcasts.length, 1)
++  const [event] = mocks.sseBroadcasts[0]
++  assert.equal(event.event, 'session.usage.updated')
++  assert.equal(event.payload.sessionKey, KEY)
++  assert.equal(event.payload.messageCount, 4)
++})
++check('concurrent replay still does not double-count usage', () => {
++  assert.equal(afterConcurrent.token_total, 150)
++  assert.equal(afterConcurrent.cost_total, 0.5)
++  assert.equal(afterConcurrent.msg_total, 4)
++})
++
++// ---------------------------------------------------------------------------
++// Phase 3 — debounced scheduling: two events collapse into one sync.
++// ---------------------------------------------------------------------------
++console.log('\nphase 3: scheduleSessionUsageSync debounces repeated events for one key')
++usageSync.__resetUsageSyncForTests()
++const callsBefore = mocks.gatewayState.usageCalls.length
++const broadcastsBefore = mocks.sseBroadcasts.length
++usageSync.scheduleSessionUsageSync(KEY, { delayMs: 1 })
++usageSync.scheduleSessionUsageSync(KEY, { delayMs: 1 })
++await sleep(30)
++const afterDebounce = clone(mocks.getUsageRow(OWNER, KEY))
++
++check('two scheduled events produce exactly one Gateway sync and one event', () => {
++  assert.equal(mocks.gatewayState.usageCalls.length - callsBefore, 1)
++  assert.equal(mocks.sseBroadcasts.length - broadcastsBefore, 1)
++})
++check('debounced replay leaves counters unchanged', () => {
++  assert.equal(afterDebounce.token_total, 150)
++  assert.equal(afterDebounce.msg_total, 4)
++})
++
++// ---------------------------------------------------------------------------
++// Phase 4 — metadata sync: replaying one session update is a no-op.
++// ---------------------------------------------------------------------------
++console.log('\nphase 4: syncUserSessionsFromGateway replayed with the same listed session')
++sessionSync.resetSessionSyncStateForTests()
++const listCalls = []
++const gatewayRpc = async (method, params) => {
++  listCalls.push({ method, params })
++  assert.equal(method, 'sessions.list')
++  return {
++    ok: true,
++    payload: {
++      sessions: [{ key: KEY_META, agentId: AGENT, channel: 'feishu', peer: 'ou_dup_meta', lastActivity: 1783507200000 }],
++    },
++  }
++}
++
++const firstSync = await sessionSync.syncUserSessionsFromGateway({ userId: OWNER, role: 'user', gatewayRpc })
++const listCallsAfterFirst = listCalls.length
++const secondSync = await sessionSync.syncUserSessionsFromGateway({ userId: OWNER, role: 'user', gatewayRpc })
++
++check('first metadata sync inserts the session once via sessions.list only', () => {
++  assert.deepEqual(firstSync, { changed: 1, inserted: 1, updated: 0, scanned: 1, agents: 1 })
++  assert.deepEqual([...new Set(listCalls.map((c) => c.method))], ['sessions.list'])
++})
++check('replayed metadata update reports changed=0 (no duplicate state change)', () => {
++  assert.equal(secondSync.changed, 0)
++  assert.equal(secondSync.scanned, 1)
++  assert.equal(listCalls.length, listCallsAfterFirst + 1)
++})
++check('replay did not create a duplicate row for the session key', () => {
++  assert.equal(mocks.usageRowsForSession(KEY_META).length, 1)
++})
++
++// ---------------------------------------------------------------------------
++// Phase 5 — scheduling level: concurrent replays coalesce per user.
++// ---------------------------------------------------------------------------
++console.log('\nphase 5: scheduleUserSessionSync coalesces concurrent replays for one user')
++sessionSync.resetSessionSyncStateForTests()
++const callsBeforeCoalesce = listCalls.length
++await Promise.all([
++  sessionSync.scheduleUserSessionSync({ userId: OWNER, role: 'user', gatewayRpc, cooldownMs: 0 }),
++  sessionSync.scheduleUserSessionSync({ userId: OWNER, role: 'user', gatewayRpc, cooldownMs: 0 }),
++])
++
++check('concurrent scheduled syncs for the same user issue one Gateway list call', () => {
++  assert.equal(listCalls.length - callsBeforeCoalesce, 1)
++})
++
++console.log(`\nCONTRACT OK: ${checks} checks passed for ${FIXTURE_ID}`)
++console.log('replaying one session update neither double-counted usage nor duplicated state changes')
+diff --git a/.prale-eval/harness/loader.mjs b/.prale-eval/harness/loader.mjs
+new file mode 100644
+index 0000000..0efb291
+--- /dev/null
++++ b/.prale-eval/harness/loader.mjs
+@@ -0,0 +1,23 @@
++// Minimal resolver hook: redirects only the module boundaries listed in the
++// fixture contract to the shared in-memory doubles in ./mocks.mjs.
++// Everything else resolves normally, so the fixture executes the real
++// session-sync / usage-sync / session-usage-cache source files.
++
++const MOCK_URL = new URL('./mocks.mjs', import.meta.url).href
++
++const REDIRECTS = [
++  { parentSuffix: '/server/core/session-usage-cache.js', specifier: '../database.js' },
++  { parentSuffix: '/server/core/usage-sync.js', specifier: './gateway-client.js' },
++  { parentSuffix: '/server/core/usage-sync.js', specifier: './multi-tenant-gateway.js' },
++  { parentSuffix: '/server/core/usage-sync.js', specifier: './sse.js' },
++  { parentSuffix: '/server/core/session-sync.js', specifier: '../user-manager.js' },
++]
++
++export async function resolve(specifier, context, nextResolve) {
++  const parent = context.parentURL || ''
++  const hit = REDIRECTS.some(
++    (r) => parent.endsWith(r.parentSuffix) && specifier === r.specifier,
++  )
++  if (hit) return { url: MOCK_URL, shortCircuit: true }
++  return nextResolve(specifier, context)
++}
+diff --git a/.prale-eval/harness/mocks.mjs b/.prale-eval/harness/mocks.mjs
+new file mode 100644
+index 0000000..51b6c67
+--- /dev/null
++++ b/.prale-eval/harness/mocks.mjs
+@@ -0,0 +1,246 @@
++// Shared in-memory doubles for the duplicate-event contract fixture.
++//
++// Scope note: `vitest` and `better-sqlite3` are not installed in this offline
++// workspace, so the fixture drives the *real* production modules
++// (server/core/session-usage-cache.js, server/core/usage-sync.js,
++// server/core/session-sync.js) and replaces only their module boundaries:
++//
++//   server/core/session-usage-cache.js  -> default export (the SQLite db handle)
++//   server/core/usage-sync.js           -> gateway-client / multi-tenant-gateway / sse
++//   server/core/session-sync.js         -> ../user-manager.js
++//
++// The db double implements exactly the statements those modules issue on the
++// duplicate-event path: the owner-scoped UPDATE user_sessions (mirroring
++// `_persistOwnerScopedUpdate`), the ownership SELECT used by
++// `batchUpdateMatchedGatewayUsage`, and the `getSessionOwner` lookup.
++
++const SEP = '\u0000'
++const k = (userId, sessionKey) => `${userId}${SEP}${sessionKey}`
++
++const usageRows = new Map() // key: user_id + session_key -> row (single physical row per composite key)
++const sessionMeta = new Map() // key: session_key -> metadata written by upsertSyncedUserSession
++const ownedAgents = new Map() // key: userId -> [agentId]
++const statements = [] // every db.prepare() result, in order
++
++// ---------------------------------------------------------------------------
++// Introspection helpers used by the fixture assertions
++// ---------------------------------------------------------------------------
++
++export function resetAll() {
++  usageRows.clear()
++  sessionMeta.clear()
++  ownedAgents.clear()
++  statements.length = 0
++}
++
++export function preparedStatements() {
++  return statements.slice()
++}
++
++export function findStatement(fragment) {
++  return statements.find((s) => s.sql.includes(fragment)) || null
++}
++
++export function updateStatements() {
++  return statements.filter((s) => /UPDATE\s+user_sessions/i.test(s.sql))
++}
++
++export function getUsageRow(userId, sessionKey) {
++  return usageRows.get(k(userId, sessionKey)) || null
++}
++
++export function usageRowsForSession(sessionKey) {
++  return [...usageRows.values()].filter((r) => r.session_key === sessionKey)
++}
++
++export function seedUsageRow(row) {
++  const full = {
++    id: row.id || `row-${usageRows.size + 1}`,
++    agent_id: null,
++    model: null,
++    model_provider: null,
++    token_input: 0,
++    token_output: 0,
++    token_cache_read: 0,
++    token_cache_write: 0,
++    token_total: 0,
++    cost_total: 0,
++    msg_total: 0,
++    msg_user: 0,
++    msg_assistant: 0,
++    msg_tool_calls: 0,
++    msg_tool_results: 0,
++    msg_errors: 0,
++    tool_usage_json: null,
++    usage_synced_at: null,
++    updated_at: null,
++    ...row,
++  }
++  usageRows.set(k(full.user_id, full.session_key), full)
++  return full
++}
++
++// ---------------------------------------------------------------------------
++// SQLite double
++// ---------------------------------------------------------------------------
++
++function parseUpdateColumns(sql) {
++  const setClause = String(sql).match(/SET([\s\S]*?)\s*WHERE/i)?.[1] || ''
++  return setClause.split(',').map((part) => ({
++    column: part.split('=')[0].trim(),
++    placeholders: (part.match(/\?/g) || []).length,
++  }))
++}
++
++const db = {
++  prepare(sql) {
++    const text = String(sql)
++    const stmt = {
++      sql: text,
++      run: () => ({ changes: 0 }),
++      get: () => undefined,
++      all: () => [],
++    }
++    statements.push(stmt)
++
++    if (/^\s*UPDATE\s+user_sessions\s+SET/i.test(text)) {
++      const binds = parseUpdateColumns(text)
++      stmt.run = (...args) => {
++        const userId = args[args.length - 2]
++        const sessionKey = args[args.length - 1]
++        const row = usageRows.get(k(userId, sessionKey))
++        // Zero matching owner rows => changes === 0 => caller treats it as a skip.
++        if (!row) return { changes: 0 }
++        let cursor = 0
++        for (const { column, placeholders } of binds) {
++          const value = args[cursor]
++          cursor += placeholders
++          // Mirror "CASE WHEN ? IS NOT NULL AND ? != '' THEN ? ELSE <existing> END".
++          if ((column === 'model' || column === 'model_provider') && (value === null || value === '')) continue
++          row[column] = value
++        }
++        return { changes: 1 }
++      }
++    } else if (/SELECT\s+user_id,\s*session_key\s+FROM\s+user_sessions/i.test(text)) {
++      stmt.all = (...args) =>
++        [...usageRows.values()]
++          .filter((r) =>
++            args.length >= 2
++              ? r.user_id === args[0] && r.session_key === args[1]
++              : r.session_key === args[0],
++          )
++          .map((r) => ({ user_id: r.user_id, session_key: r.session_key }))
++    } else if (/SELECT\s+user_id\s+FROM\s+user_sessions\s+WHERE\s+session_key\s*=\s*\?/i.test(text)) {
++      stmt.get = (sessionKey) => {
++        const row = [...usageRows.values()].find((r) => r.session_key === sessionKey)
++        return row ? { user_id: row.user_id } : undefined
++      }
++    }
++
++    return stmt
++  },
++}
++
++export default db
++
++// ---------------------------------------------------------------------------
++// usage-sync.js boundaries: gateway-client.js / multi-tenant-gateway.js / sse.js
++// ---------------------------------------------------------------------------
++
++export const gatewayState = {
++  usageCalls: [],
++  usageResponse: { sessions: [] },
++  targets: null, // null => single-gateway path
++}
++
++export async function callGatewayUsage(params = {}) {
++  gatewayState.usageCalls.push(params)
++  return JSON.parse(JSON.stringify(gatewayState.usageResponse))
++}
++
++export async function callGatewayUsageForTarget() {
++  throw new Error('callGatewayUsageForTarget is not exercised by the duplicate-event fixture')
++}
++
++export async function getGatewayHttpTargetsForAllTenants() {
++  return gatewayState.targets
++}
++
++export const sseBroadcasts = []
++
++export function broadcastSSE(...args) {
++  sseBroadcasts.push(args)
++}
++
++// ---------------------------------------------------------------------------
++// session-sync.js boundary: ../user-manager.js
++//
++// upsertSyncedUserSession mirrors the real implementation's idempotency
++// (server/user-manager.js: existing row keyed by session_key, `Math.max` on
++// last_message_at, `{ changed: false, action: 'unchanged' }` when nothing
++// differs, so a replayed session update never inserts a duplicate row).
++// ---------------------------------------------------------------------------
++
++export function setOwnedAgents(userId, ids) {
++  ownedAgents.set(userId, ids)
++}
++
++export function getAllGatewayAgentIds() {
++  return [...ownedAgents.values()].flat()
++}
++
++export function getUserOwnedAgentIds(userId) {
++  return ownedAgents.get(userId) || []
++}
++
++export function upsertSyncedUserSession({ userId, sessionKey, agentId, channel, peer, label, lastActivity }) {
++  if (!userId || !sessionKey) return { changed: false, action: 'skipped' }
++
++  const incomingLastActivity = Number.isFinite(Number(lastActivity)) ? Number(lastActivity) : null
++  const existing = sessionMeta.get(sessionKey)
++
++  if (!existing) {
++    sessionMeta.set(sessionKey, {
++      user_id: userId,
++      session_key: sessionKey,
++      agent_id: agentId || null,
++      channel: channel || null,
++      peer_id: peer || null,
++      label: label || null,
++      last_message_at: incomingLastActivity,
++    })
++    // The row inserted by metadata sync is the same physical row the usage
++    // cache later updates; usage_synced_at stays NULL until a usage sync stamps it.
++    seedUsageRow({
++      user_id: userId,
++      session_key: sessionKey,
++      agent_id: agentId || null,
++      usage_synced_at: null,
++    })
++    return { changed: true, action: 'inserted' }
++  }
++
++  const nextAgentId = agentId || existing.agent_id || null
++  const nextChannel = channel || existing.channel || null
++  const nextPeerId = peer || existing.peer_id || null
++  const nextLabel = existing.label || label || null
++  const currentLastMessageAt = Number(existing.last_message_at) || 0
++  const nextLastMessageAt =
++    incomingLastActivity == null ? existing.last_message_at || null : Math.max(currentLastMessageAt, incomingLastActivity)
++
++  const changed =
++    nextAgentId !== (existing.agent_id || null) ||
++    nextChannel !== (existing.channel || null) ||
++    nextPeerId !== (existing.peer_id || null) ||
++    nextLabel !== (existing.label || null) ||
++    nextLastMessageAt !== (existing.last_message_at || null)
++
++  if (!changed) return { changed: false, action: 'unchanged' }
++
++  existing.agent_id = nextAgentId
++  existing.channel = nextChannel
++  existing.peer_id = nextPeerId
++  existing.label = nextLabel
++  existing.last_message_at = nextLastMessageAt
++  return { changed: true, action: 'updated' }
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..7e26ca4
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,108 @@
++{
++  "task_id": "T20",
++  "repository": "wattclaw",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "syncUserSessionsFromGateway",
++      "start_line": 118,
++      "end_line": 177,
++      "observation": "Exported metadata-sync entry point. It resolves the user's allowed agent ids, lists sessions per agent with the single Gateway call `sessions.list` (bounded by perAgentLimit, no pagination/history/detail calls), normalizes each raw row, drops sessions whose agentId is outside the ownership set and sessionKeys present in recentlyDeletedSessionKeys, then calls upsertSyncedUserSession({ userId, ...session }) per row. `changed` is only incremented when the upsert reports result.changed, so replaying the same listed session (whose upsert returns changed:false) adds nothing to the counters and emits no event — the metadata half of the duplicate-event contract."
++    },
++    {
++      "path": "server/core/session-sync.js",
++      "symbol": "scheduleUserSessionSync",
++      "start_line": 179,
++      "end_line": 216,
++      "observation": "Scheduling-level dedup for metadata sync. Keyed on userId: a cooldown check against lastSyncAtByUserId (default cooldownMs 60000, DEFAULT_SESSION_SYNC_OPTIONS at lines 7-12) returns `{ changed: 0, skipped: true, reason: 'cooldown' }`, and the module-level `inFlightByUserId` map (lines 14-15) returns the existing promise for a concurrent duplicate so a second identical schedule never starts a second run. On settle the in-flight entry is deleted and lastSyncAtByUserId is stamped, so only the first of a pair of replayed updates performs work."
++    },
++    {
++      "path": "server/core/session-usage-cache.js",
++      "symbol": "_persistOwnerScopedUpdate",
++      "start_line": 122,
++      "end_line": 152,
++      "observation": "The single write path for usage. It issues `UPDATE user_sessions SET ... WHERE user_id = ? AND session_key = ?` and defines success as `result?.changes === 1`. Every counter (token_input/output/cache_read/cache_write/total, cost_total, msg_*, tool_usage_json) is assigned the Gateway's absolute value with SET — there is no `+=`, no SUM and no read-modify-write — so replaying the identical event converges to the same row values instead of double-counting. Zero matching rows yields changes 0 (callers report a skip/failure) and model/model_provider use a CASE guard so null/empty values do not overwrite existing ones."
++    },
++    {
++      "path": "server/core/session-usage-cache.js",
++      "symbol": "batchUpdateMatchedGatewayUsage",
++      "start_line": 158,
++      "end_line": 225,
++      "observation": "Batch/startup fan-in over gatewayResult.sessions. Each session key is resolved as `session.key || session.sessionKey || session.id`; the ownership lookup selects user_id/session_key rows for that key and zero matches are counted as skippedUnmatched while more than one match is counted as skippedConflict, so ambiguous ownership is never written. Only a single-owner match reaches _persistOwnerScopedUpdate, and report.updated counts writes that returned changes === 1 — replaying the same event therefore re-writes the same single row with identical absolute counters rather than creating a duplicate row or accumulating."
++    },
++    {
++      "path": "server/core/usage-sync.js",
++      "symbol": "syncSessionUsageNow",
++      "start_line": 111,
++      "end_line": 202,
++      "observation": "Event-driven single-session sync. It returns the existing promise from the module-level `inFlightSessionSyncs` map (line 14) when a sync for the same sessionKey is already running, so two concurrent replays of one session update collapse into one Gateway call and one report. Path A looks the key up with getSessionOwner(sessionKey) and writes through updateSessionUsageForUser (the owner-scoped UPDATE); the finally block deletes the in-flight entry keyed by sessionKey. This is what prevents duplicate state changes at the sync layer."
++    },
++    {
++      "path": "server/core/usage-sync.js",
++      "symbol": "scheduleSessionUsageSync",
++      "start_line": 91,
++      "end_line": 109,
++      "observation": "Debounce for repeated session-usage events. pendingSessionTimers is keyed by sessionKey; a pending timer for that key is cleared before a new one is armed, so N replayed events for one session collapse into a single fired sync — the reason a burst of duplicate events cannot multiply state changes. `broadcastSessionUsageUpdate` (lines 47-58) then emits at most one `session.usage.updated` SSE event and only when report.updated > 0 and a message count is resolvable."
++    },
++    {
++      "path": "server/user-manager.js",
++      "symbol": "upsertSyncedUserSession",
++      "start_line": 614,
++      "end_line": 689,
++      "observation": "Persistence-side idempotency for session metadata, keyed on session_key: an existing row is re-read, the merged values are compared against it, and when nothing differs the function returns `{ changed: false, action: 'unchanged' }` without issuing an UPDATE; last_message_at advances only via Math.max(current, incoming). Replaying the same session update can therefore neither insert a duplicate row nor report a duplicate change to syncUserSessionsFromGateway."
++    },
++    {
++      "path": ".prale-eval/duplicate-event-fixture.mjs",
++      "symbol": "REPLAYED_EVENT",
++      "start_line": 35,
++      "end_line": 48,
++      "observation": "The distinct duplicate-event fixture: one absolute-valued Gateway session update (input 100, output 50, totalTokens 150, totalCost 0.5, messageCounts.total 4) under the private markers fixture 'dup-event-fixture/T20' / key 'agent:agent-a:dup-fixture' / owner 'user-dup-owner'. It is replayed byte-for-byte through every entry point of the contract and never collides with another repository fixture."
++    },
++    {
++      "path": ".prale-eval/duplicate-event-fixture.mjs",
++      "symbol": "check",
++      "start_line": 54,
++      "end_line": 58,
++      "observation": "Assertion driver for the executable contract: 16 checks run against the real session-usage-cache/usage-sync/session-sync source (db, Gateway client, SSE sink and user-manager replaced by .prale-eval/harness/mocks.mjs via the .prale-eval/harness/loader.mjs resolve hook). The script exits non-zero on the first failed assertion, so its exit code is the contract verdict."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "Replaying one session update cannot double-count usage: usage is written only through the owner-scoped, absolute-valued UPDATE user_sessions ... WHERE user_id = ? AND session_key = ? whose success test is changes === 1, so a repeated event rewrites the same single row with the same totals (150 tokens, 0.5 cost, 4 messages) instead of accumulating to 300/1.0/8.",
++      "evidence_paths": [
++        "server/core/session-usage-cache.js",
++        ".prale-eval/duplicate-event-fixture.mjs"
++      ]
++    },
++    {
++      "claim": "Replaying one session update cannot emit duplicate state changes: server/core/session-sync.js coalesces concurrent schedules per userId via inFlightByUserId plus a cooldown, and only counts a change when upsertSyncedUserSession reports changed; replaying the same listed session yields changed 0 because user-manager keys the upsert on session_key and returns action 'unchanged' when nothing differs.",
++      "evidence_paths": [
++        "server/core/session-sync.js",
++        "server/user-manager.js"
++      ]
++    },
++    {
++      "claim": "A duplicate session update cannot duplicate a sync run or a broadcast: usage-sync returns the existing in-flight promise per sessionKey and debounces pending timers per sessionKey, so a replayed event collapses to one Gateway call and at most one session.usage.updated SSE event.",
++      "evidence_paths": [
++        "server/core/usage-sync.js",
++        ".prale-eval/duplicate-event-fixture.mjs"
++      ]
++    },
++    {
++      "claim": "The duplicate-event fixture is executable and self-contained: `node .prale-eval/duplicate-event-fixture.mjs` runs the real session-sync, usage-sync and session-usage-cache source with only their db/Gateway/user-manager boundaries doubled, and its 16 assertions pass (exit code 0) covering batch replay, concurrent replay, debounce, metadata replay and per-user schedule coalescing.",
++      "evidence_paths": [
++        ".prale-eval/duplicate-event-fixture.mjs",
++        "server/core/session-usage-cache.js",
++        "server/core/usage-sync.js",
++        "server/core/session-sync.js"
++      ]
++    }
++  ],
++  "conclusion": "Contract satisfied. Replaying one session update is idempotent at all three layers: the usage write is an absolute-valued, owner-scoped UPDATE keyed on the composite (user_id, session_key) with changes === 1 as the success test, so identical replays converge on the same counters (150 tokens / 0.5 cost / 4 messages) and never create a second row; usage-sync coalesces concurrent runs and debounces pending timers per sessionKey so one replayed event yields one Gateway call and one session.usage.updated event; and session-sync's per-user in-flight coalescing plus the session_key-keyed upsert make a replayed metadata update report changed: 0. Ownership ambiguity (zero or multiple owner rows) is skipped rather than written, which also prevents a duplicate write from being attributed to a second owner. Verified by the executable duplicate-event fixture, 16/16 checks passing.",
++  "validation": {
++    "command": "node .prale-eval/duplicate-event-fixture.mjs",
++    "status": "passed",
++    "notes": "Executable Node v24.14.0 contract fixture (plain node:assert + node:module loader hooks, no new dependencies). Result: 'CONTRACT OK: 16 checks passed for dup-event-fixture/T20', exit code 0, stdout captured in .prale-eval/contract-deliverable.md section 3. LIMITATION: vitest and better-sqlite3 are not installed in this offline workspace and were deliberately not installed (no dependency or package-lock changes), so `npm run test:server` could not be executed; the fixture substitutes a minimal in-memory double for the SQLite handle and for the Gateway/SSE/user-manager boundaries while executing the real production modules. The double implements only the statements on the duplicate-event path (owner-scoped UPDATE, ownership SELECT, getSessionOwner), so read/aggregate paths are not covered by this run and this is weaker evidence than the repository suite. All cited symbols were re-verified against the checkout by asserting the symbol token occurs inside its inclusive line range, and no production file was modified."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/contract-deliverable.md - 72982decc7928c08ce9aaa0fcd95610c841e2d9b112b02567395a39e55e08808
+snapshot .prale-eval/duplicate-event-fixture.mjs - 2c34f39089ededc1b9873f99417c8f26257b1bf1cb2e7dafb8f9ae350e3c4cc2
+snapshot .prale-eval/harness/loader.mjs - c0c6367d94ab9ad0d134ace549240adbae8edbc077e375c179b240899f7fd003
+snapshot .prale-eval/harness/mocks.mjs - 9c11798d267351bf2a45f4808e2a02fe0479bf2f27a68e30749a822a777d1eb2
+snapshot .prale-eval/result.json - d224590c8873e06a70b69b7f3ae386b8e2a1dce83e3fd161103c0d305f1c543c

@@ -1,0 +1,621 @@
+diff --git a/.prale-eval/demo-deliverable.md b/.prale-eval/demo-deliverable.md
+new file mode 100644
+index 0000000..f848775
+--- /dev/null
++++ b/.prale-eval/demo-deliverable.md
+@@ -0,0 +1,104 @@
++# T19 demo deliverable - tiny local RPC/command adapter with reject-before-effect and one error shape
++
++Repository: `pi` (task mode: `demo`).
++
++## What was built
++
++A dependency-free ESM demo of a local RPC/command adapter, plus a focused test file:
++
++| File | Purpose |
++| --- | --- |
++| `packages/agent/demo/rpc-adapter-demo.mjs` | Adapter, validation, fake effect, scripted self-checking demo, and a small CLI |
++| `packages/agent/demo/rpc-adapter-demo.test.mjs` | `node:test` validation of the contract (6 tests) |
++
++No package manifest, lockfile, tsconfig, git config, or task metadata was touched; the demo lives outside
++the `packages/agent/tsconfig.build.json` `src/**/*.ts` include, so the package build is unaffected.
++
++## Executable demo
++
++```bash
++# scripted, self-checking demo: prints one normalized result per case + a summary line
++node packages/agent/demo/rpc-adapter-demo.mjs
++
++# dispatch a single request from the command line (JSON in, normalized result out)
++node packages/agent/demo/rpc-adapter-demo.mjs '{"command":"echo","params":{"text":"hello"}}'
++node packages/agent/demo/rpc-adapter-demo.mjs '{"command":"echo","params":{}}'
++
++# focused validation
++node --test packages/agent/demo/rpc-adapter-demo.test.mjs
++```
++
++Observed results: scripted demo prints `{"summary":"pass","cases":10,"failures":0,"effectsApplied":2}` and exits 0;
++the test file reports `pass 6`, `fail 0`.
++
++## Contract
++
++Request envelope (JSON-ish, one adapter call):
++
++```ts
++type Request = { command: string; params?: Record<string, unknown> };
++```
++
++`dispatch(request)` always returns exactly one of two normalized results and **never throws**:
++
++```ts
++type OperationResult =
++  | { ok: true;  result: unknown }
++  | { ok: false; error: { code: string; message: string; details: object } };
++```
++
++### 1. Invalid input is rejected before the fake effect
++
++`dispatch` runs a strict, ordered validation phase and returns early at the first failure:
++
++1. request must be a plain object;
++2. `request.command` must be a non-empty string;
++3. the command must exist in the command table;
++4. `request.params` must be a plain object when present;
++5. params must satisfy the command schema - required keys present, correct types, and no unexpected keys.
++
++The fake effect (`createFakeEffect().apply`, which records every call) is reachable only after all five checks
++pass (`packages/agent/demo/rpc-adapter-demo.mjs`, effect phase). Consequently every invalid request leaves
++`effect.count() === 0`; the test suite asserts this for 18 invalid requests individually and again in an
++aggregate shape test.
++
++### 2. One stable error shape
++
++All failures - malformed request, unknown command, invalid params, *and* a command body that throws at effect
++time - are constructed by the single `reject(code, message, details)` helper, producing
++
++```json
++{ "ok": false, "error": { "code": "invalid_params", "message": "params.text must be a non-empty string",
++                          "details": { "command": "echo", "problems": ["params.text must be a non-empty string"] } } }
++```
++
++Codes: `invalid_request`, `unknown_command`, `invalid_params`, `effect_failed`. The shape is executable:
++`isErrorEnvelope(value)` returns true only for an object with exactly the keys `[ok, error]` whose `error` has
++exactly `[code, message, details]` and the right value types; `isSuccessEnvelope(value)` does the same for
++`{ ok: true, result }`. The test suite asserts both the exact key sets and the shape predicate for every
++rejection, so no code path can drift into a second error format.
++
++## Transfer from `packages/agent/src/proxy.ts`
++
++The demo deliberately copies the failure-handling structure of the repo's proxy stream function:
++
++- `streamProxy` (`packages/agent/src/proxy.ts`, lines 120-265) throws for a non-ok response at lines 174-185,
++  *before* `response.body` is consumed, and later folds both the dropped-stream case (232-243) and any thrown
++  exception / abort (246-256) into the identical `{ type: "error", reason, error }` event - the one stable
++  error shape declared by `ProxyAssistantMessageEvent` (lines 36-61). The demo's single rejection envelope and
++  its `EFFECT_FAILED` mapping of thrown command bodies mirror this.
++- `processProxyEvent` (lines 270-406) validates each event against the current partial state and throws
++  *before* mutating it (e.g. `text_delta` throws at line 293 rather than writing into a non-text slot), and
++  unknown events return `undefined` instead of corrupting state (lines 400-404). The demo's validate-then-act
++  ordering is the same idea applied to command dispatch.
++- Where the proxy uses a terminal stream event, `dispatch` returns a value: a local request/response RPC
++  adapter has no stream, so the normalized `OperationResult` is the single observation point for callers.
++
++## Validation notes and limitation
++
++- `node --test packages/agent/demo/rpc-adapter-demo.test.mjs` -> passed (6/6).
++- `node packages/agent/demo/rpc-adapter-demo.mjs` -> passed (10/10 cases, exit 0).
++- LIMITATION: the workspace has no `node_modules` and dependencies must not be installed, so the repository's
++  own vitest suite covering the cited source file (`packages/agent/test/proxy.test.ts`, normally
++  `npm run test -w @earendil-works/pi-agent-core`) could not be run. The demo and its test are dependency-free
++  ESM precisely so the focused validation still executes with plain Node (v24.14.0).
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..6b6b1e6
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,62 @@
++{
++  "task_id": "T19",
++  "repository": "pi",
++  "mode": "demo",
++  "evidence": [
++    {
++      "path": "packages/agent/src/proxy.ts",
++      "symbol": "ProxyAssistantMessageEvent",
++      "start_line": 36,
++      "end_line": 61,
++      "observation": "Declares the proxy wire protocol, including the single terminal failure variant `{ type: \"error\"; reason: Extract<StopReason, \"aborted\" | \"error\">; errorMessage?: string; usage; providerThinkingLevel? }`. That variant is the one stable error shape every server-side failure is mapped onto, which is exactly the contract the T19 demo copies into a local command adapter."
++    },
++    {
++      "path": "packages/agent/src/proxy.ts",
++      "symbol": "streamProxy",
++      "start_line": 120,
++      "end_line": 265,
++      "observation": "`streamProxy` rejects an unusable response up front: when `!response.ok` (lines 174-185) it throws before ever reading `response.body`, so an invalid/error response cannot produce partial effects for the consumer. Every later failure mode is normalized into the same terminal event - the mid-stream drop branch (lines 232-243) and the catch block (lines 246-256) both push `{ type: \"error\", reason, error: partial }` and then `stream.end()`, so callers see exactly one error shape regardless of the cause."
++    },
++    {
++      "path": "packages/agent/src/proxy.ts",
++      "symbol": "processProxyEvent",
++      "start_line": 270,
++      "end_line": 406,
++      "observation": "Processes each server event in a discriminated switch and validates the precondition before mutating the partial message: `text_delta` (282-295) checks `content?.type === \"text\"` and throws `Received text_delta for non-text content` instead of writing, and the same guard-before-mutation pattern repeats for text_end (307), thinking_delta (325), thinking_end (339), and toolcall_delta (365). Invalid input is therefore rejected before the state mutation takes effect; unknown event types fall through to the exhaustive `never` check and return `undefined` (lines 400-404) rather than corrupting state, and `toolcall_end` likewise returns `undefined` for a mismatched content slot (line 380)."
++    },
++    {
++      "path": "packages/agent/demo/rpc-adapter-demo.mjs",
++      "symbol": "createLocalRpcAdapter",
++      "start_line": 172,
++      "end_line": 228,
++      "observation": "The demo adapter: `dispatch(request)` runs the whole validation phase first (plain-object envelope, non-empty string command, known command, plain-object params, schema check via `validateParams`) and returns early on every problem, so the fake effect (`effect.apply`) is only reachable on line 212 after all checks pass. The effect call itself is wrapped in try/catch so even a throwing command body is folded into the identical rejection envelope instead of propagating."
++    },
++    {
++      "path": "packages/agent/demo/rpc-adapter-demo.mjs",
++      "symbol": "reject",
++      "start_line": 55,
++      "end_line": 66,
++      "observation": "The single constructor for the stable error shape `{ ok: false, error: { code, message, details } }`; it rejects non-string codes/messages and non-object details, so all four failure classes (invalid_request, unknown_command, invalid_params, effect_failed) are byte-for-byte the same shape. `isErrorEnvelope` (lines 69-90) is the executable predicate the test suite uses to assert that shape."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "`packages/agent/src/proxy.ts` funnels every failure mode into one stable terminal error shape: `streamProxy` throws for a non-ok response before consuming the body (lines 174-185) and both the dropped-stream branch (232-243) and the catch block (246-256) push the same `{ type: \"error\", reason, error }` event declared by the `ProxyAssistantMessageEvent` error variant (36-61).",
++      "evidence_paths": ["packages/agent/src/proxy.ts"]
++    },
++    {
++      "claim": "`processProxyEvent` in `packages/agent/src/proxy.ts` rejects invalid event/state combinations before mutating the partial message (e.g. `text_delta` throws at line 293 before touching `content.text`), which is the reject-before-effect property the T19 demo transfers to command dispatch.",
++      "evidence_paths": ["packages/agent/src/proxy.ts"]
++    },
++    {
++      "claim": "The T19 demo `packages/agent/demo/rpc-adapter-demo.mjs` implements the same contract locally: `createLocalRpcAdapter().dispatch()` validates the request envelope, command name, and params and returns early, so invalid input is rejected before the fake effect runs (effect count stays 0), and `reject()` is the only error constructor, giving one stable error shape for invalid_request, unknown_command, invalid_params, and effect_failed. This is verified by `node --test packages/agent/demo/rpc-adapter-demo.test.mjs` (6/6 passing).",
++      "evidence_paths": ["packages/agent/src/proxy.ts", "packages/agent/demo/rpc-adapter-demo.mjs"]
++    }
++  ],
++  "conclusion": "The demo is complete and executable with plain Node (no dependencies installed): `node packages/agent/demo/rpc-adapter-demo.mjs` runs a self-checking scripted demo whose 10 cases all pass and whose summary reports `effectsApplied: 2` for the 2 valid requests while all 8 invalid requests leave the fake effect at 0 calls, and `node --test packages/agent/demo/rpc-adapter-demo.test.mjs` passes 6/6 tests asserting rejection-before-effect and the single error shape. The design is grounded in `packages/agent/src/proxy.ts`: a validation/rejection phase that runs before any state mutation (processProxyEvent type guards, non-ok response thrown before body consumption) and exactly one normalized error envelope for every failure (`ProxyAssistantMessageEvent`'s `type: \"error\"` variant pushed by both the dropped-stream branch and the catch block).",
++  "validation": {
++    "command": "node --test packages/agent/demo/rpc-adapter-demo.test.mjs",
++    "status": "passed",
++    "notes": "6/6 node:test tests pass (0 fail, 0 skipped): valid input applies the fake effect exactly once and returns `{ ok: true, result }`; 18 invalid requests each return a well-formed error envelope and leave `effect.count() === 0`; every rejection (including a throwing command body and a locally built `reject()`) has exactly the keys `[ok, error]` / `[error.code, error.message, error.details]`; `dispatch` never throws for `null`, `undefined`, numbers, strings, arrays, functions, symbols, or `explode`. Supplementary run: `node packages/agent/demo/rpc-adapter-demo.mjs` -> scripted demo summary `{\"summary\":\"pass\",\"cases\":10,\"failures\":0,\"effectsApplied\":2}`, exit 0; CLI rejection path `node packages/agent/demo/rpc-adapter-demo.mjs 'not json'` also returns the same envelope. LIMITATION: the workspace has no installed dependencies (`node_modules` absent) and the task forbids installing them, so the repository's vitest suite for the cited source file (`packages/agent/test/proxy.test.ts`, run via `npm run test -w @earendil-works/pi-agent-core`) could not be executed; the demo and its test file are dependency-free ESM precisely so the focused validation still runs with plain node v24.14.0."
++  }
++}
+diff --git a/packages/agent/demo/rpc-adapter-demo.mjs b/packages/agent/demo/rpc-adapter-demo.mjs
+new file mode 100644
+index 0000000..3168c11
+--- /dev/null
++++ b/packages/agent/demo/rpc-adapter-demo.mjs
+@@ -0,0 +1,310 @@
++#!/usr/bin/env node
++/**
++ * Tiny local RPC/command adapter demo (task T19).
++ *
++ * Design contract, borrowed from the degradation/error handling in
++ * `packages/agent/src/proxy.ts`:
++ *
++ *   1. Validation happens *before* the effect. `dispatch()` checks the request
++ *      envelope, the command name, and the parameter schema first; the fake
++ *      effect is only invoked once every check passed. An invalid request
++ *      therefore never mutates adapter state (effectsApplied stays 0).
++ *   2. Every failure - malformed request, unknown command, invalid params, and
++ *      even a throwing command body - is normalized into exactly one error
++ *      shape: `{ ok: false, error: { code, message, details } }`.
++ *   3. `dispatch()` never throws. Callers branch on `ok`, like proxy stream
++ *      consumers branch on the single terminal `type: "error"` event.
++ *
++ * The module is dependency-free ESM so it runs with plain `node`.
++ *
++ * Usage:
++ *   node packages/agent/demo/rpc-adapter-demo.mjs                 # scripted, self-checking demo
++ *   node packages/agent/demo/rpc-adapter-demo.mjs '{"command":"echo","params":{"text":"hi"}}'
++ *   node --test packages/agent/demo/rpc-adapter-demo.test.mjs     # focused validation
++ */
++
++/** Canonical error codes. Every rejection uses one of these. */
++export const ERROR_CODES = Object.freeze({
++	INVALID_REQUEST: "invalid_request",
++	UNKNOWN_COMMAND: "unknown_command",
++	INVALID_PARAMS: "invalid_params",
++	EFFECT_FAILED: "effect_failed",
++});
++
++/** Exact key set of the single stable error shape. */
++export const ERROR_ENVELOPE_KEYS = Object.freeze(["ok", "error"]);
++export const ERROR_BODY_KEYS = Object.freeze(["code", "message", "details"]);
++export const SUCCESS_ENVELOPE_KEYS = Object.freeze(["ok", "result"]);
++
++function isPlainObject(value) {
++	return typeof value === "object" && value !== null && !Array.isArray(value);
++}
++
++function typeName(value) {
++	if (value === null) return "null";
++	if (Array.isArray(value)) return "array";
++	return typeof value;
++}
++
++/** Build a successful normalized operation result. */
++export function resolve(result) {
++	return { ok: true, result };
++}
++
++/** Build the one and only error shape. This is the only place errors are constructed. */
++export function reject(code, message, details = {}) {
++	if (typeof code !== "string" || code.length === 0) {
++		throw new TypeError("reject() requires a non-empty string code");
++	}
++	if (typeof message !== "string" || message.length === 0) {
++		throw new TypeError("reject() requires a non-empty string message");
++	}
++	if (!isPlainObject(details)) {
++		throw new TypeError("reject() requires a plain object for details");
++	}
++	return { ok: false, error: { code, message, details } };
++}
++
++/** Shape predicate: true only for a well-formed rejection produced by `reject()`. */
++export function isErrorEnvelope(value) {
++	if (!isPlainObject(value)) return false;
++	if (Object.keys(value).length !== ERROR_ENVELOPE_KEYS.length) return false;
++	if (!ERROR_ENVELOPE_KEYS.every((key) => Object.hasOwn(value, key))) return false;
++	const body = value.error;
++	if (!isPlainObject(body)) return false;
++	if (Object.keys(body).length !== ERROR_BODY_KEYS.length) return false;
++	if (!ERROR_BODY_KEYS.every((key) => Object.hasOwn(body, key))) return false;
++	return (
++		typeof body.code === "string" &&
++		body.code.length > 0 &&
++		typeof body.message === "string" &&
++		body.message.length > 0 &&
++		isPlainObject(body.details)
++	);
++}
++
++/** Shape predicate for the normalized success result. */
++export function isSuccessEnvelope(value) {
++	return (
++		isPlainObject(value) &&
++		Object.keys(value).length === SUCCESS_ENVELOPE_KEYS.length &&
++		SUCCESS_ENVELOPE_KEYS.every((key) => Object.hasOwn(value, key)) &&
++		value.ok === true
++	);
++}
++
++const PARAM_CHECKS = {
++	string: (value) => (typeof value === "string" ? undefined : "must be a string"),
++	"non-empty-string": (value) =>
++		typeof value === "string" && value.trim() !== "" ? undefined : "must be a non-empty string",
++	number: (value) =>
++		typeof value === "number" && Number.isFinite(value) ? undefined : "must be a finite number",
++	"number[]": (value) =>
++		Array.isArray(value) && value.every((item) => typeof item === "number" && Number.isFinite(item))
++			? undefined
++			: "must be an array of finite numbers",
++	boolean: (value) => (typeof value === "boolean" ? undefined : "must be a boolean"),
++};
++
++/**
++ * Validate params against a `{ paramName: typeName }` schema.
++ * Returns a list of human readable problems; an empty list means valid.
++ * Unknown params are rejected so typos fail loudly instead of being ignored.
++ */
++export function validateParams(schema, params) {
++	const problems = [];
++	for (const [key, expected] of Object.entries(schema)) {
++		const check = PARAM_CHECKS[expected];
++		if (!check) throw new Error(`unknown param type in schema: ${expected}`);
++		if (!Object.hasOwn(params, key)) {
++			problems.push(`missing required param "params.${key}"`);
++			continue;
++		}
++		const problem = check(params[key]);
++		if (problem) problems.push(`params.${key} ${problem}`);
++	}
++	for (const key of Object.keys(params)) {
++		if (!Object.hasOwn(schema, key)) problems.push(`unexpected param "params.${key}"`);
++	}
++	return problems;
++}
++
++/**
++ * Command table: `schema` is checked before the command runs, `effect` produces
++ * the payload handed to the fake effect. `explode` exists only to prove that a
++ * runtime failure is normalized into the same error shape as a rejection.
++ */
++export const COMMANDS = Object.freeze({
++	echo: {
++		schema: { text: "non-empty-string" },
++		effect: (params) => ({ echoed: params.text }),
++	},
++	sum: {
++		schema: { values: "number[]" },
++		effect: (params) => ({ total: params.values.reduce((acc, value) => acc + value, 0) }),
++	},
++	explode: {
++		schema: {},
++		effect: () => {
++			throw new Error("fake backend exploded");
++		},
++	},
++});
++
++/** A fake side effect: it only records that it ran, so tests can count calls. */
++export function createFakeEffect() {
++	const applied = [];
++	return {
++		apply(command, payload) {
++			applied.push({ command, payload: JSON.parse(JSON.stringify(payload)) });
++			return { applied: true, command, payload };
++		},
++		count: () => applied.length,
++		entries: () => applied.map((entry) => ({ ...entry })),
++	};
++}
++
++/**
++ * Create the adapter. `dispatch` accepts a JSON-ish RPC request
++ * (`{ command: string, params?: object }`) and always returns either the
++ * success envelope or the single stable error envelope.
++ */
++export function createLocalRpcAdapter({ effect = createFakeEffect(), commands = COMMANDS } = {}) {
++	function dispatch(request) {
++		// --- validation phase: nothing below touches the effect ---
++		if (!isPlainObject(request)) {
++			return reject(ERROR_CODES.INVALID_REQUEST, "request must be a JSON object", {
++				field: "request",
++				received: typeName(request),
++			});
++		}
++		if (typeof request.command !== "string" || request.command.trim() === "") {
++			return reject(ERROR_CODES.INVALID_REQUEST, "request.command must be a non-empty string", {
++				field: "command",
++				received: typeName(request.command),
++			});
++		}
++		const command = Object.hasOwn(commands, request.command) ? commands[request.command] : undefined;
++		if (!command) {
++			return reject(ERROR_CODES.UNKNOWN_COMMAND, `unknown command: ${request.command}`, {
++				command: request.command,
++				known: Object.keys(commands),
++			});
++		}
++		const params = request.params === undefined ? {} : request.params;
++		if (!isPlainObject(params)) {
++			return reject(ERROR_CODES.INVALID_PARAMS, "request.params must be a JSON object", {
++				field: "params",
++				received: typeName(params),
++			});
++		}
++		const problems = validateParams(command.schema, params);
++		if (problems.length > 0) {
++			return reject(ERROR_CODES.INVALID_PARAMS, problems.join("; "), {
++				command: request.command,
++				problems,
++			});
++		}
++
++		// --- effect phase: only reached by fully valid input ---
++		try {
++			const payload = command.effect(params);
++			return resolve(effect.apply(request.command, payload));
++		} catch (error) {
++			return reject(
++				ERROR_CODES.EFFECT_FAILED,
++				error instanceof Error ? error.message : String(error),
++				{ command: request.command },
++			);
++		}
++	}
++
++	return {
++		dispatch,
++		effect,
++		commands,
++		errorShapeKeys: { envelope: ERROR_ENVELOPE_KEYS, error: ERROR_BODY_KEYS },
++	};
++}
++
++const SCRIPTED_CASES = [
++	{ label: "valid echo", request: { command: "echo", params: { text: "hello" } }, expect: "ok" },
++	{ label: "valid sum", request: { command: "sum", params: { values: [1, 2, 3] } }, expect: "ok" },
++	{ label: "command body throws", request: { command: "explode" }, expect: "error:effect_failed" },
++	{ label: "unknown command", request: { command: "nope" }, expect: "error:unknown_command" },
++	{ label: "missing param", request: { command: "echo", params: {} }, expect: "error:invalid_params" },
++	{ label: "wrong param type", request: { command: "echo", params: { text: 42 } }, expect: "error:invalid_params" },
++	{ label: "unexpected param", request: { command: "echo", params: { text: "hi", oops: true } }, expect: "error:invalid_params" },
++	{ label: "params not an object", request: { command: "echo", params: "hi" }, expect: "error:invalid_params" },
++	{ label: "command not a string", request: { command: 7 }, expect: "error:invalid_request" },
++	{ label: "request not an object", request: null, expect: "error:invalid_request" },
++];
++
++/**
++ * Run the scripted demo. Every invalid case must be rejected by the validation
++ * phase with the stable shape and must leave the fake effect untouched.
++ * Returns true when all expectations hold.
++ */
++export function runScriptedDemo({ write = (line) => console.log(line) } = {}) {
++	const adapter = createLocalRpcAdapter();
++	let failures = 0;
++	for (const demoCase of SCRIPTED_CASES) {
++		const before = adapter.effect.count();
++		const outcome = adapter.dispatch(demoCase.request);
++		const after = adapter.effect.count();
++		const actual = outcome.ok ? "ok" : `error:${outcome.error.code}`;
++		let passed = actual === demoCase.expect;
++		if (!outcome.ok) {
++			passed = passed && isErrorEnvelope(outcome) && after === before;
++		} else {
++			passed = passed && isSuccessEnvelope(outcome) && after === before + 1;
++		}
++		if (!passed) failures += 1;
++		write(
++			JSON.stringify({
++				case: demoCase.label,
++				request: demoCase.request,
++				outcome,
++				effectCallsBefore: before,
++				effectCallsAfter: after,
++				expected: demoCase.expect,
++				passed,
++			}),
++		);
++	}
++	write(
++		JSON.stringify({
++			summary: failures === 0 ? "pass" : "fail",
++			cases: SCRIPTED_CASES.length,
++			failures,
++			effectsApplied: adapter.effect.count(),
++			errorShape: adapter.errorShapeKeys,
++		}),
++	);
++	return failures === 0;
++}
++
++function main(argv) {
++	const rawRequest = argv[2];
++	if (rawRequest !== undefined) {
++		let request;
++		try {
++			request = JSON.parse(rawRequest);
++		} catch (error) {
++			// Even CLI-level parse failures use the one stable shape.
++			const outcome = reject(ERROR_CODES.INVALID_REQUEST, `request is not valid JSON: ${error.message}`, {
++				field: "argv[2]",
++			});
++			console.log(JSON.stringify(outcome));
++			return 0;
++		}
++		console.log(JSON.stringify(createLocalRpcAdapter().dispatch(request)));
++		// A rejection is a normalized result, not a crash: exit 0 either way.
++		return 0;
++	}
++	return runScriptedDemo() ? 0 : 1;
++}
++
++if (import.meta.url === `file://${process.argv[1]}`) {
++	process.exitCode = main(process.argv);
++}
+diff --git a/packages/agent/demo/rpc-adapter-demo.test.mjs b/packages/agent/demo/rpc-adapter-demo.test.mjs
+new file mode 100644
+index 0000000..907d4ae
+--- /dev/null
++++ b/packages/agent/demo/rpc-adapter-demo.test.mjs
+@@ -0,0 +1,117 @@
++import assert from "node:assert/strict";
++import { test } from "node:test";
++import {
++	createLocalRpcAdapter,
++	ERROR_BODY_KEYS,
++	ERROR_CODES,
++	ERROR_ENVELOPE_KEYS,
++	isErrorEnvelope,
++	isSuccessEnvelope,
++	reject,
++} from "./rpc-adapter-demo.mjs";
++
++const INVALID_REQUESTS = [
++	null,
++	undefined,
++	42,
++	"echo",
++	[],
++	{},
++	{ command: "" },
++	{ command: "   " },
++	{ command: 7 },
++	{ command: "echo", params: "nope" },
++	{ command: "echo", params: [] },
++	{ command: "echo", params: {} },
++	{ command: "echo", params: { text: "" } },
++	{ command: "echo", params: { text: 42 } },
++	{ command: "echo", params: { text: "hi", unexpected: true } },
++	{ command: "sum", params: { values: [1, "two"] } },
++	{ command: "sum", params: { values: "1,2" } },
++	{ command: "unknown.command" },
++];
++
++test("valid input runs the fake effect once and returns the normalized success result", () => {
++	const adapter = createLocalRpcAdapter();
++	const outcome = adapter.dispatch({ command: "echo", params: { text: "hello" } });
++
++	assert.equal(isSuccessEnvelope(outcome), true);
++	assert.deepEqual(Object.keys(outcome), ["ok", "result"]);
++	assert.deepEqual(outcome.result, { applied: true, command: "echo", payload: { echoed: "hello" } });
++	assert.equal(adapter.effect.count(), 1);
++	assert.deepEqual(adapter.effect.entries(), [{ command: "echo", payload: { echoed: "hello" } }]);
++});
++
++test("invalid input is rejected before the fake effect runs", () => {
++	for (const request of INVALID_REQUESTS) {
++		const adapter = createLocalRpcAdapter();
++		const outcome = adapter.dispatch(request);
++
++		assert.equal(isErrorEnvelope(outcome), true, `expected stable error shape for ${JSON.stringify(request)}`);
++		assert.equal(outcome.ok, false);
++		assert.equal(
++			adapter.effect.count(),
++			0,
++			`fake effect must not run for invalid input ${JSON.stringify(request)}`,
++		);
++		assert.deepEqual(adapter.effect.entries(), []);
++	}
++});
++
++test("invalid input produces specific, actionable error codes", () => {
++	const adapter = createLocalRpcAdapter();
++
++	assert.equal(adapter.dispatch(null).error.code, ERROR_CODES.INVALID_REQUEST);
++	assert.equal(adapter.dispatch({ command: "" }).error.code, ERROR_CODES.INVALID_REQUEST);
++	assert.equal(adapter.dispatch({ command: "missing" }).error.code, ERROR_CODES.UNKNOWN_COMMAND);
++	assert.equal(adapter.dispatch({ command: "echo", params: {} }).error.code, ERROR_CODES.INVALID_PARAMS);
++	assert.equal(adapter.dispatch({ command: "echo", params: { text: 1 } }).error.code, ERROR_CODES.INVALID_PARAMS);
++	assert.equal(adapter.effect.count(), 0);
++});
++
++test("every rejection uses exactly the same error shape", () => {
++	const adapter = createLocalRpcAdapter();
++	const outcomes = [
++		...INVALID_REQUESTS.map((request) => adapter.dispatch(request)),
++		// a command body that throws at effect time is normalized the same way
++		adapter.dispatch({ command: "explode" }),
++		// and so is a locally constructed rejection
++		reject(ERROR_CODES.EFFECT_FAILED, "boom", { command: "explode" }),
++	];
++
++	for (const outcome of outcomes) {
++		assert.equal(isErrorEnvelope(outcome), true);
++		assert.deepEqual(Object.keys(outcome), [...ERROR_ENVELOPE_KEYS]);
++		assert.deepEqual(Object.keys(outcome.error), [...ERROR_BODY_KEYS]);
++		assert.equal(typeof outcome.error.code, "string");
++		assert.equal(typeof outcome.error.message, "string");
++		assert.equal(typeof outcome.error.details, "object");
++	}
++});
++
++test("dispatch never throws, not even for garbage or throwing commands", () => {
++	const adapter = createLocalRpcAdapter();
++	const garbage = [null, undefined, 0, "", NaN, [], {}, () => {}, Symbol("x")];
++	for (const request of garbage) {
++		assert.doesNotThrow(() => adapter.dispatch(request));
++	}
++	assert.doesNotThrow(() => adapter.dispatch({ command: "explode" }));
++	assert.equal(adapter.dispatch({ command: "explode" }).error.code, ERROR_CODES.EFFECT_FAILED);
++	assert.equal(adapter.effect.count(), 0);
++});
++
++test("the fake effect only records valid calls", () => {
++	const adapter = createLocalRpcAdapter();
++	adapter.dispatch({ command: "nope" });
++	adapter.dispatch({ command: "sum", params: { values: [1, 2] } });
++	adapter.dispatch({ command: "sum", params: { values: [3] } });
++
++	assert.equal(adapter.effect.count(), 2);
++	assert.deepEqual(
++		adapter.effect.entries(),
++		[
++			{ command: "sum", payload: { total: 3 } },
++			{ command: "sum", payload: { total: 3 } },
++		],
++	);
++});
+snapshot .prale-eval/demo-deliverable.md - 577e6e41df7d27fe9ff8850a9d1e142b1f8c9e0847f93ebff886dc139e220d8e
+snapshot .prale-eval/result.json - 950355a53a444600a6515543d77cb34d91b72909cec7adaf612ce7295b12fde9
+snapshot packages/agent/demo/rpc-adapter-demo.mjs - 7441eef93e0c881003356b2d70e6adbfc6fd9c4cfac0eea3c24e450934fa1a00
+snapshot packages/agent/demo/rpc-adapter-demo.test.mjs - 59794c78f0c8cdff13a83111dc206266569123576fc7300bf7816478542650a3

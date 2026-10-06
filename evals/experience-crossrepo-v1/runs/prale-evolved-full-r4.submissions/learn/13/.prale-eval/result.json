@@ -1,0 +1,105 @@
+{
+  "task_id": 13,
+  "repository": "tdam",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue",
+      "start_line": 11,
+      "end_line": 33,
+      "observation": "BuildQueue is the per-asset-key ownership layer: it holds a Map<string, SerialQueue> (line 12) and lazily creates one SerialQueue per key on first enqueue (lines 16-20). Because all jobs sharing an asset id (code_graph_id or wiki_id) funnel into that key's single concurrency-1 queue, the same asset can never rebuild concurrently; different keys run independently. enqueue() (lines 15-24) is declared void and fire-and-forget, attaching a .catch(() => {}) so a rejected job does not surface an unhandled rejection because the job itself (runBuild) is responsible for persisting the failed status. onIdle(key?) (lines 27-33) awaits one named queue or Promise.all over every queue, giving tests/shutdown a deterministic drain point. module.ts shares one BuildQueue instance between WikiService and CodeGraphService, so serialization is per-asset-key across both services (module.ts:210, 220, 225)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue",
+      "start_line": 21,
+      "end_line": 54,
+      "observation": "SerialQueue is a dependency-free concurrency=1 FIFO executor. State is queue: QueueEntry[] (line 24), running (25), paused (26), idleResolvers (27). add<T>() (lines 45-54) appends the task plus its resolve/reject to the tail and immediately calls drain(), returning the task's result promise; the tail-push/front-shift discipline is what makes execution strictly FIFO. start() (60-63) clears paused and re-drains, enabling pause/resume without losing queued order. There is no internal retry or dedup: each add() is exactly one execution attempt, and rejection is propagated to the caller rather than re-queued."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "drain",
+      "start_line": 81,
+      "end_line": 101,
+      "observation": "drain() is the ordering and failure-isolation point. Guard at line 82 (running || paused || empty) enforces concurrency=1 so only one task executes at a time. It shifts the head (line 84), sets running=true, and on completion uses .finally (lines 91-100) to reset running, resolve any idleResolvers when the queue is empty (93-96) or recurse to the next head otherwise (98). Because the next task is pulled from the same queue regardless of the previous task's settle state (then/catch both feed into finally), a rejected task neither blocks nor retries the queue - failures propagate to that task's promise only, and the caller-level components provide any retry/idempotency semantics."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/auto-sync-scheduler.ts",
+      "symbol": "AutoSyncScheduler",
+      "start_line": 82,
+      "end_line": 110,
+      "observation": "AutoSyncScheduler owns the auto-sync scheduling state: an in-memory FIFO queue: CodeGraphRow[] (line 94), an inFlight: Set<string> dedup set of asset ids that are queued or executing (95), counters activeSyncs/workerCount (98-100), stopped (102) and scanning (104) guards. The queue and inFlight set are memory-only, so across a process restart they are lost; sqlite-store.markInterruptedAsFailed() sweeps leftover pending/processing rows to failed on startup (sqlite-store.ts:544-559), which is the restart idempotency point. Configuration (range 34-61) clamps scan interval to 1-60 min and concurrency to 1-20, defaulting disabled."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/auto-sync-scheduler.ts",
+      "symbol": "scan",
+      "start_line": 197,
+      "end_line": 249,
+      "observation": "scan() is the ordering + dedup entry point. It is re-entrancy guarded by the scanning flag (198-202, reset in finally 223-224). It lists ready candidates via listSyncCandidates() (233-249, which filters status === 'ready' and drops missing rows) and then, in list order, skips any id already in inFlight, otherwise adds to inFlight and pushes to the tail of queue (213-219). This yields FIFO ordering and bounds queue length by the number of ready repos, and means a repo that is already queued or executing is never double-enqueued within or across scan rounds. The dedup entry is released only after the worker finishes (see runWorker finally)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/auto-sync-scheduler.ts",
+      "symbol": "runWorker",
+      "start_line": 257,
+      "end_line": 278,
+      "observation": "runWorker() implements the bounded worker pool and the retry/idempotency cadence. Each of maxConcurrentSyncs permanent workers loops while !stopped, shifts the FIFO head (260) and, when empty, sleeps WORKER_IDLE_POLL_MS=100 (262, sleep() 307-315 registers/cleans timers so stop() can clear them). activeSyncs is incremented/decremented around syncOne (266-273) to hard-limit concurrency, and the finally block (272-275) always does inFlight.delete(row.code_graph_id), re-enabling that repo for a later scan. If syncOne throws it is caught and logged (269-271) so one repo's failure never kills the worker or other repos. There is no immediate retry: a failed or busy repo is simply retried on a subsequent scan period, giving a natural per-repo cadence of max(sync duration, scanIntervalMs)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/auto-sync-scheduler.ts",
+      "symbol": "syncOne",
+      "start_line": 281,
+      "end_line": 304,
+      "observation": "syncOne() delegates the actual sync to CodeGraphService.sync() (286-288) and treats its discriminated SyncResult as the idempotency contract: kind 'ok' (already enqueued), 'busy' (asset is pending/processing, so the scheduler skips rather than duplicating work) and 'not_found' (row removed) are all logged and swallowed (290-300). Any thrown error is also caught and logged (301-303). This makes the scheduler safe to re-run every scan period even though it holds no retry counter of its own; the busy/not_found/idempotent-create semantics live in CodeGraphService (code-graph-service.ts:157-172 sync rejects pending/processing; 133-140 create returns existed without re-enqueue)."
+    },
+    {
+      "path": "MemoryKnowledge/src/routes/auto-sync.ts",
+      "symbol": "createAutoSyncRoutes",
+      "start_line": 20,
+      "end_line": 47,
+      "observation": "createAutoSyncRoutes() exposes the scheduler's externally observable state and a manual trigger. GET /auto-sync/status returns scheduler.getStatus() (running/activeSyncs/queueLength/scanning) plus the resolved config (25-35). POST /auto-sync/trigger returns triggered:false when disabled, otherwise calls scheduler.triggerScan() (which is fire-and-forget, matching scan()'s own de-dup/re-entrancy guard) and immediately returns triggered:true (37-44). This confirms that manual triggering does not bypass the FIFO/inFlight ordering; it only forces an extra scan round."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "BuildQueue owns serialization by asset key: it lazily creates one SerialQueue per key in a Map, so all jobs for the same code_graph_id/wiki_id execute one-at-a-time in enqueue order while distinct keys proceed independently; enqueue() is fire-and-forget and swallows the returned rejection because the job persists its own failed status.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    },
+    {
+      "claim": "SerialQueue provides the FIFO + concurrency-1 guarantee: add() appends the task/continuations to the tail and calls drain(), which shifts the head under a running guard and, in finally, either re-drains the next head or releases onIdle() waiters. A rejected task propagates to its own promise and the queue continues, meaning there is no internal retry or dedup at this layer.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/serial-queue.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    },
+    {
+      "claim": "Auto-sync scheduling is FIFO with inFlight-set dedup: scan() (re-entrancy guarded by the scanning flag) appends ready repos to the tail only if their id is not already in the inFlight set, and runWorker() permanently shifts the FIFO head under a maxConcurrentSyncs cap, deleting the id from inFlight in its finally block so the repo can be re-enqueued by a later scan.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/auto-sync-scheduler.ts"
+      ]
+    },
+    {
+      "claim": "Retry/idempotency in auto-sync is cadence-based rather than immediate: a failed/busy/not_found sync is caught and logged so the worker survives, and the repo is retried on a later scan period (effective cadence max(sync duration, scanIntervalMs)); idempotency itself is delegated to CodeGraphService.sync's busy/not_found discriminated result and to in-memory state lost on restart, which sqlite-store.markInterruptedAsFailed() reconciles by failing leftover pending/processing rows.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/auto-sync-scheduler.ts",
+        "MemoryKnowledge/src/store/sqlite-store.ts"
+      ]
+    },
+    {
+      "claim": "The admin route layer does not alter ownership or ordering: GET /auto-sync/status only reads getStatus(), and POST /auto-sync/trigger is a no-op when disabled and otherwise calls the fire-and-forget triggerScan(), which routes through the same dedup/re-entrancy-guarded scan() as the periodic timer.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/routes/auto-sync.ts",
+        "MemoryKnowledge/src/store/auto-sync-scheduler.ts"
+      ]
+    }
+  ],
+  "conclusion": "Ownership is layered: SerialQueue owns the primitive concurrency-1 FIFO mechanics (queue array, running/paused guards, idleResolvers); BuildQueue owns per-asset-key SerialQueue instances and hides async rejection behind fire-and-forget enqueue; CodeGraphService/WikiService own job-level idempotency by refusing to enqueue when an asset is pending/processing and by using cancelled checkpoints on delete; AutoSyncScheduler owns a separate memory-only FIFO plus inFlight dedup set, a fixed worker pool and the startup/interval timers. Ordering is FIFO everywhere (tail push / head shift) with concurrency bounded to 1 per asset key and to maxConcurrentSyncs for auto-sync; dedup at scan time bounds the auto-sync queue by the number of ready repos. Retry/idempotency points are: (1) no retry inside SerialQueue - rejection propagates while the queue keeps draining; (2) BuildQueue.enqueue swallows rejections because runBuild records the failed status; (3) asset-level idempotency via busy/not_found/sync-result handling and cancelled/isDeleted checkpoints; (4) auto-sync retry is deferred to the next scan period with the inFlight entry released in the worker's finally block; (5) across restarts the in-memory queues are lost and sqlite-store.markInterruptedAsFailed() sweeps non-terminal rows to failed. The shared BuildQueue wiring in module.ts means wiki and code-graph jobs for the same asset key are serialized by the same instance.",
+  "validation": {
+    "command": "cd /tmp/prale-real-eval-kgwzqnr3/workspace && for each cited range, sed -n \"START,ENDp\" FILE | grep -q SYMBOL",
+    "status": "passed",
+    "notes": "Programmatically re-checked every cited range in this result.json against the working tree: BuildQueue in MemoryKnowledge/src/store/build-queue.ts:11-33; SerialQueue in MemoryKnowledge/src/store/serial-queue.ts:21-54; drain in MemoryKnowledge/src/store/serial-queue.ts:81-101; AutoSyncScheduler in MemoryKnowledge/src/store/auto-sync-scheduler.ts:82-110; scan in auto-sync-scheduler.ts:197-249; runWorker in auto-sync-scheduler.ts:257-278; syncOne in auto-sync-scheduler.ts:281-304; createAutoSyncRoutes in MemoryKnowledge/src/routes/auto-sync.ts:20-47 - all reported OK. Limitation: no node_modules / TypeScript toolchain is installed in the workspace, so `npx tsc --noEmit` or `vitest run` for MemoryKnowledge could not be executed and no unit tests exist in the checkout (only 'fixture baseline' source); per instructions no dependencies were installed, and the focused validation used the available shell text-extraction tools instead. Only source/evidence files were read; no task metadata, hidden-oracle files, package locks or git configuration were modified."
+  }
+}

@@ -1,0 +1,137 @@
+{
+  "task_id": "T25",
+  "repository": "aider",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd",
+      "start_line": 11,
+      "end_line": 23,
+      "observation": "Public entry point of aider's command runner. It dispatches to run_cmd_pexpect only when sys.stdin.isatty() and pexpect.spawn exist on a non-Windows host, otherwise to run_cmd_subprocess, and in both cases returns a (returncode, output) tuple. A failing command is therefore observed as data, not as an exception: OSError is caught and normalized into (1, \"Error occurred while running command '<cmd>': ...\"), optionally routed through the caller-supplied error_print. This is the contract the operate demo relies on to observe a fake linter that exits nonzero."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd_subprocess",
+      "start_line": 42,
+      "end_line": 86,
+      "observation": "Non-interactive branch actually taken by Linter.run_cmd (aider/linter.py:47-56) and by run_cmd when stdin is not a TTY. It builds subprocess.Popen with stderr=subprocess.STDOUT (line 65), streams the child's output one character at a time while echoing it in real time (lines 76-81), then returns (process.returncode, \"\".join(output)). Two task-relevant facts: the child's nonzero exit status is preserved verbatim as the first tuple element, and stderr is merged into the captured output, so this runner alone cannot separate the fake linter's stdout from its stderr. Any other exception degrades to (1, str(e))."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd_pexpect",
+      "start_line": 89,
+      "end_line": 132,
+      "observation": "TTY/interactive branch used when pexpect is available and stdin is a terminal. It spawns the SHELL (or the command directly when the shell path does not exist) with encoding utf-8, routes all output through output_callback into a BytesIO buffer, then returns (child.exitstatus, decoded_output) after child.close(); pexpect.ExceptionPexpect, TypeError and ValueError are converted into (1, error_msg). Like the subprocess branch it reports a nonzero child status as the first element of the tuple, so callers must inspect the return code rather than expect an exception. This branch is cited from source only: pexpect is absent here, so the demo forces the non-TTY path."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "get_windows_parent_process_name",
+      "start_line": 26,
+      "end_line": 39,
+      "observation": "Windows-only helper that walks the psutil process chain to detect a powershell.exe/cmd.exe parent, used by run_cmd_subprocess to wrap the command with `powershell -Command`. It swallows every exception and returns None, which illustrates the module's defensive posture: platform-specific failures never propagate to callers of run_cmd."
+    },
+    {
+      "path": ".prale-eval/fake_linter.py",
+      "symbol": "main",
+      "start_line": 33,
+      "end_line": 39,
+      "observation": "The operated fake linter. It prints STDOUT_LINES (three file:line:col: CODE message findings plus a summary line) to stdout, prints STDERR_LINES (a configuration warning) to stderr, and exits with the nonzero EXIT_CODE (3). Producing stdout + stderr + a nonzero status in one run is exactly the observable triple this task asks to normalize."
+    },
+    {
+      "path": ".prale-eval/fake_linter.py",
+      "symbol": "STDOUT_LINES",
+      "start_line": 20,
+      "end_line": 25,
+      "observation": "Findings emitted on stdout in the linter-native `file:line:col: CODE message` shape, which the normalizer regex (ISSUE_RE) parses into structured issue objects (E501, W291, F401) with severities derived from the code prefix."
+    },
+    {
+      "path": ".prale-eval/fake_linter.py",
+      "symbol": "STDERR_LINES",
+      "start_line": 28,
+      "end_line": 30,
+      "observation": "The single diagnostic emitted on stderr; it must be captured on a separate pipe because aider's run_cmd_subprocess would otherwise fold it into stdout, and the normalizer records it in `diagnostics` rather than in `issues`."
+    },
+    {
+      "path": ".prale-eval/operate_lint_normalize.py",
+      "symbol": "run_fake_linter_separately",
+      "start_line": 63,
+      "end_line": 71,
+      "observation": "Operates the fake linter with subprocess.run(capture_output=True, text=True), yielding the raw observation {exit_code: 3, stdout: 4 lines, stderr: 1 line} as three individually addressable signals before any normalization."
+    },
+    {
+      "path": ".prale-eval/operate_lint_normalize.py",
+      "symbol": "load_runner",
+      "start_line": 74,
+      "end_line": 95,
+      "observation": "AST-extracts the real run_cmd, run_cmd_subprocess and get_windows_parent_process_name functions from aider/run_cmd.py and execs them with stdlib modules plus stub pexpect/psutil objects. This works around the recorded environment limitation (importing the module fails because pexpect is not installed) without installing anything, and guarantees the executed runner code is the repository's own source, not a reimplementation."
+    },
+    {
+      "path": ".prale-eval/operate_lint_normalize.py",
+      "symbol": "run_through_aider_runner",
+      "start_line": 98,
+      "end_line": 114,
+      "observation": "Calls the extracted aider run_cmd on the same fake-linter command with sys.stdin temporarily replaced by a non-TTY stand-in, forcing the run_cmd_subprocess branch, and captures the returned (returncode, output) tuple plus the streamed echo. Observed: exit_code == 3 (nonzero preserved) and output contains the stderr warning merged into the stdout text."
+    },
+    {
+      "path": ".prale-eval/operate_lint_normalize.py",
+      "symbol": "normalize",
+      "start_line": 117,
+      "end_line": 181,
+      "observation": "Pure normalization step: parses stdout lines into `issues` (file/line/column/code/severity/message) via ISSUE_RE, keeps non-matching stdout lines as `summary_lines`, converts stderr into `diagnostics`, derives status `fail` because exit_code != 0, computes counts, and records `runner_contract` with nonzero_exit_preserved and stderr_merged_into_stdout flags proven from the observed run."
+    },
+    {
+      "path": ".prale-eval/operate_lint_normalize.py",
+      "symbol": "main",
+      "start_line": 200,
+      "end_line": 223,
+      "observation": "Executable entry point: runs the fake linter, runs it again through the extracted aider runner, normalizes both observations into .prale-eval/normalized_lint_result.json, re-reads the file to confirm a byte-identical round trip, runs the 9 contract checks (including nonzero exit, status fail, both streams non-empty, 3 parsed issues with codes E501/W291/F401, runner exit preserved, streams merged) and exits 0 printing 'OPERATE CONTRACT HOLDS'."
+    },
+    {
+      "path": ".prale-eval/operate-deliverable.md",
+      "symbol": "What was operated",
+      "start_line": 5,
+      "end_line": 19,
+      "observation": "Describes the three-layer executable demo (fake linter, aider run_cmd runner, normalizer), the exact command to reproduce it, and the artifact each layer produces."
+    },
+    {
+      "path": ".prale-eval/normalized_lint_result.json",
+      "symbol": "runner_contract",
+      "start_line": 58,
+      "end_line": 70,
+      "observation": "The normalized operation result produced by the demo: schema prale.lint-normalized/v1 with exit_code 3, status fail, 3 structured issues, 1 stderr diagnostic, and the empirically observed runner_contract (nonzero_exit_preserved true, stderr_merged_into_stdout true)."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "aider's command runner reports a fake linter's nonzero exit as data rather than raising: aider/run_cmd.run_cmd returns a (returncode, output) tuple, converts OSError into (1, message), and run_cmd_subprocess returns process.returncode verbatim, so a lint failure with exit code 3 is observable and normalizable.",
+      "evidence_paths": ["aider/run_cmd.py", ".prale-eval/operate_lint_normalize.py", ".prale-eval/normalized_lint_result.json"]
+    },
+    {
+      "claim": "The repository runner cannot separate the fake linter's two streams: run_cmd_subprocess constructs Popen with stderr=subprocess.STDOUT, so the stderr warning appears inside the returned combined output; the operate demo therefore captures stdout and stderr individually and exposes the merge explicitly as runner_contract.stderr_merged_into_stdout.",
+      "evidence_paths": ["aider/run_cmd.py", ".prale-eval/operate_lint_normalize.py"]
+    },
+    {
+      "claim": "Both non-interactive and interactive runner branches return the child's real status as the first tuple element (process.returncode; child.exitstatus), with exceptions or unexpected errors degraded to (1, message) — so callers must branch on the status value rather than on raised exceptions.",
+      "evidence_paths": ["aider/run_cmd.py"]
+    },
+    {
+      "claim": "The fake linter in .prale-eval/fake_linter.py genuinely emits all three signals required by the task — 4 stdout lines containing 3 parseable findings, 1 stderr diagnostic, and sys.exit(3) — which the demo observed as exit_code 3, stdout_lines 4, stderr_lines 1.",
+      "evidence_paths": [".prale-eval/fake_linter.py", ".prale-eval/operate_lint_normalize.py"]
+    },
+    {
+      "claim": "The normalization is grounded in the real repository source, not a reimplementation: load_runner AST-extracts run_cmd/run_cmd_subprocess from aider/run_cmd.py and executes them with stub pexpect/psutil objects, because importing aider.run_cmd fails in this environment (pexpect is not installed) and no dependency was installed to fix it.",
+      "evidence_paths": [".prale-eval/operate_lint_normalize.py", "aider/run_cmd.py"]
+    },
+    {
+      "claim": "Running `python3 .prale-eval/operate_lint_normalize.py` exits 0 with 'OPERATE CONTRACT HOLDS', writes .prale-eval/normalized_lint_result.json (reproducible on reload) with exit_code 3, status fail, 3 issues (E501, W291, F401) and 1 diagnostic, and the deliverable markdown documents the schema, the field contract and the pexpect limitation.",
+      "evidence_paths": [".prale-eval/operate-deliverable.md", ".prale-eval/normalized_lint_result.json", ".prale-eval/operate_lint_normalize.py"]
+    }
+  ],
+  "conclusion": "A local fake linter was operated end to end: .prale-eval/fake_linter.py emits 4 stdout lines (3 parseable findings plus a summary), 1 stderr diagnostic and exit code 3; running it through the repository's own aider.run_cmd.run_cmd (AST-extracted from aider/run_cmd.py because pexpect is unavailable) confirms the runner preserves the nonzero exit status as tuple element 0 while merging stderr into stdout via stderr=subprocess.STDOUT. The observation is normalized into the prale.lint-normalized/v1 result written to .prale-eval/normalized_lint_result.json: exit_code 3, status fail, 3 structured issues (E501 error, W291 warning, F401 error), 1 stderr diagnostic, summary line, counts, and a runner_contract block recording the empirically verified nonzero-exit-preserved and streams-merged behavior. The demo exits 0 after 9 contract checks plus a reload-equality check, and .prale-eval/operate-deliverable.md documents the demo, the schema and the recorded pexpect limitation.",
+  "validation": {
+    "command": "python3 .prale-eval/operate_lint_normalize.py && python3 .prale-eval/validate_result.py",
+    "status": "passed_with_limitation",
+    "notes": "operate_lint_normalize.py ran with exit code 0 and printed 'OPERATE CONTRACT HOLDS' after 9 contract checks: nonzero exit observed (3), status 'fail', both streams non-empty, 3 issues parsed with codes E501/W291/F401, aider runner preserves the nonzero exit, aider runner merges stderr into stdout, runner identity aider.run_cmd.run_cmd; it also re-read .prale-eval/normalized_lint_result.json and confirmed a byte-identical round trip. validate_result.py then AST-verified every cited symbol's definition line falls inside its inclusive start_line/end_line range, that the required path aider/run_cmd.py is covered by substantive evidence and cited by a claim, and that result.json carries the required keys with task_id/repository/mode matching TASK.md, printing 'result.json schema OK'. LIMITATION: pexpect is not installed in this environment, so `import aider.run_cmd` itself fails and the run_cmd_pexpect (TTY) branch could not be executed; per task rules no dependency was installed, and the real run_cmd/run_cmd_subprocess source was AST-extracted and executed with stub pexpect/psutil objects while stdin was forced to a non-TTY, so the pexpect branch is grounded in source reading only."
+  }
+}

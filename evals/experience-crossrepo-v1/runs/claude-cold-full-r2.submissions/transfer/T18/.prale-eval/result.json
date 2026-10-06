@@ -1,0 +1,119 @@
+{
+  "task_id": "T18",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue",
+      "start_line": 11,
+      "end_line": 34,
+      "observation": "BuildQueue owns a Map<string, SerialQueue> keyed by asset id (line 12). Each distinct key lazily gets exactly one SerialQueue (lines 16-20), so all submissions for the same asset share a single concurrency-1 lane. This is the per-asset single-flight mechanism: duplicate submissions for one asset are serialized rather than run concurrently, which is what keeps duplicate builds from doing conflicting concurrent work over the same git/SQLite/files resources."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "enqueue",
+      "start_line": 15,
+      "end_line": 24,
+      "observation": "enqueue(key, job) is fire-and-forget: it reuses the key's existing SerialQueue or creates one, then adds the job and swallows rejection (lines 21-23). Note the contract precisely: enqueue does NOT drop duplicate jobs — it preserves FIFO order and guarantees non-overlap. Duplicate work is therefore averted by the caller's admission/checkpoint layer (wiki-service), while BuildQueue supplies the no-concurrent-duplicate guarantee at the queue level."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "onIdle",
+      "start_line": 27,
+      "end_line": 33,
+      "observation": "onIdle(key?) awaits a single key's queue or, with no argument, Promise.all over every per-asset queue (line 32). This is the deterministic drain point that makes the contract testable: after onIdle() no build job for any asset is still pending or running, so 'effective work' counts are stable and observable."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue.drain",
+      "start_line": 81,
+      "end_line": 101,
+      "observation": "The concurrency=1 engine reached through BuildQueue. drain() returns early when already running (line 82), shifts one entry, sets running=true, and only re-drains after the task settles (lines 91-99). Two jobs on the same per-asset queue can never overlap, confirming the single-flight guarantee BuildQueue delegates to."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/wiki-service.ts",
+      "symbol": "ingest",
+      "start_line": 272,
+      "end_line": 290,
+      "observation": "Admission control for build submission. If the asset is already pending or processing (lines 276-278) ingest returns {kind:\"busy\"} without writing status, without an audit row, and crucially without calling enqueueBuild — so a duplicate build submission never reaches the queue. Only a non-busy submission bumps the version, sets pending, and enqueues exactly one build (lines 279-288)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/wiki-service.ts",
+      "symbol": "runBuild",
+      "start_line": 1014,
+      "end_line": 1077,
+      "observation": "Build worker entry/exit checkpoints. The entry checkpoint (lines 1016-1019) calls isDeleted and returns before any worker invocation, so a job queued for an asset that has since been deleted produces zero effective work. The end checkpoint (lines 1039-1042) prevents committing ready/audit/callback state for an asset deleted mid-run. Together they make queued duplicates no-ops once the asset is gone."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/wiki-service.ts",
+      "symbol": "enqueueBuild",
+      "start_line": 1010,
+      "end_line": 1012,
+      "observation": "The single call site that bridges submission to the queue: it enqueues under row.wiki_id — the asset id — which is exactly the key BuildQueue partitions on. This is why two submissions for the same wiki land on the same SerialQueue lane and can never run concurrently."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/wiki-service.ts",
+      "symbol": "isDeleted",
+      "start_line": 366,
+      "end_line": 368,
+      "observation": "The worker checkpoint predicate: deleted if the cancelled flag is set or the metadata row no longer exists. The dual criterion covers both delete-during-run and delete-before-the-checkpoint orderings, letting runBuild skip a duplicate job without doing work."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/index-db.ts",
+      "symbol": "upsertSource",
+      "start_line": 219,
+      "end_line": 242,
+      "observation": "Source-submission idempotency. Query-then-update, not a blind UPSERT: unknown filename INSERTs as 'uploaded' (lines 227-232); a changed sha256 UPDATEs and resets to 'uploaded' (lines 234-240); an unchanged sha256 returns 'unchanged' with no write at all (line 241). Re-uploading identical source content therefore does not reset the row's ingested state and provokes no re-ingest — duplicate source submission is inert."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/wiki-service.ts",
+      "symbol": "registerSources",
+      "start_line": 879,
+      "end_line": 902,
+      "observation": "The caller that makes source submission idempotent: it hashes each uploaded file with sha256 (line 893) and calls upsertSource inside one write transaction (lines 889-898). Registering duplicate identical content hits the 'unchanged' branch and changes nothing, so a duplicate upload does not queue additional ingest work."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Duplicate build submissions for the same asset cannot execute concurrently: BuildQueue partitions jobs by asset key into one SerialQueue each (concurrency=1), so a repeated submission is serialized behind the in-flight build rather than run in parallel over the same git/SQLite/files resources.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    },
+    {
+      "claim": "BuildQueue.enqueue does not itself deduplicate jobs — it preserves and serializes them; the guarantee that a duplicate submission yields no duplicate effective work is completed by the caller: wiki-service.ingest rejects pending/processing duplicates as busy without enqueuing, and runBuild's isDeleted entry checkpoint turns any queued duplicate whose asset was deleted into a no-op worker invocation.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/wiki-service.ts"
+      ]
+    },
+    {
+      "claim": "enqueueBuild keys the queue by wiki_id (the asset id), which is the exact key BuildQueue partitions on, so every submission for one wiki shares a single concurrency-1 lane.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/wiki-service.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    },
+    {
+      "claim": "Duplicate SOURCE submission with identical content is idempotent: upsertSource compares the stored sha256 and returns 'unchanged' without any write, and registerSources hashes each upload before calling it, so re-uploading the same content neither resets the source row nor provokes a rebuild.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/index-db.ts",
+        "MemoryKnowledge/src/store/wiki-service.ts"
+      ]
+    },
+    {
+      "claim": "BuildQueue.onIdle drains every per-asset queue, giving a deterministic observation point at which total effective-work counts (worker invocations) for duplicate submissions can be measured.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    }
+  ],
+  "conclusion": "Proven: in MemoryKnowledge a duplicate source or build submission does not create duplicate effective work. The defense is layered. (1) Build submission admission — wiki-service.ingest (src/store/wiki-service.ts:272-290) rejects a submission while the asset is pending/processing with {kind:\"busy\"} and never calls enqueueBuild, so the duplicate never becomes a queued job; the executed demo shows 3 rapid submissions producing exactly 1 worker invocation. (2) Queue-level single-flight — BuildQueue (src/store/build-queue.ts:11-34) lazily maps each asset id to one SerialQueue whose drain has concurrency=1 (src/store/serial-queue.ts:81-101), so even when duplicate jobs do reach the queue (e.g. a race past admission) they run strictly one-at-a-time, never overlapped, as the real-source demo asserts (maxConcurrent=1 against 5 duplicate same-key jobs). (3) Worker checkpoints — runBuild (src/store/wiki-service.ts:1014-1077) checks isDeleted at entry (1016-1019) and exit (1039-1042), so a duplicate job queued for an asset deleted before or during the run performs zero worker invocations and commits nothing. (4) Source submission idempotency — upsertSource (src/engines/wiki/index-db.ts:219-242) returns 'unchanged' for an identical sha256 without writing and without resetting the row's ingested state, so re-uploading the same content provokes no re-ingest. Scope note: BuildQueue serializes but does not drop duplicates; the no-duplicate-work guarantee is architectural across the queue plus its callers, not a property of build-queue.ts alone. The contract is captured executably in .prale-eval/demo.mjs: 15/15 assertions pass, exit code 0.",
+  "validation": {
+    "command": "node --import ./register-hooks.mjs demo.mjs",
+    "status": "passed",
+    "notes": "Run from .prale-eval/ ; the two real sources were executed unmodified: MemoryKnowledge/src/store/build-queue.ts and its dependency serial-queue.ts. register-hooks.mjs installs an ESM resolve hook mapping the repo's NodeNext '.js'-suffixed relative imports to the sibling '.ts' files so Node 24 native type-stripping can load them (no tsx/ts-node and no node_modules are present). 15/15 assertions passed, exit code 0. Limitation recorded: the full wiki-service and index-db modules cannot be imported in this environment because their dependencies (better-sqlite3, lru-cache, the wiki engines) are not installed, so the admission/checkpoint/dedup logic of wiki-service.ts:272-290, 1010-1077, 366-368, 879-902 and index-db.ts:219-242 is exercised through faithful in-memory ports that mirror the cited lines, each annotated with its real source citation. The load-bearing claim about build-queue.ts itself is validated by executing the real file, not a port; no dependencies were installed and no files outside the workspace were touched."
+  }
+}

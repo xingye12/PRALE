@@ -192,6 +192,7 @@ class TelemetrySanitizer:
             session_id=_session_key(event.session_id),
             input=self.payload(event.input),
             output=self.payload(event.output),
+            metadata={key: self.describe(value) for key, value in event.metadata.items()},
         )
 
     # -- walking ------------------------------------------------------------ #
@@ -690,6 +691,7 @@ class LangfuseTelemetry:
             input=event.input,
             output=event.output,
             metadata={
+                **event.metadata,
                 "tool_call_id": event.tool_call_id,
                 "attempt": event.attempt,
                 "is_error": event.is_error,

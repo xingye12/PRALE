@@ -1,0 +1,84 @@
+{
+  "task_id": "T21",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryCore/src/core/index.ts",
+      "symbol": "TdaiCore",
+      "start_line": 24,
+      "end_line": 26,
+      "observation": "The core barrel is the only supported public surface for host-neutral memory operations: line 25 re-exports the TdaiCore facade and line 26 its options type. TdaiCore's effect-performing methods (e.g. handleTurnCommitted -> performAutoCapture) resolve only after the underlying effect completes, so a resolved promise is the caller-visible success signal. The fake-client contract test therefore asserts commit ordering against exactly this shape: success must stay uncommitted while the deferred effect is in flight, and failure must surface as a rejected operation rather than a committed success."
+    },
+    {
+      "path": "MemoryCore/src/core/index.ts",
+      "symbol": "createStorageBackend",
+      "start_line": 50,
+      "end_line": 61,
+      "observation": "The same barrel re-exports the storage seam (LocalStorageBackend, StoragePaths, StorageAdapter, createStorageBackend, createLocalStorageBackend) plus generic credential primitives (MockCredentialProvider, StaticCredentialProvider, ...). MemoryCore already treats the effect-performing layer as injectable and ships in-memory/mock credentials, which is why a fake client whose effect is deferred by the test can substitute for the real external effect (COS write / meta_assets registration) without network access or cloud credentials."
+    },
+    {
+      "path": "MemoryCore/src/core/tdai-core.ts",
+      "symbol": "SkillAssetHooks",
+      "start_line": 86,
+      "end_line": 112,
+      "observation": "The SkillAssetHooks interface (declared at line 101) and its doc block fix the effect-first contract in writing: 'onSkillCreated: v1 awaits it first; throwing = create failure' (line 89), while onSkillAccessed/onSkillArchived are explicitly fire-and-forget and swallow errors (lines 90-91). This is the repository's own statement of the invariant the new test encodes: effects that gate a success state must be awaited, and their failure must remain observable."
+    },
+    {
+      "path": "MemoryCore/src/core/skill/skill-versioning.ts",
+      "symbol": "createNewSkill",
+      "start_line": 117,
+      "end_line": 205,
+      "observation": "createNewSkill is the concrete implementation of cross-system commit ordering: step 1 writes COS and rethrows after best-effort cleanup (lines 131-144), step 2 writes the skill DB and cleans COS on failure (lines 146-167), step 3 awaits the injected effect `await this.onSkillCreated({...})` (line 174) and on rejection deletes the skill row and rethrows assetErr (lines 182-198), only then reporting `onSkillVdbChanged?.(1); return row;` (lines 202-204). No success is published before the awaited effect completes, and failure is observable to the caller."
+    },
+    {
+      "path": "MemoryCore/src/core/__tests__/fake-client-operation.contract.test.ts",
+      "symbol": "runCommitAfterEffect",
+      "start_line": 157,
+      "end_line": 188,
+      "observation": "The new contract test's commit-after-effect subject: it marks the operation pending, awaits the fake client's deferred effect, records `effect:completed`, commits exactly one success record only afterwards, and on effect rejection sets status 'failed', stores `{ message, code }` in `failure`, appends `effect:failed` and rethrows. The FakeMemoryCoreClient at lines 100-152 keeps `inFlightCount` and never settles its effect on its own, so the five tests (lines 244-364) can prove 'pending + empty commit log + unsettled promise' while the effect is in flight, prove commit follows effect completion, prove failure stays observable, and prove the suite is non-vacuous via the eager-commit control subject (lines 190-204)."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The only supported public entry point for MemoryCore core operations is the barrel MemoryCore/src/core/index.ts, which re-exports TdaiCore (line 25) and the injectable storage/credential seam (lines 50-61); because callers observe success solely through the resolved async operations of that surface, a fake-client contract test is meaningful precisely at that boundary: an asynchronous operation must not publish success until its effect completes.",
+      "evidence_paths": [
+        "MemoryCore/src/core/index.ts"
+      ]
+    },
+    {
+      "claim": "MemoryCore's public contract requires awaiting the effect before success and keeping failures observable: MemoryCore/src/core/index.ts exposes TdaiCore, whose handleTurnCommitted awaits performAutoCapture before returning CaptureResult, and SkillAssetHooks in MemoryCore/src/core/tdai-core.ts (lines 86-112, interface at 101) states 'onSkillCreated: v1 awaits it first; throwing = create failure'.",
+      "evidence_paths": [
+        "MemoryCore/src/core/index.ts",
+        "MemoryCore/src/core/tdai-core.ts"
+      ]
+    },
+    {
+      "claim": "SkillVersioning.createNewSkill implements that same effect-then-commit ordering with compensating failure handling: it awaits onSkillCreated (line 174), rolls back and rethrows on failure (lines 182-198) and only reaches the success branch onSkillVdbChanged?.(1); return row; (lines 202-204), so no success state is committed before the awaited effect completes and failure propagates.",
+      "evidence_paths": [
+        "MemoryCore/src/core/skill/skill-versioning.ts",
+        "MemoryCore/src/core/tdai-core.ts"
+      ]
+    },
+    {
+      "claim": "The delivered test MemoryCore/src/core/__tests__/fake-client-operation.contract.test.ts contains a fake client whose effect is a deferred promise (FakeMemoryCoreClient.performEffect, lines 100-152) and a commit-after-effect subject (runCommitAfterEffect, lines 157-188); its assertions prove that while the fake effect is in flight the normalized operation result stays status 'pending' with an empty `committed` list, no `commit:success` event and an unsettled promise (test at line 244), even after 20 ms of real timer time.",
+      "evidence_paths": [
+        "MemoryCore/src/core/__tests__/fake-client-operation.contract.test.ts",
+        "MemoryCore/src/core/index.ts"
+      ]
+    },
+    {
+      "claim": "The delivered test also proves failure remains observable and that the suite is non-vacuous: a rejecting fake effect rejects the returned promise, records `failure = { message, code }`, leaves `committed` empty (test at line 290) and can be retried without leaking stale success (test at line 314), while the control subject runEagerCommit (lines 190-204) commits before awaiting the effect and is caught by the identical probes (test at line 340).",
+      "evidence_paths": [
+        "MemoryCore/src/core/__tests__/fake-client-operation.contract.test.ts",
+        "MemoryCore/src/core/tdai-core.ts"
+      ]
+    }
+  ],
+  "conclusion": "The requested fake client operation test exists and passes: MemoryCore/src/core/__tests__/fake-client-operation.contract.test.ts drives a fake MemoryCore client whose effect is a deferred promise the test controls, and proves with executable assertions that (1) no success state is committed while the fake effect is in flight - status stays 'pending', `committed` is empty, no `commit:success` event exists and the operation promise is unsettled after real timer time; (2) success is committed strictly after the effect completes; (3) effect failure remains observable (returned promise rejects, `failure` records message/code, nothing is committed) and is retryable without leaking a stale success; (4) the assertions are non-vacuous because an eager-commit control subject fails the same probes. This mirrors the effect-then-commit contract of MemoryCore's public core surface (MemoryCore/src/core/index.ts:24-26 TdaiCore; MemoryCore/src/core/tdai-core.ts:86-112 SkillAssetHooks; MemoryCore/src/core/skill/skill-versioning.ts:117-205 createNewSkill) and is documented in .prale-eval/contract-deliverable.md with the normalized OperationState result shape. No task metadata, hidden-oracle file, package lock or git configuration was modified.",
+  "validation": {
+    "command": "node --test MemoryCore/src/core/__tests__/fake-client-operation.contract.test.ts",
+    "status": "passed",
+    "notes": "Run from the workspace root with Node v24.14.0, which executes TypeScript test files via built-in type stripping: 5 tests, 5 passed, 0 failed (tests 'no success state is committed while the fake effect is still in flight', 'success is committed after (never before) the effect completes', 'effect failure is observable and never becomes a committed success', 'an observable failure can be retried without leaking stale success', 'control: an eager-commit implementation fails the same assertions'). LIMITATION - the optional validation dependency vitest, which MemoryCore/vitest.config.ts configures as the repository runner (include: src/**/*.test.ts, __tests__/**/*.test.ts), is not installed in this workspace (no MemoryCore/node_modules) and cannot be installed offline: `cd MemoryCore && npm test -- --run src/core/__tests__/fake-client-operation.contract.test.ts` fails with `sh: 1: vitest: not found`. The delivered test therefore imports no third-party module and is executed with Node's built-in runner; it can be executed by vitest unchanged if the dependency becomes available. Additional discrimination check (on a scratch copy outside the deliverable, then deleted): mutating runCommitAfterEffect to commit before awaiting the fake effect made all 5 tests fail (pass 0 / fail 5), confirming the assertions detect premature success commits."
+  }
+}

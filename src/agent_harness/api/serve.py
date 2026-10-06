@@ -39,6 +39,7 @@ from agent_harness.api.settings import Settings
 from agent_harness.api.web import WebApplication, create_app
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.skill import SkillScope
+from agent_harness.domain.subagents import CONTROL_NAMES
 from agent_harness.integrations.bge_m3 import LocalBgeM3EmbeddingProvider
 from agent_harness.integrations.deepseek import DeepSeekProvider
 from agent_harness.integrations.langfuse import LangfuseTelemetry
@@ -53,7 +54,14 @@ from agent_harness.integrations.repository_explorer import (
 )
 from agent_harness.integrations.skill_reviewer import CodingSkillReviewer
 from agent_harness.integrations.skill_tools import create_skill_tools
+from agent_harness.integrations.subagent_definitions import load_subagent_definitions
 from agent_harness.runtime.generation import GenerationRequest
+from agent_harness.runtime.subagents import (
+    MappingProviderResolver,
+    create_subagent_tools,
+    validate_subagent_definitions,
+)
+from agent_harness.runtime.tools import AgentTool, RuntimeControlTool
 from agent_harness.storage.memory_sqlite import SQLiteMemoryStore
 from agent_harness.storage.skill_sqlite import SQLiteSkillStore
 
@@ -170,6 +178,7 @@ def prepare_directories(settings: Settings) -> None:
 def build_application(settings: Settings) -> Deployment:
     """Compose the deployment: provider, tools, stores, then the adapter."""
 
+    definitions = load_subagent_definitions(settings.subagent_dirs)
     prepare_directories(settings)
     provider = DeepSeekProvider(
         api_key=settings.api_key,
@@ -185,7 +194,15 @@ def build_application(settings: Settings) -> Deployment:
     available_tools = (
         create_builtin_tools(settings.project_root, repository_explorer=explorer) if settings.tools else ()
     )
-    tools = tuple(tool for tool in available_tools if tool.name in settings.tools)
+    tools: tuple[AgentTool | RuntimeControlTool, ...] = tuple(
+        tool for tool in available_tools if tool.name in settings.tools
+    )
+    resolver = (
+        MappingProviderResolver({settings.model: provider}, settings.model)
+        if settings.subagent_config.enabled
+        else None
+    )
+    validate_subagent_definitions(definitions, resolver, tools)
     stores: list[SQLiteMemoryStore | SQLiteSkillStore] = []
     memory_store = None
     skill_store = None
@@ -206,6 +223,7 @@ def build_application(settings: Settings) -> Deployment:
         stores.append(skill_store)
         if "skill_load" in settings.tools:
             tools = (*tools, *create_skill_tools(skill_store, SkillScope(settings.repository_id)))
+    tools = (*tools, *create_subagent_tools(tuple(name for name in settings.tools if name in CONTROL_NAMES)))
     web = create_app(
         settings.config,
         provider,
@@ -219,6 +237,9 @@ def build_application(settings: Settings) -> Deployment:
         tokens=settings.tokens,
         max_concurrent_drives=settings.max_concurrent_drives,
         context_management=settings.context_management,
+        definitions=definitions,
+        subagent_config=settings.subagent_config,
+        provider_resolver=resolver,
     )
     return Deployment(web, tuple(stores))
 

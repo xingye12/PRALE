@@ -1,0 +1,92 @@
+{
+  "task_id": "T06",
+  "repository": "tdam",
+  "mode": "contract",
+  "summary": "Contracted the metadata/memory-prompt client failure mode where a malformed JSON envelope leaked a raw response shape. MetadataClient and MemoryPromptClient expose only what the shared V3HttpTransport rejects with, and the transport was missing the envelope-shape guards its Python sibling already has, so a JSON `null` envelope surfaced a raw TypeError and a non-object success `data` was returned as the typed entity. The transport now normalizes both into TDAMError; an executable contract proves it.",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+      "symbol": "MetadataClient",
+      "start_line": 112,
+      "end_line": 133,
+      "observation": "The MetadataClient class (declared line 112) accepts either a MetadataClientConfig or an already-built Transport and stores it as `this.http` (lines 115-133). It performs no try/catch and no error normalization of its own: every one of the ~54 /v3/meta and 5 /v3/knowledge operations delegates straight to `this.http.post(...)`. That makes the transport the single owner of the failure contract, so any un-normalized shape the transport lets through (e.g. a raw TypeError from accessing `envelope.code` on a JSON null) is delivered verbatim to metadata callers."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+      "symbol": "getUser",
+      "start_line": 137,
+      "end_line": 140,
+      "observation": "getUser is a representative metadata operation whose declared result is the typed entity `Promise<UserPublic>`. That return type is only meaningful when the transport resolves an object `data` payload; for a failure it must reject with a normalized TDAMError rather than resolve with a raw primitive/array or throw a bare JS TypeError. This method is the metadata-side call site exercised by the executable contract."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "V3HttpTransport",
+      "start_line": 8,
+      "end_line": 137,
+      "observation": "V3HttpTransport.request already normalized the common failures into TDAMError — a non-zero business code (code/requestId/details) and a non-JSON or HTTP-error body (status code + header request id, header preferred over envelope.request_id). It did not guard the envelope shape itself, so `JSON.parse(\"null\")` produced `envelope === null` and `envelope.code` raised a raw `TypeError: Cannot read properties of null (reading 'code')`, and a success envelope with primitive/array `data` was returned to the caller as if it were the requested entity. Both paths now throw TDAMError(-1, \"API response must be a JSON object\", ...) / TDAMError(-1, \"API response data must be a JSON object\", ...)."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/errors.ts",
+      "symbol": "TDAMError",
+      "start_line": 12,
+      "end_line": 32,
+      "observation": "TDAMError is the normalized failure type: a real Error subclass with `name = \"TDAMError\"`, numeric `code`, `requestId`, and optional server-provided `details`. It is the shape the contract asserts on — a failure is 'typed' precisely when it is an instance of this class (or ParamError) carrying those fields, rather than a raw TypeError or a bare response value."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/memory-prompt-client.ts",
+      "symbol": "MemoryPromptClient",
+      "start_line": 46,
+      "end_line": 66,
+      "observation": "MemoryPromptClient uses the same V3HttpTransport as MetadataClient (constructor lines 52-66), so the prompt surface inherits the identical failure contract. Its own guardrails raise the typed ParamError for bad input (`name must be a non-empty string`, `team_id is required for effective prompt lookup`, etc.), while transport-level failures must be TDAMError. The contract checks both sides for the prompt client."
+    },
+    {
+      "path": "sdk/memory-core/python/tencentdb_agent_memory/_v3_http.py",
+      "symbol": "_decode_response",
+      "start_line": 38,
+      "end_line": 71,
+      "observation": "The Python sibling transport is the source of the transferred experience: `_decode_response` already rejects a non-dict envelope with TDAMError(-1, \"API response must be a JSON object\", ...) and a non-dict success `data` with TDAMError(-1, \"API response data must be a JSON object\", ...). The TypeScript transport now mirrors these two guards, which is what closes the raw-shape leak for both the metadata and prompt clients."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "MetadataClient performs no failure normalization: all metadata operations return `this.http.post(...)` directly, so the typed-failure contract for the metadata client is owned entirely by the shared V3HttpTransport and any raw shape it leaks reaches callers unchanged.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    },
+    {
+      "claim": "The transport's pre-existing normalization covers business-code failures (TDAMError with code/requestId/details) and non-JSON or HTTP failures (TDAMError with the HTTP status and header request id); these are the baselines the contract pins before it exercises the malformed-envelope cases.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts",
+        "sdk/memory-core/typescript/src/errors.ts"
+      ]
+    },
+    {
+      "claim": "Before the change the transport leaked raw response shapes for two envelope variants: a JSON `null` envelope raised a bare `TypeError` from `envelope.code`, and a success envelope whose `data` was a string, number or array was returned to the caller as the requested entity instead of failing. Both are now normalized to TDAMError(-1).",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    },
+    {
+      "claim": "The Python transport already contracted these exact shapes via `_decode_response`; the TypeScript transport now mirrors those two guards, transferring the cross-repository experience.",
+      "evidence_paths": [
+        "sdk/memory-core/python/tencentdb_agent_memory/_v3_http.py",
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    },
+    {
+      "claim": "MemoryPromptClient shares the same transport, so prompt operations reject malformed envelopes with TDAMError while invalid input still rejects with the typed ParamError — both are typed/normalized failures, never a raw response shape.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/memory-prompt-client.ts",
+        "sdk/memory-core/typescript/src/errors.ts"
+      ]
+    }
+  ],
+  "conclusion": "The metadata and memory-prompt clients now satisfy the contracted property: a failure exposes a typed/normalized failure (TDAMError with code/requestId/details, or ParamError for rejected input) instead of leaking a raw response shape. The gap was a missing envelope-shape guard in the shared V3HttpTransport — a JSON null envelope raised a raw TypeError and a non-object success `data` was returned as if it were the entity. Both are now normalized to TDAMError(-1), mirroring the Python transport's `_decode_response`. The executable contract passes 14/14 after the 15-line change and fails 6/14 on the untouched baseline, confirming it is not vacuous.",
+  "validation": {
+    "command": "node --import ./.prale-eval/contract/register.mjs ./.prale-eval/contract/run-contract.mjs",
+    "status": "passed",
+    "notes": "14/14 contract assertions passed on the fixed sources (exit 0). The same runner against the pre-fix baseline (git stash of src/v3/http.ts) passed only 6/14 with exit 1, including the raw `TypeError: Cannot read properties of null (reading 'code')` and a resolved raw primitive — proving the contract detects the leak. Environment limitation: this workspace has no node_modules, so vitest and undici are not installed and `npm test` cannot run; the in-repo vitest suite sdk/memory-core/typescript/tests/v3-metadata-failure-contract.test.ts was therefore not executed (file parses cleanly under `node --check`). To run the real TypeScript sources without a build, the runner uses .prale-eval/contract/loader.mjs, which maps TS `.js` specifiers to `.ts` and substitutes a minimal `undici` stub for the bare specifier (the stub's Agent is never constructed here because rejectUnauthorized is left at its secure default, so it does not affect the behaviour under test). `tsc` is likewise unavailable, so type-level checking was not run."
+  }
+}

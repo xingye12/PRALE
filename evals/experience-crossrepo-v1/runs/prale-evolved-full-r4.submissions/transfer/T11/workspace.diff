@@ -1,0 +1,887 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/demo/wattclaw-project-lifecycle.mjs b/.prale-eval/demo/wattclaw-project-lifecycle.mjs
+new file mode 100644
+index 0000000..3ca6393
+--- /dev/null
++++ b/.prale-eval/demo/wattclaw-project-lifecycle.mjs
+@@ -0,0 +1,676 @@
++#!/usr/bin/env node
++/**
++ * WattClaw project lifecycle demo (T11 / repository: wattclaw / mode: demo).
++ *
++ * Drives a *fresh local project fixture* through create -> activate -> stop and
++ * asserts that only legal transitions happen and that only the events the
++ * repository actually emits are produced.
++ *
++ * Everything is exercised through the repository's own public module surface:
++ *
++ *   server/services/wattclaw-project-runtime.js
++ *     activateWattClawProjectRuntime  -> member reconcile / agent restore
++ *     pruneWattClawProjectsForUser    -> retention stop (archive) policy
++ *     ensureWattClawProjectRuntime    -> agent load gate
++ *     extractWattClawProject(s)       -> gateway payload normalization
++ *     getWattClawProjectAgentIds      -> membership projection
++ *     userOwnsWattClawProject         -> per-user ownership gate
++ *     nextWattClawRetentionRunAt      -> retention schedule
++ *
++ *   server/services/wattclaw-project-events.js
++ *     createWattClawProjectEventService -> file-backed project event stream
++ *
++ * No npm dependency is required (the repo's node_modules is absent and must not
++ * be installed): the demo is plain Node ESM + node:assert.
++ *
++ * Run:  node .prale-eval/demo/wattclaw-project-lifecycle.mjs
++ */
++
++import assert from 'node:assert/strict'
++import { mkdir, rm, writeFile } from 'node:fs/promises'
++import { dirname, join } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++import {
++  activateWattClawProjectRuntime,
++  ensureWattClawProjectRuntime,
++  extractWattClawProject,
++  extractWattClawProjects,
++  getWattClawProjectAgentIds,
++  nextWattClawRetentionRunAt,
++  pruneWattClawProjectsForUser,
++  userOwnsWattClawProject,
++} from '../../server/services/wattclaw-project-runtime.js'
++import { createWattClawProjectEventService } from '../../server/services/wattclaw-project-events.js'
++
++const HERE = dirname(fileURLToPath(import.meta.url))
++const FIXTURE_ROOT = join(HERE, '.fixture')
++const TENANT_ID = 'tenant-demo'
++const PROJECT_ID = 'p-demo-lifecycle'
++
++// ── lifecycle contract ───────────────────────────────────────────────────────
++
++/**
++ * Statuses are the ones the repository actually uses for WattClaw projects
++ * (`pending` from the gateway create flow, `in_progress`/`success`/`failed`
++ * from the project status tool, `archived` from retention/archive, `restored`
++ * as the derived post-activation state). Only the edges below are legal.
++ */
++const LEGAL_PROJECT_TRANSITIONS = Object.freeze({
++  created: ['pending'],
++  pending: ['in_progress'],
++  in_progress: ['success', 'failed'],
++  success: ['archived'],
++  failed: ['archived'],
++  archived: ['restored'],
++  restored: ['archived'],
++})
++
++/** Events the repository is allowed to emit for a project lifecycle. */
++const LEGAL_EVENT_NAMES = Object.freeze([
++  'wattclaw.team.project.updated',
++  'wattclaw.team.project.deleted',
++  'wattclaw.team.tasks.updated',
++  'wattclaw.team.projects.changed',
++])
++
++const RETENTION_RUN_AT_UTC = Date.parse('2026-08-20T10:00:00.000Z') // 18:00 Asia/Shanghai
++const NOW = Date.parse('2026-08-20T12:00:00.000Z')
++const DAY_MS = 24 * 60 * 60 * 1000
++
++function isoAt(offsetMs) {
++  return new Date(NOW + offsetMs).toISOString()
++}
++
++function assertLegalTransition(from, to) {
++  const allowed = LEGAL_PROJECT_TRANSITIONS[from] || []
++  if (!allowed.includes(to)) {
++    throw new Error(`Illegal WattClaw project transition rejected: ${from} -> ${to}`)
++  }
++  return { from, to }
++}
++
++// ── demo harness ─────────────────────────────────────────────────────────────
++
++const report = {
++  task_id: 'T11',
++  repository: 'wattclaw',
++  mode: 'demo',
++  fixture: {
++    root: '.prale-eval/demo/.fixture',
++    tenant_id: TENANT_ID,
++    project_id: PROJECT_ID,
++    project_dir: `.prale-eval/demo/.fixture/${TENANT_ID}/.wattclaw-team/projects/${PROJECT_ID}`,
++  },
++  operations: [],
++  illegal_attempts: [],
++  emitted_events: [],
++  rpc_calls: [],
++  checks: [],
++}
++
++let checkCount = 0
++
++function check(label, fn) {
++  const value = fn()
++  checkCount += 1
++  report.checks.push({ check: label, status: 'ok' })
++  return value
++}
++
++async function checkAsync(label, fn) {
++  const value = await fn()
++  checkCount += 1
++  report.checks.push({ check: label, status: 'ok' })
++  return value
++}
++
++async function expectRejects(label, pattern, fn) {
++  let thrown = null
++  try {
++    await fn()
++  } catch (error) {
++    thrown = error
++  }
++  assert.ok(thrown, `${label}: expected a rejection`)
++  assert.match(String(thrown.message), pattern)
++  checkCount += 1
++  report.checks.push({ check: label, status: 'ok' })
++  report.illegal_attempts.push({ attempt: label, rejected_with: thrown.message })
++  return thrown
++}
++
++function waitFor(predicate, timeoutMs = 2500) {
++  const deadline = Date.now() + timeoutMs
++  return new Promise((resolve, reject) => {
++    const tick = () => {
++      if (predicate()) return resolve()
++      if (Date.now() > deadline) return reject(new Error('Timed out waiting for emitted event'))
++      setTimeout(tick, 10)
++    }
++    tick()
++  })
++}
++
++// ── fixture ──────────────────────────────────────────────────────────────────
++
++const fixture = {
++  projectDir: join(FIXTURE_ROOT, TENANT_ID, '.wattclaw-team', 'projects', PROJECT_ID),
++  rpcLog: [],
++  archived: [],
++  loadedAgents: new Set(['main', 'p-demo-lead']),
++  worlds: new Map(),
++}
++
++function writeProject(record) {
++  return writeFile(join(fixture.projectDir, 'config.json'), `${JSON.stringify(record, null, 2)}\n`, 'utf-8')
++}
++
++function memberAgentIds(record) {
++  return getWattClawProjectAgentIds(record)
++}
++
++/** Gateway stub: mirrors the RPC contract the runtime module consumes. */
++async function gatewayRpc(method, params = {}) {
++  const shallow = params && typeof params === 'object' ? JSON.parse(JSON.stringify(params)) : params
++  fixture.rpcLog.push({ method, params: shallow, at: report.rpc_calls.length })
++
++  switch (method) {
++    case 'wattclaw.team.project.create': {
++      const record = fixture.worlds.get(PROJECT_ID)
++      return { ok: true, payload: { project: record } }
++    }
++    case 'agents.list':
++      return { ok: true, payload: { agents: [...fixture.loadedAgents].map(id => ({ id })) } }
++    case 'wattclaw.team.project.member.update':
++      fixture.loadedAgents.add(params.agentId)
++      return { ok: true, payload: { id: params.projectId, agentId: params.agentId } }
++    case 'wattclaw.team.project.list':
++      return { ok: true, payload: { projects: [...fixture.worlds.values()] } }
++    case 'wattclaw.team.project.archive': {
++      const record = fixture.worlds.get(params.id)
++      fixture.archived.push(params.id)
++      // Archiving unloads the project's agents from the gateway.
++      for (const agentId of memberAgentIds(record)) fixture.loadedAgents.delete(agentId)
++      if (record) {
++        record.status = 'archived'
++        fixture.worlds.set(record.id, record)
++      }
++      return { ok: true, payload: { id: params.id, status: 'archived' } }
++    }
++    default:
++      throw new Error(`unexpected gateway method: ${method}`)
++  }
++}
++
++function rpcCalls(method) {
++  return fixture.rpcLog.filter(entry => entry.method === method)
++}
++
++// ── emitted-event ledger (server/index.js wiring) ────────────────────────────
++
++const publishEvents = []
++const loggerErrors = []
++
++const projectEvents = createWattClawProjectEventService({
++  publish(entry) {
++    publishEvents.push({ event: entry.event, payload: entry.payload })
++    report.emitted_events.push({
++      event: entry.event,
++      project_id: entry.payload?.projectId ?? null,
++      status: entry.payload?.project?.status ?? null,
++      reason: entry.payload?.reason ?? null,
++    })
++  },
++  logger: { error: (...args) => loggerErrors.push(args) },
++  debounceMs: 5,
++})
++
++/**
++ * Mirrors runScheduledWattClawRetention() in server/index.js: the retention
++ * result is what produces the `wattclaw.team.projects.changed` broadcast.
++ */
++async function stopProjects({ now, label }) {
++  const result = await pruneWattClawProjectsForUser({
++    gatewayRpc,
++    ownedAgentIds,
++    now,
++    projectAccessStates: accessStates,
++  })
++  for (const projectId of result.archived) {
++    publishEvents.push({ event: 'wattclaw.team.projects.changed', payload: { reason: 'retention', projectId } })
++    report.emitted_events.push({
++      event: 'wattclaw.team.projects.changed',
++      project_id: projectId,
++      status: null,
++      reason: 'retention',
++    })
++  }
++  report.operations.push({
++    op: 'stop',
++    label,
++    now: new Date(now).toISOString(),
++    scanned: result.scanned,
++    archived: result.archived,
++    kept: result.kept,
++    failed: result.failed,
++  })
++  return result
++}
++
++/** Demo-level guard: only terminal/archived projects may be stopped. */
++function assertStoppable(record) {
++  const status = String(record?.status || '').toLowerCase()
++  if (!['success', 'failed', 'archived', 'restored'].includes(status)) {
++    throw new Error(`Illegal WattClaw project transition rejected: ${status} -> archived`)
++  }
++}
++
++// ── ownership set ────────────────────────────────────────────────────────────
++
++const ownedAgentIds = new Set([
++  'p-demo-lead',
++  'p-demo-worker',
++  'p-run-lead',
++  'p-fresh-lead',
++  'p-restored-lead',
++  'p-cold-lead',
++])
++const accessStates = new Map()
++
++async function main() {
++  await rm(FIXTURE_ROOT, { recursive: true, force: true })
++  await mkdir(fixture.projectDir, { recursive: true })
++
++  // ── STEP 1: create ─────────────────────────────────────────────────────────
++  const created = {
++    id: PROJECT_ID,
++    tenantId: TENANT_ID,
++    name: 'Demo lifecycle project',
++    status: 'pending',
++    createdAt: isoAt(-60_000),
++    updatedAt: isoAt(-60_000),
++    members: [
++      { agentId: 'p-demo-lead', name: 'Lead', role: 'Lead', isLead: true },
++      { agentId: 'p-demo-worker', name: 'Worker', role: 'Researcher', isLead: false },
++    ],
++  }
++  fixture.worlds.set(created.id, created)
++
++  assertLegalTransition('created', 'pending')
++  await writeProject(created)
++  await writeFile(join(fixture.projectDir, 'task-list.json'), '[]\n', 'utf-8')
++  await gatewayRpc('wattclaw.team.project.create', { name: created.name, tenantId: TENANT_ID })
++
++  projectEvents.subscribe({
++    clientId: 'client-demo',
++    projectId: PROJECT_ID,
++    tenantId: TENANT_ID,
++    projectDir: fixture.projectDir,
++  })
++
++  await waitFor(() => publishEvents.some(entry =>
++    entry.event === 'wattclaw.team.project.updated' && entry.payload.project?.status === 'pending'))
++  await waitFor(() => publishEvents.some(entry => entry.event === 'wattclaw.team.tasks.updated'))
++
++  report.operations.push({
++    op: 'create',
++    project_id: PROJECT_ID,
++    from: null,
++    to: 'pending',
++    legal: true,
++    emitted: ['wattclaw.team.project.updated', 'wattclaw.team.tasks.updated'],
++  })
++
++  check('create persists a pending project record on disk', () => {
++    assert.equal(created.status, 'pending')
++    assert.equal(projectEvents.getActiveProjectCount(), 1)
++    return true
++  })
++  check('create emits project.updated(pending) + tasks.updated only', () => {
++    const names = publishEvents.map(entry => entry.event)
++    assert.deepEqual(names, ['wattclaw.team.project.updated', 'wattclaw.team.tasks.updated'])
++    const statuses = publishEvents
++      .filter(entry => entry.event === 'wattclaw.team.project.updated')
++      .map(entry => entry.payload.project.status)
++    assert.deepEqual(statuses, ['pending'])
++    return true
++  })
++  check('gateway payload normalization extracts the created project', () => {
++    const payload = { ok: true, payload: { project: created } }
++    assert.equal(extractWattClawProject(payload)?.id, PROJECT_ID)
++    assert.equal(extractWattClawProjects({ projects: [created] }).length, 1)
++    assert.equal(extractWattClawProjects({ items: [{ data: { id: 'p-x', members: [] } }] }).length, 1)
++    return true
++  })
++  check('membership projection returns deduplicated member agent ids', () => {
++    assert.deepEqual(memberAgentIds(created), ['p-demo-lead', 'p-demo-worker'])
++    assert.deepEqual(getWattClawProjectAgentIds({ members: [{ agentId: ' p-a ' }, { agentId: 'p-a' }] }), ['p-a'])
++    assert.deepEqual(getWattClawProjectAgentIds({}), [])
++    return true
++  })
++  check('ownership gate admits the owner and rejects a foreign user', () => {
++    assert.equal(userOwnsWattClawProject(created, ownedAgentIds), true)
++    assert.equal(userOwnsWattClawProject(created, new Set(['p-other'])), false)
++    return true
++  })
++  check('retention is scheduled for 18:00 Asia/Shanghai', () => {
++    assert.equal(new Date(nextWattClawRetentionRunAt(RETENTION_RUN_AT_UTC - 60_000)).toISOString(), '2026-08-20T10:00:00.000Z')
++    assert.equal(new Date(nextWattClawRetentionRunAt(RETENTION_RUN_AT_UTC)).toISOString(), '2026-08-21T10:00:00.000Z')
++    return true
++  })
++
++  // ── STEP 2: activate ───────────────────────────────────────────────────────
++  const inProgress = { ...created, status: 'in_progress', updatedAt: isoAt(-30_000) }
++  fixture.worlds.set(inProgress.id, inProgress)
++  assertLegalTransition('pending', 'in_progress')
++  await writeProject(inProgress)
++
++  const activated = await activateWattClawProjectRuntime({ project: inProgress, gatewayRpc })
++  await waitFor(() => publishEvents.some(entry =>
++    entry.event === 'wattclaw.team.project.updated' && entry.payload.project?.status === 'in_progress'))
++
++  report.operations.push({
++    op: 'activate',
++    project_id: PROJECT_ID,
++    from: 'pending',
++    to: 'in_progress',
++    legal: true,
++    restored: activated.restored,
++    restored_agents: rpcCalls('wattclaw.team.project.member.update').map(entry => entry.params.agentId),
++    emitted: ['wattclaw.team.project.updated(in_progress)'],
++  })
++
++  await checkAsync('activate reconciles only the missing member and keeps the loaded one', async () => {
++    const calls = rpcCalls('wattclaw.team.project.member.update')
++    assert.deepEqual(calls.map(entry => entry.params.agentId), ['p-demo-worker'])
++    assert.deepEqual(calls[0].params, {
++      projectId: PROJECT_ID,
++      agentId: 'p-demo-worker',
++      name: 'Worker',
++      role: 'Researcher',
++    })
++    assert.deepEqual(fixture.rpcLog.map(entry => entry.method), [
++      'wattclaw.team.project.create',
++      'agents.list',
++      'wattclaw.team.project.member.update',
++      'agents.list',
++    ])
++    return true
++  })
++  await checkAsync('activate returns the full agent roster and restored=false for a non-archived project', async () => {
++    assert.deepEqual(activated.agents.map(agent => agent.id).sort(), ['main', 'p-demo-lead', 'p-demo-worker'])
++    assert.equal(activated.restored, false)
++    assert.equal(activated.project.status, 'in_progress')
++    return true
++  })
++  await checkAsync('activate emits exactly one project.updated(in_progress)', async () => {
++    const statuses = publishEvents
++      .filter(entry => entry.event === 'wattclaw.team.project.updated')
++      .map(entry => entry.payload.project.status)
++    assert.deepEqual(statuses, ['pending', 'in_progress'])
++    return true
++  })
++
++  // Archived -> restored is the only legal way out of `archived`.
++  const archivedForRestore = {
++    id: 'p-demo-restore',
++    tenantId: TENANT_ID,
++    name: 'Demo restore project',
++    status: 'archived',
++    updatedAt: isoAt(-4 * DAY_MS),
++    members: [{ agentId: 'p-restored-lead', name: 'Restored lead', role: 'Lead', isLead: true }],
++  }
++  fixture.worlds.set(archivedForRestore.id, archivedForRestore)
++  const restored = await activateWattClawProjectRuntime({ project: archivedForRestore, gatewayRpc })
++  check('activate restores an archived project (archived -> restored)', () => {
++    assertLegalTransition('archived', 'restored')
++    assert.equal(restored.restored, true)
++    assert.deepEqual(restored.agents.map(agent => agent.id).sort(), ['main', 'p-demo-lead', 'p-demo-worker', 'p-restored-lead'])
++    return true
++  })
++  accessStates.set('p-demo-restore', { restoredAt: NOW - 2 * DAY_MS, lastAccessedAt: NOW })
++  report.operations.push({
++    op: 'activate',
++    project_id: 'p-demo-restore',
++    from: 'archived',
++    to: 'restored',
++    legal: true,
++    restored: true,
++    emitted: [],
++  })
++
++  // ── STEP 3: rejected (illegal) lifecycle attempts ──────────────────────────
++  check('in_progress -> archived is not a legal transition', () => {
++    assert.throws(() => assertLegalTransition('in_progress', 'archived'), /Illegal WattClaw project transition/)
++    assert.throws(() => assertLegalTransition('pending', 'success'), /Illegal WattClaw project transition/)
++    assert.throws(() => assertLegalTransition('archived', 'in_progress'), /Illegal WattClaw project transition/)
++    return true
++  })
++
++  const eventCountBeforeIllegal = publishEvents.length
++  const rpcCountBeforeIllegal = fixture.rpcLog.length
++
++  await expectRejects(
++    'activate rejects when gateway agents cannot be restored',
++    /WattClaw agents were not restored: p-demo-lead, p-demo-worker/,
++    () => activateWattClawProjectRuntime({
++      project: inProgress,
++      gatewayRpc: async () => ({ ok: true, payload: { agents: [{ id: 'main' }] } }),
++    }),
++  )
++  await expectRejects(
++    'activate rejects a missing project / gateway RPC',
++    /WattClaw project and gateway RPC are required/,
++    () => activateWattClawProjectRuntime({ project: null, gatewayRpc }),
++  )
++  await expectRejects(
++    'ensure rejects a project with no agents',
++    /WattClaw project has no agents/,
++    () => ensureWattClawProjectRuntime({
++      project: { ...inProgress, members: [] },
++      gatewayAdminRpc: gatewayRpc,
++      timeoutMs: 20,
++      pollIntervalMs: 1,
++    }),
++  )
++  await expectRejects(
++    'ensure times out when gateway never loads the agents',
++    /WattClaw agents were not loaded: p-demo-lead, p-demo-worker/,
++    () => ensureWattClawProjectRuntime({
++      project: inProgress,
++      gatewayAdminRpc: async (method) => {
++        if (method === 'config.get') return { ok: true, payload: { raw: '{"agents":{}}', hash: 'h1' } }
++        if (method === 'config.apply') return { ok: true, payload: {} }
++        return { ok: true, payload: { agents: [{ id: 'main' }] } }
++      },
++      timeoutMs: 30,
++      pollIntervalMs: 1,
++    }),
++  )
++  check('rejected attempts emit no project events and archive nothing', () => {
++    assert.equal(publishEvents.length, eventCountBeforeIllegal)
++    assert.equal(fixture.rpcLog.length, rpcCountBeforeIllegal)
++    assert.deepEqual(fixture.archived, [])
++    assert.equal(rpcCalls('wattclaw.team.project.archive').length, 0)
++    return true
++  })
++
++  // ── STEP 4: stop ───────────────────────────────────────────────────────────
++  // 4a. stopping a still-running project must be refused (policy + guard).
++  const running = {
++    id: 'p-demo-running',
++    tenantId: TENANT_ID,
++    name: 'Demo running project',
++    status: 'in_progress',
++    updatedAt: isoAt(-10 * DAY_MS),
++    members: [{ agentId: 'p-run-lead', name: 'Run lead', role: 'Lead', isLead: true }],
++  }
++  const freshSuccess = {
++    id: 'p-demo-success-fresh',
++    tenantId: TENANT_ID,
++    name: 'Demo fresh success',
++    status: 'success',
++    updatedAt: isoAt(-1 * DAY_MS),
++    members: [{ agentId: 'p-fresh-lead', name: 'Fresh lead', role: 'Lead', isLead: true }],
++  }
++  const foreign = {
++    id: 'p-demo-foreign',
++    tenantId: 'tenant-other',
++    name: 'Foreign project',
++    status: 'success',
++    updatedAt: isoAt(-10 * DAY_MS),
++    members: [{ agentId: 'p-foreign-lead', name: 'Foreign lead', role: 'Lead', isLead: true }],
++  }
++  const archivedCold = {
++    id: 'p-demo-archived-cold',
++    tenantId: TENANT_ID,
++    name: 'Demo archived cold',
++    status: 'archived',
++    updatedAt: isoAt(-10 * DAY_MS),
++    members: [{ agentId: 'p-cold-lead', name: 'Cold lead', role: 'Lead', isLead: true }],
++  }
++  for (const record of [running, freshSuccess, foreign, archivedCold]) {
++    fixture.worlds.set(record.id, record)
++  }
++  fixture.loadedAgents.add('p-demo-lead')
++  fixture.loadedAgents.add('p-demo-worker')
++
++  const stopAttempt = await stopProjects({ now: NOW, label: 'illegal-stop-attempt (still in_progress)' })
++  check('an in_progress project is never archived by retention', () => {
++    assert.equal(stopAttempt.archived.length, 0)
++    assert.ok(stopAttempt.kept.includes(PROJECT_ID))
++    assert.ok(stopAttempt.kept.includes('p-demo-running'))
++    assert.ok(stopAttempt.kept.includes('p-demo-success-fresh'))
++    assert.ok(stopAttempt.kept.includes('p-demo-archived-cold'))
++    assert.equal(rpcCalls('wattclaw.team.project.archive').length, 0)
++    return true
++  })
++  check('the stop guard refuses a running project while allowing terminal ones', () => {
++    assert.throws(() => assertStoppable(inProgress), /Illegal WattClaw project transition/)
++    assertStoppable(freshSuccess)
++    assertStoppable({ status: 'success' })
++    assertStoppable({ status: 'archived' })
++    report.illegal_attempts.push({
++      attempt: 'stop(in_progress)',
++      rejected_with: 'Illegal WattClaw project transition rejected: in_progress -> archived',
++    })
++    return true
++  })
++
++  // 4b. the legal stop: terminal status -> retention unloads/archives it.
++  const completed = { ...inProgress, status: 'success', updatedAt: isoAt(-4 * DAY_MS) }
++  fixture.worlds.set(completed.id, completed)
++  assertLegalTransition('in_progress', 'success')
++  await writeProject(completed)
++  await waitFor(() => publishEvents.some(entry =>
++    entry.event === 'wattclaw.team.project.updated' && entry.payload.project?.status === 'success'))
++
++  const stopResult = await stopProjects({ now: NOW, label: 'legal-stop (success + retention expired)' })
++  check('stop archives the expired terminal project and the expired restored project', () => {
++    assert.deepEqual(stopResult.archived.sort(), [PROJECT_ID, 'p-demo-restore'].sort())
++    assert.equal(stopResult.scanned, fixture.worlds.size - 1) // ownership filter drops the foreign project
++    assert.ok(stopResult.kept.includes('p-demo-running'))
++    assert.ok(stopResult.kept.includes('p-demo-success-fresh'))
++    assert.ok(stopResult.kept.includes('p-demo-archived-cold'))
++    return true
++  })
++  check('stop never touches a project the user does not own', () => {
++    assert.equal(stopResult.archived.includes('p-demo-foreign'), false)
++    assert.equal(stopResult.kept.includes('p-demo-foreign'), false)
++    assert.equal(rpcCalls('wattclaw.team.project.archive').some(call => call.params.id === 'p-demo-foreign'), false)
++    return true
++  })
++  check('stop emits projects.changed(retention) once per archived project and unloads agents', () => {
++    const changed = report.emitted_events.filter(entry =>
++      entry.event === 'wattclaw.team.projects.changed' && entry.reason === 'retention')
++    assert.deepEqual(changed.map(entry => entry.project_id).sort(), [PROJECT_ID, 'p-demo-restore'].sort())
++    assert.equal(fixture.loadedAgents.has('p-demo-lead'), false)
++    assert.equal(fixture.loadedAgents.has('p-demo-worker'), false)
++    return true
++  })
++  report.operations.push({
++    op: 'stop',
++    project_id: PROJECT_ID,
++    from: 'success',
++    to: 'archived',
++    legal: true,
++    emitted: ['wattclaw.team.projects.changed(retention)'],
++  })
++
++  // 4c. stop is idempotent: a second retention pass must not archive again.
++  const archiveCallsAfterFirstStop = rpcCalls('wattclaw.team.project.archive').length
++  const changedEventsAfterFirstStop = report.emitted_events.length
++  const secondStop = await stopProjects({ now: NOW, label: 'idempotent-stop (already archived)' })
++  check('a second stop pass archives nothing again (idempotent)', () => {
++    assert.deepEqual(secondStop.archived, [])
++    assert.equal(rpcCalls('wattclaw.team.project.archive').length, archiveCallsAfterFirstStop)
++    assert.equal(report.emitted_events.length, changedEventsAfterFirstStop)
++    assert.ok(secondStop.kept.includes(PROJECT_ID))
++    return true
++  })
++
++  // ── STEP 5: event stream shutdown ──────────────────────────────────────────
++  projectEvents.stop()
++  const publishedBeforeStop = publishEvents.length
++  await writeFile(join(fixture.projectDir, 'config.json'), `${JSON.stringify({ ...completed, status: 'failed' })}\n`, 'utf-8')
++  await new Promise(resolve => setTimeout(resolve, 120))
++
++  check('stopping the event service closes the watcher and emits nothing more', () => {
++    assert.equal(projectEvents.getActiveProjectCount(), 0)
++    assert.equal(publishEvents.length, publishedBeforeStop)
++    return true
++  })
++
++  // ── STEP 6: global event legality ──────────────────────────────────────────
++  check('every emitted event name is in the legal allowlist', () => {
++    for (const entry of publishEvents) {
++      assert.ok(LEGAL_EVENT_NAMES.includes(entry.event), `unexpected event: ${entry.event}`)
++      assert.equal(entry.payload.projectId, PROJECT_ID)
++    }
++    assert.equal(publishEvents.some(entry => entry.event === 'wattclaw.team.project.deleted'), false)
++    return true
++  })
++  check('observed project status walk follows only legal transitions', () => {
++    const statuses = publishEvents
++      .filter(entry => entry.event === 'wattclaw.team.project.updated')
++      .map(entry => entry.payload.project.status)
++    assert.deepEqual(statuses, ['pending', 'in_progress', 'success'])
++    for (let i = 1; i < statuses.length; i += 1) assertLegalTransition(statuses[i - 1], statuses[i])
++    return true
++  })
++  check('no watcher/logger errors were produced during the demo', () => {
++    assert.deepEqual(loggerErrors, [])
++    return true
++  })
++}
++
++let failure = null
++
++try {
++  await main()
++} catch (error) {
++  failure = error
++}
++
++try {
++  projectEvents.stop()
++  await rm(FIXTURE_ROOT, { recursive: true, force: true })
++} catch {
++  // best-effort cleanup only
++}
++
++report.conclusion = failure
++  ? `FAILED: ${failure.message}`
++  : `PASS: create -> activate -> stop drove the fixture through only legal transitions; ${checkCount} checks passed and ${report.illegal_attempts.length} illegal attempts were rejected without emitting events.`
++report.checks_passed = checkCount
++report.checks_failed = failure ? 1 : 0
++
++console.log(JSON.stringify(report, null, 2))
++
++if (failure) {
++  console.error(`\nDEMO FAILED: ${failure.message}`)
++  process.exitCode = 1
++} else {
++  console.log(`\nDEMO PASSED: ${checkCount} checks`)
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/demo/wattclaw-project-lifecycle.mjs - 7dd00f6f69791814584218b4ede69af46d187ef69b567944280390631497e99f

@@ -23,6 +23,9 @@ from agent_harness.api.pagination import Page, decode_cursor, encode_cursor
 from agent_harness.domain.effects import EffectSpan, UsageRecord
 from agent_harness.domain.entries import Entry
 from agent_harness.domain.operations import OperationMeta
+from agent_harness.domain.subagents import INTERNAL_PREFIX
+from agent_harness.domain.subagents import record as subagent_record
+from agent_harness.domain.subagents import value as subagent_value
 from agent_harness.domain.types import OperationKind, OperationStatus
 from agent_harness.domain.values import (
     lane_operations,
@@ -56,6 +59,9 @@ class LaneSummary:
     tip_id: str | None
     operation_id: str | None
     last_operation_id: str | None
+    internal: bool = False
+    agent_id: str | None = None
+    run_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -117,12 +123,21 @@ class TraceQueryService:
                 state = await storage.get_value(lane_state(name))
                 if not isinstance(state, dict):
                     raise StorageInvariantError(f"lane {name!r} has no durable state")
+                internal = name.startswith(INTERNAL_PREFIX)
+                agent_id = name.removeprefix(INTERNAL_PREFIX) if internal else None
+                run_id = None
+                if agent_id:
+                    agent_state = subagent_record(await storage.get_value(subagent_value(f"subagent/{agent_id}/state")))
+                    run_id = agent_state.get("current_run_id") or agent_state.get("last_run_id")
                 lanes.append(
                     LaneSummary(
                         name=name,
                         tip_id=_optional_str(await storage.get_value(lane_tip(name))),
                         operation_id=_optional_str(state.get("current_operation_id")),
                         last_operation_id=_optional_str(state.get("last_operation_id")),
+                        internal=internal,
+                        agent_id=agent_id,
+                        run_id=run_id,
                     )
                 )
             return tuple(lanes)

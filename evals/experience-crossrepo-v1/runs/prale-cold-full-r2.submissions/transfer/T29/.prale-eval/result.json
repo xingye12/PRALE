@@ -1,0 +1,79 @@
+{
+  "task_id": "T29",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 15,
+      "observation": "The exported resolver is the only production code that turns a requested generated-file path into a candidate path. It strips trailing slashes from the workspace realpath (line 2), normalizes backslash separators to '/' (line 3), and treats a request as workspace-absolute when it equals or is prefixed by the workspace root (lines 4-9). Otherwise it joins the request onto the workspace root, first removing any leading slashes (lines 11-14). Crucially it never canonicalizes '..' segments and never rejects anything: for '../secret.txt', '/../etc/passwd', '..%2f..%2fetc%2fpasswd' or '..\\..\\etc\\passwd' it returns a candidate that escapes the workspace root by design, so its output is a candidate to be validated, not an authorization verdict."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "isGeneratedFilePathAllowed",
+      "start_line": 39,
+      "end_line": 45,
+      "observation": "Deny-list predicate applied to the workspace-relative path of the resolved target. It lowercases every path segment (line 40), rejects any segment in GENERATED_FILE_DENIED_SEGMENTS ('.git', '.openclaw' — lines 26-27, 41), rejects the name '.env' or any '.env.*' name (line 43), and rejects the agent bootstrap/memory names such as memory.md, workspace-state.json, tools.md (lines 28-37, 44). It is case-insensitive, so 'Notes/MEMORY.MD' is denied."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "createFileRoutes",
+      "start_line": 72,
+      "end_line": 139,
+      "observation": "The GET /api/chat/generated-file route is where the contract is enforced. It reads the query value, trims it and normalizes backslashes (line 75), rejects empty paths and NUL bytes with 400 (line 89), resolves the workspace realpath (lines 106-111), calls resolveGeneratedFileCandidatePath (line 112), canonicalizes the candidate with 'realpath -e' (lines 122-132, 404 when missing) and then takes posix.relative(workspaceReal, targetReal) (line 134). The escape predicate on line 135 ('!relativePath || relativePath === \"..\" || relativePath.startsWith(\"../\") || posix.isAbsolute(relativePath)') combined with isGeneratedFilePathAllowed on line 136 returns 403 File access denied. This is the boundary that rejects traversal, encoded-separator and deny-listed paths."
+    },
+    {
+      "path": "server/utils/generated-file-path.traversal.test.js",
+      "symbol": "evaluateGeneratedFileRequest",
+      "start_line": 72,
+      "end_line": 114,
+      "observation": "New executable contract fixture added by this task. It imports the real resolver and replays the route pipeline (single percent-decode, trim + backslash normalization, NUL/empty rejection, candidate resolution, canonicalization, workspace containment, deny list) and returns a normalized operation result { decision, status, reason, pathMode, candidatePath, candidateRelativePath, targetReal, relativePath }. The fixture drives 8 valid-path cases (all allow, all targets inside the root) and 16 unsafe-path cases (all denied, never 200), plus a guard-as-boundary test, a symlink-escape test and an invariant test, and passes 29/29 under 'node --test'."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "resolveGeneratedFileCandidatePath is not a security boundary: for every traversal or encoded-separator request ('../secret.txt', '/../etc/passwd', '%2e%2e%2fsecret.txt', '..%2f..%2fetc%2fpasswd', '..%5c..%5csecret.txt', '..\\..\\etc\\passwd', '<workspace>/../../outside.txt') it returns a candidate path that still escapes the workspace root, because it only trims slashes and rewrites backslashes and never collapses '..' segments. The fixture asserts both halves: the escaping candidate and the guard that rejects it.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js",
+        "server/utils/generated-file-path.traversal.test.js"
+      ]
+    },
+    {
+      "claim": "Encoded separators are handled at the correct layer. The value is percent-decoded exactly once by the query parser (replayed by decodeURIComponent), so '%2e%2e%2fsecret.txt' becomes '../secret.txt' and is canonicalized/rejected by the containment guard, while a double-encoded '%252e%252e%252fsecret.txt' decodes only to the literal in-root file name '%2e%2e%2fsecret.txt' and cannot traverse. NUL bytes injected via '%00' are rejected with 400 before any resolution happens.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js",
+        "server/utils/generated-file-path.traversal.test.js"
+      ]
+    },
+    {
+      "claim": "Valid generated paths remain inside the intended root. Workspace-relative, workspace-root-relative ('/downloads/report.pdf'), workspace-absolute, backslash-separated ('reports\\2026\\q1.pdf'), interior-traversal ('./downloads/../downloads/report.pdf'), single-encoded dot-segment ('%2e/downloads/report.pdf') and prefix-sharing sibling ('/…/report-agent-v2/notes.txt') requests all resolve to a target under '<workspace>/' with a relativePath that is non-empty, not '..'-prefixed and not absolute. Interior '..' is canonicalized away instead of being rejected, so legitimate generated paths keep working.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/utils/generated-file-path.traversal.test.js"
+      ]
+    },
+    {
+      "claim": "Containment is enforced only after realpath canonicalization, which also closes the symlink hole: a candidate string that is inside the root but whose 'realpath -e' target lives outside the root is rejected with 403 'escaped-workspace' (fixture models this through the canonicalize override). The same guard rejects deny-listed names and segments (.git, .openclaw, .env*, memory.md, workspace-state.json) case-insensitively, and rejects the workspace root itself (empty relative path).",
+      "evidence_paths": [
+        "server/handlers/files.js",
+        "server/utils/generated-file-path.traversal.test.js"
+      ]
+    },
+    {
+      "claim": "The contract is executable with no installed dependencies: 'node --test server/utils/generated-file-path.traversal.test.js' reports tests 29 / pass 29 / fail 0, with 8 valid-path subtests, 16 unsafe-path subtests and 3 invariant tests. No production source was modified for this task.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.traversal.test.js"
+      ]
+    }
+  ],
+  "conclusion": "The traversal/encoded-separator contract for generated-file downloads is now pinned by an executable, dependency-free fixture (server/utils/generated-file-path.traversal.test.js) plus the documented contract in .prale-eval/contract-deliverable.md. The fixture imports the real resolveGeneratedFileCandidatePath and replays the route pipeline from server/handlers/files.js (single percent-decode, backslash normalization, NUL/empty rejection, candidate resolution, realpath canonicalization, posix.relative containment, denied-segment/name check) into a normalized { decision, status, reason } result. Every unsafe spelling - plain '..', '/..', '%2e%2e%2f', '..%2f..%2f', '%2e%2e%2f%2e%2e%2f', '%5c', raw backslash traversal, workspace-absolute prefix escapes, duplicated-root-prefix escapes, NUL injection, deny-listed .git/.openclaw/.env*/memory.md names, and the workspace root itself - is rejected with a non-200 status (400 or 403), and every valid generated path resolves to a target strictly under the workspace root with a non-escaping relativePath. The key contract insight, asserted directly, is that the resolver returns a candidate and the containment guard in files.js is the boundary that makes traversal rejection observable. The fixture passes 29/29 under node --test; the only validation gaps are environmental (vitest and express/multer are not installed, so the pre-existing vitest spec and an in-process import of files.js were not possible) and are recorded in the deliverable and validation notes.",
+  "validation": {
+    "command": "node --test server/utils/generated-file-path.traversal.test.js",
+    "status": "pass",
+    "notes": "Executed inside the workspace with Node v24.14.0: 'tests 29 / pass 29 / fail 0 / duration_ms 75.3'. The fixture covers 8 valid-path subtests (all allow, targetReal under the workspace root, relativePath never '..'-prefixed or absolute) and 16 unsafe-path subtests (all deny with 400/403 and an attributable reason), plus a guard-as-boundary test, a symlink-escape test and a whole-result invariant test. Limitations: (1) the optional vitest dependency is not installed in this environment (node_modules is absent and dependencies must not be installed), so the pre-existing vitest-syntax spec server/utils/generated-file-path.test.js could not be run; the new fixture uses the repository's node:test convention instead, as already used for server/services/external-session-projection.test.js in package.json's test:server script. (2) server/handlers/files.js cannot be imported here because it requires express/multer/node-pty, so the fixture restates its containment and denied-name predicates verbatim with line citations (files.js:26-45, 134-139) while importing the real resolver from server/utils/generated-file-path.js. (3) 'realpath -e' is modelled with posix.normalize for string cases and an explicit canonicalize override for the symlink case; the fixture touches no paths outside the workspace and writes no files."
+  }
+}

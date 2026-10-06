@@ -1,0 +1,70 @@
+{
+  "task_id": 12,
+  "repository": "tdam",
+  "mode": "contract",
+  "request": "Contract the v3 SDK HTTP/error path under sdk/memory-core/typescript/src/v3: add a fixture for a malformed error envelope.",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "V3HttpTransport.request",
+      "start_line": 58,
+      "end_line": 129,
+      "observation": "The v3 transport's single decode path. It reads the raw body, derives `headerRequestId` from `x-qcloud-transaction-id`/`x-trace-id` (lines 81-84), then JSON-parses (lines 87-95) and normalizes any failure to a TDAMError. New guard at lines 97-103 rejects a JSON body that is not an object (`null`, array, scalar) with TDAMError(-1, \"API response must be a JSON object\") instead of letting `envelope.code` at line 105 throw a raw TypeError. Lines 105-118 normalize a non-zero/missing business code to a numeric code (business code, else HTTP status) and carry message/requestId/details into TDAMError."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/errors.ts",
+      "symbol": "TDAMError",
+      "start_line": 12,
+      "end_line": 33,
+      "observation": "The normalized error type thrown by the v3 HTTP path. The constructor (lines 26-32) stores numeric `code`, `requestId`, and optional `details`, and formats Error.message as `[code] message (request_id=requestId)` at line 27. This is the stable shape every malformed-envelope case must resolve to; `details` (lines 15-24) preserves server `data` on business errors so callers can do conflict recovery."
+    },
+    {
+      "path": "sdk/memory-core/typescript/tests/fixtures/v3/malformed-error-envelope.json",
+      "symbol": "json_null_body",
+      "start_line": 16,
+      "end_line": 27,
+      "observation": "The canonical malformed error envelope: HTTP 200 whose body parses to `null`. The fixture also carries `json_array_body`, `non_json_error_body`, `string_code_error`, and `missing_code_and_message`, each with the expected normalized `TDAMError` (code/message/requestId). Before the guard this case threw `TypeError: Cannot read properties of null (reading 'code')`."
+    },
+    {
+      "path": "sdk/memory-core/typescript/tests/v3/run-malformed-envelope.mjs",
+      "symbol": "runCase",
+      "start_line": 34,
+      "end_line": 49,
+      "observation": "Dependency-free executable demo: stubs `globalThis.fetch`, drives the real `V3HttpTransport.post` for each fixture case, and asserts the thrown value is a TDAMError with the expected code/message/requestId. Includes a well-formed success control to prove the guard did not regress the happy path."
+    },
+    {
+      "path": "sdk/memory-core/typescript/tests/v3/malformed-error-envelope.test.ts",
+      "symbol": "describe(\"v3 transport / malformed error envelope\")",
+      "start_line": 30,
+      "end_line": 72,
+      "observation": "Vitest contract suite mirroring the runner for the repo's configured test command (`vitest run`, include `tests/**/*.test.ts`). Asserts each fixture case rejects with TDAMError, that a `null` body is not a TypeError, and that a well-formed envelope still unwraps to `data` plus `trace_id`."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Every malformed error envelope in the fixture is normalized by V3HttpTransport.request into a thrown TDAMError rather than an uncaught TypeError or an unexpected resolved value: a null body, an array body, and a bare scalar body yield TDAMError(-1, 'API response must be a JSON object'); a non-JSON body yields a TDAMError coded by HTTP status (or -1 on a 2xx); and a non-numeric/missing business code yields a TDAMError whose numeric code falls back to the HTTP status.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts",
+        "sdk/memory-core/typescript/src/errors.ts"
+      ]
+    },
+    {
+      "claim": "TDAMError is the stable normalized result type of the v3 error path: it exposes a numeric `code`, a `requestId` (header transaction id, else header trace id, else envelope `request_id`), and optional `details`, and formats Error.message as `[code] message (request_id=requestId)`.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/errors.ts"
+      ]
+    },
+    {
+      "claim": "The v3 error path distinguishes the three failure families on one decode path: non-JSON body (lines 87-95), JSON body that is not an envelope object (lines 97-103), and a well-formed object with non-zero/missing business code or a non-2xx status (lines 105-118); only `code === 0` with `response.ok` resolves to `data` (lines 120-125).",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    }
+  ],
+  "conclusion": "The v3 SDK HTTP/error path is now contracted against malformed error envelopes. tests/fixtures/v3/malformed-error-envelope.json captures five malformed envelopes (null/array/non-JSON body, non-numeric code, missing code+message) with their expected normalized results, and the minimal guard added to V3HttpTransport.request (src/v3/http.ts:97-103, mirroring the Python v3 transport's strict isinstance(envelope, dict) check) ensures each normalizes to a TDAMError instead of crashing with an uncaught TypeError on a null/array/scalar JSON body. The fixture is executable via tests/v3/run-malformed-envelope.mjs (no dependencies installed) and via the vitest suite tests/v3/malformed-error-envelope.test.ts. Happy-path unwrapping and trace_id propagation are unchanged.",
+  "validation": {
+    "command": "cd sdk/memory-core/typescript && node tests/v3/run-malformed-envelope.mjs",
+    "status": "passed",
+    "notes": "Ran with Node v24.14.0 (native TypeScript type-stripping) and an in-runner module-resolution hook (tests/v3/undici-stub-hooks.mjs) that stubs the uninstalled `undici` package and maps the sources' `*.js` specifiers to `*.ts`, so the REAL src/v3/http.ts and src/errors.ts are exercised. Result: 5/5 malformed-envelope cases normalized to the expected TDAMError plus 1/1 well-formed success control, 0 failures, exit 0. Regression check: before the guard, the `json_null_body` case produced `TypeError: Cannot read properties of null (reading 'code')`. LIMITATION: no node_modules are present and dependency installation is out of scope, so `vitest run` / tsc could not be executed; tests/v3/malformed-error-envelope.test.ts is provided for the configured `vitest run` command but was not run in this environment."
+  }
+}

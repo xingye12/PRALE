@@ -118,6 +118,7 @@ class ToolTelemetry:
     error_class: str | None = None
     started_at: int | None = None
     ended_at: int = 0
+    metadata: Mapping[str, JsonValue] = field(default_factory=dict)
 
 
 TelemetryEvent = OperationTelemetry | GenerationTelemetry | ToolTelemetry

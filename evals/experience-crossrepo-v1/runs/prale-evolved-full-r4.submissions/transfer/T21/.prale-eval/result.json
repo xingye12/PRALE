@@ -1,0 +1,75 @@
+{
+  "task_id": "T21",
+  "repository": "pi",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "parseArgs",
+      "start_line": 36,
+      "end_line": 71,
+      "observation": "parseArgs accepts --input, --dry-run and optional --source-commit without requiring --bucket/--endpoint: lines 68-69 only demand bucket and endpoint when dryRun is false. This is what lets the offline fixture be validated with no storage credentials and no network endpoint."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "main",
+      "start_line": 263,
+      "end_line": 288,
+      "observation": "main() resolves the input dir, runs the local validateBundle check, writes publication.json into the fixture dir (line 282), and at line 285 takes the dry-run early return ('no objects uploaded') before line 290 creates any temp dir or calls downloadIndex/uploadJson. The only network-touching branch is therefore never entered."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "aws",
+      "start_line": 184,
+      "end_line": 198,
+      "observation": "aws() is the sole child-process path that would reach the network (spawnSync('aws', ...) with AWS_EC2_METADATA_DISABLED to avoid metadata lookups). It is only reachable from the publish branch after the dry-run return, so the offline fixture check never spawns it."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "downloadIndex",
+      "start_line": 200,
+      "end_line": 213,
+      "observation": "downloadIndex() reads s3://$bucket/index.json via --endpoint-url, i.e. the remote pull that a fixture lacking network data cannot satisfy. It is called only after the dry-run return in main(), confirming the chosen check bypasses it."
+    },
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "scripts",
+      "start_line": 54,
+      "end_line": 64,
+      "observation": "The package's scripts contract separates networked generation from offline use: generate-models (line 56) drives generate-models.ts, which fetches https://models.dev/api.json and provider /models endpoints; build:offline (line 61) deliberately omits it and instead runs check:model-data (line 59, validates committed src/providers/data) plus a tygo build; generate-model-catalog (line 58) emits the JSON bundle under ../../.artifacts/model-catalog that the root check:model-catalog script validates."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The offline fixture check is network-safe by construction: the publisher validates a purely local JSON bundle and, under --dry-run, returns ('no objects uploaded') before creating temp dirs or invoking the aws S3 download/upload path, so no network data is required or fetched.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs"
+      ]
+    },
+    {
+      "claim": "Running the fixture with --dry-run and an explicit --source-commit leaves parseArgs satisfied without --bucket/--endpoint and skips gitSourceCommit(), so the validation spawns neither the aws CLI nor git; the only network-capable functions (aws, downloadIndex, uploadJson) stay unreachable.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs"
+      ]
+    },
+    {
+      "claim": "packages/ai/package.json defines an explicit offline model-data path: build:offline runs check:model-data against committed data instead of generate-models, whose generate-models.ts fetches models.dev; generate-model-catalog produces the .artifacts/model-catalog JSON that the root publisher consumes, matching the fixture layout.",
+      "evidence_paths": [
+        "packages/ai/package.json"
+      ]
+    },
+    {
+      "claim": "The repository itself treats this path as the narrowest offline check: the root check:model-catalog script runs scripts/publish-model-catalog.mjs --input .artifacts/model-catalog --dry-run, and the focused node:test suite scripts/publish-model-catalog.test.mjs builds the same JSON-only fixture and asserts the normalized publication counts; both were exercised here without network access.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs",
+        "packages/ai/package.json"
+      ]
+    }
+  ],
+  "conclusion": "Operated the offline model-catalog fixture successfully. The narrowest valid local check is `node --test scripts/publish-model-catalog.test.mjs`, the repository's focused node:test suite that constructs a JSON-only catalog fixture and invokes scripts/publish-model-catalog.mjs --dry-run; it passed (1/1). In addition, a workspace-local fixture (.prale-eval/fixture/model-catalog, 500 anthropic + 5 openai + 1 openrouter chat models, 1 image, 1 classifier) was validated with `node scripts/publish-model-catalog.mjs --input .prale-eval/fixture/model-catalog --source-commit t21-offline-fixture --dry-run`, producing a normalized publication record with revision sha256-8fb10cb8e46d1c858d0faa7c2499d0ea47085fa2826f6913659aace5206dc0ff, 3 providers, 506 chat, 1 image, 1 classifier and 508 total models. Both checks are offline-safe because the dry-run branch returns before any aws S3 download/upload or git invocation, and because an explicit --source-commit removes the only other subprocess call. No tracked files, locks, git configuration, or task metadata were modified (git status shows only the new untracked .prale-eval/ directory).",
+  "validation": {
+    "command": "TMPDIR=\"$PWD/.prale-eval/tmp\" node --test scripts/publish-model-catalog.test.mjs",
+    "status": "passed",
+    "notes": "Narrowest valid local check: the repo's own focused node:test for the model-catalog publisher. Observed 'pass 1 / fail 0' (exit 0). It needs no network, no node_modules and no aws CLI: the test builds a temp JSON-only fixture and the publisher's --dry-run path returns at scripts/publish-model-catalog.mjs:285-288 (before mkdtempSync/downloadIndex/uploadJson at 290+); the sole network-capable symbol, aws() at :184-198, is never spawned. TMPDIR was pointed inside the workspace so the test's temp writes stay local. Secondary operate run: `node .prale-eval/offline-model-catalog-demo.mjs` also exited 0 and emitted the normalized publication.json summarized in the conclusion and in .prale-eval/operate-deliverable.md. Limitation: node_modules is absent, so the vitest/typescript workspace suites and tsgo typecheck (build:offline) could not be run; they were not needed for this offline check."
+  }
+}

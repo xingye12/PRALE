@@ -1,0 +1,101 @@
+{
+  "task_id": "T11",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 63,
+      "observation": "The shared header gate for every meta/skill panel route. It reads the action via readAction, then enforces required headers in order and short-circuits BEFORE await next(), so the downstream handler (and therefore the kernel fake client) is unreachable on any failure: (1) missing/blank x-tdai-service-id -> respondControlError(c, 400, 'MISSING_INSTANCE_ID') at lines 34-37; (2) registry resolve() throwing InstanceRegistryError code 400 -> respondControlError(c, 400, 'INVALID_INSTANCE') at lines 39-47; (3) missing/blank x-tdai-user-key on any non-'auth/verify' path (omitUserKey === false) -> respondControlError(c, 400, 'MISSING_USER_KEY') at lines 49-53. Only when all checks pass does it c.set('panelMeta', ...) and await next() (lines 55-61)."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "readAction",
+      "start_line": 24,
+      "end_line": 29,
+      "observation": "Extracts the action by looking for the literal '/meta/' marker in the request path and returns '' otherwise. For the /skill/* route the path does not contain '/meta/', so action === '' and the auth/verify exemption never applies: skill requests always require x-tdai-user-key. This is exactly the missing-user-key branch exercised by the contract demo."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "PanelMetaContext",
+      "start_line": 11,
+      "end_line": 16,
+      "observation": "The context object the middleware sets on success (instanceId, gatewayEndpoint, gatewayApiKey, optional userKey). It is populated from the resolved registry entry and the trimmed inbound headers, and is what route handlers read via c.get('panelMeta') to build the downstream MetaCallContext. It is only ever set after the header gate passes, confirming the gate is a precondition for any downstream call."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+      "symbol": "registerSkillProxyRoutes",
+      "start_line": 26,
+      "end_line": 50,
+      "observation": "The contracted 'different panel route': POST /api/v1/skill/* mounts validatePanelMetaHeaders(deps) as the first middleware (line 27), then, for allowed actions only, calls the downstream client via deps.skillKernel.invoke(action, body, ctx) at line 49. Because the middleware runs first and returns before next() on missing/invalid headers, a header-gate rejection guarantees skillKernel.invoke (and every other downstream client) is never called. The route is structurally distinct from the task/list-with-agents aggregation route (single downstream invoke, no fan-out)."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+      "symbol": "resolve",
+      "start_line": 96,
+      "end_line": 101,
+      "observation": "InstanceRegistry.resolve() looks the instance id up in the loaded registry and throws InstanceRegistryError(400, 'INVALID_INSTANCE') when unknown (line 99). The middleware catches only that code-400 case and converts it to the INVALID_INSTANCE envelope; the resolver therefore never returns a partial entry, so a bogus x-tdai-service-id cannot fall through to the handler or the downstream client."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondControlError",
+      "start_line": 22,
+      "end_line": 25,
+      "observation": "Builds the standard control envelope for all gate failures: controlEnvelope(code, message, reqId) yields { code, message, request_id, data: null }, and respondEnvelope maps code 400 -> HTTP status 400 via mapHttpStatusFromEnvelopeCode. This is the exact envelope asserted by every negative case in the contract demo."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/headers.ts",
+      "symbol": "META_HEADER_SERVICE_ID",
+      "start_line": 5,
+      "end_line": 6,
+      "observation": "Defines the two required inbound header names on one contract with the kernel: x-tdai-service-id and x-tdai-user-key. The middleware reads both with .trim(), so a blank/whitespace-only value is treated identically to an absent header (MISSING_INSTANCE_ID / MISSING_USER_KEY) — a case the demo asserts."
+    },
+    {
+      "path": "MemoryPanel/tests/panel/skill-proxy-header-contract.test.ts",
+      "symbol": "fakeSkillKernel",
+      "start_line": 56,
+      "end_line": 58,
+      "observation": "The recording downstream fake client (vi.fn) injected as deps.skillKernel, plus a second fake for deps.metaKernel. makeHarness builds a minimal Hono app around the real registerSkillProxyRoutes + real requestLogger + real validatePanelMetaHeaders and a real InstanceRegistry with one entry. The five negative cases assert fakeSkillKernel.invoke was never called; the positive control asserts it is called exactly once with action 'list' and the resolved MetaCallContext, proving the negative assertions are meaningful."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The panel header gate validatePanelMetaHeaders returns the standard control envelope with HTTP 400 for every missing/invalid required header permutation — MISSING_INSTANCE_ID (absent or blank x-tdai-service-id), INVALID_INSTANCE (unknown instance id), MISSING_USER_KEY (absent or blank x-tdai-user-key on a non-auth/verify path) — and short-circuits before await next(), so no downstream client can be invoked on those paths.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/http/envelope.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts"
+      ]
+    },
+    {
+      "claim": "POST /api/v1/skill/* is a different panel route from the task/list-with-agents aggregation route; it mounts the same validatePanelMetaHeaders middleware first and only reaches its single downstream call deps.skillKernel.invoke after next(), so a header-gate rejection guarantees the downstream fake client is never called.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts"
+      ]
+    },
+    {
+      "claim": "For the /skill/* path readAction returns '' (no '/meta/' marker), so the auth/verify exemption does not apply and x-tdai-user-key is mandatory; unknown instance ids fail inside InstanceRegistry.resolve() with code 400 and are normalized to the INVALID_INSTANCE envelope rather than propagating.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/config/instance-registry.ts"
+      ]
+    },
+    {
+      "claim": "The executable contract demo wires the real middleware and route to recording fake downstream clients and asserts both halves of the contract: the exact standard envelope (code, message, echoed request_id, data: null) with HTTP 400, and zero invocations of the downstream fake client; a valid-header control case shows the fake is invoked exactly once, confirming the negative assertions are not vacuous.",
+      "evidence_paths": [
+        "MemoryPanel/tests/panel/skill-proxy-header-contract.test.ts",
+        "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts"
+      ]
+    }
+  ],
+  "conclusion": "POST /api/v1/skill/* (a panel route different from the task/list-with-agents aggregation route) is contracted: all missing/invalid header permutations are rejected by validatePanelMetaHeaders with the standard control envelope { code: 400, message, request_id, data: null } at HTTP 400, the middleware short-circuits before await next(), and the downstream fake client (deps.skillKernel.invoke) is therefore never called. The behavior is captured as an executable vitest contract (MemoryPanel/tests/panel/skill-proxy-header-contract.test.ts) with a valid-header control case; execution was blocked only because workspace dependencies are not installed, which is recorded in validation.",
+  "validation": {
+    "command": "pnpm --dir MemoryPanel vitest run tests/panel/skill-proxy-header-contract.test.ts",
+    "status": "blocked",
+    "notes": "Required dev dependency (vitest) is not installed: MemoryPanel/node_modules is absent, and installing dependencies is out of scope for this task, so the suite could not be executed. As the available focused check, the test file was parsed with `node --check MemoryPanel/tests/panel/skill-proxy-header-contract.test.ts` using Node v24 TypeScript type-stripping, which passed (PARSE_OK), and `npx --no-install vitest` was confirmed to refuse to fetch the missing package. The contract is fully specified in .prale-eval/contract-deliverable.md and must be re-run as stated in `command` in an environment with dependencies installed."
+  }
+}

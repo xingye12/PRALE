@@ -1,0 +1,104 @@
+{
+  "task_id": "T11",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 63,
+      "observation": "The shared panel header guard. It reads x-tdai-service-id, returns the standard control envelope (400 MISSING_INSTANCE_ID) when absent, resolves the instance via deps.instanceRegistry.resolve and returns 400 INVALID_INSTANCE on InstanceRegistryError(400), then requires x-tdai-user-key unless the action is auth/verify (400 MISSING_USER_KEY). Each rejection `return`s from the middleware before the single `await next()` at line 61, so the downstream route handler (and any kernel client it would call) is never reached when required headers are missing or invalid."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+      "symbol": "registerSkillProxyRoutes",
+      "start_line": 26,
+      "end_line": 52,
+      "observation": "The contracted route that is different from the meta proxy: `api.post('/skill/*', validatePanelMetaHeaders(deps), handler)` registers the skill data-plane proxy. Its handler is the only place that calls the downstream fake client `deps.skillKernel.invoke(action, body, ctx)` (line 49); because validatePanelMetaHeaders guards the route and readAction('/skill/...') never equals 'auth/verify', a request with missing/invalid x-tdai-service-id or missing x-tdai-user-key is answered by the middleware and never invokes skillKernel."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondControlError",
+      "start_line": 22,
+      "end_line": 25,
+      "observation": "Builds the standard control envelope (controlEnvelope -> { code, message, request_id, data: null }) and writes it with mapHttpStatusFromEnvelopeCode. This is what every header-guard rejection returns, guaranteeing the standard envelope shape ({ code: 400, message: 'MISSING_INSTANCE_ID' | 'INVALID_INSTANCE' | 'MISSING_USER_KEY', request_id, data: null }) on the wire."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "mapHttpStatusFromEnvelopeCode",
+      "start_line": 11,
+      "end_line": 15,
+      "observation": "Standard envelope code -> HTTP status mapping: code 0 -> 200, code 400-599 -> that code, everything else -> 502. It is the reason the guard's code:400 envelopes are emitted as HTTP 400, so a contracted rejection asserts both the body envelope and the HTTP status."
+    },
+    {
+      "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+      "symbol": "InstanceRegistry.resolve",
+      "start_line": 96,
+      "end_line": 100,
+      "observation": "Resolves an instance id; an unknown id throws InstanceRegistryError(400, 'INVALID_INSTANCE'). validatePanelMetaHeaders catches exactly this case and converts it into the 400 INVALID_INSTANCE control envelope, which is the 'invalid required header' branch of the contract."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/headers.ts",
+      "symbol": "META_HEADER_SERVICE_ID",
+      "start_line": 5,
+      "end_line": 6,
+      "observation": "Canonical header names shared by inbound validation and outbound forwarding: x-tdai-service-id (META_HEADER_SERVICE_ID) and x-tdai-user-key (META_HEADER_USER_KEY). These are the required headers the contract exercises."
+    },
+    {
+      "path": "MemoryPanel/tests/panel/contract-skill-proxy-headers.test.ts",
+      "symbol": "describe('contract: POST /api/v1/skill/* required headers')",
+      "start_line": 79,
+      "end_line": 156,
+      "observation": "Executable contract demo: mounts the real registerSkillProxyRoutes under /api/v1 with a fake downstream skillKernel (vi.fn) and asserts (1) missing x-tdai-service-id -> 400 MISSING_INSTANCE_ID envelope + invoke not called, (2) unknown instance -> 400 INVALID_INSTANCE + not called, (3) missing x-tdai-user-key -> 400 MISSING_USER_KEY + not called, (4) whitespace-only headers treated as missing, and (5) valid headers -> 200 code:0 with the same fake called exactly once, proving the route is wired so the negative assertions are meaningful."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "POST /api/v1/skill/* with no x-tdai-service-id is short-circuited inside validatePanelMetaHeaders and returns the standard control envelope (HTTP 400, code 400, message MISSING_INSTANCE_ID, data null); because the guard returns before `await next()`, the skill proxy handler and its downstream skillKernel client are never invoked.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+        "MemoryPanel/src/panel/http/envelope.ts"
+      ]
+    },
+    {
+      "claim": "An x-tdai-service-id that the instance registry cannot resolve makes InstanceRegistry.resolve throw InstanceRegistryError(400), which validatePanelMetaHeaders converts into the standard envelope (HTTP 400, message INVALID_INSTANCE) before next(), so no downstream call happens for the invalid-header case either.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/config/instance-registry.ts",
+        "MemoryPanel/src/panel/http/envelope.ts"
+      ]
+    },
+    {
+      "claim": "For the skill route the parsed action is the skill action (e.g. 'get'), never 'auth/verify', so omitUserKey is false and a request carrying a valid instance but no x-tdai-user-key is rejected with HTTP 400 / MISSING_USER_KEY in the standard envelope without reaching the handler.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts"
+      ]
+    },
+    {
+      "claim": "Every header-guard rejection reuses respondControlError/controlEnvelope, so all rejections share the standard envelope shape {code, message, request_id, data: null}, and mapHttpStatusFromEnvelopeCode emits code 400 as HTTP 400 — the exact contract the executable demo asserts for both the body and the status.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/envelope.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts"
+      ]
+    },
+    {
+      "claim": "The executable vitest demo tests/panel/contract-skill-proxy-headers.test.ts verifies the three missing/invalid-header rejections all avoid the downstream fake client (vi.fn not called) and adds a valid-header case where the same fake is invoked exactly once, proving the route/client wiring so the negative assertions are not vacuous.",
+      "evidence_paths": [
+        "MemoryPanel/tests/panel/contract-skill-proxy-headers.test.ts",
+        "MemoryPanel/src/panel/http/routes/skill/proxy.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts"
+      ]
+    }
+  ],
+  "conclusion": "The skill data-plane panel route POST /api/v1/skill/* (a different route from the meta proxy, registered by registerSkillProxyRoutes) is contracted against the shared validatePanelMetaHeaders guard: missing x-tdai-service-id, an unresolvable instance, and a missing x-tdai-user-key each return the standard control envelope with HTTP 400 (MISSING_INSTANCE_ID / INVALID_INSTANCE / MISSING_USER_KEY, data null), and because each guard return precedes `await next()`, the downstream fake skillKernel client is never called. The executable vitest demo asserts the three rejection paths plus a reachability case (valid headers -> 200 and exactly one downstream call), and the artifact .prale-eval/contract-deliverable.md documents the contract, the demo, and the evidence map.",
+  "validation": {
+    "command": "cd MemoryPanel && npm test -- tests/panel/contract-skill-proxy-headers.test.ts",
+    "status": "blocked",
+    "notes": "The fixture workspace has no MemoryPanel/node_modules (no hono, no vitest) and dependency installation is out of scope, so the focused vitest contract could not execute here. Observed: `sh: 1: vitest: not found` (npm test) and `npx --no-install vitest ...` -> 'npx canceled due to missing packages' (vitest@5.0.3). This is an environment limitation, not a source failure. The command above is the exact reproduction once `npm install`/`pnpm install` is run in MemoryPanel; the test targets the real route registration (registerSkillProxyRoutes) and the real middleware, using an injected vi.fn fake for deps.skillKernel. Fallback dependency-free check executed in-repo (node -e reading the real sources) confirmed the static invariants relied on by the contract: the three `return respondControlError(c, 400, 'MISSING_INSTANCE_ID'|'INVALID_INSTANCE'|'MISSING_USER_KEY')` guards all precede the single `await next()`, `api.post('/skill/*', validatePanelMetaHeaders(deps), ...)` is the registered route, and `deps.skillKernel.invoke` appears only after the middleware in the handler; that check passed."
+  }
+}

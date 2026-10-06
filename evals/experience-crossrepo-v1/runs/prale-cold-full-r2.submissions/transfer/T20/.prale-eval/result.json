@@ -1,0 +1,110 @@
+{
+  "task_id": "T20",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.enqueue",
+      "start_line": 14,
+      "end_line": 24,
+      "observation": "enqueue(key, job) is the only submission door into the queue: the first job for a key lazily creates a SerialQueue and stores it in the `queues` map, and every later submission for the same key is appended to that same lane via `q.add(job)`. The call is fire-and-forget (`void q.add(job).catch(...)`), so a service that submits the same source twice would otherwise run it twice; the dedup proof therefore has to show that the second submission never reaches this method (or is absorbed/rejected before it). Line 5 of the file header states the guarantee the queue itself provides: 'same asset never rebuilds concurrently'."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.onIdle",
+      "start_line": 26,
+      "end_line": 33,
+      "observation": "onIdle(key?) is the deterministic join used by the contract fixture: `onIdle(key)` awaits that key's SerialQueue and `onIdle()` awaits every lane via Promise.all. This is what lets the fixture observe the terminal state of the single effective build (`ready`) without polling, and to assert that no second build is still pending behind the first."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.queues",
+      "start_line": 11,
+      "end_line": 12,
+      "observation": "The class holds `Map<string, SerialQueue>` keyed by asset id (code_graph_id / wiki_id). Keying the lane by the asset identity — not by the caller or request — is what makes repeated submissions of the same source land on one serial lane instead of fanning out into parallel, conflicting builds."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue.drain",
+      "start_line": 81,
+      "end_line": 101,
+      "observation": "drain() is the concurrency=1 primitive behind BuildQueue: it refuses to start a new entry while `running` is true and only re-enters (or releases idle resolvers) in the task's `.finally`. The fixture's raw-queue scenario asserts exactly this: two jobs on the same key produce the strictly serial trace start:same-key-1 → end:same-key-1 → start:same-key-2 → end:same-key-2 with max concurrency 1, while different keys still run concurrently."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.create",
+      "start_line": 132,
+      "end_line": 139,
+      "observation": "create() delegates to `store.createCodeGraph(params)`, which resolves the source identity (service_id, team_id, repo_url, branch), and only enqueues a build when `existed === false`. Submitting the same source a second time returns `{ existed: true, row }` for the same code_graph_id and therefore never calls enqueueBuild — this is the mechanism that turns two submissions of the same source into one effective build."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.sync",
+      "start_line": 153,
+      "end_line": 171,
+      "observation": "sync() is the re-submission path for an already-created source. If the row is `pending` or `processing` it returns `{ kind: \"busy\", status, step }` before touching status/version/audit, so a duplicate submitted while the first build is in flight is rejected instead of being queued a second time. Only after the row is terminal does sync() bump version, set status back to `pending` and enqueue one new generation."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/code-graph-service.ts",
+      "symbol": "CodeGraphService.runBuild",
+      "start_line": 275,
+      "end_line": 343,
+      "observation": "runBuild() is the queued job and it owns the recorded terminal state: it sets `processing`/`cloning`, calls the injected worker with the per-asset dir, then on success writes `status: \"ready\"`, `internal_status: null`, `sync_error: null`, `commit_hash`, `stats_json` and `last_sync_at`, and appends the `ready` audit row; a worker error instead records `status: \"failed\"` plus `sync_error`. The fixture's fake worker resolves once, so the observed lifecycle is exactly pending → processing → ready with version 1."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/sqlite-store.ts",
+      "symbol": "SqliteKnowledgeStore.createCodeGraph",
+      "start_line": 69,
+      "end_line": 137,
+      "observation": "The real persistence layer encodes the source identity as a lookup on (serviceId, teamId, repoUrl, branch) with `deletedAt IS NULL` and returns `{ existed: true }` when it already exists; the unique-violation branch of the insert retries/resolves to the existing row for a concurrent race. The fixture's in-memory store mirrors this contract so the duplicate-submission proof holds against the same identity rule the production store enforces."
+    },
+    {
+      "path": "MemoryKnowledge/test/contracts/queue-duplicate-source/duplicate-source.contract.mjs",
+      "symbol": "scenarioDuplicateCreate",
+      "start_line": 219,
+      "end_line": 273,
+      "observation": "The contract fixture itself: it submits the same source twice through CodeGraphService.create (lines 224-225), joins with onIdle(), then asserts that the second submission was absorbed (`existed: true`, same code_graph_id), that the worker ran exactly once, that exactly one metadata row exists, and that the row records the terminal state `ready` with version 1, commit_hash/stats_json/last_sync_at set, lifecycle pending → processing → ready and audit actions [create, ready]. The companion scenarios cover a duplicate arriving while the first build is in flight (rejected as `busy`) and the raw per-key serial/cross-key concurrent BuildQueue semantics."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Submitting the same source twice through the repository's BuildQueue-backed CodeGraphService produces exactly one effective build: the second submission is absorbed by the idempotent source lookup (same code_graph_id, existed=true) and no second job is ever enqueued.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/sqlite-store.ts",
+        "MemoryKnowledge/test/contracts/queue-duplicate-source/duplicate-source.contract.mjs"
+      ]
+    },
+    {
+      "claim": "The single effective build records the expected terminal state: the row ends at status `ready` with internal_status/sync_error null, version 1, commit_hash + stats_json + last_sync_at persisted, an observed lifecycle of pending → processing → ready, and an audit trail of exactly [create, ready].",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/test/contracts/queue-duplicate-source/duplicate-source.contract.mjs"
+      ]
+    },
+    {
+      "claim": "A duplicate submission that arrives while the first build is still in flight is rejected with { kind: \"busy\" } (status pending/processing) before any status overwrite, version bump, audit write or re-enqueue, so the in-flight generation still yields exactly one effective build and still terminates at `ready`, version 1.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/code-graph-service.ts",
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/test/contracts/queue-duplicate-source/duplicate-source.contract.mjs"
+      ]
+    },
+    {
+      "claim": "BuildQueue itself is a per-asset-key lane (Map<string, SerialQueue>): repeated enqueues for one key are strictly serial — never concurrent, FIFO — while different keys use independent lanes that may run at the same time, which is the safety property that makes service-side dedup sufficient and starvation-free.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts",
+        "MemoryKnowledge/test/contracts/queue-duplicate-source/duplicate-source.contract.mjs"
+      ]
+    }
+  ],
+  "conclusion": "Contracted and proven: a dependency-free queue fixture at MemoryKnowledge/test/contracts/queue-duplicate-source/ submits the same source (service_id, team_id, repo_url, branch) twice against the real BuildQueue + CodeGraphService sources and demonstrates one effective build with a recorded terminal state. Sequentially, the second submission is absorbed by the idempotent source lookup (existed=true, same code_graph_id) so the worker runs once and one metadata row records ready/version 1 with commit_hash, stats_json, last_sync_at, lifecycle pending→processing→ready and audit [create, ready]. While the first build is in flight, the duplicate is rejected with { kind: \"busy\", status: \"processing\", step: \"indexing\" } without touching version or audit. At the queue layer, the same key is strictly serial (max concurrency 1, FIFO) while different keys run concurrently. All three scenarios pass under plain Node (no install step required).",
+  "validation": {
+    "command": "cd MemoryKnowledge && node --no-warnings --import ./test/contracts/queue-duplicate-source/register.mjs --test ./test/contracts/queue-duplicate-source/duplicate-source.contract.mjs",
+    "status": "passed",
+    "notes": "Node v24.14.0, no dependencies installed in this checkout (vitest/better-sqlite3/tsx are absent and no install was performed), so the fixture runs on the built-in test runner plus a 20-line resolver hook (test/contracts/queue-duplicate-source/ts-js-resolver.mjs) that maps the repo's bundler-style `./x.js` specifiers to the on-disk `./x.ts` sources; Node's default type stripping loads the production files unmodified. Result: 3/3 tests pass (same source twice → one effective build reaching ready; duplicate while in flight rejected as busy; BuildQueue per-key serial + cross-key independent). The normalized operation result was also produced by the plain runner `cd MemoryKnowledge && node --no-warnings --import ./test/contracts/queue-duplicate-source/register.mjs ./test/contracts/queue-duplicate-source/run.mjs` (exit 0): {submissions_of_same_source: 2, effective_builds: 1, metadata_rows: 1, terminal_state: \"ready\", version: 1, lifecycle: [pending, processing, ready], audit_actions: [create, ready]}. Limitation: because the repo's own `vitest run` suite cannot execute without an install, the fixture is wired for `node --test` rather than vitest; no other validation dependency was used or required."
+  }
+}

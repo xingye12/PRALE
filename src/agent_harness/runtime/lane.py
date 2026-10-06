@@ -29,7 +29,7 @@ from agent_harness.runtime.events import EventBus, EventListener, HarnessEvent
 from agent_harness.runtime.hooks import HookRegistry
 from agent_harness.runtime.retry import RetryPolicy
 from agent_harness.runtime.telemetry import TelemetrySink
-from agent_harness.runtime.tools import AgentTool, ToolRegistry
+from agent_harness.runtime.tools import AgentTool, RuntimeControlTool, ToolRegistry
 from agent_harness.storage.protocol import AppendList, DeleteValue, InsertEntry, SetValue, Write
 
 if TYPE_CHECKING:
@@ -37,6 +37,7 @@ if TYPE_CHECKING:
     from agent_harness.domain.skill import SkillScope
     from agent_harness.memory.runtime import MemoryRuntime
     from agent_harness.runtime.generation import ChatProvider
+    from agent_harness.runtime.subagents import SubagentRuntime
     from agent_harness.skill.runtime import SkillEvolutionRuntime
 
 
@@ -74,7 +75,7 @@ class Lane:
         session: Session,
         id_factory: Callable[[], str] | None = None,
         now_ms: Callable[[], int] | None = None,
-        tools: tuple[AgentTool, ...] = (),
+        tools: tuple[AgentTool | RuntimeControlTool, ...] = (),
         retry: RetryPolicy = RetryPolicy(),
         events: EventBus | None = None,
         hooks: HookRegistry | None = None,
@@ -86,6 +87,12 @@ class Lane:
         telemetry: TelemetrySink | None = None,
         context_management: ContextManagementConfig = ContextManagementConfig(),
     ) -> None:
+        self.subagents: SubagentRuntime | None = None
+        self.subagent_run_id: str | None = None
+        self.system_prompt: str | None = None
+        self.provider_id: str | None = None
+        self.subagent_context: dict[str, object] = {}
+        self.effect_closed = False
         self.name = name
         self._session = session
         self._id_factory = id_factory or (lambda: str(uuid.uuid4()))
@@ -171,8 +178,11 @@ class Lane:
                 raise RuntimeError(f"operation {operation_id!r} has incomplete durable state")
             if current.control == "cancel_requested":
                 return AbortResult(operation_id, newly_requested=False)
+            self.effect_closed = True
+            cascade = await self.subagents.cascade_writes(mutator, operation_id) if self.subagents else []
             await mutator.commit(
                 [
+                    *cascade,
                     *self.trace_writes(operation_id, "cancel_requested", {"state": current.at}),
                     SetValue(
                         operation_state(operation_id),
@@ -187,11 +197,15 @@ class Lane:
         current = asyncio.current_task()
         if result.newly_requested and task is not None and task is not current and not task.done():
             task.cancel()
+        if self.subagents:
+            await self.subagents.request_cancellation_cleanup(parent_id=result.operation_id)
         return result
 
     async def drive(self, provider: "ChatProvider") -> OperationResult:
         from agent_harness.runtime.drive import Drive
 
+        if self.subagents:
+            self.subagents.bind_parent_provider(self, provider)
         async with self._session.operation_lock(self.name):
             active = await self.active_operation()
             if active is None:
@@ -225,6 +239,8 @@ class Lane:
         """Recover durable state; a provider is needed only when recovery can continue a safe effect."""
         from agent_harness.runtime.drive import Drive
 
+        if self.subagents and provider is not None:
+            self.subagents.bind_parent_provider(self, provider)
         async with self._session.operation_lock(self.name):
             active = await self.active_operation()
             if active is None:
@@ -289,6 +305,7 @@ class Lane:
                         "repository_id": scope.repository_id,
                     },
                     "lane": self.name,
+                    "subagent": self.subagent_context,
                     "kind": result.kind,
                     "operation_id": result.operation_id,
                     "base_tip_id": result.from_tip_id,
@@ -309,6 +326,7 @@ class Lane:
                         skill_outbox,
                         {
                             "event": "skill_capture_requested",
+                            "subagent": self.subagent_context,
                             "key": key,
                             "scope": {"repository_id": self._skill_scope.repository_id},
                             "lane": self.name,
@@ -424,61 +442,104 @@ class Lane:
         self, kind: OperationKind, request: dict[str, object], supplied_id: str | None
     ) -> OperationAdmission:
         operation_id = supplied_id or self._id_factory()
-        started_at = self._now_ms()
-        prompt_entry_id = self._id_factory() if kind == "run" else None
 
         async def admit(mutator: SessionMutator) -> OperationAdmission:
-            if await mutator.get_value(operation_meta(operation_id)) is not None:
-                raise OperationAlreadyExists(f"operation {operation_id!r} already exists")
-            state_value = await mutator.get_value(lane_state(self.name))
-            state = state_value or {"current_operation_id": None, "last_operation_id": None}
-            current = state.get("current_operation_id")
-            if current is not None:
-                raise LaneBusy(self.name, current)
-            tip = await mutator.get_value(lane_tip(self.name))
-            if tip is not None and not isinstance(tip, str):
-                raise RuntimeError(f"invalid lane tip for {self.name!r}")
-            operation_request = request | ({"prompt_entry_id": prompt_entry_id} if prompt_entry_id is not None else {})
-            meta = OperationMeta(operation_id, self.name, tip, started_at, kind, operation_request)
-            durable_state = OperationState(at="starting", control="running", data={})
-            writes: list[Write] = []
-            if prompt_entry_id is not None:
-                writes.append(
-                    InsertEntry(
-                        NewEntry(prompt_entry_id, tip, "message", {"role": "user", "content": request["prompt"]})
-                    )
-                )
-                writes.append(SetValue(lane_tip(self.name), prompt_entry_id))
-                parent_id = prompt_entry_id
-                for message in request.get("before_run_messages", []):
-                    entry_id = self._id_factory()
-                    writes.append(
-                        InsertEntry(NewEntry(entry_id, parent_id, "message", {"role": "user", "content": message}))
-                    )
-                    writes.append(SetValue(lane_tip(self.name), entry_id))
-                    parent_id = entry_id
-            writes.extend(
-                [
-                    SetValue(operation_meta(operation_id), meta),
-                    SetValue(operation_state(operation_id), durable_state),
-                    SetValue(
-                        lane_state(self.name),
-                        {"current_operation_id": operation_id, "last_operation_id": state.get("last_operation_id")},
-                    ),
-                    # The turn index is written with the admission, in the same
-                    # transaction: a reader must never miss an admitted operation.
-                    AppendList(
-                        lane_operations(self.name),
-                        {"operation_id": operation_id, "kind": kind, "started_at": started_at},
-                    ),
-                ]
-            )
+            self.effect_closed = False
+            result, writes = await self.admission_writes(mutator, kind, request, operation_id)
             await mutator.commit(writes)
-            return OperationAdmission(operation_id=operation_id, kind=kind, started_at=started_at)
+            return result
 
         admitted = await self._session.mutate(admit)
         await self.emit("operation_admitted", admitted.operation_id, {"kind": admitted.kind})
         return admitted
+
+    async def terminal_writes(
+        self,
+        mutator: SessionMutator,
+        result: OperationResult,
+        answer: tuple[str, str] | None = None,
+    ) -> list[Write]:
+        extra = await self.subagents.terminal_writes(mutator, self, result, answer) if self.subagents else []
+        return [
+            *extra,
+            SetValue(
+                operation_state(result.operation_id), OperationState("terminal", "settled", {"status": result.status})
+            ),
+            SetValue(operation_result(result.operation_id), result),
+            SetValue(lane_state(self.name), {"current_operation_id": None, "last_operation_id": result.operation_id}),
+            DeleteValue(operation_lease(result.operation_id)),
+        ]
+
+    async def admission_writes(
+        self,
+        mutator: SessionMutator,
+        kind: OperationKind,
+        request: dict[str, object],
+        operation_id: str,
+    ) -> tuple[OperationAdmission, list[Write]]:
+        started_at = self._now_ms()
+        prompt_entry_id = self._id_factory() if kind == "run" else None
+        if await mutator.get_value(operation_meta(operation_id)) is not None:
+            raise OperationAlreadyExists(f"operation {operation_id!r} already exists")
+        state_value = await mutator.get_value(lane_state(self.name))
+        state = state_value or {"current_operation_id": None, "last_operation_id": None}
+        current = state.get("current_operation_id")
+        if current is not None:
+            raise LaneBusy(self.name, current)
+        tip = await mutator.get_value(lane_tip(self.name))
+        if tip is not None and not isinstance(tip, str):
+            raise RuntimeError(f"invalid lane tip for {self.name!r}")
+        operation_request = request | ({"prompt_entry_id": prompt_entry_id} if prompt_entry_id is not None else {})
+        meta = OperationMeta(operation_id, self.name, tip, started_at, kind, operation_request)
+        durable_state = OperationState(at="starting", control="running", data={})
+        writes: list[Write] = []
+        if self.name not in await mutator.read_list(session_lanes()):
+            writes.append(AppendList(session_lanes(), self.name))
+        if prompt_entry_id is not None:
+            writes.append(
+                InsertEntry(NewEntry(prompt_entry_id, tip, "message", {"role": "user", "content": request["prompt"]}))
+            )
+            writes.append(SetValue(lane_tip(self.name), prompt_entry_id))
+            parent_id = prompt_entry_id
+            for message in request.get("before_run_messages", []):
+                entry_id = self._id_factory()
+                writes.append(
+                    InsertEntry(NewEntry(entry_id, parent_id, "message", {"role": "user", "content": message}))
+                )
+                writes.append(SetValue(lane_tip(self.name), entry_id))
+                parent_id = entry_id
+        if request.get("subagent"):
+            context_id = self.new_id()
+            writes.extend(
+                [
+                    InsertEntry(
+                        NewEntry(
+                            context_id,
+                            parent_id,
+                            "custom",
+                            {"event": "subagent_run_admitted", "subagent": request["subagent"]},
+                        )
+                    ),
+                    SetValue(lane_tip(self.name), context_id),
+                ]
+            )
+        writes.extend(
+            [
+                SetValue(operation_meta(operation_id), meta),
+                SetValue(operation_state(operation_id), durable_state),
+                SetValue(
+                    lane_state(self.name),
+                    {"current_operation_id": operation_id, "last_operation_id": state.get("last_operation_id")},
+                ),
+                # The turn index is written with the admission, in the same
+                # transaction: a reader must never miss an admitted operation.
+                AppendList(
+                    lane_operations(self.name),
+                    {"operation_id": operation_id, "kind": kind, "started_at": started_at},
+                ),
+            ]
+        )
+        return OperationAdmission(operation_id=operation_id, kind=kind, started_at=started_at), writes
 
     async def _queue(self, kind: str, prompt: str) -> str:
         entry_id = self._id_factory()
@@ -510,10 +571,20 @@ class Lane:
             existing = await mutator.get_value(operation_lease(operation_id))
             if existing is not None and not replace:
                 return False
-            await mutator.commit([SetValue(operation_lease(operation_id), {"id": lease_id})])
+            extra = (
+                await self.subagents.claim_writes(mutator, self.subagent_run_id)
+                if (self.subagents and self.subagent_run_id)
+                else []
+            )
+            await mutator.commit([*extra, SetValue(operation_lease(operation_id), {"id": lease_id})])
             return True
 
-        return await self._session.mutate(claim)
+        claimed = await self._session.mutate(claim)
+        if claimed and self.subagent_run_id:
+            meta = await self._session.get_value(operation_meta(operation_id))
+            queued_ms = max(0, self.now_ms() - meta.started_at) if isinstance(meta, OperationMeta) else None
+            await self.emit("subagent_started", operation_id, {**self.subagent_context, "queued_ms": queued_ms})
+        return claimed
 
     async def _release_drive(self, operation_id: str, lease_id: str) -> None:
         async def release(mutator: SessionMutator) -> None:

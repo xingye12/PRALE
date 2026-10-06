@@ -1,0 +1,805 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/config-queue-failure-fixture.mjs b/.prale-eval/config-queue-failure-fixture.mjs
+new file mode 100644
+index 0000000..a150115
+--- /dev/null
++++ b/.prale-eval/config-queue-failure-fixture.mjs
+@@ -0,0 +1,260 @@
++#!/usr/bin/env node
++// Contract fixture: "the first queued config job fails, the next one must still
++// settle deterministically."
++//
++// It exercises the REAL server/core/config-queue.js ConfigQueue class.  Only the
++// single module specifier `./gateway-client.js` is rebound to an injected stub
++// (via a data: URL module) so the fixture can run without the repository's
++// node_modules; the queue's enqueue/_process/_execute/retry code paths are the
++// unmodified source.
++//
++// The scripted gateway is a *configuration fixture*: an in-memory config
++// document (sourceConfig + hash) that mutates only when a config.patch is
++// accepted. Two fixtures are contracted:
++//
++//   S1 get-fails-first    job1's first config.get returns a non-retryable
++//                         transport error, so job1 rejects and never reads,
++//                         transforms or writes config; job2 then reads the
++//                         untouched config and settles (patch -> get -> apply).
++//   S2 patch-fails-first  job1 reads + transforms, but its config.patch is
++//                         rejected (non-retryable), so job1 rejects without
++//                         recording a patch or applying; job2 then patches and
++//                         applies against the still-original hash.
++//
++// Each fixture is replayed REPEATS times; every run must produce an identical
++// observable trace/outcome, which is what "settles deterministically" means here.
++//
++// Exit code 0 => every contracted check passed; 1 => at least one failed.
++
++import { readFileSync } from 'node:fs'
++import path from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
++const QUEUE_PATH = path.join(WORKSPACE, 'server/core/config-queue.js')
++const REPEATS = 30
++
++const IMPORT_SPECIFIER = "import { gatewayAdminRpc } from './gateway-client.js'"
++const REBIND = 'const gatewayAdminRpc = (...args) => globalThis.__configQueueFixtureRpc(...args)'
++
++async function loadConfigQueueClass () {
++  const source = readFileSync(QUEUE_PATH, 'utf8')
++  if (!source.includes(IMPORT_SPECIFIER)) {
++    throw new Error(`cannot rebind gatewayAdminRpc: import not found in ${QUEUE_PATH}`)
++  }
++  const body = `${source.replace(IMPORT_SPECIFIER, REBIND)}\nexport { ConfigQueue }\n`
++  const url = `data:text/javascript;base64,${Buffer.from(body, 'utf8').toString('base64')}`
++  const mod = await import(url)
++  return mod.ConfigQueue
++}
++
++function deepClone (value) {
++  return JSON.parse(JSON.stringify(value))
++}
++
++// Scripted in-memory Gateway config document. `failGet`/`failPatch` make the
++// first N calls of that method return a non-retryable error, which is exactly
++// what makes "the first job fails" deterministic (no OCC/rate-limit backoff).
++function createScriptedGateway ({ hash, config, failGet = 0, failPatch = 0 }) {
++  const gw = {
++    hash,
++    config: deepClone(config),
++    calls: [],
++    getCalls: 0,
++    patchCalls: 0,
++    applyCalls: 0,
++  }
++
++  gw.rpc = async (method, params = {}) => {
++    gw.calls.push({ method, params: deepClone(params), hash: gw.hash })
++    if (method === 'config.get') {
++      gw.getCalls += 1
++      if (gw.getCalls <= failGet) return { ok: false, error: 'gateway transport offline (fixture)' }
++      return { ok: true, payload: { sourceConfig: deepClone(gw.config), hash: gw.hash } }
++    }
++    if (method === 'config.patch') {
++      gw.patchCalls += 1
++      if (gw.patchCalls <= failPatch) return { ok: false, error: 'config.patch rejected: invalid logLevel (fixture)' }
++      gw.config = JSON.parse(params.raw)
++      gw.hash = `${hash}-r${gw.patchCalls}`
++      return { ok: true, payload: {} }
++    }
++    if (method === 'config.apply') {
++      gw.applyCalls += 1
++      return { ok: true, payload: { applied: true, hash: gw.hash } }
++    }
++    return { ok: false, error: `unexpected method: ${method}` }
++  }
++
++  return gw
++}
++
++// The two contracted configuration fixtures.
++const FIXTURES = [
++  {
++    id: 'get-fails-first',
++    gateway: {
++      hash: 'hash-s1-1',
++      config: { agents: { main: { name: 'main' } }, gateway: { logLevel: 'info' }, bindings: [] },
++      failGet: 1,
++    },
++    jobs: [
++      { label: 'fail-at-get', transform: cfg => ({ ...cfg, gateway: { ...cfg.gateway, logLevel: 'warn' } }) },
++      { label: 'settle-after', transform: cfg => ({ ...cfg, gateway: { ...cfg.gateway, logLevel: 'debug' } }) },
++    ],
++    expect: {
++      firstError: 'gateway transport offline (fixture)',
++      trace: ['config.get:fail', 'config.get:ok', 'config.patch:ok', 'config.get:ok', 'config.apply:ok'],
++      patchCalls: 1,
++      applyCalls: 1,
++      finalLogLevel: 'debug',
++      patchBaseHashes: ['hash-s1-1'],
++    },
++  },
++  {
++    id: 'patch-fails-first',
++    gateway: {
++      hash: 'hash-s2-1',
++      config: { agents: { main: { name: 'main' } }, gateway: { logLevel: 'info' }, bindings: [] },
++      failPatch: 1,
++    },
++    jobs: [
++      { label: 'fail-at-patch', transform: cfg => ({ ...cfg, gateway: { ...cfg.gateway, logLevel: 'trace' } }) },
++      { label: 'settle-after', transform: cfg => ({ ...cfg, gateway: { ...cfg.gateway, logLevel: 'debug' } }) },
++    ],
++    expect: {
++      firstError: 'config.patch rejected: invalid logLevel (fixture)',
++      trace: ['config.get:ok', 'config.patch:fail', 'config.get:ok', 'config.patch:ok', 'config.get:ok', 'config.apply:ok'],
++      patchCalls: 2,
++      applyCalls: 1,
++      finalLogLevel: 'debug',
++      // job1 read hash-s2-1; its rejected patch left the document untouched, so
++      // job2 must still read+patch against the SAME base hash.
++      patchBaseHashes: ['hash-s2-1', 'hash-s2-1'],
++    },
++  },
++]
++
++function traceOf (calls) {
++  const seen = { 'config.get': 0, 'config.patch': 0, 'config.apply': 0 }
++  return calls.map((call) => {
++    switch (call.method) {
++      case 'config.get':
++        seen['config.get'] += 1
++        // A call is "fail" when its recorded outcome is not ok; the scripted
++        // gateway marks that by returning an error to _execute.
++        return `config.get:${call.ok ? 'ok' : 'fail'}`
++      case 'config.patch':
++        seen['config.patch'] += 1
++        return `config.patch:${call.ok ? 'ok' : 'fail'}`
++      case 'config.apply':
++        seen['config.apply'] += 1
++        return `config.apply:${call.ok ? 'ok' : 'fail'}`
++      default:
++        return call.method
++    }
++  })
++}
++
++async function runFixture (ConfigQueue, fixture) {
++  const gw = createScriptedGateway(fixture.gateway)
++
++  // Record outcomes on the call log so traceOf() can label ok/fail.
++  const rawRpc = gw.rpc
++  gw.rpc = async (method, params) => {
++    const result = await rawRpc(method, params)
++    gw.calls[gw.calls.length - 1].ok = result.ok === true
++    return result
++  }
++
++  globalThis.__configQueueFixtureRpc = gw.rpc
++  const queue = new ConfigQueue()
++  const hashBeforeFirstJob = gw.hash
++
++  const first = queue.enqueue(fixture.jobs[0].transform, fixture.jobs[0].label)
++  const second = queue.enqueue(fixture.jobs[1].transform, fixture.jobs[1].label)
++  const [r1, r2] = await Promise.allSettled([first, second])
++
++  const hashAfterBothSettled = gw.hash
++  const patchBaseHashes = gw.calls
++    .filter(call => call.method === 'config.patch')
++    .map(call => call.params.baseHash)
++
++  // Freeze outcome 2 without throwing when the queue resolved `undefined`.
++  const secondOutcome = r2.status === 'fulfilled' ? `resolved:${String(r2.value)}` : `rejected:${r2.reason?.message}`
++
++  return {
++    id: fixture.id,
++    firstStatus: r1.status,
++    firstError: r1.status === 'rejected' ? r1.reason?.message : null,
++    secondOutcome,
++    queueDrained: queue.length === 0,
++    hashBeforeFirstJob,
++    hashAfterBothSettled,
++    trace: traceOf(gw.calls),
++    patchCalls: gw.patchCalls,
++    applyCalls: gw.applyCalls,
++    patchBaseHashes,
++    finalLogLevel: gw.config.gateway.logLevel,
++    finalConfig: gw.config,
++  }
++}
++
++function checkFixture (fixture, run) {
++  const e = fixture.expect
++  const checks = [
++    ['first job rejected', run.firstStatus === 'rejected', run.firstStatus],
++    ['first job carries its own error', run.firstError === e.firstError, run.firstError],
++    ['next job settled', run.secondOutcome === 'resolved:undefined', run.secondOutcome],
++    ['queue drained after both jobs', run.queueDrained === true, run.queueDrained],
++    ['patch/apply counts', run.patchCalls === e.patchCalls && run.applyCalls === e.applyCalls,
++      `patch=${run.patchCalls} apply=${run.applyCalls}`],
++    ['call trace', JSON.stringify(run.trace) === JSON.stringify(e.trace), run.trace.join(',')],
++    ['base hashes', JSON.stringify(run.patchBaseHashes) === JSON.stringify(e.patchBaseHashes),
++      run.patchBaseHashes.join(',')],
++    ['final config', run.finalLogLevel === e.finalLogLevel, run.finalLogLevel],
++  ]
++  return checks
++}
++
++async function main () {
++  const ConfigQueue = await loadConfigQueueClass()
++  let failed = 0
++
++  for (const fixture of FIXTURES) {
++    const runs = []
++    for (let i = 0; i < REPEATS; i++) runs.push(await runFixture(ConfigQueue, fixture))
++
++    const signatures = new Set(runs.map(run => JSON.stringify(run)))
++    const deterministic = signatures.size === 1
++    const run = runs[0]
++    const checks = checkFixture(fixture, run)
++    const failures = checks.filter(([, ok]) => !ok)
++
++    if (!deterministic) {
++      failed += 1
++      console.log(`[fixture] ${fixture.id}: FAIL (${signatures.size} distinct outcomes over ${REPEATS} runs)`)
++    }
++    for (const [name, ok, detail] of checks) {
++      if (!ok) {
++        failed += 1
++        console.log(`[fixture] ${fixture.id}: FAIL ${name} -> ${detail}`)
++      }
++    }
++    if (deterministic && failures.length === 0) {
++      console.log(`[fixture] ${fixture.id}: PASS (${REPEATS}/${REPEATS} identical runs; first job rejected, next job settled)`)
++    }
++  }
++
++  if (failed > 0) {
++    console.log(`[fixture] CONTRACT FAILED (${failed} failing check(s))`)
++    process.exitCode = 1
++    return
++  }
++  console.log('[fixture] ALL CHECKS PASSED')
++}
++
++main().catch((err) => {
++  console.error(`[fixture] harness error: ${err?.stack || err}`)
++  process.exitCode = 1
++})
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..f745a8a
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,132 @@
++# Contract deliverable — ConfigQueue failure-ordering fixture (T08)
++
++Repository: `wattclaw` · Task mode: `contract` · Batch key: `wattclaw`
++
++## 1. What is contracted
++
++The behaviour under contract is the ConfigQueue failure-isolation guarantee of
++`server/core/config-queue.js`:
++
++> **If the first queued configuration job fails, the next queued job must still be
++> executed and must settle deterministically against the configuration state that
++> the failed job never mutated.**
++
++Two mechanisms in the source provide this, and the fixture makes both observable:
++
++| Mechanism | Source | Contracted effect |
++| --- | --- | --- |
++| Failure-isolated FIFO drain | `ConfigQueue._process` (`server/core/config-queue.js:24-37`) | `_running` single-flight guard; the `while` loop `shift()`s one job per iteration and either `item.resolve(result.data)` or `item.reject(result.error)`; a rejection does **not** break the loop, and `_running` is released only after the queue is empty. |
++| Per-job read→transform→write→apply chain with selective retry | `ConfigQueue._execute` (`server/core/config-queue.js:60-99`) | `config.get` → `transformFn(sourceConfig)` → `_waitForSlot()` → `config.patch` (with the fresh `baseHash`) → `_recordPatch()` → `config.get` → `config.apply`. Only `config changed since last load` and `rate limit` errors are retried (`isOcc` / `isRateLimit`, lines 84-97); every other failure returns `{ ok: false, error }` on the first attempt. |
++
++Because the failing job aborts **before** any accepted patch is recorded or applied,
++the gateway config document and its hash are unchanged, so the next job's `config.get`
++returns the same `baseHash` and its own patch/apply chain succeeds. That is the
++determinism claim: the next job's outcome depends only on the untouched fixture state,
++not on how or when the first job failed.
++
++## 2. The different configuration fixture
++
++`/.prale-eval/config-queue-failure-fixture.mjs` is the executable fixture. It differs
++from a transform-level rejection fixture: failure is injected at the **Gateway /
++configuration layer** through a scripted in-memory config document, and two distinct
++first-job failure points are contracted.
++
++The harness loads the **real** `server/core/config-queue.js`; only the single
++`import { gatewayAdminRpc } from './gateway-client.js'` specifier is rebound to the
++injected stub (via a `data:` URL module) so the fixture runs without `node_modules`.
++The unmodified `enqueue`, `_process`, `_execute`, `_waitForSlot`, `_recordPatch` and
++`configQueueExecute` code paths execute.
++
++### Fixture A — `get-fails-first`
++
++Scripted config document: `{ agents: { main: { name: 'main' } }, gateway: { logLevel: 'info' }, bindings: [] }`, hash `hash-s1-1`.
++
++1. **job 1** (`fail-at-get`, transform `logLevel: 'warn'`) — its first `config.get`
++   returns `{ ok: false, error: 'gateway transport offline (fixture)' }`, a
++   non-retryable error. `_execute` throws at line 65, the catch gate does not match
++   `isOcc`/`isRateLimit`, and the promise rejects after a single attempt. No
++   transform, no `config.patch`, no `config.apply`.
++2. **job 2** (`settle-after`, transform `logLevel: 'debug'`) — reads the untouched
++   document (`baseHash: 'hash-s1-1'`), patches, re-reads and applies, resolving
++   `undefined`.
++
++Expected normalized operation result:
++
++```
++trace          config.get:fail, config.get:ok, config.patch:ok, config.get:ok, config.apply:ok
++first job      rejected: 'gateway transport offline (fixture)'
++next job       resolved: undefined
++queue length   0 (drained)
++config.patch   1 call, baseHash hash-s1-1
++config.apply   1 call
++final config   gateway.logLevel = 'debug'
++```
++
++### Fixture B — `patch-fails-first`
++
++Scripted config document: `{ agents: { main: { name: 'main' } }, gateway: { logLevel: 'info' }, bindings: [] }`, hash `hash-s2-1`.
++
++1. **job 1** (`fail-at-patch`, transform `logLevel: 'trace'`) — reads and transforms
++   successfully, but its `config.patch` returns
++   `{ ok: false, error: 'config.patch rejected: invalid logLevel (fixture)' }`.
++   `_execute` throws at line 73 before `_recordPatch()` / `config.apply`, so the
++   promise rejects and the document keeps hash `hash-s2-1`.
++2. **job 2** (`settle-after`, transform `logLevel: 'debug'`) — still reads
++   `hash-s2-1`, patches, re-reads and applies, resolving `undefined`.
++
++Expected normalized operation result:
++
++```
++trace          config.get:ok, config.patch:fail, config.get:ok, config.patch:ok, config.get:ok, config.apply:ok
++first job      rejected: 'config.patch rejected: invalid logLevel (fixture)'
++next job       resolved: undefined
++queue length   0 (drained)
++config.patch   2 calls, baseHashes hash-s2-1, hash-s2-1   <-- failing job left the hash untouched
++config.apply   1 call (next job only)
++final config   gateway.logLevel = 'debug'
++```
++
++## 3. Determinism check
++
++`main()` replays each fixture `REPEATS = 30` times (60 runs total) with a fresh
++`ConfigQueue` and a fresh scripted gateway per run, and requires a **single distinct
++JSON signature** across replays — covering per-job status/error, the next job's
++outcome, drained queue length, call trace, patch/apply counts, patch base hashes and
++the final config — in addition to the per-check expectations. No wall-clock waits are
++involved: fewer than `_MAX_PATCHES` patches per run means `_waitForSlot` never sleeps,
++and the injected errors are non-retryable so `_execute` never backs off.
++
++## 4. How to run it
++
++```
++node .prale-eval/config-queue-failure-fixture.mjs     # fixture -> exit 0, "[fixture] ALL CHECKS PASSED"
++node .prale-eval/validate-result.mjs                  # result.json / citation checks -> "ALL RESULT CHECKS PASSED"
++node --check .prale-eval/config-queue-failure-fixture.mjs
++```
++
++Observed output: `[fixture] get-fails-first: PASS (30/30 identical runs; first job
++rejected, next job settled)` and `[fixture] patch-fails-first: PASS (30/30 identical
++runs; first job rejected, next job settled)`, then `[fixture] ALL CHECKS PASSED`,
++exit code 0.
++
++## 5. Validation limitation
++
++`node_modules` and the `vitest` runner are absent from this workspace, so the
++repository's official test suite could not be executed and no dependency was
++installed. The substitute evidence is (a) the fixture, which executes the real
++`ConfigQueue` source against a scripted gateway, and (b) `.prale-eval/validate-result.mjs`,
++which statically re-verifies the result metadata, every evidence symbol/line-range
++citation and claim grounding. These are lower strength than the full test suite and
++are recorded as such in `result.json.validation.notes`.
++
++## 6. Files
++
++| File | Role |
++| --- | --- |
++| `.prale-eval/result.json` | Contract result: metadata, evidence citations, claims, conclusion, validation. |
++| `.prale-eval/config-queue-failure-fixture.mjs` | Executable configuration fixture and determinism harness. |
++| `.prale-eval/validate-result.mjs` | Focused static validation of the result artifact. |
++| `.prale-eval/contract-deliverable.md` | This document. |
++
++No task metadata, hidden-oracle file, package lock or git configuration was modified;
++the only added files are the four above.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..afcafd1
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,105 @@
++{
++  "task_id": "T08",
++  "repository": "wattclaw",
++  "mode": "contract",
++  "request": "Contract a different configuration fixture where the first job fails and the next job must still settle deterministically.",
++  "deliverables": [
++    ".prale-eval/result.json",
++    ".prale-eval/contract-deliverable.md",
++    ".prale-eval/config-queue-failure-fixture.mjs",
++    ".prale-eval/validate-result.mjs"
++  ],
++  "evidence": [
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "enqueue",
++      "start_line": 15,
++      "end_line": 20,
++      "observation": "enqueue(transformFn, label, method='config.patch') wraps each configuration job in its own Promise, pushes { transformFn, label, method, resolve, reject } onto the FIFO _queue and kicks _process(). Settlement is therefore per-job: one job's rejection cannot resolve or reject another job's promise, and the (transformFn, label, method) triple is the queued unit the fixture contracts."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "_process",
++      "start_line": 24,
++      "end_line": 37,
++      "observation": "The single-flight drain: the _running guard makes re-entrant enqueue() calls return without starting a second loop, the while loop shifts exactly one item per iteration and awaits _execute(item), then item.resolve(result.data) on ok / item.reject(result.error) on failure. Crucially the loop is not broken by a rejection (lines 27-35) and _running is only cleared after the queue is empty (line 36), so a failing first job still leaves the next job to be drained and settled in order."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "_waitForSlot",
++      "start_line": 46,
++      "end_line": 54,
++      "observation": "The proactive sliding-window throttle: _cleanWindow() drops timestamps older than _WINDOW_MS (60s) and the method returns immediately while fewer than _MAX_PATCHES (3) patches were recorded in the window, only sleeping when the window is full. In the fixture only one or two patches are issued, so no wall-clock wait is introduced and failure/settlement timing stays deterministic."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "_execute",
++      "start_line": 60,
++      "end_line": 99,
++      "observation": "The per-job pipeline the fixture drives: config.get → transformFn(sourceConfig) (a falsy transform resolves early with data:null, line 69) → _waitForSlot() → config.patch with baseHash from the fresh read (line 72) → _recordPatch() → a second config.get → config.apply with the second payload's baseHash (line 80) → resolve({ok:true, data:undefined}). Every non-ok gateway reply is turned into a thrown Error (lines 65, 73, 77, 81), which is what makes 'the first job fails' an explicit, observable rejection."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "isOcc",
++      "start_line": 84,
++      "end_line": 97,
++      "observation": "The catch gate that makes failure deterministic: only errors whose message contains 'config changed since last load' (isOcc) or 'rate limit' (isRateLimit) are retried, and only while attempt < maxRetries-1; every other error falls through to console.error plus return { ok:false, error: err } with no backoff. The fixture's first-job errors ('gateway transport offline', 'config.patch rejected: invalid logLevel') are non-retryable, so the first job rejects on attempt 1 and the queue proceeds immediately to the next job."
++    },
++    {
++      "path": "server/core/config-queue.js",
++      "symbol": "configQueueExecute",
++      "start_line": 102,
++      "end_line": 106,
++      "observation": "Module-level singleton (const configQueue = new ConfigQueue()) plus the exported entry point configQueueExecute(transformFn, label, method) that production handlers (server/handlers/channels.js, system.js, agent-team.js) call. The fixture loads this exact module and its ConfigQueue class, so the contracted failure-isolation guarantee is about the real serialized config-write path, not a re-implementation."
++    },
++    {
++      "path": ".prale-eval/config-queue-failure-fixture.mjs",
++      "symbol": "createScriptedGateway",
++      "start_line": 58,
++      "end_line": 90,
++      "observation": "The scripted configuration fixture: an in-memory Gateway config document ({ agents, gateway, bindings } + hash) whose config.get returns a fresh deep copy, whose config.patch replaces the document and advances the hash only when accepted, and whose failGet/failPatch knobs make the first N calls of a method return a non-retryable error. This is the 'different configuration fixture': failure is injected at the gateway/config layer rather than by throwing inside transformFn."
++    },
++    {
++      "path": ".prale-eval/config-queue-failure-fixture.mjs",
++      "symbol": "FIXTURES",
++      "start_line": 93,
++      "end_line": 136,
++      "observation": "Declares the two contracted fixtures and their expected normalized results. get-fails-first: job1's first config.get fails → expected trace [config.get:fail, config.get:ok, config.patch:ok, config.get:ok, config.apply:ok], 1 patch, 1 apply, final logLevel 'debug', baseHash 'hash-s1-1'. patch-fails-first: job1's config.patch is rejected → expected trace [config.get:ok, config.patch:fail, config.get:ok, config.patch:ok, config.get:ok, config.apply:ok] with BOTH patch base hashes equal to 'hash-s2-1', proving the failed job left the hash untouched."
++    },
++    {
++      "path": ".prale-eval/config-queue-failure-fixture.mjs",
++      "symbol": "runFixture",
++      "start_line": 159,
++      "end_line": 201,
++      "observation": "Enqueues the failing job first and the next job second on one queue instance, awaits both with Promise.allSettled, and records the normalized operation result: per-job status/error, second job outcome, queue length (drained), hash before/after, exact call trace, patch/apply counts, patch base hashes and final config. main() replays each fixture REPEATS=30 times and requires a single distinct run signature, which is the executable determinism check."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "_execute executes one configuration job as a strict read→transform→write→apply chain, and its catch block retries only the two named transient classes (OCC 'config changed since last load' and 'rate limit'). Any other failure — a config.get transport error or a rejected config.patch — returns { ok:false, error } on the first attempt with no sleep, so 'the first job fails' is deterministic (single attempt, stable error identity) instead of a timing-dependent retry.",
++      "evidence_paths": ["server/core/config-queue.js", ".prale-eval/config-queue-failure-fixture.mjs"]
++    },
++    {
++      "claim": "The queue drain is failure-isolated and FIFO: _process holds the _running single-flight guard, shifts one queued job per iteration, rejects that job's promise with its own error on failure, and continues the same while loop until the queue is empty. Therefore when the first job fails, the next enqueued job is still executed and settled in order, and _running is only released after the queue has drained.",
++      "evidence_paths": ["server/core/config-queue.js", ".prale-eval/config-queue-failure-fixture.mjs"]
++    },
++    {
++      "claim": "The failed first job never mutates the gateway configuration: a failed config.get aborts before transformFn runs, and a rejected config.patch aborts before _recordPatch() and config.apply. The document and its hash are unchanged, so the next job reads that same baseHash and settles deterministically (config.get → transform → _waitForSlot → config.patch → config.get → config.apply, resolving undefined). The fixture asserts this as an exact call trace, patch/apply counts and patch base-hash list, and requires identical results over 30 replays per fixture.",
++      "evidence_paths": ["server/core/config-queue.js", ".prale-eval/config-queue-failure-fixture.mjs"]
++    },
++    {
++      "claim": "configQueueExecute is the production entry point onto the module-level singleton configQueue, used by server/handlers/channels.js, server/handlers/system.js and server/handlers/agent-team.js, so the contracted failure isolation applies to the real serialized config-write path rather than a fixture-local re-implementation.",
++      "evidence_paths": ["server/core/config-queue.js"]
++    },
++    {
++      "claim": "The fixture rebinds only the single gateway-client import specifier (so it can run without node_modules) and otherwise loads the unmodified server/core/config-queue.js source; the determinism contract is checked by requiring one distinct JSON signature across 30 replays per fixture in addition to the per-check expectations.",
++      "evidence_paths": [".prale-eval/config-queue-failure-fixture.mjs", "server/core/config-queue.js"]
++    }
++  ],
++  "conclusion": "The different configuration fixture required by this task is implemented and passing: .prale-eval/config-queue-failure-fixture.mjs drives the real server/core/config-queue.js ConfigQueue with a scripted in-memory Gateway config document, and contracts two failure-ordering cases. In get-fails-first the first job's config.get returns a non-retryable transport error, so job1 rejects with that exact error after a single attempt and never transforms or writes config; the next job then reads the untouched document (same hash), patches it, re-reads and applies, resolving undefined with the expected trace [config.get:fail, config.get:ok, config.patch:ok, config.get:ok, config.apply:ok]. In patch-fails-first job1 reads and transforms but its config.patch is rejected, so no patch is recorded and no apply is issued; the next job then patches and applies against the same base hash. Both fixtures produced byte-identical normalized results across 30 replays (60 runs total), exit code 0, and each per-run check (first job rejected, next job settled, queue drained, exact trace, patch/apply counts, base hashes, final config) passed.",
++  "validation": {
++    "command": "node --check .prale-eval/config-queue-failure-fixture.mjs && node .prale-eval/config-queue-failure-fixture.mjs && node .prale-eval/validate-result.mjs",
++    "status": "pass",
++    "notes": "config-queue-failure-fixture.mjs: exit code 0, '[fixture] get-fails-first: PASS (30/30 identical runs; first job rejected, next job settled)' and '[fixture] patch-fails-first: PASS (30/30 identical runs ...)' then '[fixture] ALL CHECKS PASSED'. validate-result.mjs re-opened .prale-eval/result.json and programmatically asserted: task_id/repository/mode equal the literals parsed from TASK.md (T08 / wattclaw / contract); every evidence entry's file exists, start_line <= end_line, and the named symbol literally occurs inside the cited inclusive range; every claim has non-empty evidence_paths naming existing paths; the required path server/core/config-queue.js has substantive evidence and claim coverage; and .prale-eval/contract-deliverable.md exists. LIMITATION: node_modules and the vitest runner are absent from this workspace, so the repository's official vitest suite could not be executed and no dependency was installed; the fixture (which executes the real ConfigQueue source) plus the static result checks are the substitute evidence, and they are lower strength than the full test suite."
++  }
++}
+diff --git a/.prale-eval/validate-result.mjs b/.prale-eval/validate-result.mjs
+new file mode 100644
+index 0000000..cc16cf9
+--- /dev/null
++++ b/.prale-eval/validate-result.mjs
+@@ -0,0 +1,76 @@
++#!/usr/bin/env node
++// Focused validation for this contract task: re-open .prale-eval/result.json and
++// assert it exactly matches the authoritative metadata in TASK.md, that every
++// evidence citation is real (file exists, inclusive range valid, named symbol
++// literally present inside the range), that every claim names existing evidence
++// paths, that the required contract path is covered, and that the deliverable
++// markdown exists. Exits non-zero on any failure.
++
++import { readFileSync, existsSync } from 'node:fs'
++import path from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++const WORKSPACE = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
++const failures = []
++const check = (name, ok, detail = '') => {
++  console.log(`${ok ? 'PASS' : 'FAIL'} ${name}${detail ? ` -> ${detail}` : ''}`)
++  if (!ok) failures.push(name)
++}
++
++const task = readFileSync(path.join(WORKSPACE, 'TASK.md'), 'utf8')
++const literal = (field) => task.match(new RegExp('`' + field + '` exactly `([^`]+)`'))?.[1]
++const expected = {
++  task_id: literal('task_id'),
++  repository: literal('repository'),
++  mode: literal('mode'),
++}
++const requiredPath = task.match(/^- `(server\/core\/config-queue\.js)`$/m)?.[1]
++
++const resultPath = path.join(WORKSPACE, '.prale-eval/result.json')
++const result = JSON.parse(readFileSync(resultPath, 'utf8'))
++
++check('task_id matches TASK.md', result.task_id === expected.task_id, `${result.task_id} vs ${expected.task_id}`)
++check('repository matches TASK.md', result.repository === expected.repository, `${result.repository} vs ${expected.repository}`)
++check('mode matches TASK.md', result.mode === expected.mode, `${result.mode} vs ${expected.mode}`)
++check('required evidence path parsed', Boolean(requiredPath), String(requiredPath))
++
++check('evidence is a non-empty array', Array.isArray(result.evidence) && result.evidence.length > 0)
++check('claims is a non-empty array', Array.isArray(result.claims) && result.claims.length > 0)
++check('conclusion is non-empty string', typeof result.conclusion === 'string' && result.conclusion.length > 0)
++check('validation has command/status/notes',
++  Boolean(result.validation?.command) && result.validation?.status === 'pass' && Boolean(result.validation?.notes))
++
++const evidencePaths = new Set()
++for (const entry of result.evidence) {
++  const label = `${entry.path}:${entry.symbol}`
++  const abs = path.join(WORKSPACE, entry.path)
++  if (!existsSync(abs)) { check(`evidence file exists ${label}`, false); continue }
++  evidencePaths.add(entry.path)
++  const lines = readFileSync(abs, 'utf8').split('\n')
++  const inRange = Number.isInteger(entry.start_line) && Number.isInteger(entry.end_line) &&
++    entry.start_line >= 1 && entry.end_line >= entry.start_line && entry.end_line <= lines.length
++  check(`evidence range valid ${label}`, inRange, `${entry.start_line}-${entry.end_line}`)
++  if (!inRange) continue
++  const slice = lines.slice(entry.start_line - 1, entry.end_line).join('\n')
++  check(`symbol in range ${label}`, slice.includes(entry.symbol))
++  check(`observation substantive ${label}`, typeof entry.observation === 'string' && entry.observation.length > 40)
++}
++
++check('required path cited', requiredPath && evidencePaths.has(requiredPath), String(requiredPath))
++
++for (const [i, claim] of result.claims.entries()) {
++  check(`claim ${i + 1} text`, typeof claim.claim === 'string' && claim.claim.length > 40)
++  check(`claim ${i + 1} evidence_paths`,
++    Array.isArray(claim.evidence_paths) && claim.evidence_paths.length > 0 &&
++    claim.evidence_paths.every(p => evidencePaths.has(p)), JSON.stringify(claim.evidence_paths))
++}
++check('required path has claim coverage',
++  result.claims.some(c => Array.isArray(c.evidence_paths) && c.evidence_paths.includes(requiredPath)))
++
++check('contract-deliverable.md exists', existsSync(path.join(WORKSPACE, '.prale-eval/contract-deliverable.md')))
++check('deliverable names the fixture',
++  existsSync(path.join(WORKSPACE, '.prale-eval/contract-deliverable.md')) &&
++  readFileSync(path.join(WORKSPACE, '.prale-eval/contract-deliverable.md'), 'utf8').includes('config-queue-failure-fixture.mjs'))
++
++console.log(failures.length === 0 ? 'ALL RESULT CHECKS PASSED' : `RESULT CHECKS FAILED: ${failures.length}`)
++process.exitCode = failures.length === 0 ? 0 : 1
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/config-queue-failure-fixture.mjs - b35224dada964bc25e9f75dd44289348c2c28e348119b8cef0eb0f3a4027ac4d
+snapshot .prale-eval/contract-deliverable.md - 915e450ba82534b88cc240c07d06e4f12f172831431ea6697093bc696f1d56e9
+snapshot .prale-eval/result.json - 5510f53b20d5f3cb67d58655779341da302edfee0288a7c263bcf11c31005063
+snapshot .prale-eval/validate-result.mjs - 95daa05f4dcbdd7995fde68b402c3abb3d37b7b0ad438619f116276b3d523ebe

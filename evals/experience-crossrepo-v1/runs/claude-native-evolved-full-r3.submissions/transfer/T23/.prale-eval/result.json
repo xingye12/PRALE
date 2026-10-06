@@ -1,0 +1,78 @@
+{
+  "task_id": "T23",
+  "repository": "wattclaw",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "MultiTenantGatewayProxy.call",
+      "start_line": 148,
+      "end_line": 151,
+      "observation": "The proxy's request-scoped entry point does not accept a caller-supplied tenant. It delegates to this.manager.getGatewayForCurrentRequest(), so the tenant that will receive an RPC is derived from server-side request state, not from client input. This is the dispatch seam the demo exercises for the allowed (own-tenant) request."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getGatewayForCurrentRequest",
+      "start_line": 397,
+      "end_line": 411,
+      "observation": "Selects the tenant from AsyncLocalStorage via getRequestTenant() (line 399), falling back to ensureUserTenant(user) / getDefaultTenant(). Because the context tenant is authoritative, a request can only reach the tenant bound to the authenticated user (or the admin-provided context); it then resolves a cached gateway client and ensures the connection before returning it. This is exactly the mapping the demo mirrors for the allowed path, and why a foreign tenant is never implicit."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "callGatewayForTenant",
+      "start_line": 417,
+      "end_line": 424,
+      "observation": "Cross-tenant routing is a separate, explicit API: it bypasses the request-context tenant selection (comment lines 413-416) and takes an explicit tenantId. In server/index.js it is only invoked from admin/aggregation flows (e.g. resolveWattClawProjectTenant, callGatewayForAllTenants). Non-admin request paths use the context-bound proxy call, so a mismatched tenant is not reachable and is rejected before any dispatch. The demo's admin cross-tenant scenario corresponds to this path."
+    },
+    {
+      "path": "server/core/request-context.js",
+      "symbol": "getRequestTenant",
+      "start_line": 17,
+      "end_line": 19,
+      "observation": "Reads the tenant stored on the AsyncLocalStorage request context (set by authMiddleware via runWithRequestContext). This is the real, dependency-free module the demo imports directly; the demo binds tenant-1 for alice and asserts getRequestTenant() returns it inside the dispatch context."
+    },
+    {
+      "path": "server/core/sse.js",
+      "symbol": "broadcastSSE",
+      "start_line": 7,
+      "end_line": 43,
+      "observation": "Complementary tenant-isolation guard inside this function: at line 23 an SSE payload carrying a tenantId that does not match a non-admin client's tenantId is skipped before any delivery. Together with the context-bound RPC selection it shows the repository enforces tenant mismatch by dropping the request/event rather than forwarding it, which is the behavior the demo asserts as 'not dispatched'."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "WattClaw derives the destination tenant of a request from the server-side request context, not from a client-supplied tenant id: MultiTenantGatewayProxy.call delegates to getGatewayForCurrentRequest, which reads getRequestTenant(). An allowed own-tenant request therefore reaches the bound tenant's gateway.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js",
+        "server/core/request-context.js"
+      ]
+    },
+    {
+      "claim": "Reaching a tenant other than the one bound to the request is only possible through the explicit, admin-oriented callGatewayForTenant path; ordinary request handling never routes to a foreign tenant, so a mismatched tenant is rejected before dispatch.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "The repository rejects tenant mismatch by filtering/skipping rather than forwarding (sse.js:23 skips mismatched non-admin clients), which matches the demo's assertion that a mismatched request leaves the fake backend's dispatch count unchanged.",
+      "evidence_paths": [
+        "server/core/sse.js",
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "The executable demo binds tenant identity through the real request-context module and reproduces both outcomes: an allowed request is recorded by the fake gateway backend, while a mismatched tenant raises a 403 Access denied without any dispatch.",
+      "evidence_paths": [
+        "demo/tenant-isolation-demo.mjs",
+        "demo/fixtures/fake-gateway-config.json",
+        "server/core/request-context.js"
+      ]
+    }
+  ],
+  "conclusion": "Using local fake gateway/config fixtures, the demo shows tenant isolation end-to-end at the dispatch seam reproduced from server/core/multi-tenant-gateway.js: an allowed own-tenant request (alice -> tenant-1) and an admin cross-tenant request (root -> tenant-2) both reach the fake gateway backend and are recorded with the owning tenant's token, whereas a mismatched request (alice targeting tenant-2) is rejected with a 403 Access denied before any backend call is made. All five demo assertions pass with exit code 0.",
+  "validation": {
+    "command": "node demo/tenant-isolation-demo.mjs",
+    "status": "passed",
+    "notes": "Runs with Node v24.14.0 using only Node built-ins plus the repository's server/core/request-context.js. No npm dependencies are installed in this workspace (node_modules is absent) and none are required or installed. Output JSON reports passed=true: allowed_own_tenant_reaches_backend=true, allowed_request_binds_own_tenant=true, mismatched_tenant_rejected=true (403 Access denied), mismatched_tenant_not_dispatched=true (backend dispatch count unchanged), admin_cross_tenant_reaches_backend=true. Exit code 0."
+  }
+}

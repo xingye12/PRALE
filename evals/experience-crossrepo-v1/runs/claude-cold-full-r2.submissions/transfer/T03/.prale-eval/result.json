@@ -1,0 +1,118 @@
+{
+  "task_id": "T03",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "slugify",
+      "start_line": 30,
+      "end_line": 64,
+      "observation": "slugify() is the normalization primitive this contract is built on. It scans the title character by character, flushing alternating CJK and latin/alnum tokens, lowercasing only latin tokens, treating every space/punctuation character as a segment boundary, then joins with '-' and strips duplicate/edge hyphens. Because it is a pure string->string function with no state and no I/O, the same title always yields the same slug: 'Aloe Vera' and 'aloe  vera!' both normalize to 'aloe-vera'. That identity is what makes duplicate entities detectable, and it is what the demo proves by re-running normalization under shuffled input order and re-hashing the result."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "dirForType",
+      "start_line": 84,
+      "end_line": 87,
+      "observation": "dirForType() maps a page type to its wiki directory via the TYPE_DIR table (slug.ts:72-81), trimming and lowercasing the key and falling back to the raw key (or 'other' when empty) for unknown types. This is the second half of path normalization: it decides that a malformed or missing `type` lands in the generic 'other' directory rather than throwing. In the demo corpus, documents whose `type` is blank, numeric, or unparsed all normalize into wiki/other/*, deterministically and explicitly."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "pageRelPath",
+      "start_line": 94,
+      "end_line": 98,
+      "observation": "pageRelPath(type, title) composes slugify(title) with dirForType(type) into 'wiki/<dir>/<slug>.md'. It is the dedup gateway: a second ingest of the same entity name produces the identical relative path, so the writer finds the existing page and merges (merge.ts:70-109) instead of creating a second file. The demo asserts this is a pure function by calling it twice per document and comparing, and shows two differently-spelled documents collapsing onto the single path wiki/entities/aloe-vera.md."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "CJK_RE",
+      "start_line": 14,
+      "end_line": 22,
+      "observation": "CJK_RE plus the isCjkChar/isAlnumChar predicates classify each character, and they are the reason normalization is lossless for non-ASCII: CJK ideographs are retained verbatim (never romanized, never dropped) while only latin runs are lowercased and punctuation is treated as a boundary. This keeps slugs stable for mixed-language titles such as 'Redis 主从 Cluster' -> 'redis-主从-cluster', which is why the demo's idempotence check (slugify(slug) === slug) holds for every emitted anchor."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "parseFrontmatter",
+      "start_line": 42,
+      "end_line": 62,
+      "observation": "parseFrontmatter() is the tolerant frontmatter contract: it matches FM_RE (frontmatter.ts:36), and on any failure -- no fence, YAML parse error, or a non-object result -- returns `{type:'other'}` with the remainder as body and hasFrontmatter:false, never throwing. Line 60 additionally folds a missing/blank/non-string `type` down to 'other'. The demo mirrors this observable behaviour exactly and adds typed diagnostics for each branch, so the downgrade is explicit instead of silent."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "readSources",
+      "start_line": 71,
+      "end_line": 76,
+      "observation": "readSources() accepts only arrays of strings and returns [] for anything else -- a scalar `sources:` value is discarded rather than coerced into a one-element list. The demo's SOURCES_NOT_ARRAY diagnostic fires on exactly this case (corpus files 02 and 05) and records that the value was dropped instead of guessed, keeping the raw/rm cascade contract sound."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "isLocked",
+      "start_line": 65,
+      "end_line": 68,
+      "observation": "isLocked() uses a strict `frontmatter.locked === true` test, so the string \"true\" does NOT lock a page. This is the contract's sharpest invalid-metadata case: guessing that an unparseable lock flag means 'locked' would silently protect a page the user never locked, so the tolerant path degrades to unlocked and the demo emits LOCKED_NOT_BOOLEAN to say so out loud."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/merge.ts",
+      "symbol": "unionSources",
+      "start_line": 37,
+      "end_line": 43,
+      "observation": "unionSources() merges two source lists into a de-duplicated union, skipping non-strings and blanks and preserving first-seen order. It is the deterministic result of a dedup hit: when the demo's two 'Aloe Vera' spelling variants land on one page path, the normalized entity carries the union of both documents' sources rather than one document overwriting the other."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/merge.ts",
+      "symbol": "mergePage",
+      "start_line": 70,
+      "end_line": 109,
+      "observation": "mergePage() defines what a duplicate slug means. A null existing content writes a new page; an existing locked page is skipped (never overwritten); otherwise the page is merged, with a rule-based redundancy short-circuit (merge.ts:55-60) ahead of the LLM paths. It is the contract that makes 'duplicate heading / duplicate entity' a merge decision rather than a file-name race, and it is why the demo reports mergedDocuments per normalized page rather than reporting a collision error."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/chunker.ts",
+      "symbol": "splitIntoUnits",
+      "start_line": 27,
+      "end_line": 63,
+      "observation": "splitIntoUnits() splits a document at markdown heading boundaries using `isHeading = /^#{1,6}\\s+\\S/` (chunker.ts:32). The demo's section scanner mirrors that same heading pattern, which is what makes 'duplicate headings' a real case rather than a synthetic one: repeated heading text produces repeated section units, and the demo assigns them stable ordinal anchors (overview, overview-2, ...) instead of letting the second one shadow the first."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Normalization is deterministic: slugify() and pageRelPath() are pure functions, so a corpus normalized twice, or normalized under a shuffled document order, yields a byte-identical canonical result. The demo builds the report five times (two file-order runs plus three seeded shuffles) and all five canonical SHA-256 digests are 5274fe8f4ef02ae92621d030e637e6a8189e8e278c269da77049651521d3f12e.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts"
+      ]
+    },
+    {
+      "claim": "Duplicate headings are handled deterministically: repeated heading text within one document is normalized to ordinal-suffixed section anchors (overview, overview-2, succulent-overview-2, grafting-2), so no occurrence is shadowed; every anchor is a fixed point of slugify. The demo asserts this over 18 anchors across the 7-document corpus.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/chunker.ts"
+      ]
+    },
+    {
+      "claim": "Duplicate entities across documents are merged, not duplicated: 'Aloe Vera' and 'aloe  vera!' normalize to the same slug and therefore the same page path wiki/entities/aloe-vera.md, collapsing two corpus documents onto one normalized page with a de-duplicated union of sources.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/merge.ts"
+      ]
+    },
+    {
+      "claim": "Malformed frontmatter is handled explicitly rather than silently: an absent frontmatter block, an unterminated fence, a YAML parse failure, a blank or non-string `type`, a scalar `sources`, and a non-boolean `locked` each downgrade to the documented tolerant outcome AND emit a typed diagnostic. The demo asserts that all ten expected diagnostic codes (NO_FRONTMATTER, UNTERMINATED_FRONTMATTER, YAML_PARSE_ERROR, TYPE_ABSENT, TYPE_EMPTY, TYPE_NOT_STRING, SOURCES_NOT_ARRAY, LOCKED_NOT_BOOLEAN, TITLE_MISSING, DUPLICATE_HEADING) actually fire on the corpus; 19 diagnostics were emitted in total.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"
+      ]
+    },
+    {
+      "claim": "The `locked` flag is resolved strictly: the string \"true\" does not lock a page, so an unparseable lock flag degrades to unlocked and is reported (LOCKED_NOT_BOOLEAN) rather than guessed into protecting a page the user never locked.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"
+      ]
+    }
+  ],
+  "conclusion": "Contracting a different corpus (seven succulent-care notes carrying duplicate headings and six distinct classes of malformed metadata) against the repository's normalization module shows the transferable contract holds: slugify/dirForType/pageRelPath are pure, idempotent mappings, so normalization is deterministic (five runs, file order and three seeded shuffles, all produce canonical sha256 5274fe8f4ef02ae92621d030e637e6a8189e8e278c269da77049651521d3f12e) and duplicate headings resolve to stable ordinal anchors while duplicate entities collapse onto one merged page path. Invalid metadata is never silently absorbed: each defect downgrades to the tolerant outcome documented in frontmatter.ts (type -> \"other\", sources -> [], locked -> unlocked, title derived from the first heading) and simultaneously emits a typed diagnostic, with all ten expected codes firing. The executable demo `.prale-eval/normalize-corpus.ts` exits 0 only when determinism, order-independence, idempotence, the duplicate-heading exercise, the cross-document merge, and full diagnostic coverage all hold.",
+  "validation": {
+    "command": "node .prale-eval/normalize-corpus.ts",
+    "status": "passed",
+    "notes": "Exit code 0. The demo imports the real MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts verbatim (Node 24 native type-stripping; that module has no third-party imports) and self-asserts five properties: repeat-run hash match, order-independence across three seeded shuffles, idempotence of every slug/page path/section anchor, that duplicate headings and a cross-document duplicate entity both occur, and that all ten expected diagnostic codes fire. Result: 7 documents -> 6 normalized pages, 19 diagnostics, canonical sha256 5274fe8f4ef02ae92621d030e637e6a8189e8e278c269da77049651521d3f12e identical across 5 runs; report written to .prale-eval/normalized-report.json. LIMITATION: the repository's own frontmatter.ts depends on the `yaml` package, and no node_modules are present in this checkout; dependencies must not be installed, so frontmatter.ts (and therefore vitest, whose `npm test` script is defined in MemoryKnowledge/package.json but has no installed runner) was NOT executed. The tolerant frontmatter contract is re-implemented in the demo over a documented minimal YAML subset that reproduces the observable behaviour of frontmatter.ts:42-76 (FM_RE fence split, parse-failure downgrade, non-empty-string type fallback, sources array requirement, strict locked === true). The module named by the acceptance contract, slug.ts, is executed directly and unmodified."
+  }
+}

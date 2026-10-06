@@ -1,0 +1,95 @@
+{
+  "task_id": 27,
+  "repository": "tdam",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/engines/code/normalize.ts",
+      "symbol": "normalizeRepoUrl",
+      "start_line": 13,
+      "end_line": 35,
+      "observation": "Datasource-URL normalization that runs before indexing: SSH (`git@host:path.git`, optional `ssh://`), HTTPS (`https://host/path.git`) and already-normalized bare `host/path` inputs are all collapsed to the same `host/path` form with the `.git` suffix stripped. This is what makes re-indexing the same repository idempotent regardless of how the remote URL was spelled."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/code/normalize.ts",
+      "symbol": "sourceKey",
+      "start_line": 40,
+      "end_line": 42,
+      "observation": "Builds the stable per-datasource index key as `${normalizeRepoUrl(repo)}:${branch || \"main\"}`. Because it reuses normalizeRepoUrl, the three URL spellings above produce one identical key, which is the unique ownership/idempotency key for the datasource bucket."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "FM_RE",
+      "start_line": 36,
+      "end_line": 36,
+      "observation": "Frontmatter fence regex `/^---\\r?\\n([\\s\\S]*?)\\r?\\n---\\r?\\n?/`, tolerant of CRLF line endings. It defines exactly the block that a pre-index normalizer must canonicalize (BOM/CRLF stripped, fence required)."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "parseFrontmatter",
+      "start_line": 42,
+      "end_line": 62,
+      "observation": "Tolerant frontmatter reader: it splits page content into `frontmatter` + `body`, but a missing block or a YAML parse failure is swallowed and degraded to `{ type: \"other\" }` with `hasFrontmatter: false`; a non-object or blank `type` is also coerced to \"other\". This is precisely the gap the task closes — tolerant read must be paired with a strict normalization/validation gate that rejects malformed metadata before the page enters the index."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "buildPage",
+      "start_line": 85,
+      "end_line": 101,
+      "observation": "Canonical page writer used for producing/rewriting pages: fixed field order (type -> title -> description -> sources -> tags -> timestamp -> other custom fields), `type` defaults to \"other\", the body is trimmed, and `locked` is deliberately never emitted. A normalize-before-index step should re-emit through this same shape so the stored page is canonical."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/index.ts",
+      "symbol": "ensureSources",
+      "start_line": 368,
+      "end_line": 375,
+      "observation": "Ingest-side normalization of a candidate page's `sources`: it filters non-string entries and force-adds the current source filename, rebuilding the page through buildPage. Shows that per-page metadata normalization already happens between extraction and commit — the natural insertion point for a strict reject-malformed-metadata gate."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/index.ts",
+      "symbol": "canonicalizePagePath",
+      "start_line": 392,
+      "end_line": 411,
+      "observation": "Normalizes a candidate page's on-disk path before commit: it reads `type`/`title` from frontmatter, trims them, slugifies the title and maps type -> directory (`entity` -> `entities`), falling back to a directory-normalized version of the LLM path. Demonstrates the pre-index normalization contract that the demo's `normalizeAndIndexEntry` reproduces."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Before indexing, datasource identity is normalized: normalizeRepoUrl collapses SSH, HTTPS and bare git URLs to one `host/path` form (stripping `.git`), and sourceKey composes that with the branch (defaulting to `main`) into a single stable index key, so the same repository cannot be indexed into two buckets.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/code/normalize.ts"
+      ]
+    },
+    {
+      "claim": "The existing frontmatter reader is deliberately tolerant, not rejecting: parseFrontmatter downgrades a missing fence, malformed YAML, a non-object payload, or a blank `type` to `{ type: \"other\" }` (hasFrontmatter false for the failure cases), so malformed metadata would be silently indexed unless a strict normalization/validation gate rejects it first.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"
+      ]
+    },
+    {
+      "claim": "The canonical normalized page shape is defined by buildPage: fixed field order, trimmed body, `type` required with \"other\" fallback, and `locked` never written — so a normalize-before-index step must re-emit page content through this shape (and must drop `locked`) to stay consistent with rewrite/merge paths.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"
+      ]
+    },
+    {
+      "claim": "Normalization already sits immediately before commit in the ingest pipeline — ensureSources coerces `sources` to strings and force-adds the current source, while canonicalizePagePath derives the canonical `wiki/<dir>/<slug>.md` path from normalized type/title — which is the correct insertion point for failing closed on malformed metadata before any page is written.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/index.ts"
+      ]
+    },
+    {
+      "claim": "The delivered executable demo puts that contract into practice: it normalizes repo URLs and markdown/frontmatter (BOM/CRLF, type trim, scalar->list coercion, de-duplication, dropped `locked`, canonical field order) and rejects malformed metadata with typed codes (EMPTY_REPO_URL, MISSING_FRONTMATTER, MALFORMED_YAML, INVALID_TYPE, INVALID_FIELD); the recorded run passes all 10 contract cases.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/code/normalize.ts",
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts"
+      ]
+    }
+  ],
+  "conclusion": "TencentDB Agent Memory already has both halves of the normalization contract for indexing — normalizeRepoUrl/sourceKey give every datasource a single idempotent key, and buildPage defines the canonical page shape (fixed field order, trimmed body, `locked` never written) — but parseFrontmatter intentionally fails open, degrading missing or malformed frontmatter to `{ type: \"other\" }`. Normalizing markdown/frontmatter before indexing therefore requires wrapping the tolerant reader in a strict gate: canonicalize BOM/CRLF/fence and type/title/sources/tags (coercing scalar values to de-duplicated string lists, dropping `locked`, preserving unknown fields), and reject malformed metadata with descriptive typed codes (EMPTY_REPO_URL, MISSING_FRONTMATTER, MALFORMED_YAML, INVALID_TYPE, INVALID_FIELD) so no degraded page is ever indexed. The dependency-free demo .prale-eval/demo/normalize-and-validate.mjs implements exactly this and its recorded run passes 10/10 cases.",
+  "validation": {
+    "command": "node .prale-eval/demo/normalize-and-validate.mjs && node .prale-eval/verify-citations.mjs",
+    "status": "passed",
+    "notes": "Demo run: exit 0 with summary { total: 10, passed: 10, failed: 0 } — it verifies URL normalization (three spellings -> one source key), page normalization (BOM/CRLF handled, title trimmed, scalar sources coerced and de-duplicated, `locked` dropped, canonical field order, unknown field preserved) and rejection of each malformed case with its expected code. Citation check: a focused node script over result.json and the cited sources confirmed task_id/repository/mode, non-empty evidence/claims/conclusion/validation, that every named symbol occurs inside its inclusive [start_line, end_line] range, that required paths MemoryKnowledge/src/engines/code/normalize.ts and MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts are cited, and that each claim's evidence_paths resolve and cover both required paths. LIMITATION: this checkout has no installed dependencies (no node_modules), so `pnpm typecheck` / `vitest run` and direct import of frontmatter.ts (which needs the `yaml` package) could not be executed; no dependency was installed and the dependency-free demo plus static citation check are recorded as the constrained-strength substitute."
+  }
+}

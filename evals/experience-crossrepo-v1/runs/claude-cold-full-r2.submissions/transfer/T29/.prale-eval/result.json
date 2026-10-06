@@ -1,0 +1,91 @@
+{
+  "task_id": "T29",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 15,
+      "observation": "The whole module is this one function. It normalizes the requested path (backslashes to forward slashes), detects a path that is already inside the workspace real root via the exact boundary `normalizedRequested === workspace || startsWith(workspace + '/')`, and otherwise re-roots the request under the workspace. It returns { candidatePath, pathMode } for three modes: 'workspace-absolute', 'workspace-root-relative' (leading slash) and 'workspace-relative'. It deliberately performs no containment rejection of its own: `../..`, encoded separators and null bytes pass through unchanged, so safety must be established by the caller. That makes it the resolution half of the traversal contract that this fixture pins."
+    },
+    {
+      "path": "server/utils/index.js",
+      "symbol": "safePath",
+      "start_line": 174,
+      "end_line": 187,
+      "observation": "The repository's other path-safety helper. It resolves the base and the sanitized user path, then computes `relative(base, target)` and rejects with null when the relative path starts with '..' (or contains a `..` segment). This is the canonical containment predicate that the generated-file contract mirrors: resolve first, then prove the result is a descendant of the root rather than a sibling or ancestor."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "isGeneratedFilePathAllowed",
+      "start_line": 39,
+      "end_line": 45,
+      "observation": "Second half of the download gate: once a candidate is proven to be inside the workspace it is lower-cased, split into segments, and rejected if any segment is a denied name/directory or the final name is `.env`/`.env.*`. Together with the containment test this is what makes the generated-file route's allow-list decision; the fixture exercises the containment half of that decision."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "escapedWorkspace",
+      "start_line": 134,
+      "end_line": 136,
+      "observation": "The live enforcement point for generated-file downloads. After `resolveGeneratedFileCandidatePath` produces `candidatePath`, the handler runs `realpath` on it and computes `posix.relative(workspaceReal, targetReal)`, then rejects with 403 when the relative path is empty, '..', starts with '../', or is absolute. This is exactly the containment contract encoded by `normalizeGeneratedFilePath` in the new fixture, and it is why a bare `resolveGeneratedFileCandidatePath` result is not by itself a safe path."
+    },
+    {
+      "path": "server/utils/generated-file-path.contract.js",
+      "symbol": "normalizeGeneratedFilePath",
+      "start_line": 28,
+      "end_line": 48,
+      "observation": "The new normalized operation added by this task. It rejects empty paths, embedded null bytes and encoded separator/traversal tokens (`%2e`, `%2f`, `%5c`, `%00`) before calling `resolveGeneratedFileCandidatePath`, then applies the handler's `posix.relative` containment predicate and returns either { ok: false, reason } or an accepted { ok: true, candidatePath, pathMode, relativePath } that is guaranteed to be a strict descendant of the workspace root."
+    },
+    {
+      "path": "server/utils/generated-file-path.contract.js",
+      "symbol": "GENERATED_FILE_PATH_FIXTURE_CASES",
+      "start_line": 57,
+      "end_line": 83,
+      "observation": "The traversal / encoded-separator case table. Unsafe rows cover plain `../` traversal, backslash and leading-slash traversal, the workspace root itself, encoded `%2e%2e%2f` / `%5c` / `%2f` sequences (upper and lower case), an encoded null byte, a raw null byte and the empty path; valid rows cover workspace-relative, root-relative and absolute generated paths plus spaces, an interior `.`-segment and a sibling-prefix path (`<root>-evil/x.pdf`) that must be re-rooted instead of escaping."
+    },
+    {
+      "path": "server/utils/generated-file-path.traversal.test.js",
+      "symbol": "generated-file-path traversal / encoded-separator contract",
+      "start_line": 21,
+      "end_line": 66,
+      "observation": "The executable fixture. It runs on Node's built-in `node:test` runner (no dev dependency needed), asserts each reject row fails with the expected reason and each accept row resolves to the expected relativePath/pathMode, and adds two invariant tests: every accepted candidate is a strict descendant of the root with no `..` segment, and the normalized operation results are printed as a table."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "`resolveGeneratedFileCandidatePath` only normalizes and re-roots a requested path into a candidate; it never rejects unsafe input, so the generated-file traversal guarantee depends on a containment check performed by the caller (the `posix.relative` guard in server/handlers/files.js).",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js"
+      ]
+    },
+    {
+      "claim": "`safePath` establishes the repository's canonical containment predicate: resolve the target, compute `relative(base, target)`, and reject (return null) when the relative path escapes with `..`, which is the same resolve-then-prove-inside shape the new generated-file contract reproduces.",
+      "evidence_paths": [
+        "server/utils/index.js"
+      ]
+    },
+    {
+      "claim": "The new `normalizeGeneratedFilePath` contract rejects traversal, encoded-separator (`%2e`/`%2f`/`%5c`/`%00`) and null-byte requests before resolution, and accepts valid workspace-relative, root-relative and absolute generated paths while guaranteeing every accepted candidate stays inside the intended workspace root.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/utils/generated-file-path.contract.js"
+      ]
+    },
+    {
+      "claim": "The executable fixture encodes the contract as a case table plus invariant checks and passes end-to-end: all 20 assertions in server/utils/generated-file-path.traversal.test.js succeed, so unsafe paths are rejected and valid generated paths remain inside the intended root.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.traversal.test.js",
+        "server/utils/generated-file-path.contract.js"
+      ]
+    }
+  ],
+  "conclusion": "The traversal / encoded-separator contract for generated-file paths is now pinned as an executable fixture. `resolveGeneratedFileCandidatePath` performs normalization only (workspace-absolute / workspace-root-relative / workspace-relative), so the fixture composes it with the handler's `posix.relative` containment predicate and adds pre-resolution rejection of encoded separators, encoded/raw null bytes and empty paths. Twelve unsafe cases are rejected with a stable reason and eight valid generated paths are accepted with `candidatePath` proven to be a strict descendant of the fixture workspace root, including a sibling-prefix path that is re-rooted rather than allowed to escape. All 20 assertions pass under `node --test`.",
+  "validation": {
+    "command": "node --test server/utils/generated-file-path.traversal.test.js",
+    "status": "passed",
+    "notes": "20/20 assertions pass (12 reject cases, 6 accept cases, 2 invariant/demo tests) in ~72ms on Node v24.14.0. The fixture uses only Node built-ins (`node:test`, `node:assert/strict`, `node:path`) plus the repository module under test, so it needs no installed dependencies. Limitation: `node_modules/` is absent in this workspace, so vitest is not available (`import('vitest')` fails with ERR_MODULE_NOT_FOUND); the pre-existing vitest suite `server/utils/generated-file-path.test.js` was therefore not executed and was left unmodified. No dependencies were installed and no package/lock or git configuration files were touched."
+  }
+}

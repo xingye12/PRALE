@@ -1,0 +1,159 @@
+{
+  "task_id": 15,
+  "repository": "tdam",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/kernel/headers.ts",
+      "symbol": "META_HEADER_SERVICE_ID",
+      "start_line": 5,
+      "end_line": 7,
+      "observation": "Single source of truth for the three kernel v3 wire header names: META_HEADER_SERVICE_ID = 'x-tdai-service-id' (line 5, carries instance_id), META_HEADER_USER_KEY = 'x-tdai-user-key' (line 6), META_HEADER_REQUEST_ID = 'x-request-id' (line 7). The file comment states the Control panel uses the same names for both inbound validation and outbound forwarding, which is what ties the middleware to the transport layer."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 63,
+      "observation": "Hono middleware factory that is the trust boundary for /api/v1/meta/*. It reads META_HEADER_SERVICE_ID (line 34) and 400s MISSING_INSTANCE_ID if absent, resolves the instance via deps.instanceRegistry.resolve (line 41) and maps an InstanceRegistryError(400) to 400 INVALID_INSTANCE, then requires META_HEADER_USER_KEY unless the action is 'auth/verify' (omitUserKey, lines 49-53), finally writing a PanelMetaContext onto c.set('panelMeta', ...) (lines 55-60) so the route handler gets registry-sourced gateway credentials rather than caller-supplied ones."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+      "symbol": "registerMetaProxyRoutes",
+      "start_line": 148,
+      "end_line": 219,
+      "observation": "Registers api.post('/meta/*', validatePanelMetaHeaders(deps), ...) - the HTTP route entry point. It derives the action from the path (readAction), rejects unknown/not-in-scope actions (404/501), parses the JSON body, assembles MetaCallContext from c.get('panelMeta') plus c.get('reqId') (lines 170-177), runs the optional duplicate pre-check, and dispatches through deps.metaKernel.invoke(action, body, ctx) (line 204) before returning respondEnvelope(c, envelope) (line 218)."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+      "symbol": "FetchMetaKernelAdapter",
+      "start_line": 6,
+      "end_line": 18,
+      "observation": "Implements MetaKernelPort over a KernelHttpPort. invoke(action, body, ctx) (line 12) applies meta-only policy before transport: sanitizeBody strips top-level limit/offset for non-META_LIST_ACTIONS, then sets omitUserKey = (action === 'auth/verify'), builds KernelCredentials via toKernelCredentials, and calls this.http.postEnvelope('/v3/meta/' + action, payload, cred)."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/transport-fetch.ts",
+      "symbol": "executeMetaFetch",
+      "start_line": 125,
+      "end_line": 232,
+      "observation": "The fetch mechanic that finally talks to the kernel: POSTs {endpoint}/v3/meta/{action} with headers Content-Type, Authorization: Bearer apiKey, and the header constants from headers.ts (META_HEADER_SERVICE_ID, META_HEADER_REQUEST_ID, META_HEADER_USER_KEY), with an AbortController timeout (default 15s). It normalises the raw response into a MetaEnvelope (lines 170-175), throws KernelFetchError(502) on invalid envelope, KernelFetchError(code) when code!=0 in 'data' mode, and 504/502 on abort/network failure; 'envelope' mode returns non-zero codes without throwing."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+      "symbol": "FetchKernelHttpAdapter",
+      "start_line": 10,
+      "end_line": 46,
+      "observation": "postEnvelope adapts KernelCredentials to MetaFetchConfig and calls executeMetaFetch in 'envelope' mode, so panel callers always receive an envelope. It catches KernelFetchError and synthesises a normalised MetaEnvelope with message KERNEL_TIMEOUT (504) or KERNEL_UNAVAILABLE (502), keeping the control-plane error surface uniform."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "mapHttpStatusFromEnvelopeCode",
+      "start_line": 11,
+      "end_line": 15,
+      "observation": "Defines the MetaEnvelope shape {code, message, request_id, data} (lines 3-8) and the HTTP-status projection: 400 <= code < 600 -> code, code === 0 -> 200, everything else -> 502. This is the rule that lets the panel's HTTP status mirror kernel business codes."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondEnvelope",
+      "start_line": 18,
+      "end_line": 20,
+      "observation": "respondEnvelope(c, envelope) serialises a MetaEnvelope with c.json using mapHttpStatusFromEnvelopeCode(envelope.code); respondControlError (lines 22-25) builds a code/message envelope from the request's reqId for middleware-generated 400/404/409/501 responses."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/types.ts",
+      "symbol": "toKernelCredentials",
+      "start_line": 23,
+      "end_line": 36,
+      "observation": "Maps the middleware-assembled MetaCallContext (instanceId, gatewayEndpoint, gatewayApiKey, userKey, reqId) to KernelCredentials, setting userKey to undefined when opts.omitUserKey is true. This is the glue between the panelMeta context written by the middleware and the transport's MetaFetchConfig."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/app.ts",
+      "symbol": "buildPanelApp",
+      "start_line": 17,
+      "end_line": 59,
+      "observation": "Composes the Hono app: app.use('*', requestLogger) first, then mounts the /api/v1 sub-app containing registerMetaInstanceRoutes, registerMetaProxyRoutes, registerSkillProxyRoutes and the panel business routes, plus onError producing a 500 {code,message,request_id,data} envelope."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/request-logger.ts",
+      "symbol": "requestLogger",
+      "start_line": 36,
+      "end_line": 72,
+      "observation": "Generates or propagates x-request-id (c.req.header('x-request-id') ?? randomUUID()), stores it as ctx.reqId and echoes it on the response header, which is the same value later forwarded to the kernel as META_HEADER_REQUEST_ID and copied into MetaEnvelope.request_id."
+    },
+    {
+      "path": "MemoryPanel/src/panel/panel-deps.ts",
+      "symbol": "buildPanelDeps",
+      "start_line": 32,
+      "end_line": 61,
+      "observation": "Wires the adapter chain at composition time: one FetchKernelHttpAdapter is shared by FetchMetaKernelAdapter and FetchSkillKernelAdapter, both receiving config.metadataRemoteTimeoutMs, which is how the meta and skill ports end up on the same transport and envelope code."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "kernel/headers.ts is the single shared vocabulary for kernel v3 headers: META_HEADER_SERVICE_ID ('x-tdai-service-id'), META_HEADER_USER_KEY ('x-tdai-user-key') and META_HEADER_REQUEST_ID ('x-request-id') are imported by both the inbound validator (validate-panel-headers.ts) and the outbound transport (transport-fetch.ts), so inbound validation and outbound forwarding cannot drift.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/headers.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/kernel/transport-fetch.ts"
+      ]
+    },
+    {
+      "claim": "validate-panel-headers.ts is the trust boundary: it requires x-tdai-service-id (else 400 MISSING_INSTANCE_ID), resolves it through deps.instanceRegistry to obtain gateway_endpoint/api_key (mapping registry 400 errors to INVALID_INSTANCE), requires x-tdai-user-key unless the action is 'auth/verify', and exposes the result on ctx.panelMeta so route handlers never accept caller-supplied gateway credentials.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts"
+      ]
+    },
+    {
+      "claim": "The request flow from HTTP route to envelope is: routes/meta/proxy.ts 'POST /meta/*' -> validatePanelMetaHeaders -> MetaCallContext from panelMeta+reqId -> MetaKernelPort.invoke -> FetchMetaKernelAdapter.invoke -> FetchKernelHttpAdapter.postEnvelope -> executeMetaFetch -> MetaEnvelope -> mapHttpStatusFromEnvelopeCode / respondEnvelope back to the caller.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+        "MemoryPanel/src/panel/kernel/transport-fetch.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts",
+        "MemoryPanel/src/panel/http/envelope.ts"
+      ]
+    },
+    {
+      "claim": "The adapter layer adds policy that is not transport: FetchMetaKernelAdapter sanitizes limit/offset out of non-list action bodies and drops user_key for 'auth/verify' via toKernelCredentials' omitUserKey option, while FetchSkillKernelAdapter passes skill bodies through unchanged because they use nested pagination.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-skill-kernel-adapter.ts",
+        "MemoryPanel/src/panel/kernel/types.ts"
+      ]
+    },
+    {
+      "claim": "Envelope normalisation is deliberate: executeMetaFetch converts HTTP/network failures into KernelFetchError(502/504) and FetchKernelHttpAdapter turns those into a synthetic MetaEnvelope (KERNEL_UNAVAILABLE / KERNEL_TIMEOUT), so every layer above the transport always receives {code,message,request_id,data} and HTTP status derives only from mapHttpStatusFromEnvelopeCode.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/transport-fetch.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts",
+        "MemoryPanel/src/panel/http/envelope.ts"
+      ]
+    },
+    {
+      "claim": "Request identity propagates end to end: requestLogger assigns or propagates x-request-id into ctx.reqId, proxy.ts copies it into MetaCallContext.reqId, and executeMetaFetch forwards it as x-request-id and uses it as the fallback MetaEnvelope.request_id when the kernel omits one.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/request-logger.ts",
+        "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+        "MemoryPanel/src/panel/kernel/types.ts",
+        "MemoryPanel/src/panel/kernel/transport-fetch.ts"
+      ]
+    },
+    {
+      "claim": "Composition root panel-deps.ts builds one FetchKernelHttpAdapter and injects it into both FetchMetaKernelAdapter and FetchSkillKernelAdapter, which is why the meta and skill data planes share the same transport, timeout and envelope handling.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/panel-deps.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-skill-kernel-adapter.ts"
+      ]
+    }
+  ],
+  "conclusion": "MemoryPanel routes every /api/v1/meta/* call through a single pipeline: buildPanelApp (http/app.ts:17) installs requestLogger, which sets ctx.reqId from x-request-id; the route api.post('/meta/*') (http/routes/meta/proxy.ts:149) is guarded by validatePanelMetaHeaders (http/middleware/validate-panel-headers.ts:31), the trust boundary that reads x-tdai-service-id and x-tdai-user-key (names centralised in kernel/headers.ts:5-7), resolves the instance to gateway credentials and stores them on ctx.panelMeta; the handler builds a MetaCallContext and calls MetaKernelPort.invoke, implemented by FetchMetaKernelAdapter (kernel/adapters/fetch-meta-kernel-adapter.ts:12), which applies meta-only policy (body sanitisation, omitUserKey for auth/verify) and delegates to FetchKernelHttpAdapter.postEnvelope -> executeMetaFetch (kernel/transport-fetch.ts:125). The kernel's JSON reply is normalised into MetaEnvelope {code,message,request_id,data} (kernel/envelope.ts:3-8) and returned by respondEnvelope (http/envelope.ts:18) with HTTP status derived from code via mapHttpStatusFromEnvelopeCode (0->200, 400-599->code, else 502). The full HTTP-route-to-adapter-to-envelope diagram (Mermaid + ASCII) is written to .prale-eval/request-flow.md.",
+  "validation": {
+    "command": "node -e \"<verify .prale-eval/result.json citations against working tree>\"",
+    "status": "pass",
+    "notes": "Ran a Node one-liner from the workspace root that (1) JSON-parses .prale-eval/result.json, asserts task_id===15, repository==='tdam', mode==='explore', and that evidence/claims/validation keys exist; (2) for every evidence entry opens the cited repo-relative file and checks the inclusive start_line..end_line slice contains the named symbol text; (3) asserts the two contract paths MemoryPanel/src/panel/kernel/headers.ts and MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts each have an evidence entry and at least one claim listing that path in evidence_paths. Result: all 12 evidence citations resolved and both contract paths were covered. LIMITATION: the repository's own test toolchain could not be executed - MemoryPanel has no tests/ directory and no node_modules, so `npm run typecheck` (tsc) and `npm test` (vitest) are unavailable without installing dependencies, which the task forbids. A structural citation check was used as the closest focused validation instead."
+  }
+}

@@ -1,0 +1,94 @@
+{
+    "task_id": "T24",
+    "repository": "aider",
+    "mode": "contract",
+    "evidence": [
+        {
+            "path": "aider/models.py",
+            "symbol": "ModelInfoManager.get_model_from_cached_json_db",
+            "start_line": 223,
+            "end_line": 247,
+            "observation": "Resolves a model name against model_info_manager.local_model_metadata first, then the cached litellm price/context JSON database. When nothing matches it returns dict() (line 247) rather than a default capability/cost record, so an unknown model surfaces as an explicitly empty mapping. The only name-shortening path (lines 242-245) returns the shorter entry solely when its litellm_provider equals the requested prefix, so a bare name like aurora-1-mini cannot silently inherit meta/aurora-1-mini metadata."
+        },
+        {
+            "path": "aider/models.py",
+            "symbol": "ModelInfoManager.get_model_info",
+            "start_line": 249,
+            "end_line": 274,
+            "observation": "Combines the cached lookup with litellm.get_model_info. If litellm raises for an unmapped model (the exception mentioning model_prices_and_context_window.json) it is caught and swallowed, and the function falls through to 'return cached_info' (line 274) - which is {} for an unknown model. No cost, context-window or supports_* key is ever synthesized here, so 'unknown' cannot masquerade as 'known with permissive capabilities'."
+        },
+        {
+            "path": "aider/models.py",
+            "symbol": "Model.__init__",
+            "start_line": 330,
+            "end_line": 369,
+            "observation": "Stores the metadata lookup in self.info (line 348) and derives max_chat_history_tokens from 'self.info.get(\"max_input_tokens\") or 0' (line 354), clamped to the documented min 1024 / max 8192 band (line 357). For an unknown model info is empty, so the chat-history budget is the 1024-token sane default instead of an invented context window."
+        },
+        {
+            "path": "aider/models.py",
+            "symbol": "Model.configure_model_settings",
+            "start_line": 385,
+            "end_line": 435,
+            "observation": "Initializes accepts_settings to [] when it is None (lines 400-401) and only appends optional settings such as thinking_tokens/reasoning_effort for explicitly matched settings or openrouter models (lines 415-435). Local metadata registration therefore cannot silently switch on an unsupported capability, which is exactly what the contract asserts for meta/aurora-1-pro (accepts_settings == [] despite declared metadata)."
+        },
+        {
+            "path": "aider/models.py",
+            "symbol": "Model.get_repo_map_tokens",
+            "start_line": 782,
+            "end_line": 789,
+            "observation": "Returns the documented 1024-token default when info carries no max_input_tokens (lines 783-784, 785 guard). This is the second observable 'sane default' the contract pins: an unknown model gets 1024 repo-map tokens rather than a value inferred from a fabricated context window."
+        },
+        {
+            "path": "aider/models.py",
+            "symbol": "register_litellm_models",
+            "start_line": 1112,
+            "end_line": 1133,
+            "observation": "Public registration entry point used by aider.main.register_litellm_models. It parses each metadata file (json5), skips missing/empty files, and merges the declared dictionaries verbatim into model_info_manager.local_model_metadata (line 1127). It neither invents missing capability keys nor rewrites declared ones, and an explicit 'supports_function_calling: false' from the fixture is preserved as False."
+        },
+        {
+            "path": "aider/models.py",
+            "symbol": "sanity_check_model",
+            "start_line": 1164,
+            "end_line": 1200,
+            "observation": "Makes unknown-model handling explicit: when no environment keys are known it emits 'Warning for <model>: Unknown which environment variables are required.' (line 1183), and when metadata is empty it emits 'Warning for <model>: Unknown context window size and costs, using sane defaults.' (lines 1190-1192), returning show=True (line 1200) so callers see a problem flag instead of silence."
+        }
+    ],
+    "claims": [
+        {
+            "claim": "An unknown model is represented explicitly as an empty metadata mapping: ModelInfoManager.get_model_from_cached_json_db returns dict() and ModelInfoManager.get_model_info returns that empty dict when litellm has no mapping, so no cost/context/capability values are fabricated. Executed: 'meta/ghost-404' -> {} through both the manager and Model(...).info.",
+            "evidence_paths": [
+                "aider/models.py"
+            ]
+        },
+        {
+            "claim": "Registering the local metadata fixture is verbatim and minimal: register_litellm_models stores exactly the two declared entries (meta/aurora-1-mini with only max_input_tokens/litellm_provider/mode, meta/aurora-1-pro with an explicit supports_function_calling: false) into model_info_manager.local_model_metadata without adding, defaulting or deleting keys; lookup returns those entries unchanged, so missing keys stay absent rather than becoming permissive defaults.",
+            "evidence_paths": [
+                "aider/models.py"
+            ]
+        },
+        {
+            "claim": "Unknown model handling is announced, not silent: sanity_check_model returns True for 'meta/ghost-404' and emits the two explicit warnings ('Unknown which environment variables are required.' and 'Unknown context window size and costs, using sane defaults.'), while an unknown model also receives only documented sane defaults (max_chat_history_tokens == 1024, get_repo_map_tokens() == 1024) and claims no optional settings (accepts_settings == [], extra_params is None).",
+            "evidence_paths": [
+                "aider/models.py"
+            ]
+        },
+        {
+            "claim": "Metadata cannot silently enable unsupported capabilities: Model.configure_model_settings initializes accepts_settings to [] and only appends thinking_tokens/reasoning_effort via explicit model settings or openrouter name rules, so neither the partial fixture entry nor the entry declaring supports_function_calling: false yields any advertised optional setting; the explicit False is preserved as a bool False rather than being upgraded to True.",
+            "evidence_paths": [
+                "aider/models.py"
+            ]
+        },
+        {
+            "claim": "Lookup does not silently transfer another model's metadata: the prefix-stripping branch of get_model_from_cached_json_db requires the candidate entry's litellm_provider to equal the requested provider prefix, so querying the bare name 'aurora-1-mini' returns {} instead of inheriting 'meta/aurora-1-mini'.",
+            "evidence_paths": [
+                "aider/models.py"
+            ]
+        }
+    ],
+    "conclusion": "The contract holds for the new local model metadata fixture (.prale-eval/contract/local-model-metadata.json). Driving the real aider.models code shows explicit unknown-model handling at every layer: an undeclared model resolves to an explicit empty metadata dict ({}), is reported through sanity_check_model's explicit 'Unknown ...' warnings with a truthy problem flag, and receives only documented sane defaults (1024 chat-history/repo-map tokens) while claiming no optional settings (accepts_settings == []). Fixture-declared metadata is stored verbatim, so partial entries keep their missing capability/cost keys absent and an explicit supports_function_calling: false stays False - nothing silently claims an unsupported capability. The executable contract .prale-eval/contract/check_unknown_model_contract.py passes 7/7 assertions and emits the normalized result .prale-eval/contract/contract-report.json; no repository source, task metadata, lockfile or git configuration was modified.",
+    "validation": {
+        "command": "python .prale-eval/contract/check_unknown_model_contract.py",
+        "status": "pass",
+        "notes": "Executed from the repository root: 7/7 contract assertions passed (C1 registration verbatim, C2 unknown model -> {}, C3 no basename inheritance, C4 explicit sanity-check warnings + True, C5 sane 1024 defaults with accepts_settings == [], C6 partial fixture metadata exact with no invented keys, C7 explicit False capability preserved), exit code 0; the normalized report was written to .prale-eval/contract/contract-report.json with top-level status 'pass'. LIMITATION: the optional third-party dependencies of this checkout are not installed and dependency installation is out of scope, so the harness installs narrow in-process shims before importing aider.models - json5 missing -> JSON-plus-line-comment shim, oslex missing -> shlex-based join/split shim, litellm missing -> stub whose get_model_info raises the model_prices_and_context_window.json error for unmapped models and whose validate_environment returns {'keys_in_environment': False, 'missing_keys': []}. The aider.models code paths under test are the real repository code; only the third-party boundary is simulated, and the limitations are recorded verbatim in contract-report.json under environment.limitations. The run is hermetic: HOME is redirected to .prale-eval/contract/_home (all aider cache writes stay in the workspace) and outbound HTTP is disabled, so no network access or writes outside the workspace occur."
+    }
+}

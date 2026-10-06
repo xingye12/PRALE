@@ -1,0 +1,55 @@
+{
+  "task_id": "T02",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "ConfigQueue._process",
+      "start_line": 24,
+      "end_line": 37,
+      "observation": "_process is the serial drain loop. It awaits _execute(item) and, when the result is not ok, rejects only that item's promise (item.reject(result.error)); the rejection is a normal return value of the awaited call, so the while loop is not aborted and the next queued job is shifted and executed. This is the mechanism that gives failure isolation: a failed first job cannot strand the queue."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "ConfigQueue._execute",
+      "start_line": 60,
+      "end_line": 99,
+      "observation": "_execute contains the failure classification. Each gateway RPC result is checked explicitly (if (!_r.ok) throw new Error(_r.error)); the catch block retries only errors whose message contains 'config changed since last load' or 'rate limit' while attempts remain, and otherwise returns the shape { ok: false, error: err } instead of throwing out of the queue. A non-retryable first-job failure therefore resolves the item as a settled rejection without escaping into the drain loop."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "ConfigQueue.enqueue",
+      "start_line": 15,
+      "end_line": 20,
+      "observation": "enqueue wraps each submitted job in its own Promise and stores the caller's resolve/reject alongside the transform. Because every job owns an independent settle pair, a failure of one job rejects only its own caller's promise; other jobs keep their own pending promises and are settled later by the same _process loop."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "ConfigQueue._recordPatch",
+      "start_line": 56,
+      "end_line": 58,
+      "observation": "_recordPatch pushes Date.now() to _patchTimestamps and is invoked only after a successful config.patch (line 74). A job that fails before its patch succeeds records nothing, so a failing first job does not consume the 3-per-60s rate-limit budget (see _waitForSlot, lines 46-54) and cannot delay the jobs queued behind it."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "ConfigQueue guarantees failure isolation: when the first queued job fails, _process rejects only that job's promise and continues its serial while loop, so the next job still executes and settles deterministically rather than being skipped or left pending.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "_execute converts a failing gateway RPC into a returned { ok: false, error } result for non-retryable errors (and after retries are exhausted), rather than throwing past the drain loop; the error is delivered to the item's own reject handler, keeping failure scoped to a single job.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "A failing first job consumes no rate-limit slot because _recordPatch runs only after a successful config.patch, so subsequent queued jobs are not delayed by the earlier failure and settle within the same deterministic ordering.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    }
+  ],
+  "conclusion": "The configuration fixture .prale-eval/config-queue-failure-isolation.test.mjs contracts the failure-isolation behavior of server/core/config-queue.js: a scripted gateway makes the first queued job fail (config.patch returns an error), and the fixture asserts that the first job rejects with its error while the next job still runs the full get/patch/get/apply cycle and fulfils, and that a third job after the failure also settles (proving the queue is not wedged). Repeating the run three times against fresh queue instances yields the identical fail-then-settle outcome, demonstrating deterministic settlement.",
+  "validation": {
+    "command": "node --test .prale-eval/config-queue-failure-isolation.test.mjs",
+    "status": "passed",
+    "notes": "Ran with the repository Node runtime (v24.14.0) using only Node built-ins. node_modules is not installed, so the fixture does not depend on vitest or any package: it uses node:test, node:assert and module.registerHooks to substitute the real ./gateway-client.js dependency of config-queue.js with an in-memory scripted gateway, so the unmodified production ConfigQueue class is exercised. Result: tests 2, pass 2, fail 0. The hidden vitest-based oracle is not required by this fixture and was not run."
+  }
+}

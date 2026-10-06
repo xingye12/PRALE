@@ -1,0 +1,131 @@
+{
+  "task_id": 28,
+  "repository": "wattclaw",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "pruneWattClawProjectsForUser",
+      "start_line": 125,
+      "end_line": 205,
+      "observation": "Automatic retention is the only server-side edge into 'archived'. The per-project loop (lines 162-196) derives terminalStatus from status==='success'||'failed'||'fail' and gates archival on terminalExpired (now-terminalAt >= FINAL_PROJECT_RETENTION_MS), restoredExpired (status==='archived' && restoredAt>0 && now-restoredAt >= RESTORED_PROJECT_RETENTION_MS) or archivedNeedsUnload (status==='archived' && restoredAt===0 && hasLoadedAgent). Anything else is pushed to `skipped`/`kept` (line 178). So allowed automation edges are terminal->archived and archived(re-restored/cold-with-loaded-agents)->archived; every non-terminal or fresh-terminal status is a forbidden edge into archived."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "activateWattClawProjectRuntime",
+      "start_line": 207,
+      "end_line": 256,
+      "observation": "Implements the explicit allowed edge archived->restored. It re-creates only missing members via wattclaw.team.project.member.update (lines 225-237), throws if any project agent is still missing (lines 247-249), and returns `restored: projectStatus(currentProject) === 'archived'` (line 254). It is never invoked automatically by the retention pass, which confirms restore is a user-triggered transition rather than part of pruning."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "FINAL_PROJECT_RETENTION_MS",
+      "start_line": 80,
+      "end_line": 82,
+      "observation": "Retention windows that parameterise the allowed/forbidden edges: FINAL_PROJECT_RETENTION_MS = 3 days for terminal success/failed projects, RESTORED_PROJECT_RETENTION_MS = 24h before a restored archive may be archived again, and SHANGHAI_UTC_OFFSET_MS used by nextWattClawRetentionRunAt to schedule the daily 18:00 Asia/Shanghai retention run that evaluates those edges."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "projectStatus",
+      "start_line": 96,
+      "end_line": 98,
+      "observation": "Normalises project.status (trim + lowercase) into the canonical state token used by every transition predicate, so the state machine is case/whitespace insensitive; the same statuses observed here (success, failed/fail, archived, in_progress, pending) map onto the WattClawProjectStatus union in src/api/types/wattclaw-team.ts."
+    },
+    {
+      "path": "src/stores/wattclaw-collaboration.ts",
+      "symbol": "handleRealtimeEvent",
+      "start_line": 324,
+      "end_line": 340,
+      "observation": "Forbidden-edge enforcement on the client. On a wattclaw.team.project.updated event the guard `if (archivedProjectIds.has(targetProjectId) && nextStatus !== 'archived') return` (line 334) makes archived a sink: a Gateway update can never move an archived project to any non-archived status. Line 335 latches the archived set, and the same id is re-added whenever listWattClawProjects reports status 'archived' (loadSavedProjectsMeta, line 903)."
+    },
+    {
+      "path": "src/stores/wattclaw-collaboration.ts",
+      "symbol": "initialize",
+      "start_line": 684,
+      "end_line": 730,
+      "observation": "Confirms archived is not auto-restored: when the loaded project status is 'archived' (line 699) the store binds the manager session read-only and returns without calling activateWattClawProject, so archived->restored (or archived->in_progress) is forbidden automatically and requires the explicit restoreProject action."
+    },
+    {
+      "path": "src/stores/wattclaw-collaboration.ts",
+      "symbol": "restoreProject",
+      "start_line": 732,
+      "end_line": 769,
+      "observation": "The explicit allowed edge archived->restored: it calls RPC activateWattClawProject, replaces the project status with 'restored' when the previous status was archived (line 749), clears the archived latch, sets runtimeReady=true and persists the metadata. prepareOutgoingMessage (line ~515) separately throws for archived projects, blocking an archived->in_progress interaction edge."
+    },
+    {
+      "path": "src/views/wattclaw-collaboration/WattClawProjectPanel.vue",
+      "symbol": "ARCHIVABLE_STATUSES",
+      "start_line": 156,
+      "end_line": 167,
+      "observation": "Manual archive/restore edge set. ARCHIVABLE_STATUSES = {success, fail, failed, paused, restored} plus canArchive means only finished projects may transition to archived by hand (in_progress/pending/creating/planning/waiting cannot). canRestore is true only when status==='archived' && !runtimeReady, restricting the restore edge to an explicit, runtime-down archived project."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Allowed edge success/failed/fail -> archived: terminal projects are archived by the automatic retention pass only after FINAL_PROJECT_RETENTION_MS (3 days) since updatedAt/createdAt; fresh terminal projects are kept.",
+      "evidence_paths": [
+        "server/services/wattclaw-project-runtime.js"
+      ]
+    },
+    {
+      "claim": "Allowed edge archived -> restored: activateWattClawProjectRuntime restores missing project members and returns restored:true when the project status is 'archived'; the client performs this only on explicit user action via restoreProject, not during initialize or realtime updates.",
+      "evidence_paths": [
+        "server/services/wattclaw-project-runtime.js",
+        "src/stores/wattclaw-collaboration.ts"
+      ]
+    },
+    {
+      "claim": "Forbidden edge archived -> any non-archived status: handleRealtimeEvent rejects Gateway updates that would move a latched archived project away from 'archived', initialize skips runtime activation for archived projects, and prepareOutgoingMessage throws, so the only legal exit from archived is an explicit restore.",
+      "evidence_paths": [
+        "src/stores/wattclaw-collaboration.ts"
+      ]
+    },
+    {
+      "claim": "Forbidden edge in_progress/pending/planning/creating/waiting/paused -> archived via automation: these are non-terminal, so the retention loop never calls wattclaw.team.project.archive on them and pushes them to kept/skipped.",
+      "evidence_paths": [
+        "server/services/wattclaw-project-runtime.js"
+      ]
+    },
+    {
+      "claim": "Allowed manual-archive edge {success, fail, failed, paused, restored} -> archived, and manual restore edge archived -> restored, are exposed and constrained by ARCHIVABLE_STATUSES and canRestore in the project panel; paused is archivable only manually because retention treats it as non-terminal.",
+      "evidence_paths": [
+        "src/views/wattclaw-collaboration/WattClawProjectPanel.vue",
+        "server/services/wattclaw-project-runtime.js"
+      ]
+    },
+    {
+      "claim": "Allowed self-edge archived -> archived (re-archive/unload): retention re-archives an archived project when it was restored more than 24h ago (restoredExpired) or when it still has loaded agents after a cold archive (archivedNeedsUnload); an archived project whose agents are already unloaded and never restored is forbidden from re-archiving and is kept.",
+      "evidence_paths": [
+        "server/services/wattclaw-project-runtime.js"
+      ]
+    }
+  ],
+  "conclusion": {
+    "state_machine": "Project lifecycle states observed: creating, waiting, pending, planning, in_progress (a.k.a. running), paused, success, failed/fail (terminal), archived, restored. Status is normalised with trim().toLowerCase() (projectStatus) and typed by WattClawProjectStatus in src/api/types/wattclaw-team.ts.",
+    "allowed_edges": [
+      "creating -> waiting | pending | planning (draft/creation flow; 'pending' gates the start-confirmation UI)",
+      "pending | planning | waiting | creating -> in_progress (project start)",
+      "in_progress -> success | failed | paused",
+      "{success, failed} -> archived (automatic retention after 3 days: FINAL_PROJECT_RETENTION_MS)",
+      "{success, fail, failed, paused, restored} -> archived (explicit manual archive, ARCHIVABLE_STATUSES)",
+      "archived -> restored (explicit user action, only when runtime is not ready; activateWattClawProjectRuntime returns restored:true)",
+      "restored -> in_progress (runtime re-activated on restore)",
+      "restored -> archived (re-archive allowed)",
+      "archived -> archived (retention re-archive: restored >24h ago, or still has loaded agents -> forced unload)"
+    ],
+    "forbidden_edges": [
+      "archived -> {creating, waiting, pending, planning, in_progress, paused, success, failed}: blocked by the realtime archived latch, by initialize (no auto-activation), and by prepareOutgoingMessage",
+      "{success, failed} -> in_progress/pending (no resurrection of terminal projects)",
+      "fresh terminal {success, failed} -> archived (younger than 3 days: kept)",
+      "{in_progress, pending, planning, creating, waiting, paused} -> archived by retention (non-terminal: kept/skipped; paused is manual-only)",
+      "archived (restoredAt===0 && agents unloaded) -> archived (no-op, kept)",
+      "archived (restoredAt within 24h) -> archived (restoredExpired not reached, kept)"
+    ],
+    "summary": "The lifecycle is a forward pipeline that ends in the archived sink. Terminal outcomes (success/failed/fail) may flow to archived automatically after a 3-day retention window or manually at any time; paused and restored are only archivable manually; a restored archive may be re-archived after 24h, and a cold archive whose agents are still loaded is force-unloaded. The single legal exit from archived is the explicit archived->restored user action; no realtime event, initial page load, or retention pass may take an archived project out of that state, and no non-terminal project may be archived by automation."
+  },
+  "validation": {
+    "command": "node --input-type=module <<'EOF' (imports ./server/services/wattclaw-project-runtime.js and exercises pruneWattClawProjectsForUser over one project per status with a fixed now, plus activateWattClawProjectRuntime on an archived project)",
+    "status": "pass",
+    "notes": "Executed against the workspace module (node v24.14.0). Result: archived (allowed ->archived) = [p-success-old, p-failed-old, p-fail-old, p-archived-restored]; kept (forbidden ->archived) = [p-success-fresh, p-running-old(in_progress), p-pending-old, p-paused-old, p-archived-cold]; activateWattClawProjectRuntime(project.status='archived') returned restored=true. This matches the existing expectations in server/services/wattclaw-project-runtime.test.js ('archives only expired terminal or restored archived projects' and 'restores only missing project agents with their original IDs'). The repository's vitest suite could not be run because node_modules is absent and dependency installation is out of scope for this task; the equivalent assertions were reproduced with a dependency-free node script instead."
+  }
+}

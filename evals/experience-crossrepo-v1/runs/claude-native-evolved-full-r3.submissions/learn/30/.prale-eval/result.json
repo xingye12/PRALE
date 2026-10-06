@@ -1,0 +1,68 @@
+{
+  "task_id": 30,
+  "repository": "tdam",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/http.ts",
+      "symbol": "HttpTransport",
+      "start_line": 27,
+      "end_line": 110,
+      "observation": "The class is the SDK's single egress point. Its constructor snapshots the request scope metadata once (Authorization: Bearer {apiKey}, x-tdai-service-id = serviceId, Content-Type: application/json, plus x-tdai-user-key only when a userKey is supplied) into a private `headers` record, and normalizes the endpoint by stripping trailing slashes. Because the header record is captured per instance and never mutated by `post()`, every request the transport emits carries that transport's scope, and two transports with different serviceId/userKey keep isolated scopes. The fake-transport test asserts exactly this header set on every recorded interaction."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/http.ts",
+      "symbol": "HttpTransport.post",
+      "start_line": 65,
+      "end_line": 109,
+      "observation": "The only outbound call path: it computes `url = endpoint + path`, installs an AbortController timeout, and issues exactly one `fetch(url, { method: 'POST', headers, body: JSON.stringify(body), signal })` per invocation. There is no retry loop, queue, or concurrency reordering, so the order of recorded fetches equals the order of `post()` calls — the property the request-order tests verify. It then unwraps the response envelope (`code === 0` returns `data`, otherwise throws TDAMError with code/message/requestId/details) and injects `trace_id` from the `x-trace-id` response header, which the envelope tests pin down."
+    },
+    {
+      "path": "MemoryCore/src/core/index.ts",
+      "symbol": "InstanceConfigProvider",
+      "start_line": 31,
+      "end_line": 41,
+      "observation": "The core barrel's only public path to instance-scope resolution: it re-exports InstanceConfigProvider/LocalConfigSource and the InstanceConfig/VdbConfig/CosConfig/IConfigSource types. InstanceConfigProvider holds a per-instanceId map of VDB configs with a TTL cache, i.e. the server-side meaning of the `x-tdai-service-id` scope header the SDK attaches. This grounds why the scope metadata asserted by the transport tests is not cosmetic: it selects which instance configuration and storage the core resolves for a request."
+    },
+    {
+      "path": "MemoryCore/src/core/index.ts",
+      "symbol": "StorePool",
+      "start_line": 44,
+      "end_line": 45,
+      "observation": "Re-exports StorePool and its PooledStore/StorePoolOptions/StoreMode types — the per-instanceId Store pool. Its `getStore(instanceId, vdbConfig)` keys the pool by the same instanceId carried in the SDK's `x-tdai-service-id` header, so request order plus consistent per-request scope metadata together determine which pooled store handles each call. This closes the loop between the SDK-side fake transport and the core-side scope handling."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "HttpTransport emits exactly one POST per call, in call order, to `endpoint + path`, with endpoint trailing slashes normalized; there is no hidden retry or reordering, so the recorded request stream is a faithful, ordered log of caller intent.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/http.ts"
+      ]
+    },
+    {
+      "claim": "Scope metadata is bound per transport at construction and attached to every request: Authorization: Bearer <apiKey>, x-tdai-service-id: <serviceId>, Content-Type: application/json, and x-tdai-user-key only when a userKey is configured. Interleaving two transports with different serviceId/userKey keeps each request's scope aligned with the transport that issued it, and body-level scope fields (team_id/agent_id/user_id/task_id) pass through the JSON body without leaking into headers.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/http.ts"
+      ]
+    },
+    {
+      "claim": "The envelope contract is what makes order/scope assertions meaningful: code === 0 unwraps to `data`, a non-zero code throws TDAMError carrying code, message, requestId (x-qcloud-transaction-id header or envelope.request_id) and object `data` as details, a non-2xx response throws TDAMError with the HTTP status, and a successful response gets `trace_id` injected from the x-trace-id header.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/http.ts"
+      ]
+    },
+    {
+      "claim": "The scope header asserted by the interaction test is the same instance key the core resolves on: MemoryCore/src/core/index.ts re-exports InstanceConfigProvider (per-instanceId VDB config map with TTL cache) and StorePool (per-instanceId Store pool keyed by instanceId), so x-tdai-service-id selects which instance configuration and pooled store serve each ordered request.",
+      "evidence_paths": [
+        "MemoryCore/src/core/index.ts",
+        "sdk/memory-core/typescript/src/http.ts"
+      ]
+    }
+  ],
+  "conclusion": "Implemented a zero-dependency fake-transport interaction test at sdk/memory-core/typescript/tests/fake-transport.test.ts that replaces globalThis.fetch with a recording fake gateway and asserts (a) request order — exactly one POST per post() call, emitted in call order to endpoint+path, a failed call recorded once with the stream continuing in order, and order/scope staying aligned when two scoped transports interleave — and (b) scope metadata — Authorization: Bearer, x-tdai-service-id, content-type on every request, x-tdai-user-key only when configured, per-transport scope isolation, and body-level IdFields passing through without leaking into headers. The transport being exercised (HttpTransport in src/http.ts) is the SDK's single egress point, and the MemoryCore/src/core/index.ts barrel re-exports the per-instanceId InstanceConfigProvider/StorePool that consume the same x-tdai-service-id scope key server-side, so the assertions pin down a real, contract-relevant boundary rather than an implementation detail. All 9 assertions pass under Node's native TypeScript type stripping; the repository's vitest devDependency is not installed and installing it was out of scope, so the suite is authored against node:test and excluded from vitest.config.ts's collection (mirroring the existing tests/e2e.test.ts standalone-script precedent).",
+  "validation": {
+    "command": "node --import ./tests/resolve-ts-extensions.mjs --test tests/fake-transport.test.ts",
+    "status": "passed",
+    "notes": "Run from sdk/memory-core/typescript. Result: 9 tests / 3 suites, 9 pass, 0 fail (Node v24.14.0 native type stripping; tests/resolve-ts-extensions.mjs is a zero-dependency ESM resolve hook mapping NodeNext-style `./x.js` specifiers onto their `./x.ts` sources so src/http.ts imports without a build step). Limitation: the repository's declared runner (vitest, plus tsc for type-checking) is not installed — there is no node_modules anywhere in the workspace — and installing dependencies was explicitly out of scope, so `npx vitest run` was NOT executed and neither was `tsc --noEmit`. tests/fake-transport.test.ts therefore uses node:test instead of vitest globals and is listed in vitest.config.ts `exclude` alongside the pre-existing tests/e2e.test.ts entry, so a future installed-vitest run collects it as neither a passing nor an empty suite; the assertions themselves are runner-independent."
+  }
+}

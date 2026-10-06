@@ -1,0 +1,80 @@
+{
+  "task_id": "T27",
+  "repository": "tdam",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "MemoryClientConfig",
+      "start_line": 8,
+      "end_line": 19,
+      "observation": "The shared config interface every client consumes: `endpoint`, `apiKey`, `serviceId` plus timeout/TLS flags. v3 `MemoryClient` extends this (V3MemoryClientConfig in v3/types.ts) with the team/agent/user/session/task identity fields, so this is the type through which the demo's scope metadata and auth headers are declared. The demo constructs `new MemoryClient({ endpoint, apiKey, serviceId, teamId, agentId, userId, sessionId, taskId })`, and the observed write/read bodies carry exactly the isolation triple this config supplies."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "Transport",
+      "start_line": 24,
+      "end_line": 28,
+      "observation": "The transport seam explicitly documented 'for testing — inject a mock that satisfies this': a `post<T>(path, body)` method with an optional `get<T>(path, query)`. It is the injection point the v3 MemoryClient's second constructor overload accepts (`constructor(transport: Transport, isolation)`), so it is the reason order, scope and result normalization are observable without real network access. The demo instead satisfies the same seam with the concrete V3HttpTransport pointed at a loopback server, which lets the assertions inspect the actual JSON on the wire rather than a mock's recollection."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "MemoryClient.addConversation",
+      "start_line": 193,
+      "end_line": 199,
+      "observation": "Representative data-plane write: the method merges `this.iso.baseBody()` (the isolation triple) with per-call fields and pipes the result through `stripUndefined` before POSTing to `/v3/conversation/add`. The demo's `writeScenario` (lines 336-343) follows the identical `baseBody()` + `stripUndefined` shape, which is what makes the recorded write body show a full scope and no undefined-valued keys."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "MemoryClient.withIsolation",
+      "start_line": 180,
+      "end_line": 189,
+      "observation": "Narrowing operation used for the demo's scoped read: it resolves `IsolationContext.with(overrides)` and returns a new MemoryClient that shares the SAME `this.http` transport but a recomputed scope. `withIsolation({ taskId: null })` clears task_id, so the scoped read's body drops it entirely — the assertion that `task_id` is absent from the read body is grounded here."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "V3HttpTransport.request",
+      "start_line": 58,
+      "end_line": 121,
+      "observation": "Where result normalization happens: builds the URL as `endpoint + path`, POSTs `JSON.stringify(params)` with the Authorization / x-tdai-service-id headers, parses the `{code, message, request_id, data}` envelope, throws TDAMError unless HTTP ok and `code === 0`, then returns `envelope.data` and merges `trace_id` from the `x-trace-id` response header. The demo's assertions that results equal the raw `data` plus `trace_id` and contain no envelope keys are direct consequences of this method."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The SDK's public test seam is the `Transport` interface declared alongside `MemoryClientConfig`; injecting it (or, as the demo does, pointing the real V3HttpTransport at a loopback server) is sufficient to observe request order, scope metadata and normalized results without touching production endpoints.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/src/v3/client.ts",
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    },
+    {
+      "claim": "The demo performs exactly one write then one scoped read — `POST /v3/scenario/write` followed by `POST /v3/scenario/read` — in that order, because `writeScenario` and `readScenario` each issue a single awaited POST over the shared transport.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/src/v3/client.ts",
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    },
+    {
+      "claim": "Scope metadata is carried on every data-plane body as `team_id`/`agent_id`/`user_id` (plus `task_id`) derived from the config, and narrowing the scope via `withIsolation({ taskId: null })` removes `task_id` from the serialized body rather than sending it as null, because `stripUndefined` filters undefined values before the POST.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/src/v3/client.ts"
+      ]
+    },
+    {
+      "claim": "Results are normalized: the `{code, message, request_id, data}` response envelope is unwrapped so callers receive `data` alone, with `trace_id` merged in from the `x-trace-id` header, and non-zero business codes surface as TDAMError instead of a value.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    }
+  ],
+  "conclusion": "The demo executes real SDK code end to end against a local fake HTTP backend with no installed dependencies. It issues one scenario write and one scoped read, and all seven checks pass: the backend records the write POST before the read POST; both bodies carry the team/agent/user isolation triple with the narrowed read omitting task_id and session_id; and both results are the unwrapped `data` payload with trace_id merged and no envelope fields leaked. The fake backend independently rejects any request missing the isolation triple, so the passing run proves the SDK emitted the scope rather than the test assuming it. The write/read round-trip is confirmed by the read returning the exact content that was written.",
+  "validation": {
+    "command": "node --experimental-transform-types --import ./.prale-eval/demo/register.mjs ./.prale-eval/demo/run-demo.mjs",
+    "status": "pass",
+    "notes": "Executed on Node v24.14.0; exit code 0 with 'all 7 checks passed' and status PASS in the JSON report. Limitation: this checkout has no node_modules and no tsc/tsx/vitest binary, and installing dependencies is out of scope, so the repo's `pnpm test` (vitest) suite could not run. Two resolver limitations were worked around by .prale-eval/demo/loader.mjs: (1) the SDK's TS '.js' specifiers have no compiled counterparts, and (2) the bare 'undici' dependency imported by v3/http.ts is absent, satisfied by a no-op Agent shim — that shim is never constructed here because the demo uses plain HTTP without setting rejectUnauthorized. TypeScript parameter properties in v3/client.ts require Node's --experimental-transform-types rather than strip-only mode."
+  }
+}

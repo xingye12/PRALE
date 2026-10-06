@@ -1,0 +1,796 @@
+diff --git a/server/utils/generated-file-path.test.js b/server/utils/generated-file-path.test.js
+index f448463..ff51ea4 100644
+--- a/server/utils/generated-file-path.test.js
++++ b/server/utils/generated-file-path.test.js
+@@ -1,6 +1,16 @@
+ import { describe, expect, it } from 'vitest'
++import { posix } from 'path'
+ import { resolveGeneratedFileCandidatePath } from './generated-file-path.js'
+ 
++// Same containment rule the generated-file route applies to the realpathed
++// target (server/handlers/files.js): a request may only name a target inside
++// the workspace root.
++function containment(workspaceRoot, candidatePath) {
++  const relativePath = posix.relative(workspaceRoot, posix.normalize(candidatePath))
++  const escaped = !relativePath || relativePath === '..' || relativePath.startsWith('../') || posix.isAbsolute(relativePath)
++  return { relativePath, escaped }
++}
++
+ describe('resolveGeneratedFileCandidatePath', () => {
+   const workspace = '/home/wattman/.wattclaw/user/report-agent'
+ 
+@@ -25,4 +35,59 @@ describe('resolveGeneratedFileCandidatePath', () => {
+       pathMode: 'workspace-absolute',
+     })
+   })
++
++  // Traversal / encoded-separator contract. The resolver is a normalizer: it
++  // rewrites encoded separators and joins the request onto the root, but it
++  // never rejects, so containment is asserted on top of its output in the same
++  // way the route does it.
++  it('rewrites backslash-encoded separators before classifying the path', () => {
++    expect(resolveGeneratedFileCandidatePath(workspace, 'downloads\\report.pdf')).toEqual({
++      candidatePath: `${workspace}/downloads/report.pdf`,
++      pathMode: 'workspace-relative',
++    })
++  })
++
++  it('exposes a relative traversal unchanged for the caller to contain', () => {
++    const resolved = resolveGeneratedFileCandidatePath(workspace, '../../outside/secret.txt')
++    expect(resolved).toEqual({
++      candidatePath: `${workspace}/../../outside/secret.txt`,
++      pathMode: 'workspace-relative',
++    })
++    expect(containment(workspace, resolved.candidatePath)).toEqual({
++      relativePath: '../../outside/secret.txt',
++      escaped: true,
++    })
++  })
++
++  it('keeps a backslash-encoded traversal escaping the root after normalization', () => {
++    const resolved = resolveGeneratedFileCandidatePath(workspace, '..\\..\\outside\\secret.txt')
++    expect(resolved).toEqual({
++      candidatePath: `${workspace}/../../outside/secret.txt`,
++      pathMode: 'workspace-relative',
++    })
++    expect(containment(workspace, resolved.candidatePath).escaped).toBe(true)
++  })
++
++  it('rejects a leading-slash traversal against the workspace root', () => {
++    const resolved = resolveGeneratedFileCandidatePath(workspace, '/../outside/secret.txt')
++    expect(resolved).toEqual({
++      candidatePath: `${workspace}/../outside/secret.txt`,
++      pathMode: 'workspace-root-relative',
++    })
++    expect(containment(workspace, resolved.candidatePath).escaped).toBe(true)
++  })
++
++  it('keeps the documented valid path modes inside the workspace root', () => {
++    const requests = [
++      resolveGeneratedFileCandidatePath(workspace, 'downloads/report.pdf'),
++      resolveGeneratedFileCandidatePath(workspace, '/downloads/report.pdf'),
++      resolveGeneratedFileCandidatePath(workspace, `${workspace}/downloads/report.pdf`),
++    ]
++    for (const request of requests) {
++      expect(containment(workspace, request.candidatePath)).toEqual({
++        relativePath: 'downloads/report.pdf',
++        escaped: false,
++      })
++    }
++  })
+ })
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..4b51630
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,126 @@
++# Contract: traversal / encoded-separator fixture for generated-file paths
++
++Task `T10` — repository `wattclaw`, mode `contract`.
++
++Request: *contract a new traversal/encoded-separator fixture: verify unsafe paths are rejected
++and valid generated paths remain inside the intended root.*
++
++## 1. Contract under test
++
++The generated-file download route (`GET /api/chat/generated-file`, `server/handlers/files.js`)
++turns a user-supplied `path` query value into a filesystem target in two stages:
++
++1. **Resolution** — `resolveGeneratedFileCandidatePath(workspaceReal, requestedPath)`
++   (`server/utils/generated-file-path.js:1-15`) is a *pure normalizer*:
++
++   | input shape | output `pathMode` | output `candidatePath` |
++   | --- | --- | --- |
++   | already starts with the workpace root | `workspace-absolute` | the request unchanged |
++   | starts with `/` | `workspace-root-relative` | `${workspace}/` + request without leading slashes |
++   | anything else | `workspace-relative` | `${workspace}/` + request |
++
++   It strips trailing slashes from the workspace (line 2), rewrites backslash *encoded
++   separators* to `/` (line 3), and **never rejects, clamps or collapses `..` segments**. It is
++   therefore not a containment decision on its own.
++
++2. **Containment** — the route realpaths the candidate and rejects it unless
++   `path.posix.relative(workspaceReal, targetReal)` is non-empty, not `..`, does not start with
++   `../` and is not absolute (`server/handlers/files.js:134-138`). Additional gates reject the
++   request shape (NUL byte / empty, `files.js:89`) and denied names/segments
++   (`.env`, `.env.*`, `.git`, `.openclaw`, agent dotfiles — `files.js:39-45`).
++
++The contract this fixture pins:
++
++> **Unsafe requests (traversal, encoded-separator traversal, symlink escape, absolute path
++> outside the root, denied names) must be rejected; valid generated paths (relative,
++> root-relative, workspace-absolute) must resolve to a target strictly inside the intended
++> workspace root.**
++
++## 2. Executable demo
++
++`server/utils/generated-file-path.traversal-fixture.mjs` — runnable with the Node standard
++library only (no `vitest`, no `node_modules`, no network):
++
++```bash
++node server/utils/generated-file-path.traversal-fixture.mjs
++```
++
++What it does:
++
++* builds a throw-away tree under the git-ignored `<repo>/.tmp/` (workspace root
++  `.tmp/…/workspace/agent-root`, a real `downloads/report.pdf`, an `.env`, a sibling
++  `outside/secret.txt` that must stay unreachable, and an `escape-link` symlink that is
++  lexically inside the root but really points outside it), and removes it again in a `finally`;
++* mirrors the route's gates (`decide()` at `…traversal-fixture.mjs:98-113`): resolve →
++  `realpath` (null ⇒ `rejected:not-found`) → `posix.relative` containment (⇒ `rejected:escape`)
++  → name gate (⇒ `rejected:denied-name`) → otherwise `accepted`;
++* asserts every **unsafe** request (literal, backslash-encoded, root-relative, nested,
++  Express-decoded percent-encoded traversal, symlink escape, absolute-outside path, missing
++  target, denied `.env`) is rejected for the expected reason;
++* asserts every **valid** generated path is accepted, keeps its documented `pathMode`, and
++  realpaths to a target strictly beneath `workspaceReal`;
++* asserts the normalizer properties that make the contract necessary (`..` survives resolution;
++  backslash → `/`; trailing slash stripped; NUL byte fails the request-shape gate).
++
++Observed result (exit code `0`):
++
++```
++CONTRACT FIXTURE PASSED: 21/21 checks
++```
++
++## 3. Normalized operation result
++
++| request (`path` query value) | `pathMode` | decision | reason |
++| --- | --- | --- | --- |
++| `downloads/report.pdf` | workspace-relative | accepted | inside root |
++| `downloads\report.pdf` (encoded separator) | workspace-relative | accepted | encoded separator normalized to `/` |
++| `/downloads/report.pdf` | workspace-root-relative | accepted | inside root |
++| `<workspace>/downloads/report.pdf` | workspace-absolute | accepted | inside root |
++| `<workspace>/downloads/../downloads/report.pdf` | workspace-absolute | accepted | normalizes back inside root |
++| `../../outside/secret.txt` | workspace-relative | rejected:escape | `posix.relative` starts with `../` |
++| `..\..\outside\secret.txt` | workspace-relative | rejected:escape | backslashes rewritten to `/`, then escape |
++| `/../../outside/secret.txt` | workspace-root-relative | rejected:escape | leading slash re-rooted, then escape |
++| `downloads/../../../outside/secret.txt` | workspace-relative | rejected:escape | nested escape |
++| `/downloads/../../../outside/secret.txt` | workspace-root-relative | rejected:escape | nested escape |
++| `decodeURIComponent('..%2F..%2Foutside%2Fsecret.txt')` | workspace-relative | rejected:escape | percent-decoding happens before the resolver |
++| `escape-link/secret.txt` (symlink) | workspace-relative | rejected:escape | realpath lands outside the root |
++| `/abs/path/outside/secret.txt` | workspace-relative | rejected:not-found | absolute-outside request is re-rooted under the workspace |
++| `downloads/missing.pdf` | workspace-relative | rejected:not-found | `realpath` fails |
++| `downloads/../.env` | workspace-relative | rejected:denied-name | name gate (`.env`) |
++| `<path with NUL byte>` | — | rejected:invalid-request | request-shape gate before resolution |
++
++## 4. Repository test suite
++
++The same expectations are pinned in the repo's own runner
++(`server/utils/generated-file-path.test.js`): a `containment()` helper (`:8-12`) applies the
++route's `posix.relative` rule to the resolver output, and five added cases cover encoded
++separators, relative/root-relative traversal, and the documented valid path modes. They run
++under the project's normal tooling:
++
++```bash
++npx vitest run server/utils/generated-file-path.test.js
++```
++
++## 5. Validation performed here
++
++```bash
++node server/utils/generated-file-path.traversal-fixture.mjs
++node --check server/utils/generated-file-path.js \
++  && node --check server/utils/generated-file-path.test.js \
++  && node --check server/utils/generated-file-path.traversal-fixture.mjs
++node --input-type=module -e "<replay of the added vitest expectations against the real module>"
++node -e "<result.json schema / symbol-range / claim-coverage assertions>"
++```
++
++All passed (`21/21` fixture checks, exit code `0`).
++
++**Limitation (recorded):** `node_modules` is absent in this checkout, so the project test
++runner (`vitest`) could not be executed and no dependency was installed. The added
++`generated-file-path.test.js` cases were therefore verified by replaying their expectations
++against the real module with plain `node` (equivalent for this dependency-free module), and the
++standalone fixture is the executable end-to-end evidence. This is substitute evidence of
++limited strength, not a run of the official suite.
++
++No task metadata, hidden-oracle file, package lock or git configuration was modified; only
++`server/utils/generated-file-path.traversal-fixture.mjs` (new),
++`server/utils/generated-file-path.test.js` (added cases) and `.prale-eval/` were touched.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..615e154
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,153 @@
++{
++  "task_id": "T10",
++  "repository": "wattclaw",
++  "mode": "contract",
++  "evidence": [
++    {
++      "path": "server/utils/generated-file-path.js",
++      "symbol": "resolveGeneratedFileCandidatePath",
++      "start_line": 1,
++      "end_line": 15,
++      "observation": "The module's only export: it takes the realpathed workspace root and the requested path and returns { candidatePath, pathMode }. It performs no rejection of its own - it never throws, never clamps and never collapses '..' segments - so it is a pure normalizer whose output is not yet a containment decision. The contract fixture pins exactly this shape and asserts containment on top of it, as the route does."
++    },
++    {
++      "path": "server/utils/generated-file-path.js",
++      "symbol": "normalizedWorkspace",
++      "start_line": 2,
++      "end_line": 2,
++      "observation": "Strips trailing slashes from workspaceReal so the prefix test on line 4 and the join on line 12 agree on one root form; the fixture asserts `${workspace}/` is normalized identically to `${workspace}`."
++    },
++    {
++      "path": "server/utils/generated-file-path.js",
++      "symbol": "normalizedRequested",
++      "start_line": 3,
++      "end_line": 3,
++      "observation": "Rewrites backslash ('encoded') separators to '/' before any classification: '..\\\\..\\\\outside\\\\secret.txt' becomes '../../outside/secret.txt' and 'downloads\\\\report.pdf' becomes 'downloads/report.pdf'. This is why an encoded-separator traversal must be rejected by the caller exactly like a literal one, and why an encoded valid path still resolves inside the root."
++    },
++    {
++      "path": "server/utils/generated-file-path.js",
++      "symbol": "isWorkspaceAbsolute",
++      "start_line": 4,
++      "end_line": 9,
++      "observation": "Prefix test against the normalized workspace (plus the workspace-absolute early return). Because the request is never path-normalized, a request containing '..' segments can still satisfy this test, and a non-matching absolute request is not treated as unsafe here - it falls through to the join branch. Traversal therefore survives resolution and must be caught downstream."
++    },
++    {
++      "path": "server/utils/generated-file-path.js",
++      "symbol": "candidatePath",
++      "start_line": 11,
++      "end_line": 14,
++      "observation": "The fall-through branch re-roots every request that does not start with the workspace root under `${workspace}/` (leading slashes removed) and labels the result 'workspace-root-relative' or 'workspace-relative'. Note the direct consequence the fixture records: an absolute path that names a target outside the root is re-rooted into the workspace, so it fails later as not-found rather than as an escape."
++    },
++    {
++      "path": "server/handlers/files.js",
++      "symbol": "requestedPath",
++      "start_line": 75,
++      "end_line": 75,
++      "observation": "Route-level request preparation: the 'path' query value is trimmed and its backslashes are already rewritten to '/' before validation (Express has already percent-decoded the query value). The fixture therefore models 'decode first, then resolve', which is why `decodeURIComponent('..%2F..%2Foutside%2Fsecret.txt')` is equivalent to a literal '../../outside/secret.txt'."
++    },
++    {
++      "path": "server/handlers/files.js",
++      "symbol": "isGeneratedFilePathAllowed",
++      "start_line": 39,
++      "end_line": 45,
++      "observation": "The name/segment gate applied to the relative path after containment: it denies '.git'/'openclaw' segments, '.env'/'.env.*' names and the agent dotfiles (agents.md, soul.md, user.md, identity.md, tools.md, bootstrap.md, memory.md, workspace-state.json). The fixture mirrors it and asserts 'downloads/../.env' is rejected as denied-name even though it stays inside the root."
++    },
++    {
++      "path": "server/handlers/files.js",
++      "symbol": "resolveGeneratedFileCandidatePath",
++      "start_line": 112,
++      "end_line": 112,
++      "observation": "The single call site: the resolver is invoked with `workspaceReal` (produced by `realpath -e` on the workspace on line 107) and the raw request, and its result is only logged before the realpath/containment gate. This confirms rejection is deliberately kept out of the resolver and lives in the route."
++    },
++    {
++      "path": "server/handlers/files.js",
++      "symbol": "escapedWorkspace",
++      "start_line": 134,
++      "end_line": 138,
++      "observation": "The containment gate: `posix.relative(workspaceReal, targetReal)` must be non-empty, not '..', not start with '../' and not be absolute, otherwise the request is answered 403 'File access denied'. The fixture reproduces this predicate with `realpathSync` on real files, so symlink escapes that are lexically inside the root are rejected too."
++    },
++    {
++      "path": "server/utils/generated-file-path.test.js",
++      "symbol": "containment",
++      "start_line": 8,
++      "end_line": 12,
++      "observation": "Helper added to the repo's own vitest suite expressing the route's containment predicate on the resolver output (`posix.relative` after `posix.normalize`), so the traversal contract is enforceable by the project runner without any filesystem setup."
++    },
++    {
++      "path": "server/utils/generated-file-path.test.js",
++      "symbol": "resolveGeneratedFileCandidatePath",
++      "start_line": 43,
++      "end_line": 48,
++      "observation": "The new encoded-separator case: 'downloads\\\\report.pdf' must resolve to `${workspace}/downloads/report.pdf` with pathMode 'workspace-relative'. Together with the four neighbouring cases (relative traversal at :50-60, backslash-encoded traversal at :62-69, leading-slash traversal at :71-78, valid modes inside the root at :80-91) it is the repo-suite half of the fixture."
++    },
++    {
++      "path": "server/utils/generated-file-path.traversal-fixture.mjs",
++      "symbol": "decide",
++      "start_line": 98,
++      "end_line": 113,
++      "observation": "The fixture's decision harness: resolve -> realpathOrNull (null becomes 'rejected:not-found') -> posix.relative containment ('rejected:escape') -> name gate ('rejected:denied-name') -> 'accepted'. It is a faithful mirror of files.js:112-138 with sync `realpathSync` and no gateway, and it provides both the rejection and acceptance verdicts used by the two tables below it."
++    },
++    {
++      "path": "server/utils/generated-file-path.traversal-fixture.mjs",
++      "symbol": "UNSAFE_CASES",
++      "start_line": 118,
++      "end_line": 130,
++      "observation": "The unsafe request table: literal '../../outside/secret.txt', backslash-encoded traversal, leading-slash traversal, nested traversal after a valid prefix, decoded percent-encoded traversal, a symlink whose target is outside the root, an absolute path outside the root, a missing target and the denied '.env' name - each with its expected rejection reason."
++    },
++    {
++      "path": "server/utils/generated-file-path.traversal-fixture.mjs",
++      "symbol": "VALID_CASES",
++      "start_line": 132,
++      "end_line": 139,
++      "observation": "The valid request table: workspace-relative, backslash-encoded relative, root-relative (leading slash), workspace-absolute, './' dot-segment and an absolute dot-dot that normalizes back inside; each must be accepted, keep its documented pathMode and realpath to a target strictly beneath workspaceReal."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "resolveGeneratedFileCandidatePath is a pure normalizer, not a guard: it returns { candidatePath, pathMode } for every input, throws on nothing, and never collapses or rejects '..' segments (a relative traversal resolves to `${workspace}/../../outside/secret.txt` with pathMode 'workspace-relative'), so containment must be enforced by the caller rather than trusted to the resolver.",
++      "evidence_paths": [
++        "server/utils/generated-file-path.js",
++        "server/handlers/files.js",
++        "server/utils/generated-file-path.traversal-fixture.mjs"
++      ]
++    },
++    {
++      "claim": "Encoded separators are normalized before classification: line 3 rewrites backslashes to '/' (and the route pre-normalizes again at files.js:75), so '..\\\\..\\\\outside\\\\secret.txt' resolves to exactly the same candidate as '../../outside/secret.txt' and is rejected by containment, while 'downloads\\\\report.pdf' resolves inside the root to `${workspace}/downloads/report.pdf`.",
++      "evidence_paths": [
++        "server/utils/generated-file-path.js",
++        "server/handlers/files.js",
++        "server/utils/generated-file-path.traversal-fixture.mjs",
++        "server/utils/generated-file-path.test.js"
++      ]
++    },
++    {
++      "claim": "Unsafe paths are rejected by the fixture's mirrored route gates: literal, backslash-encoded, root-relative and nested traversal plus a symlink escape and an Express-decoded percent-encoded traversal all fail the realpath + posix.relative containment check (403 File access denied); an absolute path naming a target outside the root is re-rooted into the workspace by the join branch and fails as not-found (404); '.env' is rejected by the name gate even though it stays inside the root.",
++      "evidence_paths": [
++        "server/handlers/files.js",
++        "server/utils/generated-file-path.js",
++        "server/utils/generated-file-path.traversal-fixture.mjs"
++      ]
++    },
++    {
++      "claim": "Valid generated paths remain inside the intended root: workspace-relative, workspace-root-relative (leading slash), workspace-absolute, './' dot-segment and a self-normalizing absolute dot-dot request are all accepted, each retaining its documented pathMode and realpath-ing to a target strictly beneath workspaceReal.",
++      "evidence_paths": [
++        "server/utils/generated-file-path.js",
++        "server/utils/generated-file-path.traversal-fixture.mjs",
++        "server/utils/generated-file-path.test.js"
++      ]
++    },
++    {
++      "claim": "The contract is executable in this checkout: `node server/utils/generated-file-path.traversal-fixture.mjs` runs on the Node standard library only, builds and removes its own scratch tree under the git-ignored `.tmp/`, and passes 21/21 checks with exit code 0; the same expectations are pinned in the repo suite via the `containment` helper and the new cases in server/utils/generated-file-path.test.js.",
++      "evidence_paths": [
++        "server/utils/generated-file-path.traversal-fixture.mjs",
++        "server/utils/generated-file-path.test.js"
++      ]
++    }
++  ],
++  "conclusion": "Contracted the traversal/encoded-separator behaviour of the generated-file download path. Reading server/utils/generated-file-path.js shows the resolver is a pure normalizer (trailing-slash strip, backslash->'/' encoded-separator rewrite, workspace-prefix passthrough, otherwise re-root under the workspace) that never contains '..' segments; containment is the caller's job, implemented in server/handlers/files.js as `realpath -e` plus `posix.relative` (reject empty, '..', '../'-prefixed or absolute) and additionally by the request-shape and denied-name gates. The new fixture server/utils/generated-file-path.traversal-fixture.mjs reproduces those gates on a real throw-away tree and asserts 10 unsafe requests are rejected (literal/root-relative/nested/backslash-encoded/percent-decoded traversal, symlink escape, absolute-outside and missing targets, denied .env) while 6 valid generated paths are accepted and realpath strictly inside the workspace root, plus 5 resolver-normalization and request-shape assertions - 21/21 checks, exit code 0. The same expectations are pinned in the repo's vitest suite (server/utils/generated-file-path.test.js) via a containment() helper and five added cases. Limitation: node_modules is absent, so vitest could not be executed and no dependency was installed; the added suite cases were verified by replaying their expectations against the real module with plain node, and that limitation is recorded in the deliverable. No task metadata, hidden-oracle file, package lock or git configuration was modified.",
++  "validation": {
++    "command": "node server/utils/generated-file-path.traversal-fixture.mjs && node --check server/utils/generated-file-path.js && node --check server/utils/generated-file-path.test.js && node --check server/utils/generated-file-path.traversal-fixture.mjs && node --input-type=module -e \"<replay of the added vitest expectations against ./server/utils/generated-file-path.js>\" && node -e \"<result.json metadata/symbol-range/claim-coverage assertions>\"",
++    "status": "passed",
++    "notes": "The fixture printed 'CONTRACT FIXTURE PASSED: 21/21 checks' with exit code 0 (10/10 unsafe requests rejected for the expected reason, 6/6 valid paths accepted strictly inside the workspace root, plus resolver-normalization and request-shape properties), and its scratch tree under .tmp/ was removed afterwards. The added vitest cases were replayed against the real dependency-free module with plain node and all assertions held. LIMITATION: node_modules is absent in this checkout, so `npx vitest run server/utils/generated-file-path.test.js` could not be executed and no dependency was installed; the node replay is substitute evidence of limited strength, not a run of the official suite. Only server/utils/generated-file-path.traversal-fixture.mjs (new), server/utils/generated-file-path.test.js (added cases) and .prale-eval/ were created or changed."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+diff --git a/server/utils/generated-file-path.traversal-fixture.mjs b/server/utils/generated-file-path.traversal-fixture.mjs
+new file mode 100644
+index 0000000..f09589c
+--- /dev/null
++++ b/server/utils/generated-file-path.traversal-fixture.mjs
+@@ -0,0 +1,210 @@
++#!/usr/bin/env node
++/**
++ * Traversal / encoded-separator contract fixture for
++ * `resolveGeneratedFileCandidatePath` (server/utils/generated-file-path.js).
++ *
++ * Executable with the Node.js standard library only - no vitest, no
++ * node_modules, no network:
++ *
++ *   node server/utils/generated-file-path.traversal-fixture.mjs
++ *
++ * It pins the two halves of the generated-file download contract:
++ *
++ *   1. RESOLUTION. `resolveGeneratedFileCandidatePath` is a pure normalizer:
++ *      it strips trailing slashes from the workspace, rewrites backslash
++ *      ("encoded") separators to `/`, keeps requests that already start with
++ *      the workspace root as `workspace-absolute`, and otherwise joins the
++ *      request onto the workspace root. It never rejects, clamps or resolves
++ *      `..` segments, so its output alone is NOT a containment decision.
++ *
++ *   2. CONTAINMENT. The caller decides exactly as
++ *      server/handlers/files.js does: realpath the candidate, then reject when
++ *      `path.posix.relative(workspaceReal, targetReal)` is empty, `..`, starts
++ *      with `../` or is absolute. Unsafe requests (literal traversal,
++ *      backslash-encoded traversal, percent-encoded traversal decoded by
++ *      Express, symlink escapes, missing targets) are rejected; valid generated
++ *      paths must realpath to a target strictly inside the workspace root.
++ *
++ * Exit code 0 = every contract case held; non-zero = a case failed.
++ */
++
++import assert from 'node:assert/strict'
++import { existsSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
++import path, { posix } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++import { resolveGeneratedFileCandidatePath } from './generated-file-path.js'
++
++const here = path.dirname(fileURLToPath(import.meta.url))
++const repoRoot = path.resolve(here, '..', '..')
++
++// Build a throw-away tree inside the repository (git-ignored `.tmp/`) so the
++// fixture exercises realpath on a real filesystem without touching anything
++// outside the workspace.
++const tmpRoot = path.join(repoRoot, '.tmp', 'generated-file-path-traversal-fixture')
++// The agent root is nested two levels under tmpRoot so that `../..` traversals
++// can reach a real sibling file that lives outside the root.
++const workspaceDir = path.join(tmpRoot, 'workspace', 'agent-root')
++const outsideDir = path.join(tmpRoot, 'outside')
++
++rmSync(tmpRoot, { recursive: true, force: true })
++mkdirSync(path.join(workspaceDir, 'downloads'), { recursive: true })
++mkdirSync(outsideDir, { recursive: true })
++writeFileSync(path.join(workspaceDir, 'downloads', 'report.pdf'), 'report')
++writeFileSync(path.join(workspaceDir, '.env'), 'SECRET=1')
++writeFileSync(path.join(outsideDir, 'secret.txt'), 'secret')
++// A symlink that is lexically inside the workspace but really lands outside it.
++symlinkSync(path.join('..', '..', 'outside'), path.join(workspaceDir, 'escape-link'), 'dir')
++
++const workspaceReal = realpathSync(workspaceDir)
++
++// --- mirrors of the caller gates in server/handlers/files.js ----------------
++
++// request-shape gate (files.js:89) - null byte / empty request.
++function passesRequestShapeGate(sessionKey, agentId, requestedPath) {
++  return Boolean(sessionKey && agentId && requestedPath && !requestedPath.includes('\0'))
++}
++
++// name gate (files.js:29-44) - `.env`, `.env.*`, `.git`/`.openclaw` segments, dotfiles.
++const DENIED_SEGMENTS = new Set(['.git', '.openclaw'])
++const DENIED_NAMES = new Set([
++  'agents.md',
++  'soul.md',
++  'user.md',
++  'identity.md',
++  'tools.md',
++  'bootstrap.md',
++  'memory.md',
++  'workspace-state.json',
++  'openclaw-workspace-state.json',
++])
++function isGeneratedFilePathAllowed(relativePath) {
++  const segments = relativePath.split('/').filter(Boolean).map((segment) => segment.toLowerCase())
++  if (segments.some((segment) => DENIED_SEGMENTS.has(segment))) return false
++  const name = segments[segments.length - 1] || ''
++  if (name === '.env' || name.startsWith('.env.')) return false
++  return !DENIED_NAMES.has(name)
++}
++
++// containment gate (files.js:122-138) - realpath + posix.relative.
++function realpathOrNull(candidatePath) {
++  try {
++    return realpathSync(candidatePath)
++  } catch {
++    return null
++  }
++}
++
++function decide(requestedPath) {
++  const { candidatePath, pathMode } = resolveGeneratedFileCandidatePath(workspaceReal, requestedPath)
++  const targetReal = realpathOrNull(candidatePath)
++  if (targetReal === null) {
++    return { decision: 'rejected:not-found', candidatePath, pathMode, relativePath: null }
++  }
++  const relativePath = posix.relative(workspaceReal, targetReal)
++  const escapedWorkspace = !relativePath || relativePath === '..' || relativePath.startsWith('../') || posix.isAbsolute(relativePath)
++  if (escapedWorkspace) {
++    return { decision: 'rejected:escape', candidatePath, pathMode, relativePath }
++  }
++  if (!isGeneratedFilePathAllowed(relativePath)) {
++    return { decision: 'rejected:denied-name', candidatePath, pathMode, relativePath }
++  }
++  return { decision: 'accepted', candidatePath, pathMode, relativePath }
++}
++
++// --- contract cases --------------------------------------------------------
++
++// name, request, expected decision
++const UNSAFE_CASES = [
++  ['literal parent traversal', '../../outside/secret.txt', 'rejected:escape'],
++  ['backslash-encoded traversal', '..\\..\\outside\\secret.txt', 'rejected:escape'],
++  ['root-relative (leading slash) traversal', '/../../outside/secret.txt', 'rejected:escape'],
++  ['nested traversal after a valid prefix', 'downloads/../../../outside/secret.txt', 'rejected:escape'],
++  ['root-relative nested traversal', '/downloads/../../../outside/secret.txt', 'rejected:escape'],
++  ['percent-encoded traversal after Express decoding', decodeURIComponent('..%2F..%2Foutside%2Fsecret.txt'), 'rejected:escape'],
++  ['symlink that leaves the root lexically', 'escape-link/secret.txt', 'rejected:escape'],
++  ['absolute path that names a target outside the root', path.join(outsideDir, 'secret.txt'), 'rejected:not-found'],
++  ['nonexistent relative target', 'downloads/missing.pdf', 'rejected:not-found'],
++  ['denied dotfile name', 'downloads/../.env', 'rejected:denied-name'],
++]
++
++// name, request, expected pathMode, expected relativePath
++const VALID_CASES = [
++  ['workspace-relative generated path', 'downloads/report.pdf', 'workspace-relative', 'downloads/report.pdf'],
++  ['backslash-encoded valid path', 'downloads\\report.pdf', 'workspace-relative', 'downloads/report.pdf'],
++  ['workspace-root-relative generated path', '/downloads/report.pdf', 'workspace-root-relative', 'downloads/report.pdf'],
++  ['workspace-absolute generated path', path.join(workspaceReal, 'downloads', 'report.pdf'), 'workspace-absolute', 'downloads/report.pdf'],
++  ['dot segment that stays inside', './downloads/report.pdf', 'workspace-relative', 'downloads/report.pdf'],
++  ['absolute dot-dot that normalizes back inside', `${workspaceReal}/downloads/../downloads/report.pdf`, 'workspace-absolute', 'downloads/report.pdf'],
++]
++
++const lines = []
++let passed = 0
++let total = 0
++
++function check(label, condition, detail) {
++  total += 1
++  if (condition) passed += 1
++  lines.push(`${condition ? 'PASS' : 'FAIL'}  ${label}  ${detail}`)
++  assert.ok(condition, `${label} -> ${detail}`)
++}
++
++try {
++  lines.push(`workspaceReal = ${workspaceReal}`)
++  lines.push('')
++  lines.push('unsafe requests (must be rejected):')
++  for (const [label, request, expected] of UNSAFE_CASES) {
++    const result = decide(request)
++    check(
++      `reject: ${label}`,
++      result.decision === expected,
++      `request=${JSON.stringify(request)} decision=${result.decision} (expected ${expected}) candidate=${result.candidatePath}`,
++    )
++  }
++
++  lines.push('')
++  lines.push('valid generated paths (must stay strictly inside the root):')
++  for (const [label, request, expectedMode, expectedRelative] of VALID_CASES) {
++    const result = decide(request)
++    const strictlyInside = result.decision === 'accepted'
++      && result.relativePath === expectedRelative
++      && realpathOrNull(result.candidatePath).startsWith(`${workspaceReal}${path.sep}`)
++    check(
++      `accept: ${label}`,
++      result.decision === 'accepted' && result.pathMode === expectedMode && strictlyInside,
++      `request=${JSON.stringify(request)} decision=${result.decision} pathMode=${result.pathMode} relative=${result.relativePath} candidate=${result.candidatePath}`,
++    )
++  }
++
++  lines.push('')
++  lines.push('resolver normalization properties:')
++  const traversalInside = resolveGeneratedFileCandidatePath(workspaceReal, '../../outside/secret.txt')
++  check(
++    'resolver does not reject or clamp traversal (it is a normalizer, the caller contains)',
++    traversalInside.candidatePath === `${workspaceReal}/../../outside/secret.txt` && traversalInside.pathMode === 'workspace-relative',
++    `candidate=${traversalInside.candidatePath} pathMode=${traversalInside.pathMode}`,
++  )
++  const encoded = resolveGeneratedFileCandidatePath(workspaceReal, 'downloads\\report.pdf')
++  check(
++    'encoded separators are rewritten to "/" before classification',
++    encoded.candidatePath === `${workspaceReal}/downloads/report.pdf` && encoded.pathMode === 'workspace-relative',
++    `candidate=${encoded.candidatePath} pathMode=${encoded.pathMode}`,
++  )
++  const trailingSlash = resolveGeneratedFileCandidatePath(`${workspaceReal}/`, 'downloads/report.pdf')
++  check(
++    'trailing slashes on the workspace root are stripped',
++    trailingSlash.candidatePath === `${workspaceReal}/downloads/report.pdf`,
++    `candidate=${trailingSlash.candidatePath}`,
++  )
++
++  lines.push('')
++  lines.push('request-shape gate:')
++  check('null byte in the request is rejected before resolution', !passesRequestShapeGate('agent:a:main', 'a', 'downloads/report.pdf\u0000.txt'), 'path with NUL char -> invalid request')
++  check('null byte free request passes the shape gate', passesRequestShapeGate('agent:a:main', 'a', 'downloads/report.pdf'), 'valid request shape')
++
++  console.log(lines.join('\n'))
++  console.log(`\nCONTRACT FIXTURE PASSED: ${passed}/${total} checks`)
++} finally {
++  rmSync(tmpRoot, { recursive: true, force: true })
++  assert.ok(!existsSync(tmpRoot), 'fixture scratch tree was cleaned up')
++}
+snapshot .prale-eval/contract-deliverable.md - 6f13d15e5155523945d4832f3cb73c64eb9d2899d55e99e083371b8bcbd636a7
+snapshot .prale-eval/result.json - 7f6f518e8020f89c48202cd3f77683a66073b52d04f8e8d8e4107deab1ff5fbc
+snapshot server/utils/generated-file-path.test.js b085e5dc0293342acc29cda2e5a47f8d0045cffd1ccf9a689a77eec3444255d0 c125bdaec02be280fbcc7d9360ea951b648a5e191866d91e2e429c5bfb469aee
+snapshot server/utils/generated-file-path.traversal-fixture.mjs - 5abbdf52eaddb507e1a1237741792d2f0f726c27e929c70a0baa74d633fc753f

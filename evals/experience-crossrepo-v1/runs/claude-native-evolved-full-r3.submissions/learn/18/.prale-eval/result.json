@@ -1,0 +1,62 @@
+{
+  "task_id": 18,
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "enqueue",
+      "start_line": 15,
+      "end_line": 20,
+      "observation": "Public queue entry point: each call wraps the caller's transformFn/label/method into a Promise and pushes { transformFn, label, method, resolve, reject } onto this._queue, then calls this._process(). Every caller therefore receives a promise that settles only when its own slot is drained, which is the basis for ordered (FIFO) updates."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_process",
+      "start_line": 24,
+      "end_line": 37,
+      "observation": "Serialization primitive. The this._running boolean guard makes a second concurrent invocation return immediately, so exactly one drain loop is active; the while loop shifts items one at a time and resolves/rejects each item before taking the next. Because shift() is FIFO and _execute is awaited, updates execute in enqueue order and later transforms observe the previous write's committed state."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_execute",
+      "start_line": 60,
+      "end_line": 99,
+      "observation": "Core per-item pipeline: fresh config.get, transformFn(sourceConfig), null => resolve(null) with no mutation, then _waitForSlot(), config.patch/config.set with baseHash, _recordPatch(), a second config.get and config.apply. The catch block classifies errors: only messages containing 'config changed since last load' (OCC) or 'rate limit' are retried up to maxRetries=3; every other error is a rejected configuration action and is returned as { ok: false, error } so _process rejects that item's promise without disturbing the queue."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_waitForSlot",
+      "start_line": 46,
+      "end_line": 58,
+      "observation": "Sliding-window rate limiter plus its timestamp recorder. _waitForSlot (46-54) trims timestamps older than _WINDOW_MS via _cleanWindow and, when the window already holds _MAX_PATCHES (3) entries, sleeps until the oldest slides out plus a 200ms margin; _recordPatch (56-58) appends the timestamp only after a successful config.patch/config.set. A rejected action never reaches _recordPatch, so it does not consume rate-limit budget."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "configQueueExecute",
+      "start_line": 104,
+      "end_line": 106,
+      "observation": "The single exported API. It forwards (transformFn, label, method) to the module-level ConfigQueue singleton instance created at line 102, meaning all callers across the server share one serialized queue and one rate-limit window."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Ordered updates: configQueueExecute/enqueue store each configuration update on a single FIFO queue, and the _running guard in _process guarantees only one item executes at a time, so updates commit in enqueue order and each transformFn receives the previous update's committed config.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "One rejected configuration action: when the Gateway rejects a config.patch/config.set with an error that is neither an OCC conflict ('config changed since last load') nor a rate limit ('rate limit'), _execute's catch block returns { ok: false, error } instead of retrying, so _process rejects only that enqueued promise, records no patch timestamp, and continues draining later items in order.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "Each executed update follows the fixed sequence config.get -> config.patch|config.set (with baseHash) -> config.get -> config.apply, and _recordPatch is invoked only after a successful mutation, so a rejected action leaves both the persisted config and the rate-limit window unchanged.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    }
+  ],
+  "conclusion": "server/core/config-queue.js is a single global serialization point for Gateway config mutations. Its exported configQueueExecute() funnels every update through ConfigQueue.enqueue(); the _running guard plus the FIFO while-shift loop in _process() deliver ordered updates where each transform observes the previous commit. _execute() runs a get -> patch/set -> get -> apply pipeline and distinguishes retryable transient faults (OCC conflict, rate limit, retried up to 3 times) from terminal failures: any other Gateway error becomes { ok:false, error }, rejecting only that caller's promise while the queue keeps draining. The executable demo in .prale-eval/config-queue.demo.mjs exercises both behaviors against the real module code and exits 0 with CONTRACT OK.",
+  "validation": {
+    "command": "node .prale-eval/config-queue.demo.mjs",
+    "status": "passed",
+    "notes": "Ran in Node v24.14.0 inside the workspace; exit code 0, assertion output 'CONTRACT OK'. The demo imports the real server/core/config-queue.js and redirects its './gateway-client.js' import to an in-memory Gateway stub using node:module registerHooks, so no network or npm dependencies are needed. Verified: (1) three successful updates execute in strict FIFO order with the config.get/patch/get/apply frame sequence, and the final committed config contains alpha=1,beta=2,delta=4; (2) the 'update-gamma' action rejected with 'mutation rejected by gateway policy' rejects only its own promise, is never committed, and the following 'update-delta' update still resolves. Limitation: node_modules is absent in this checkout, so the repository's vitest-based suites (npm run test:server) could not be executed; the dependency-free demo was used as the focused validation instead."
+  }
+}

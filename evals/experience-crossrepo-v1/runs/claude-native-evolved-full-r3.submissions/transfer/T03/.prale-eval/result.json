@@ -1,0 +1,68 @@
+{
+  "task_id": "T03",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "slugify",
+      "start_line": 30,
+      "end_line": 64,
+      "observation": "String normalization is deterministic: it trims, scans char-by-char into CJK vs Latin/digit tokens, lower-cases Latin runs, preserves CJK verbatim, treats every other char as a segment boundary, then joins with '-' and collapses/trims hyphens. Pure function of its input, so duplicate headings written as case/whitespace/punctuation variants collapse to one slug (the dedup key). In the demo, 'Redis 主从复制', 'redis 主从复制', 'Redis  主从复制!', 'Redis-主从复制' and '  Redis 主从复制  ' all produce 'redis-主从复制'."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "dirForType",
+      "start_line": 84,
+      "end_line": 87,
+      "observation": "Metadata-driven directory resolution handles invalid/unknown type explicitly: the key is trimmed and lower-cased, looked up in TYPE_DIR (lines 72-81), and unknown or empty types fall through to an explicit non-empty fallback ('other') rather than throwing or producing an empty path segment. Proven in the demo: dirForType('') -> 'other' and dirForType('ENTITY') -> 'entities'."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts",
+      "symbol": "pageRelPath",
+      "start_line": 94,
+      "end_line": 98,
+      "observation": "Composes slugify(title) with dirForType(type) into the stable wiki-relative path 'wiki/<dir>/<slug>.md'. This is the dedup key an ingest hits on re-ingest: identical headings yield the identical path, so a second ingest merges instead of creating a new page. Because the directory is a function of type, invalid metadata that defaults type to 'other' explicitly redirects the same heading to 'wiki/other/...'."
+    },
+    {
+      "path": "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+      "symbol": "parseFrontmatter",
+      "start_line": 42,
+      "end_line": 62,
+      "observation": "Supporting evidence for the malformed-frontmatter half of the contract. Parsing is tolerant by construction: a missing '---' block returns { type: 'other', hasFrontmatter: false }; a YAML parse failure is caught and returns the same sentinel with hasFrontmatter:false (lines 51-58); a non-object or a non-string/blank 'type' is coerced to the sentinel 'other' (line 60). It never throws, which is what lets the demo normalize every malformed corpus page to an explicit wiki/other/ path."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Heading normalization in slug.ts is deterministic: slugify is a pure function, so repeated and order-independent runs over the adversarial corpus produce a byte-identical manifest (sha256 0c2b79e65d209a41a409e96d872e7e67b6eb41a7563e7305c848710db555808c, identical across three separate node processes).",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts"
+      ]
+    },
+    {
+      "claim": "Duplicate headings collapse to one identity: five surface forms of 'Redis 主从复制' and two of 'Kafka Consumer Lag' normalize to single slugs ('redis-主从复制', 'kafka-consumer-lag'); the four group-A members carrying valid 'type: entity' metadata also resolve to one path 'wiki/entities/redis-主从复制.md', so a re-ingest merges rather than duplicates.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts"
+      ]
+    },
+    {
+      "claim": "Invalid type metadata is handled explicitly rather than by throwing: dirForType maps the empty/unknown type to the explicit 'other' directory, and pageRelPath therefore returns 'wiki/other/<slug>.md' for it, while a well-formed but unseen type ('playbook') is preserved rather than falsely defaulted.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts"
+      ]
+    },
+    {
+      "claim": "Malformed or missing frontmatter is handled explicitly and non-fatally: parseFrontmatter returns the sentinel type 'other' with hasFrontmatter:false for missing/unparseable blocks and coerces non-string or blank 'type' to 'other', which downstream pageRelPath/dirForType turn into the explicit wiki/other/ path for all five malformed corpus pages.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/frontmatter.ts",
+        "MemoryKnowledge/src/engines/wiki/ingest-v2/slug.ts"
+      ]
+    }
+  ],
+  "conclusion": "The ingest normalization contract holds on an adversarial corpus of duplicate headings and malformed frontmatter. Executing the repository's real slug.ts (and frontmatter.ts via a labelled yaml test double, since the dependency is not installed) shows normalization is deterministic (stable sha256 manifest across repeated, reordered, and independent-process runs) and that invalid metadata is handled explicitly: malformed/missing frontmatter resolves to the sentinel type 'other' and the explicit wiki/other/ directory without any exception, while duplicate headings collapse onto one slug/one page path. The contract demo exits 0 with checks PASS. Limitation: vitest/tsx and the 'yaml' package are absent from this offline environment, so validation uses Node's built-in TS type-stripping plus a documented, strict yaml test double; repository sources were not modified.",
+  "validation": {
+    "command": "node --import ./.prale-eval/demo/register.mjs ./.prale-eval/demo/normalize-contract.mjs",
+    "status": "pass",
+    "notes": "Exit code 0; 11/11 checks PASS; manifestDigest 0c2b79e65d209a41a409e96d872e7e67b6eb41a7563e7305c848710db555808c reproduced identically in 3 independent node processes. Demo artifacts live under .prale-eval/demo/ (corpus.mjs, normalize-contract.mjs, yaml-shim.mjs, hooks.mjs, register.mjs). LIMITATION: node_modules is absent and dependencies must not be installed, so vitest/tsx could not be used and the third-party 'yaml' package that frontmatter.ts imports is unavailable; a Node module-resolution hook maps that specifier to a small, clearly-labelled strict test double so the real frontmatter.ts code paths execute. The double throws on malformed YAML, exercising the repository's real try/catch fallback (frontmatter.ts:51-58); it is demo scaffolding and is never imported by repository code. slug.ts requires no shim and ran against the real module. No task metadata, oracle files, lockfiles, or git configuration were modified."
+  }
+}

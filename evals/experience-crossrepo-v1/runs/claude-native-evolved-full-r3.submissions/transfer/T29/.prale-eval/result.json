@@ -1,0 +1,72 @@
+{
+  "task_id": "T29",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 15,
+      "observation": "Pure path builder for the generated-file download route. It trims trailing slashes from the workspace realpath (line 2), converts backslashes in the requested path to forward slashes (line 3), and classifies the request as 'workspace-absolute' when the request already equals the workspace or begins with workspace + '/' (lines 4-9). Otherwise it anchors the request under the workspace after stripping leading slashes (lines 11-14). The function performs no rejection itself: traversal such as '../etc/passwd', its backslash variant, or a workspace-absolute path that later folds out via '..' is returned verbatim as a candidatePath, so safety depends on the downstream containment guard."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "createFileRoutes",
+      "start_line": 72,
+      "end_line": 173,
+      "observation": "The /api/chat/generated-file handler that consumes resolveGeneratedFileCandidatePath. It rejects null bytes and empty input up front (line 89), resolves the candidate with `realpath -e` (line 124), then enforces containment at lines 134-139: posix.relative(workspaceReal, targetReal) plus the escapedWorkspace predicate (!relativePath || === '..' || startsWith('../') || isAbsolute) returns 403 File access denied. Because realpath resolves `..` and symlinks before the relative check, traversal and root-escapes are rejected here rather than in the resolver. Note the route never calls decodeURIComponent, so percent-encoded separators arrive as literal segments."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "isGeneratedFilePathAllowed",
+      "start_line": 39,
+      "end_line": 45,
+      "observation": "Secondary denial layer applied only after the containment check passes: rejects any path containing a .git or .openclaw segment (line 41), a .env / .env.* basename (line 43), and a fixed set of sensitive workspace filenames such as agents.md, soul.md and workspace-state.json (line 44). This shows the generated-file contract is defense in depth: containment first, then name/segment allow-listing on the workspace-relative path."
+    },
+    {
+      "path": "server/utils/index.js",
+      "symbol": "safePath",
+      "start_line": 174,
+      "end_line": 187,
+      "observation": "The equivalent containment primitive used by the write-oriented file routes (/api/files/set, mkdir, upload). It replaces backslashes, strips leading slashes, resolves against the workspace base (lines 177-179), and returns null when path.relative reports '..' or a '..' segment (lines 180-186). Contrasting it with the generated-file guard is useful because /api/files/get (files.js lines 293-297) explicitly double-decodes URI input before calling these routes, so the encoded-separator surface is neutralized by the guard rather than by the resolver."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "resolveGeneratedFileCandidatePath is a pure path builder, not a validator: it only normalizes separators and anchors root-relative/workspace-absolute requests onto the workspace, returning every input (including traversal payloads) as a candidate path.",
+      "evidence_paths": ["server/utils/generated-file-path.js"]
+    },
+    {
+      "claim": "Unsafe paths are rejected downstream by the posix.relative containment guard in the generated-file handler, and only after that by the isGeneratedFilePathAllowed name/segment allow-list, so traversal never reaches a file read.",
+      "evidence_paths": [
+        "server/handlers/files.js",
+        "server/utils/generated-file-path.js"
+      ]
+    },
+    {
+      "claim": "Valid generated paths in all three modes (workspace-relative, workspace-root-relative, workspace-absolute) remain inside the intended workspace root, and a workspace string prefix that is not a path boundary (e.g. '<workspace>-evil/') cannot be confused for a workspace-absolute path.",
+      "evidence_paths": ["server/utils/generated-file-path.js"]
+    },
+    {
+      "claim": "Percent-encoded separators (%2e%2e%2f, %2f, %5c, double-encoded) are not decoded by the resolver, so they remain a single literal path segment that stays under the workspace root; a payload that a single URI decode would turn into '../../etc/passwd' is rejected by the containment guard, so the encoded form cannot escape either.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js"
+      ]
+    },
+    {
+      "claim": "The sibling write-oriented routes double-decode request paths but then rely on the same relative-based escape check in safePath, which returns null for any resolved target outside the workspace base.",
+      "evidence_paths": [
+        "server/utils/index.js",
+        "server/handlers/files.js"
+      ]
+    }
+  ],
+  "conclusion": "The traversal/encoded-separator contract holds. The new fixture server/utils/generated-file-path.traversal.test.js exercises resolveGeneratedFileCandidatePath together with a faithful model of the handler containment guard and passes all 8 cases: valid relative, root-relative and workspace-absolute generated paths stay inside the intended root; '.', '..' and backslash traversal in every position, an over-deep '../../..' payload, a workspace-absolute path that folds out via '..', and the workspace root itself are all rejected by the escapedWorkspace predicate; a sibling directory sharing the workspace as a string prefix is not misclassified as workspace-absolute; and percent-encoded or double-encoded separators are never decoded by the resolver, so they remain a single literal segment inside the root (while the once-decoded traversal form is rejected by the guard). No rejection logic was added because the resolver is intentionally a pure builder and the existing handler already enforces containment; the fixture pins that split contract.",
+  "validation": {
+    "command": "node --test server/utils/generated-file-path.traversal.test.js",
+    "status": "pass",
+    "notes": "Node v24.14.0 built-in test runner executed the new fixture: 8 tests, 8 pass, 0 fail (duration ~63ms). The repository's configured runner is vitest, but node_modules is not installed and dependency installation is out of scope for this task, so the fixture was written against node:test + node:assert/strict to remain directly executable without adding dependencies; the pre-existing server/utils/generated-file-path.test.js (vitest) was left unmodified and could not be executed for the same reason. The vitest-style assertions and semantics are equivalent, so running it under vitest once dependencies are installed should produce the same result."
+  }
+}

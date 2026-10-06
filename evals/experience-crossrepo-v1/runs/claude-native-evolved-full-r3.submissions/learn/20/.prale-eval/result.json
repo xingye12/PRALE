@@ -1,0 +1,104 @@
+{
+  "task_id": 20,
+  "repository": "wattclaw",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 15,
+      "observation": "Pure resolver that returns { candidatePath, pathMode } and performs NO validation or rejection. It strips trailing slashes from workspaceReal (line 2), converts backslashes in the request to forward slashes (line 3), and if the request is the workspace itself or starts with `${workspace}/` it returns it unchanged as pathMode 'workspace-absolute' (lines 4-9). Otherwise it prefixes the workspace after stripping leading slashes (line 12) and labels the result 'workspace-root-relative' when the request began with '/', else 'workspace-relative' (line 13). Crucially it does not collapse '..' segments, so candidatePath is not canonical and may point outside the workspace; containment is decided later by the caller."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "sanitizeFilename",
+      "start_line": 19,
+      "end_line": 27,
+      "observation": "Attachment-name sanitizer. It trims the name, returns '' for empty input, replaces every run of characters outside Unicode letters/numbers/dot/hyphen/underscore with '_', collapses repeated underscores, strips leading/trailing underscores, and truncates to 60 chars. Because '/' and '\\' are not in the allowed set they are replaced with '_', so a path-traversal payload like '../../etc/pass wd?.pdf' cannot survive as a directory separator; dots are retained, yielding '.._.._etc_pass_wd_.pdf'."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "buildRemoteFileName",
+      "start_line": 36,
+      "end_line": 43,
+      "observation": "Builds Gateway's collision-resistant attachment name as '{sanitized-name}---{uuid8}{ext}'. It lowercases the extension (line 37), separates the base name (line 38), falls back to 'file' when sanitization empties the base (line 39), takes the first 8 hex chars of a random UUID (line 40), and returns { fileName, baseName, ext }. Observed: buildRemoteFileName('report.pdf') -> fileName 'report---<8hex>.pdf', baseName 'report', ext '.pdf'."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "uploadToGateway",
+      "start_line": 54,
+      "end_line": 63,
+      "observation": "Materializes an attachment on the local filesystem (the module is local-filesystem-only). It resolves the media directory from GATEWAY_CONFIG_DIR with default '<configDir>/media/inbound' (lines 55-57), accepts a targetDir override, derives the remote file name via buildRemoteFileName (line 58), joins the path (line 59), creates the directory recursively (line 60), writes the buffer (line 61), and returns { path, fileName, originalName, size }. Observed with a controlled fixture: uploading a 27-byte buffer wrote '<mediaDir>/report---<8hex>.pdf' and the canonical path stayed inside the media directory."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "deleteRemoteFile",
+      "start_line": 71,
+      "end_line": 79,
+      "observation": "Deletes an attachment by absolute path and is idempotent: it returns true on a successful unlink and also true when the target is already gone (ENOENT, line 76), and false for any other error. Observed: deleting the just-uploaded fixture file returned true, and deleting a non-existent path also returned true."
+    },
+    {
+      "path": "server/gateway-file-transfer.js",
+      "symbol": "writeRemoteFile",
+      "start_line": 88,
+      "end_line": 97,
+      "observation": "Writes UTF-8 text to an absolute attachment path, creating the parent directory recursively first (lines 90-91), and returns true on success or false on any failure instead of throwing (lines 92-95). Observed: writing inside the fixture media directory returned true."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "isGeneratedFilePathAllowed",
+      "start_line": 39,
+      "end_line": 45,
+      "observation": "Denied-name policy applied to the workspace-relative path after canonicalization. It lowercases path segments and rejects any path containing a denied segment (.git, .openclaw), rejects the exact name '.env' or any '.env.*', and rejects the protected generated-file names (AGENTS.md, SOUL.md, USER.md, IDENTITY.md, TOOLS.md, BOOTSTRAP.md, MEMORY.md, workspace-state.json, openclaw-workspace-state.json). Observed: '.env' and 'agents.md' both produced HTTP 403 'File access denied'."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "createFileRoutes",
+      "start_line": 134,
+      "end_line": 139,
+      "observation": "The authoritative containment guard for GET /api/chat/generated-file. After `realpath -e` resolves the candidate (line 124), it computes posix.relative(workspaceReal, targetReal) and rejects when the relative path is empty (target is the workspace itself), is '..', starts with '../', or is absolute; combined with the denied-name check it returns HTTP 403 'File access denied' (line 138). This is the rejection step the pure resolver omits. Observed: '../secret.txt', the backslash form '..\\secret.txt', and a symlink 'escape-link' that canonicalizes outside the workspace were all rejected 403 with relativePath '../secret.txt'."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "createFileRoutes",
+      "start_line": 89,
+      "end_line": 92,
+      "observation": "Pre-resolution request validation: the request is rejected with HTTP 400 'Invalid generated file request' when sessionKey, agentId, or the requested path is missing/empty, or when the path contains a NUL byte. Observed: a path containing '\\u0000' and the empty path were both rejected 400 before any path resolution occurred."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "resolveGeneratedFileCandidatePath is a pure, non-validating path builder: it classifies input into exactly three modes (workspace-absolute, workspace-root-relative, workspace-relative) and normalizes backslashes and leading slashes, but it never collapses '..' segments and never rejects input, so its candidatePath is a non-canonical candidate that may point outside the workspace.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js"
+      ]
+    },
+    {
+      "claim": "For unsafe traversal input the canonical path is what determines the verdict: '../secret.txt' and its backslash equivalent resolve to a candidate outside the workspace, canonicalization yields relativePath '../secret.txt', and the route rejects with HTTP 403 'File access denied'. A symlink inside the workspace that points outside is rejected identically, which is why the guard uses realpath containment rather than a textual prefix test.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js"
+      ]
+    },
+    {
+      "claim": "Two distinct rejection classes exist for unsafe input: (1) escaping the workspace after canonicalization, and (2) remaining inside the workspace but matching the denied-segment/denied-name policy. Safe input ('downloads/report.pdf', '/downloads/report.pdf', and the already-absolute in-workspace path) is allowed and canonicalizes to the same path under the workspace root.",
+      "evidence_paths": [
+        "server/handlers/files.js",
+        "server/utils/generated-file-path.js"
+      ]
+    },
+    {
+      "claim": "The attachment utilities operate on the local filesystem: sanitizeFilename removes path separators so an uploaded name cannot introduce directories, buildRemoteFileName produces a unique '{sanitized}---{uuid8}{ext}' name, uploadToGateway writes it under the resolved media directory, and deleteRemoteFile is idempotent for missing files.",
+      "evidence_paths": [
+        "server/gateway-file-transfer.js"
+      ]
+    }
+  ],
+  "conclusion": "Operating resolveGeneratedFileCandidatePath on the controlled fixture confirms it is a pure candidate-path builder, not a security boundary: it returns { candidatePath, pathMode } in one of three modes and performs no rejection. The canonical path is established downstream by realpath plus posix.relative containment in server/handlers/files.js. Safe requests resolve to the same canonical file under the workspace root (e.g. 'downloads/report.pdf' -> '<workspace>/downloads/report.pdf', allowed). Unsafe input is rejected in two classes: workspace escape ('../secret.txt', '..\\secret.txt', and the symlink 'escape-link' all canonicalize to '../secret.txt') -> HTTP 403 'File access denied (canonical path escapes workspace)'; and denied names inside the workspace ('.env', 'agents.md') -> HTTP 403 'File access denied (denied segment or name)'. Malformed requests (NUL byte or empty path) are rejected earlier with HTTP 400 'Invalid generated file request'. The attachment utilities are complementary and safe at the name layer: sanitizeFilename strips '/' and '\\' so '../../etc/pass wd?.pdf' becomes '.._.._etc_pass_wd_.pdf' (dots preserved but harmless without separators), and uploadToGateway wrote a unique 'report---<8hex>.pdf' inside the fixture media directory. No repository source was modified; only artifacts under .prale-eval/ were created.",
+  "validation": {
+    "command": "node .prale-eval/demo/generated-file-path-demo.mjs",
+    "status": "passed",
+    "notes": "Exit code 0. The demo imports the real exported symbols resolveGeneratedFileCandidatePath (server/utils/generated-file-path.js) and sanitizeFilename/buildRemoteFileName/uploadToGateway/deleteRemoteFile/writeRemoteFile (server/gateway-file-transfer.js) and runs 11 controlled cases plus the attachment operations, printing the canonical path and rejection reason for each. The repository's own vitest suite could not be executed because node_modules is absent (no vitest binary) and dependency installation is out of scope; server/utils/generated-file-path.test.js therefore could not be run. The repo has no linter configured. The rejection policy enforced by the demo mirrors the module-private guard in server/handlers/files.js (denied segment/name set lines 25-45; workspace-containment check lines 134-139; request validation lines 89-92), since those helpers are not exported. Raw output is saved at .prale-eval/demo/demo-output.json."
+  }
+}

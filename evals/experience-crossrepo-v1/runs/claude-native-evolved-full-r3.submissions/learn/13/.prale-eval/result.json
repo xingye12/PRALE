@@ -1,0 +1,98 @@
+{
+  "task_id": 13,
+  "repository": "tdam",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.enqueue",
+      "start_line": 15,
+      "end_line": 24,
+      "observation": "enqueue() owns a per-key Map<string, SerialQueue> (declared line 12) and lazily creates one SerialQueue per asset key. Every call appends the job to that key's queue via `void q.add(job).catch(() => {})`, so execution is fire-and-forget: the returned promise is deliberately discarded and any rejection is swallowed because the job (runBuild) is responsible for persisting its own failed status. Ordering guarantee is per-key FIFO and concurrency=1; different keys get independent queues and therefore run concurrently. There is no dedupe or coalescing here — two enqueue() calls for the same key enqueue two separate jobs that both run, so idempotency must be enforced by the job itself (the runBuild entry checkpoint / cgService.sync busy rejection)."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/build-queue.ts",
+      "symbol": "BuildQueue.onIdle",
+      "start_line": 27,
+      "end_line": 33,
+      "observation": "onIdle(key?) is the drain/join point for the queue set: with a key it awaits that key's SerialQueue.onIdle() (optional-chained, so an unknown key resolves immediately as a no-op); without a key it awaits Promise.all over every queue currently in the Map. This is the ownership hand-off used by the services' own onIdle() (wiki-service.ts:1131, code-graph-service.ts:395) for tests and graceful shutdown, and it is the only place a caller can observe completion of a fire-and-forget build. Queues are never removed from the Map, so the set only grows per distinct key."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue.drain",
+      "start_line": 81,
+      "end_line": 101,
+      "observation": "drain() is the concurrency=1 executor. It returns early if running, paused, or empty, otherwise shifts exactly one entry (FIFO, line 84), sets running=true, and runs the task. On settle it resolves/rejects the entry's promise and in .finally() resets running and either resolves all idleResolvers (queue empty) or recursively drains the next entry. This structure is the ordering and retry/idempotency boundary: a task runs exactly once (no retry, no backoff), a failure of one task is isolated and does not stall subsequent tasks, and pause()/start() (56-63) suspend/resume the drain loop without dropping queued work. clear() (74-79) rejects only queued entries; an already-running task is not cancelled."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/serial-queue.ts",
+      "symbol": "SerialQueue.add",
+      "start_line": 45,
+      "end_line": 54,
+      "observation": "add<T>() pushes a {task, resolve, reject} entry onto the FIFO array and immediately calls drain(), returning the task's result promise to the caller. It performs no deduplication or keying, so SerialQueue itself guarantees only FIFO serialization; a duplicate submission is a second serialized execution. The matching onIdle() (65-72) resolves immediately when the queue is empty and not running, otherwise parks a resolver that drain() releases when the backlog empties. Together these are the primitives BuildQueue composes per asset key."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/auto-sync-scheduler.ts",
+      "symbol": "AutoSyncScheduler.scan",
+      "start_line": 197,
+      "end_line": 226,
+      "observation": "Auto-sync scheduling is a second, coarser queue owned by AutoSyncScheduler (not by BuildQueue). scan() is re-entrancy guarded by the `scanning` flag, lists status==='ready' rows via listSyncCandidates() (233-249), and dedupes against the inFlight Set (keyed by code_graph_id) before pushing onto its own FIFO array. This is the scheduler's idempotency point: a repo already queued or being processed is skipped, bounding the queue at the number of repos. Candidates are only 'ready' rows, so failed syncs are not retried by the scheduler — a retry requires an explicit cgService.sync(), which itself rejects with busy while pending/processing."
+    },
+    {
+      "path": "MemoryKnowledge/src/store/auto-sync-scheduler.ts",
+      "symbol": "AutoSyncScheduler.runWorker",
+      "start_line": 257,
+      "end_line": 278,
+      "observation": "runWorker() is the consumer half of the scheduler queue: a resident worker loops while !stopped, shifts one row FIFO, sleeps WORKER_IDLE_POLL_MS (100ms) when empty, increments activeSyncs, and always removes the row's id from inFlight in .finally() so the same repo can be re-enqueued on a later scan. Exceptions from syncOne are swallowed (syncOne itself catches), so one repo's failure cannot kill a worker or block others. Concurrency is bounded by maxConcurrentSyncs workers created in start() (134-137); this layer orders across repos, while the per-asset serialization of an actual build still belongs to the shared BuildQueue underneath."
+    },
+    {
+      "path": "MemoryKnowledge/src/module.ts",
+      "symbol": "sharedQueue",
+      "start_line": 210,
+      "end_line": 224,
+      "observation": "Ownership of the build queue is the composition root: module.ts constructs one `sharedQueue = new BuildQueue()` (line 210) and injects it as opts.queue into both WikiService (line 215) and CodeGraphService (line 223). Both services fall back to a private `new BuildQueue()` when no queue is injected (wiki-service.ts:228, code-graph-service.ts:117). Sharing one queue means wiki keys and code-graph keys live in the same Map but are distinct id spaces, so same-asset builds serialize while wiki and code-graph builds may proceed concurrently across different keys."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "BuildQueue owns ordering by delegating each asset key to its own SerialQueue: BuildQueue.enqueue lazily creates a per-key SerialQueue and appends fire-and-forget, so same-key jobs execute strictly FIFO with concurrency=1 while different keys run independently and concurrently.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    },
+    {
+      "claim": "There is no retry or backoff anywhere in the queue pair: SerialQueue.drain runs each task exactly once and, because the next drain happens in .finally(), one task's failure is isolated and never stalls the remaining backlog; BuildQueue.enqueue discards the returned promise and swallows rejections (delegating failure persistence to the job), so a failed build is simply dropped rather than re-queued.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/build-queue.ts",
+        "MemoryKnowledge/src/store/serial-queue.ts"
+      ]
+    },
+    {
+      "claim": "Idempotency is not provided by SerialQueue or BuildQueue — both append without dedupe — and is instead enforced by callers: CodeGraphService.runBuild and WikiService.runBuild take a deleted-state checkpoint at entry and after processing, CodeGraphService.sync rejects with busy while status is pending/processing, and delete/cleanup paths (cleanupResources, rmSync force, hard-delete) are idempotent.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/serial-queue.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    },
+    {
+      "claim": "Auto-sync scheduling is a separate FIFO-and-worker-pool layer: AutoSyncScheduler.scan dedupes candidates with an inFlight Set and only selects status==='ready' rows, while runWorker consumers shift FIFO and clear inFlight in finally, so enqueue/processing is deduped and bounded but failed repos are not automatically retried.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/store/auto-sync-scheduler.ts"
+      ]
+    },
+    {
+      "claim": "The build queue is shared by construction: module.ts creates a single BuildQueue and injects it into both WikiService and CodeGraphService, making the module composition root the owner of queue lifecycle (with each service exposing onIdle for shutdown), while the scheduler holds its own separate in-memory queue.",
+      "evidence_paths": [
+        "MemoryKnowledge/src/module.ts",
+        "MemoryKnowledge/src/store/build-queue.ts"
+      ]
+    }
+  ],
+  "conclusion": "Ownership: module.ts owns one shared BuildQueue injected into WikiService and CodeGraphService; BuildQueue owns a Map of per-asset SerialQueue instances; the build itself is a fire-and-forget runBuild job whose state machine (pending -> processing -> ready/failed) lives in the store. AutoSyncScheduler owns a second, independent scheduling queue (FIFO array + fixed worker pool) that periodically feeds cgService.sync(). Ordering: within a key, FIFO and strictly one-at-a-time (SerialQueue.drain shifts one entry and only re-drains on settle); across keys there is no ordering and builds run concurrently. The scheduler orders across repos FIFO with bounded concurrency (maxConcurrentSyncs), not per asset. Retry/idempotency: the queue pair deliberately provides neither retry nor dedupe — a task runs once, failures are swallowed/isolated, and duplicate enqueues both execute. Idempotency is pushed to the boundaries: runBuild's isDeleted checkpoints (cancelled marker or row already hard-deleted) make cancellation safe, cleanup is idempotent and repeatable, cgService.sync's busy/not_found rejection prevents overlapping rebuilds of the same asset, and the scheduler's inFlight Set plus ready-only candidate filter prevents duplicate queueing. Consequently, automatic recovery from a failed build is absent: failed rows leave the ready-only candidate set and require an explicit manual sync (happy path: the retry succeeds because status is no longer pending/processing and a new version is enqueued).",
+  "validation": {
+    "command": "grep -n \"enqueue(key\\|async onIdle\\|drain()\\|add<T>\\|class SerialQueue\\|this.queue.shift\\|inFlight.add\\|private async scan\\|private async runWorker\\|const sharedQueue\" MemoryKnowledge/src/store/build-queue.ts MemoryKnowledge/src/store/serial-queue.ts MemoryKnowledge/src/store/auto-sync-scheduler.ts MemoryKnowledge/src/module.ts",
+    "status": "passed",
+    "notes": "Static citation check only: the command confirms every cited symbol exists and that the start_line/end_line ranges reported in evidence are the real, current declarations in the working tree (build-queue.ts:15/27, serial-queue.ts:21/45/81, auto-sync-scheduler.ts:197/216/257/260, module.ts:210). No behavioral test or typecheck could be executed because the repository ships no test files and node_modules is absent (no tsc/vitest available), and dependency installation is out of scope for this task; this limitation is recorded here instead. Findings were derived by reading the full source of the cited files plus their consumers (code-graph-service.ts, wiki-service.ts, module.ts)."
+  }
+}

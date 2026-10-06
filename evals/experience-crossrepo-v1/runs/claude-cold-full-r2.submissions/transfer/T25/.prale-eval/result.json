@@ -1,0 +1,78 @@
+{
+  "task_id": "T25",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "syncUserSessionsFromGateway",
+      "start_line": 118,
+      "end_line": 177,
+      "observation": "The single apply path for a Gateway session update. For every scanned row it calls upsertSyncedUserSession (line 163) and increments the changed/inserted/updated counters only inside `if (result.changed)` (lines 164-168). A replayed identical update therefore returns changed:false and contributes zero to every counter, so a duplicate event cannot be counted twice; a distinct event still increments exactly once."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "normalizeGatewaySessionForSync",
+      "start_line": 59,
+      "end_line": 77,
+      "observation": "Deterministic field normalization (sessionKey, agentId, channel, peer, label, lastActivity) with stable fallbacks. Because the same raw Gateway row always normalizes to an identical object, a replay reaches the upsert with byte-identical fields, which is what lets the downstream change comparison conclude 'unchanged' instead of re-writing state."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "scheduleUserSessionSync",
+      "start_line": 179,
+      "end_line": 216,
+      "observation": "Second guard against duplicate events above the upsert layer: a per-user cooldown (line 190) and an in-flight promise map (lines 195-199, 214) that returns the existing promise for a concurrent replay. Two simultaneous replays of the same update therefore produce one Gateway call and one state change, not two."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "resetSessionSyncStateForTests",
+      "start_line": 218,
+      "end_line": 221,
+      "observation": "Clears the inFlightByUserId and lastSyncAtByUserId module maps so the duplicate-event fixture starts from a clean scheduler state and its coalescing assertion is not polluted by earlier runs."
+    },
+    {
+      "path": "server/user-manager.js",
+      "symbol": "upsertSyncedUserSession",
+      "start_line": 614,
+      "end_line": 689,
+      "observation": "The idempotency authority the contract rests on. On an existing row it computes `changed` by comparing agent/channel/peer/label/display_title/tenant/last_message_at (updated_at is deliberately excluded) and returns { changed: false, action: 'unchanged' } with no UPDATE when nothing differs; last_message_at uses Math.max so replaying an older or equal timestamp never advances state."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "updateSessionUsageForUser",
+      "start_line": 89,
+      "end_line": 117,
+      "observation": "Usage is written through _persistOwnerScopedUpdate as an absolute SET of token_*/msg_*/cost_total columns, not a read-modify-write increment, so re-applying the same usage payload is a no-op on the totals and cannot double-count. This is the usage-side half of the duplicate-event contract."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Replaying one identical Gateway session update cannot emit a duplicate state change: syncUserSessionsFromGateway only counts and persists when upsertSyncedUserSession reports result.changed, and the upsert reports changed:false for an identical row, so a replayed event yields changed=0 while a distinct event yields changed=1.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/user-manager.js"
+      ]
+    },
+    {
+      "claim": "Replaying one session update cannot double-count usage: usage columns are persisted as absolute values by the owner-scoped UPDATE, so applying the same update twice leaves token/msg/cost totals identical rather than summing them, and the sync counters (changed/inserted/updated) are likewise not re-incremented on replay.",
+      "evidence_paths": [
+        "server/core/session-usage-cache.js",
+        "server/core/session-sync.js"
+      ]
+    },
+    {
+      "claim": "Duplicate delivery is suppressed at two layers: deterministic normalization makes a replay field-identical, the upsert then rejects it as 'unchanged', and scheduleUserSessionSync additionally coalesces concurrent replays for the same user into a single in-flight sync via cooldown plus the inFlightByUserId promise map.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/user-manager.js"
+      ]
+    }
+  ],
+  "conclusion": "The duplicate-event contract holds. Executing the real server/core/session-sync.js against a distinct duplicate-event fixture (one Gateway session update delivered twice, plus a concurrent scheduled replay) produced exactly one state change and one usage application for the first delivery, zero for the verbatim replay, and still applied a genuinely newer update exactly once. The two independent guards (unchanged-detection in upsertSyncedUserSession and in-flight coalescing in scheduleUserSessionSync) mean a replayed event can neither double-count usage nor emit a duplicate state change. A negative control with dedup disabled makes the fixture fail, confirming the assertions have teeth.",
+  "validation": {
+    "command": "node .prale-eval/fixtures/duplicate-event/run.mjs",
+    "status": "pass",
+    "notes": "Ran on Node v24.14.0 with no installed dependencies: the fixture loads the unmodified server/core/session-sync.js through a small node:module resolve hook that swaps only its single '../user-manager.js' import for an in-memory stub mirroring upsertSyncedUserSession semantics. All 5 checks pass and the process exits 0. Negative control `DUPLICATE_FIXTURE_DISABLE_DEDUP=1 node .prale-eval/fixtures/duplicate-event/run.mjs` exits 1 with 'replayed update emits no duplicate state change' failing (1 !== 0). vitest is not installed in this workspace, so the repository's own vitest suite was not run; this fixture uses only Node built-ins."
+  }
+}

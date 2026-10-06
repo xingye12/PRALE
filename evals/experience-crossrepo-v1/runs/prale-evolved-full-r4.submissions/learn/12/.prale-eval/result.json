@@ -1,0 +1,87 @@
+{
+  "task_id": 12,
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "V3HttpTransport",
+      "start_line": 8,
+      "end_line": 122,
+      "observation": "The strict v3 HTTP transport. Its private request() decodes the response body as ApiResponseEnvelope<T> and is the single place where an HTTP/business error is turned into a TDAMError. A malformed error envelope (wrong `code` type, missing `message`, primitive `data`) must still be normalized here rather than crash."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "request",
+      "start_line": 58,
+      "end_line": 121,
+      "observation": "request() computes `businessCode = typeof envelope.code === \"number\" ? envelope.code : undefined`; when the response is not ok or the business code is unusable it throws TDAMError with `code` falling back to the HTTP status (`businessCode && businessCode !== 0 ? businessCode : response.status`), `message` falling back to `HTTP <status>`, and `details` only when `envelope.data` is an object. Non-numeric `code`, null `message` and primitive `data` therefore collapse to a deterministic HTTP-status error."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/errors.ts",
+      "symbol": "TDAMError",
+      "start_line": 12,
+      "end_line": 33,
+      "observation": "TDAMError is the normalized error surface for the v3 path: it carries numeric `code`, `requestId` and optional `details`, and renders its message as `[<code>] <message> (request_id=<id>)`. This is the exact type and message shape the malformed-envelope fixture pins."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/errors.ts",
+      "symbol": "ParamError",
+      "start_line": 5,
+      "end_line": 10,
+      "observation": "ParamError is the client-side TypeError thrown for invalid transport construction; it is distinct from TDAMError so that a malformed *server* error envelope is never confused with bad caller input."
+    },
+    {
+      "path": "sdk/memory-core/typescript/tests/fixtures/malformed-error-envelope.json",
+      "symbol": "expected_error",
+      "start_line": 19,
+      "end_line": 25,
+      "observation": "New fixture. It encodes an HTTP 503 JSON body `{\"code\":\"E_BACKEND_UNAVAILABLE\",\"message\":null,\"data\":\"upstream overloaded\"}` — off-spec in all three envelope fields — together with the exact TDAMError the transport must produce (code 503 from the HTTP status, message `HTTP 503`, requestId from x-qcloud-transaction-id, no details)."
+    },
+    {
+      "path": "sdk/memory-core/typescript/tests/run-malformed-envelope-demo.mjs",
+      "symbol": "V3HttpTransport",
+      "start_line": 48,
+      "end_line": 70,
+      "observation": "Dependency-free executable demo. It loads the real src/v3/http.ts through Node's type stripping (stubbing only the undici `Agent` import), feeds the fixture into a stubbed global `fetch`, and asserts the normalized TDAMError contract."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "V3HttpTransport.request() contract-normalizes a malformed error envelope instead of crashing: because `code` is not a number the business code is discarded, the thrown TDAMError.code falls back to the HTTP status (503) and its message falls back to `HTTP 503`, exactly as pinned by the new fixture.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts",
+        "sdk/memory-core/typescript/src/errors.ts",
+        "sdk/memory-core/typescript/tests/fixtures/malformed-error-envelope.json"
+      ]
+    },
+    {
+      "claim": "The request id surfaced on TDAMError comes from the x-qcloud-transaction-id / x-trace-id response header (with envelope.request_id only as a fallback), so the malformed envelope's expected request id is recovered from the header even though the body is unusable.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts",
+        "sdk/memory-core/typescript/src/errors.ts"
+      ]
+    },
+    {
+      "claim": "Server-provided `details` are preserved only when envelope.data is an object; a primitive data value is dropped, and errors.ts documents why optional details exist — so the malformed envelope yields `details === undefined`.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts",
+        "sdk/memory-core/typescript/src/errors.ts"
+      ]
+    },
+    {
+      "claim": "The fixture is executable, not merely descriptive: run-malformed-envelope-demo.mjs drives the real V3HttpTransport source with the fixture and asserts code/message/requestId/details, giving a runnable contract check in an environment without node_modules.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/tests/fixtures/malformed-error-envelope.json",
+        "sdk/memory-core/typescript/tests/run-malformed-envelope-demo.mjs",
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    }
+  ],
+  "conclusion": "The v3 SDK HTTP/error path is contracted around the exact normalization performed in `V3HttpTransport.request()` (sdk/memory-core/typescript/src/v3/http.ts): a response body that is not a well-formed ApiResponseEnvelope must never crash the transport — a non-numeric `code` is dropped so `TDAMError.code` falls back to the HTTP status, an empty `message` falls back to `HTTP <status>`, the request id is recovered from the x-qcloud-transaction-id/x-trace-id header, and `details` survive only when `data` is an object. The contract is pinned by a new fixture, tests/fixtures/malformed-error-envelope.json (HTTP 503, code `\"E_BACKEND_UNAVAILABLE\"`, message null, data a primitive string, expected TDAMError code 503 / message `[503] HTTP 503 (request_id=txn-malformed-0001)` / no details), plus a vitest contract test for CI and a dependency-free executable demo that loads the real source and asserts the same values. The demo passes in this checkout without installing vitest/undici.",
+  "validation": {
+    "command": "node sdk/memory-core/typescript/tests/run-malformed-envelope-demo.mjs && node .prale-eval/validate.mjs",
+    "status": "passed",
+    "notes": "The package declares `undici` (dependency) and `vitest` (devDependency), but no node_modules exists anywhere in the checkout and installing dependencies is forbidden, so `npx vitest run` is unavailable. Instead the focused validation runs two dependency-free Node scripts: (1) run-malformed-envelope-demo.mjs loads the real src/v3/http.ts via Node's type stripping (resolving the bare `undici` import to a stub `Agent` and mapping NodeNext `.js` specifiers to `.ts`), feeds the fixture into a stubbed global fetch, and asserts the resulting TDAMError (code 503, message `[503] HTTP 503 (request_id=txn-malformed-0001)`, requestId from header, details undefined) — it prints `PASS malformed-error-envelope`; (2) .prale-eval/validate.mjs re-checks result.json metadata, that every cited symbol literally occurs inside its cited line range, that both contract paths have evidence and are named by claims, and that the fixture encodes a malformed envelope — it prints `PASSED: 6 evidence entries, 4 claims`. The vitest file tests/v3-http-malformed-envelope.test.ts is the CI-shaped equivalent and was not executed (vitest absent)."
+  }
+}

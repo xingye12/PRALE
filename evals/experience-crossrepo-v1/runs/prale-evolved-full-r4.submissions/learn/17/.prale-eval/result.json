@@ -1,0 +1,97 @@
+{
+  "task_id": 17,
+  "repository": "wattclaw",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "server/core/request-context.js",
+      "symbol": "runWithRequestContext",
+      "start_line": 5,
+      "end_line": 7,
+      "observation": "runWithRequestContext(context, fn) is the single writer of request-scoped state: it runs fn inside an AsyncLocalStorage store initialized with the supplied context object (or {} when the context is falsy). The store is created at module scope with `new AsyncLocalStorage()`, so there is no global mutable tenant variable; the tenant identity lives only on the async continuation. Because the store is created per run() invocation, nested/concurrent requests cannot overwrite each other's tenant."
+    },
+    {
+      "path": "server/core/request-context.js",
+      "symbol": "getRequestTenant",
+      "start_line": 17,
+      "end_line": 19,
+      "observation": "getRequestTenant() returns `getRequestContext()?.tenant || null`, and its sibling getRequestUser() (lines 13-15) returns `?.user || null`, while getRequestContext() (lines 9-11) returns `requestContext.getStore() || null`. All three are total: outside any runWithRequestContext scope they return null rather than throwing or leaking a previous request's tenant. This null-on-absence contract is what lets the gateway distinguish 'no tenant pinned by the request' from 'tenant explicitly pinned'."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getGatewayForCurrentRequest",
+      "start_line": 397,
+      "end_line": 411,
+      "observation": "getGatewayForCurrentRequest() is the tenant-boundary enforcement point for WS RPC. It reads getRequestUser() and getRequestTenant() from the request context and resolves the tenant with the precedence `contextTenant || (user ? await this.ensureUserTenant(user) : await this.getDefaultTenant())`. So a tenant pinned on the request always wins; otherwise a logged-in user is mapped to their assigned tenant via ensureUserTenant(); only with no user and no pinned tenant does it fall back to getDefaultTenant() (lines 496-499: first listed tenant, else a new 'tenant-1' record). It then builds the per-tenant client and awaits ensureConnected(tenant.id, gateway) before returning. MultiTenantGatewayProxy.call (lines 148-151) routes every generic call through this method, so the tenant isolation of ordinary traffic depends entirely on this function."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getHttpTargetForCurrentRequest",
+      "start_line": 448,
+      "end_line": 466,
+      "observation": "getHttpTargetForCurrentRequest() applies the identical context-precedence rule to HTTP traffic: `contextTenant || (user ? ensureUserTenant(user) : getDefaultTenant())`, then returns `{ baseUrl: http://<tenant.host>:<tenant.port>, headers: { Authorization: Bearer <tenant.token> }, tenant }`. Both the tenant host/port and the per-tenant bearer token are derived from the resolved tenant, so request-scoped HTTP calls carry the tenant's own credentials rather than a shared/global one. server/core/gateway-client.js `_buildGatewayHttpOptions` consumes this and only falls back to envConfig.OPENCLAW_WS_URL/OPENCLAW_AUTH_TOKEN when the function returns falsy (i.e. multi-tenant disabled), which is the single-tenant degradation path."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "callGatewayForTenant",
+      "start_line": 417,
+      "end_line": 424,
+      "observation": "callGatewayForTenant(tenantId, method, params, timeout) is the deliberate escape hatch from context-derived selection: the comment at lines 413-416 states it 'bypasses request-context tenant selection' and is used for cross-tenant admin operations. It bootstraps, loads the tenant row by explicit id, and throws `Tenant <id> not found` (line 420) when the id does not resolve, so an invalid/cross-tenant id is a hard failure rather than a silent fallback to the default tenant. Its all-tenant sibling callGatewayForAllTenants (lines 429-446) fans out with Promise.allSettled and maps each outcome back to `{ tenantId, ok, value|error }`, so one tenant's failure is attributed and does not abort the others."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "ensureConnected",
+      "start_line": 704,
+      "end_line": 780,
+      "observation": "ensureConnected(tenantId, gateway) is the failure-behavior core of gateway selection. It short-circuits when gateway.isConnected, coalesces concurrent attempts through this.connecting (lines 714-717, cleared in .finally at 774-776) so parallel requests never open duplicate sockets, and otherwise races a connect against a timer. On timeout it rejects with `Gateway for <tenantId> did not connect in time` after cleanup() detaches listeners (lines 727-740); on an 'error' event it rejects with the underlying error unless the error matches isPairingOrScopeError (lines 2586-2589: pairing required / scope upgrade / pending approval / missing scope), in which case it approves the pending backend device once and retries before rejecting (lines 746-760). Because getGatewayForCurrentRequest/getHttpTargetForCurrentRequest/getHttpTargetForTenantId all await this method, an unreachable tenant surfaces as a propagated rejection to the caller rather than a partial or cross-tenant response; server/core/auth.js turns such failures into HTTP 503."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "moveUserToTenant",
+      "start_line": 335,
+      "end_line": 351,
+      "observation": "moveUserToTenant(userId, tenantId, beforeAssign) guards the assignment boundary: it throws `Tenant <id> not found` when the target row is absent (line 337) and `Tenant <id> is full (count/maxUsers)` when the tenant already holds maxUsers other users (lines 341-344), so capacity is enforced before the UPSERT in assignUserToTenant (lines 613-620). The optional beforeAssign callback runs before the write and its return value is surfaced as `sync`, giving callers (server/handlers/tenants.js) a hook for per-tenant config sync around an authorized admin move."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "MultiTenantGatewayProxy",
+      "start_line": 130,
+      "end_line": 152,
+      "observation": "MultiTenantGatewayProxy is the facade the rest of the server treats as 'the gateway'. Its `call` (lines 148-151) delegates to manager.getGatewayForCurrentRequest() rather than to any tenant-specific client, so every generic RPC is automatically scoped to the request's tenant; `isConnected` (136-138) is true when ANY tenant client is connected, and `connect`/`disconnect` (140-146) bootstrap or tear down all tenant clients. This is why callers that must address a specific tenant use the explicit callGatewayForTenant/getGatewayHttpTargetForTenantId APIs instead of the proxy."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Request-scoped tenant identity is carried only via AsyncLocalStorage in server/core/request-context.js: runWithRequestContext is the sole writer and getRequestTenant/getRequestUser/getRequestContext read the store, returning null outside a request scope. This makes tenant selection per-continuation rather than a global, and the null sentinel is what the gateway uses to mean 'no tenant pinned'.",
+      "evidence_paths": [
+        "server/core/request-context.js",
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "Tenant boundary enforcement for request traffic is centralized in multi-tenant-gateway.js: getGatewayForCurrentRequest (397-411) and getHttpTargetForCurrentRequest (448-466) resolve the tenant with precedence request-context tenant > user's assigned tenant via ensureUserTenant > getDefaultTenant, and derive both connection target and bearer token from that single resolved tenant. Because MultiTenantGatewayProxy.call (148-151) routes through getGatewayForCurrentRequest, ordinary WS RPC cannot address a tenant other than the one the request resolved.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js",
+        "server/core/request-context.js"
+      ]
+    },
+    {
+      "claim": "Cross-tenant access is explicit and validated, not accidental: callGatewayForTenant (417-424) documents that it bypasses request-context selection and throws `Tenant <id> not found` for unknown ids, while callGatewayForAllTenants (429-446) uses Promise.allSettled and returns per-tenant { tenantId, ok, value|error } so a single tenant failure is attributed instead of aborting the fan-out.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "Failure behavior is fail-closed and per-tenant: ensureConnected (704-780) coalesces concurrent connects via this.connecting, rejects with `Gateway for <tenantId> did not connect in time` on timeout, retries once on pairing/scope errors identified by isPairingOrScopeError (2586-2589), and otherwise propagates the underlying error; moveUserToTenant (335-351) throws on unknown/full tenants before writing the assignment. Callers therefore propagate rejection rather than degrading to a shared/default tenant, and server/core/auth.js maps such failures to HTTP 503.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js"
+      ]
+    }
+  ],
+  "conclusion": "Tenant boundary enforcement in wattclaw is layered. server/core/request-context.js provides a per-continuation AsyncLocalStorage store with runWithRequestContext as its only writer and getRequestTenant/getRequestUser/getRequestContext as total readers returning null when no request scope is active. server/core/multi-tenant-gateway.js consumes that store at exactly two request-facing entry points, getGatewayForCurrentRequest and getHttpTargetForCurrentRequest, which resolve a single tenant using precedence request-context tenant > user's assigned tenant (ensureUserTenant) > getDefaultTenant, and then build both the connection target and the Authorization bearer from that tenant; the MultiTenantGatewayProxy.call facade routes generic RPC through the same method, so ordinary traffic is tenant-isolated by construction. Deliberate cross-tenant/admin operations must call the explicit APIs callGatewayForTenant / callGatewayForAllTenants / getHttpTargetForTenantId, which validate the id (throwing 'Tenant <id> not found') and, for the fan-out, attribute failures per tenant via Promise.allSettled. Failure behavior is fail-closed: ensureConnected rejects on connect timeout or socket error (retrying once only for pairing/scope errors), coalescing concurrent attempts to avoid duplicate sockets, and moveUserToTenant rejects unknown or full tenants before mutating the assignment table. The net effect is that an unreachable or unspecified tenant produces a propagated error (surfaced as HTTP 503 by auth middleware) rather than a silent fallback to another tenant.",
+  "validation": {
+    "command": "node --check server/core/multi-tenant-gateway.js && node --check server/core/request-context.js && python3 (programmatic check that each cited start_line/end_line range contains its named symbol)",
+    "status": "passed",
+    "notes": "node --check parsed both modules without syntax errors, and a script re-read each cited inclusive line range and confirmed the named symbol (getGatewayForCurrentRequest, callGatewayForTenant, callGatewayForAllTenants, getHttpTargetForCurrentRequest, ensureConnected, moveUserToTenant, MultiTenantGatewayProxy, runWithRequestContext, getRequestTenant, getRequestUser, getRequestContext) falls inside it. A focused unit-test run was NOT possible: no node_modules are installed in this workspace, so vitest and its dependency graph are unavailable; per instructions no dependencies were installed and this limitation is recorded here instead. Static inspection of server/core/auth.js and server/core/gateway-client.js was used to confirm how the cited gateway functions are consumed at runtime."
+  }
+}

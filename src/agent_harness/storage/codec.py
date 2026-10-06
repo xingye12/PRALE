@@ -2,8 +2,7 @@ import json
 from dataclasses import asdict
 from typing import Any
 
-from agent_harness.api.models import OperationResult
-from agent_harness.domain.operations import OperationMeta, OperationState
+from agent_harness.domain.operations import OperationMeta, OperationResult, OperationState
 
 
 def dumps(value: object) -> str:

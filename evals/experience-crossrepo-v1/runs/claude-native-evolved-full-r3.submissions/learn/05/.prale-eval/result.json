@@ -1,0 +1,123 @@
+{
+  "task_id": "05",
+  "repository": "pi",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "\"scripts\"",
+      "start_line": 54,
+      "end_line": 64,
+      "observation": "The ai package's npm scripts define the whole model pipeline. `generate-models` (line 56) runs `node scripts/generate-models.ts --strict`, the network-backed full regeneration that fetches models.dev/OpenRouter/AI-Gateway/Radius and rewrites both the committed TypeScript shards and the ignored JSON data. `hydrate-model-data` (line 57) is the same generator with `--strict --data-only`, which only re-emits the JSON data directory from the already-committed provider list (still network-backed). `generate-model-catalog` (line 58) is `--strict --json-only --json-output ../../.artifacts/model-catalog`, producing the publishable bundle. `check:model-data` (line 59) validates the generated JSON without any fetch, `build` (line 60) chains generate-models then build:offline, and `build:offline` (line 61) is `check:model-data && tsgo -p tsconfig.build.json && cp -r src/providers/data dist/providers/data` — no network call."
+    },
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "\"build:offline\"",
+      "start_line": 60,
+      "end_line": 63,
+      "observation": "The `build` script (line 60) = generate-models + build:offline, i.e. refresh-then-build. `build:offline` (line 61) is the offline-safe path: it only validates the already-present generated data (`check:model-data`), compiles with tsgo, and copies `src/providers/data` into `dist/providers/data`. It performs zero network fetches, so it is safe to run in an air-gapped environment as long as the data directory has been hydrated ahead of time."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "validateBundle",
+      "start_line": 85,
+      "end_line": 176,
+      "observation": "validateBundle is the offline gatekeeper for publishing. It reads the generated bundle purely from local files (models.json, models.all.json, providers.json, and the per-provider shards under providers/) and enforces structural invariants: provider index equals the sorted providers of models.all.json (102-105), the required providers anthropic/openai/openrouter are present (109-111), provider shards are byte-equal to models.all.json (120-123), model identity is unique per type (124-138), the legacy models.json is exactly the chat projection of models.all.json (140-147), shard file names match the index (150-154), and at least MINIMUM_MODEL_COUNT=500 chat models exist (155-157). It computes a content-addressed sha256 revision over models.all.json (159-161) so downstream uploads can be skipped when unchanged. No network is used here."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "main",
+      "start_line": 263,
+      "end_line": 325,
+      "observation": "main wires the local-only validation to the optional network publish. It calls validateBundle on the resolved --input directory (line 266) and always writes a local publication.json manifest (line 282). With `--dry-run` it prints the manifest and returns without uploading (285-288), making `npm run check:model-catalog` a fully offline validation of the generated catalog. Only in non-dry-run mode does it touch the network: it shells out to the `aws` CLI via downloadIndex/uploadJson to read the existing index and upload revision objects plus index.json to S3/R2 (290-324). gitSourceCommit (178-182) and the aws helper (184-198) are the only external-process dependencies, and both are bypassed by --dry-run/--source-commit."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "buildIndex",
+      "start_line": 233,
+      "end_line": 261,
+      "observation": "buildIndex constructs the ModelCatalogIndex document: it keeps any existing catalog entries whose minimumPiVersion differs, appends the new entry stamped with MINIMUM_PI_VERSION and the freshly computed revision, sorts by semver precedence, and re-validates through parseModelCatalogIndex (the exact parser pi.dev uses). This is local, deterministic bookkeeping that determines which catalog revision a given pi client version receives at runtime; it requires no network beyond the optional index download done earlier in main."
+    },
+    {
+      "path": "packages/ai/scripts/generate-models.ts",
+      "symbol": "generateModels",
+      "start_line": 2648,
+      "end_line": 2664,
+      "observation": "generateModels always awaits the upstream fetches (models.dev chat, models.dev classifier, OpenRouter, Cloudflare AI Gateway, Radius) at 2648-2654, regardless of --data-only. This is why `hydrate:model-data` and `generate:model-catalog` are network-backed: they regenerate content from live catalogs. Only the local `check:model-data` / `build:offline` stage avoids the network, consuming the committed TS shards and the hydrated JSON data directory."
+    },
+    {
+      "path": "packages/ai/scripts/model-data.ts",
+      "symbol": "validateGeneratedModelData",
+      "start_line": 303,
+      "end_line": 306,
+      "observation": "validateGeneratedModelData is the no-network validator behind `check:model-data`. It derives the expected structure from the committed TypeScript provider shards (readModelDataStructure reads src/models.generated.ts imports and the *.models.ts files) and compares it against the on-disk src/providers/data JSON plus .manifest.json hashes. This lets the offline build verify the hydrated data matches the committed catalog without contacting any upstream."
+    },
+    {
+      "path": "scripts/model-catalog-protocol.ts",
+      "symbol": "parseModelCatalogIndex",
+      "start_line": 164,
+      "end_line": 199,
+      "observation": "parseModelCatalogIndex is the dependency-free validator pi.dev and pi both use; publish-model-catalog.mjs imports it (along with MODEL_CATALOG_PREFIX, MODEL_CATALOG_SCHEMA_VERSION, getModelCatalogArtifactKey, getModelCatalogProviderKey and compareModelCatalogPiVersions, lines 15-23) to validate and build the index offline. The file header (lines 1-26) documents the storage layout under MODEL_CATALOG_PREFIX and states it is copied verbatim into pi.dev, keeping it free of imports and runtime-specific APIs so it runs unchanged in Node.js and Cloudflare Workers — which is what lets the local validation and the hosted serving logic agree without network access."
+    },
+    {
+      "path": "README.md",
+      "symbol": "Development",
+      "start_line": 54,
+      "end_line": 59,
+      "observation": "The Development section documents the intended split: `npm run build` refreshes model data then builds, while `npm run build:offline` rebuilds using existing model data without network access. This is the user-facing statement of the offline contract implemented by packages/ai."
+    },
+    {
+      "path": "scripts/create-source-archive.sh",
+      "symbol": "model_data_dir",
+      "start_line": 82,
+      "end_line": 92,
+      "observation": "The release source-archive script hard-requires generated model data to already exist: it checks for packages/ai/src/providers/data/.manifest.json (82-84) and for the provider JSON files (85-92), erroring with \"Run npm run hydrate:model-data first\" otherwise. This confirms the JSON data directory is a hydrated (not committed) build input that must be produced before offline/packaged builds."
+    },
+    {
+      "path": ".github/workflows/build-binaries.yml",
+      "symbol": "Hydrate release model data",
+      "start_line": 52,
+      "end_line": 53,
+      "observation": "CI hydrates network-fetched model data once (`npm run hydrate:model-data`) before creating the release source archive, so that downstream standalone-binary builds can use `--offline-model-data` and the committed/archived data instead of contacting upstream catalogs."
+    },
+    {
+      "path": ".github/workflows/publish-model-catalog.yml",
+      "symbol": "Generate model catalog JSON",
+      "start_line": 60,
+      "end_line": 64,
+      "observation": "The catalog workflow runs `npm run generate:model-catalog` (network) to build .artifacts/model-catalog, then `npm run check:model-catalog` (offline dry-run of publish-model-catalog.mjs) to validate it, and uploads the artifact; a separate publish job (using the aws CLI against Cloudflare R2) performs the only network upload. So generation is network-bound, validation is offline, and publication is a guarded, separately-gated step."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "packages/ai/package.json defines three distinct model inputs with different network requirements: `generate-models` and `hydrate-model-data` are network-backed generators of the ignored JSON data, `generate-model-catalog` is a network-backed generator of the publishable bundle under .artifacts/, and `check:model-data` is a no-network validator.",
+      "evidence_paths": ["packages/ai/package.json", "packages/ai/scripts/generate-models.ts", "packages/ai/scripts/model-data.ts"]
+    },
+    {
+      "claim": "The offline-safe build path is `build:offline`, which validates the already-hydrated data with `check:model-data`, compiles with tsgo, and copies src/providers/data into dist — it performs no fetch, so `npm run build:offline` succeeds without network once the data directory exists.",
+      "evidence_paths": ["packages/ai/package.json", "README.md"]
+    },
+    {
+      "claim": "The generated TypeScript provider shards (src/providers/*.models.ts, src/models.generated.ts) are committed to the repository, but the JSON data directory packages/ai/src/providers/data/ is gitignored and therefore must be hydrated before offline or release builds.",
+      "evidence_paths": ["packages/ai/package.json", "scripts/create-source-archive.sh", ".github/workflows/build-binaries.yml"]
+    },
+    {
+      "claim": "scripts/publish-model-catalog.mjs separates offline validation from network publication: validateBundle and buildIndex operate purely on local generated files, main always writes publication.json, and `--dry-run` (used by `npm run check:model-catalog`) returns before any S3/R2 upload.",
+      "evidence_paths": ["scripts/publish-model-catalog.mjs"]
+    },
+    {
+      "claim": "validateBundle enforces the publishable-bundle contract entirely offline: required providers, per-provider shard equality, chat-projection equality of models.json, unique typed identities, and the MINIMUM_MODEL_COUNT=500 floor, then derives a content-addressed sha256 revision over models.all.json so unchanged catalogs are not re-uploaded.",
+      "evidence_paths": ["scripts/publish-model-catalog.mjs"]
+    },
+    {
+      "claim": "Only the publish/upload step and the upstream-catalog fetches require network; the deterministic revision and index selection logic lives in scripts/model-catalog-protocol.ts, which is dependency-free and shared with pi.dev so it runs identically in Node and Cloudflare Workers.",
+      "evidence_paths": ["scripts/publish-model-catalog.mjs", "scripts/model-catalog-protocol.ts"]
+    }
+  ],
+  "conclusion": "The pi model pipeline splits into three tiers. (1) Generated: `npm run generate-models` (packages/ai/package.json:56) is the full, network-backed regeneration of the committed TypeScript shards (src/providers/*.models.ts, src/models.generated.ts) plus the ignored JSON data under src/providers/data/. (2) Hydrated: `npm run hydrate:model-data` (line 57) re-emits only that JSON data directory (--data-only) using the existing provider list; it is still network-backed, and because the data dir is gitignored (verified: absent in this checkout and untracked) it must be run before any offline-packed build — the release source-archive script and build-binaries workflow both gate on it. (3) Offline-safe: `npm run build:offline` (line 61) only validates the hydrated data against the committed TS catalog via `check:model-data`, compiles, and copies the data into dist, with no fetch — matching README's \"without network access\". The publishable catalog bundle is generated network-side by `generate:model-catalog` into .artifacts/model-catalog, then validated fully offline by scripts/publish-model-catalog.mjs in --dry-run (validateBundle enforces structural invariants and computes a sha256 revision from local bytes). Network is touched only by the four upstream fetches in generate-models.ts:2648-2654 and by the aws-CLI uploads inside main() (lines 290-324), which --dry-run skips. Therefore inputs safe to use offline are: the committed TypeScript model shards, the hydrated src/providers/data JSON + .manifest.json, and the generated .artifacts/model-catalog bundle; the only non-offline inputs are the live models.dev/OpenRouter/AI-Gateway/Radius catalog fetches and the S3/R2 upload path.",
+  "validation": {
+    "command": "node --test scripts/publish-model-catalog.test.mjs",
+    "status": "passed",
+    "notes": "Ran the repo's focused unit test for the catalog publish path (1 test, 1 pass). It drives scripts/publish-model-catalog.mjs end-to-end in --dry-run mode against a synthetic local bundle, exercising the offline validateBundle/buildIndex/publication.json path without any network or AWS access, and asserts the per-type chat/image/classifier and total model counts. Environment: node v24.14.0. The network-backed generators (`generate-models`, `hydrate-model-data`, `generate:model-catalog`) and `check:model-data`/`build:offline` were not executed because they require either live upstream catalogs or the absent gitignored src/providers/data directory; those constraints are recorded here rather than worked around."
+  }
+}

@@ -1,0 +1,106 @@
+{
+  "task_id": "T13",
+  "repository": "tdam",
+  "mode": "contract",
+  "route_under_contract": "POST /api/v1/task/list-with-agents",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 62,
+      "observation": "The header-guard middleware factory. It reads x-tdai-service-id (line 34) and returns `respondControlError(c, 400, 'MISSING_INSTANCE_ID')` when absent/blank (35-37), resolves it via deps.instanceRegistry.resolve and returns 400 'INVALID_INSTANCE' on InstanceRegistryError(400) (39-47), then requires x-tdai-user-key for every action except 'auth/verify' and returns 400 'MISSING_USER_KEY' when absent (49-53). Only after all guards does it c.set('panelMeta', ...) (55-60) and `await next()` (61), so a rejected request can never reach the downstream client."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "readAction",
+      "start_line": 24,
+      "end_line": 29,
+      "observation": "Derives the meta action from the request path (text after '/meta/'), returning '' for non-meta paths. On the contracted route '/api/v1/task/list-with-agents' it returns '', which is not 'auth/verify', so the user-key guard is NOT omitted — the route always requires x-tdai-user-key."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/headers.ts",
+      "symbol": "META_HEADER_SERVICE_ID",
+      "start_line": 5,
+      "end_line": 6,
+      "observation": "Single source of truth for the required inbound header names: META_HEADER_SERVICE_ID = 'x-tdai-service-id' and META_HEADER_USER_KEY = 'x-tdai-user-key'; the middleware and the test import these constants rather than hard-coding strings."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondControlError",
+      "start_line": 22,
+      "end_line": 25,
+      "observation": "Builds the standard control envelope through controlEnvelope (code/message/request_id/data=null, lines 10-15) using reqId from c.get('reqId') ?? '', then responds with respondEnvelope, which maps the envelope code to the HTTP status. This is the exact envelope returned by every rejection branch of the middleware."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "mapHttpStatusFromEnvelopeCode",
+      "start_line": 10,
+      "end_line": 15,
+      "observation": "Maps envelope.code to HTTP status: 400-599 map to the code itself (line 12), 0 maps to 200, anything else to 502. Therefore the middleware's code:400 control envelopes are emitted with HTTP status 400."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/routes/task.ts",
+      "symbol": "registerTaskRoutes",
+      "start_line": 75,
+      "end_line": 162,
+      "observation": "Registers the contracted Panel-layer aggregate route: api.post('/task/list-with-agents', validatePanelMetaHeaders(deps), handler) (lines 82-85). The middleware is mounted before the handler, so missing/invalid headers short-circuit with the control envelope and the handler's deps.metaKernel.invoke('task/list', ...) calls (the downstream fake client in the demo) are never reached."
+    },
+    {
+      "path": "MemoryPanel/tests/panel/validate-panel-headers.contract.test.ts",
+      "symbol": "buildHarness",
+      "start_line": 39,
+      "end_line": 76,
+      "observation": "Executable demo harness: a real Hono app mounting the real registerTaskRoutes over a real InstanceRegistry seeded with one 'local' instance, and a fake downstream client `metaKernel.invoke = vi.fn(async () => OK_ENVELOPE)`. Cases 1-4 send missing/blank/unknown headers and assert the 400 control envelope plus `invoke` not called; case 5 (valid headers) is the positive control proving the fake client is reachable, so the negative cases are non-vacuous."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Contract route POST /api/v1/task/list-with-agents with a missing or blank x-tdai-service-id returns HTTP 400 and the standard control envelope {code:400, message:'MISSING_INSTANCE_ID', request_id:<string>, data:null}, and the downstream client is never invoked because the middleware returns before c.set('panelMeta') / await next().",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts",
+        "MemoryPanel/src/panel/http/envelope.ts",
+        "MemoryPanel/src/panel/http/routes/task.ts"
+      ]
+    },
+    {
+      "claim": "A syntactically present but unknown x-tdai-service-id is rejected by deps.instanceRegistry.resolve with InstanceRegistryError(400), which the middleware converts to the control envelope code:400, message:'INVALID_INSTANCE', data:null (HTTP 400) instead of propagating the throw, so the downstream client is still never called.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/http/envelope.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts"
+      ]
+    },
+    {
+      "claim": "Because readAction('/api/v1/task/list-with-agents') returns '' (the '/meta/' marker is absent), the auth/verify exemption does not apply, so a missing or blank x-tdai-user-key yields code:400, message:'MISSING_USER_KEY' and the request never reaches the downstream client.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts",
+        "MemoryPanel/src/panel/http/routes/task.ts"
+      ]
+    },
+    {
+      "claim": "The rejection response is the standard envelope in both shape and status: controlEnvelope always emits exactly {code, message, request_id, data:null} and mapHttpStatusFromEnvelopeCode maps code 400 to HTTP 400, so all three header-failure branches emit identical envelope structure with distinct messages.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/envelope.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts"
+      ]
+    },
+    {
+      "claim": "The executable demo is non-vacuous: cases 1-4 assert the 400 control envelope AND that the fake downstream client (metaKernel.invoke spy) has zero calls, while the positive control with valid headers passes the handler through and observes exactly one invoke('task/list') call.",
+      "evidence_paths": [
+        "MemoryPanel/tests/panel/validate-panel-headers.contract.test.ts",
+        "MemoryPanel/src/panel/http/routes/task.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts"
+      ]
+    }
+  ],
+  "conclusion": "The panel route POST /api/v1/task/list-with-agents is contracted behind validatePanelMetaHeaders: missing/blank x-tdai-service-id (400 MISSING_INSTANCE_ID), unknown x-tdai-service-id (400 INVALID_INSTANCE) and missing/blank x-tdai-user-key (400 MISSING_USER_KEY) each return the standard control envelope {code, message, request_id, data:null} at HTTP 400, and all three branches return before c.set('panelMeta')/await next(), so the downstream fake client is never called. The vitest demo in MemoryPanel/tests/panel/validate-panel-headers.contract.test.ts encodes this contract (including a positive control proving the fake client is reachable). Because hono/zod/vitest are not installed in this checkout and dependencies must not be installed, runtime execution was substituted by 14/14 passing static assertions over the real sources; see validation.",
+  "validation": {
+    "command": "node .prale-eval/validate-panel-headers-contract.mjs",
+    "status": "passed",
+    "notes": "Dependency-free static contract validator over the real sources: 14/14 assertions passed (exit 0), covering the header constants, the three guard branches and their codes, that all three control errors are `return`ed, that `await next()` and `c.set('panelMeta', ...)` are textually after the last guard (no downstream call on rejection), the envelope shape/request_id/status mapping (400->400), and that registerTaskRoutes mounts validatePanelMetaHeaders on /task/list-with-agents. LIMITATION: vitest, hono and zod are not installed in this checkout and installing dependencies is out of scope, so the focused runtime test MemoryPanel/tests/panel/validate-panel-headers.contract.test.ts could NOT be executed here; the static assertions verify the guarded source text rather than executed runtime behaviour. Run `cd MemoryPanel && pnpm install && pnpm test -- tests/panel/validate-panel-headers.contract.test.ts` (or `npx vitest run`) to obtain the runtime-strength evidence."
+  }
+}

@@ -41,6 +41,37 @@ SQLite 是单机持久化后端，`MemoryStorage` 用于测试。工具可标记
 
 核心库不绑定 HTTP 框架。`HarnessRpc` 提供传输无关的 JSON-RPC-shaped dispatch；`AuthenticatedHarnessService` 叠加可替换认证与可关闭的远程订阅，供 WebSocket、SSE 或 TUI 外壳使用。认证凭据和连接状态不会写入 Session。
 
+## Subagent
+
+默认开启的本地 Subagent 使用同一 Session 内的独立历史，支持 `general-purpose`、`explore`、`plan`、自定义定义、前台/后台、查询、停止与续跑。子工具权限只收缩；Explore/Plan 不开放 Bash 或写入工具。父显式取消会级联取消其子运行；等待超时、断开或父正常结束不会取消后台运行。
+
+```python
+from agent_harness import SubagentConfig, SubagentRequest
+from agent_harness.runtime.subagents import MappingProviderResolver, create_subagent_tools
+
+harness = await Harness.open(
+    "session-1", storage,
+    tools=create_subagent_tools(),  # 模型可委派；普通工具按需加入此 tuple
+    subagent_config=SubagentConfig(enabled=True),
+    provider_resolver=MappingProviderResolver({"default": provider}, "default"),
+)
+lane = await harness.acquire_lane("main")
+parent = await lane.prompt("分析项目")
+child = await harness.start_subagent(
+    "main", parent.operation_id,
+    SubagentRequest("检查架构", "架构检查", "plan", run_in_background=True),
+    idempotency_key="architecture-review",
+)
+result = await harness.wait_subagent_run(child.run_id, timeout_ms=30_000)
+# result.retrieval_status == "timeout" 时，子运行仍可继续。
+# 显式停止：await harness.stop_subagent_run(child.run_id)
+await harness.close()  # 停止本地执行器；保留持久恢复状态
+```
+
+部署默认启用 runtime，未设置 `PRALE_TOOLS` 时默认提供 `subagent`、`subagent_continue`、`subagent_output`、`subagent_list`、`subagent_stop`。显式 `PRALE_TOOLS` 列表完全替代默认集合，空字符串禁用全部模型工具；`PRALE_SUBAGENTS_ENABLED=false` 关闭 runtime。Python library 默认启用 facade 与恢复，模型工具仍通过 `tools=create_subagent_tools()` 注册。后台结果进入父 inbox，空闲时不主动调用模型。重开已启用的 Harness 会恢复已接纳运行；缺失 provider 和不完整状态通过恢复报告显式列出。
+
+Python DTO 无额外依赖；显式配置 `PRALE_SUBAGENT_DIRS='["agents"]'` 加载 Markdown 时需安装 `.[subagents]`。文件不会自动发现、热加载或执行。完整持久化与恢复契约见 [Subagent 实现方案](specs/subagent-system-implementation-plan.md)。
+
 ## 追踪与评测
 
 `agent_harness.integrations.langfuse` 在每次 settlement 提交之后，把执行事实（operation 起止、每次 generation、每次 tool attempt）投影为 Langfuse observation。它订阅事实流，不参与 Drive 的判定：整条 trace 丢失也不改变 Session。默认关闭，需设置 `LANGFUSE_TRACING_ENABLED` 与两个 key 才启用（启动时只给开关不给 key 会被拒绝），并需要 `langfuse` extra。

@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+"""Executable demo: build an aider-style code-map from a miniature repository.
+
+The demo mirrors the code-map contract implemented in ``aider/repomap.py`` and
+the ignore contract implemented in ``aider/repo.py``:
+
+* candidate files come from walking the repository while dropping everything
+  matched by the repository ignore rules (``Repo.ignored_file`` /
+  ``git_ignored_file`` -> untracked, ignored, or generated files never reach a
+  ``RepoMap`` instance, because the caller only hands it discoverable files);
+* the remaining source files are parsed into ``def``/``ref`` tags
+  (``RepoMap.get_tags_raw``);
+* the tags are turned into a ranked symbol graph (``RepoMap.get_ranked_tags``);
+* the winner tags are rendered as ``rel_fname:`` blocks whose lines of interest
+  are the definitions (``RepoMap.render_tree`` / ``RepoMap.to_tree``).
+
+It then proves two properties of the resulting map:
+
+1. the relevant symbol ``render_code_map`` (``src/codemap.py``) is present;
+2. the ignored/generated files ``generated/schema_pb2.py``, ``ignored_secret.py``,
+   ``build/artifact.py`` and ``notes.log`` are absent, even though they exist on
+   disk with their own hidden symbols.
+
+The real ``aider.repomap.RepoMap`` class is probed first.  When its optional
+runtime dependencies (``diskcache``, ``grep_ast``) are missing, the demo falls
+back to the dependency-free normalized operation below and records that
+limitation in the emitted ``demo-output.json``.
+
+Usage:  python3 .prale-eval/demo_code_map.py
+"""
+
+import ast
+import json
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+MINI_REPO = HERE / "mini_repo"
+OUTPUT = HERE / "demo-output.json"
+
+RELEVANT_FILE = "src/codemap.py"
+RELEVANT_SYMBOL = "render_code_map"
+
+HIDDEN_FILES = [
+    "generated/schema_pb2.py",
+    "ignored_secret.py",
+    "build/artifact.py",
+    "notes.log",
+]
+HIDDEN_SYMBOLS = [
+    "generated_symbol_should_be_hidden",
+    "ignored_symbol_should_be_hidden",
+    "build_artifact_symbol_should_be_hidden",
+]
+
+SOURCE_SUFFIXES = {".py", ".md"}
+
+
+# --------------------------------------------------------------------------
+# fixture
+# --------------------------------------------------------------------------
+FIXTURE = {
+    ".gitignore": "__pycache__/\n*.pyc\nbuild/\ngenerated/\n*.log\nignored_secret.py\n",
+    "README.md": "# Miniature repository\n\nFixture for the aider code-map demo.\n",
+    "src/__init__.py": '"""Miniature package."""\n',
+    "src/codemap.py": (
+        '"""Miniature code-map helper used by the demo fixture."""\n'
+        "\n"
+        "from collections import Counter\n"
+        "\n"
+        "\n"
+        "def tokenize_symbol(name):\n"
+        '    """Split a snake_case symbol name into its parts."""\n'
+        '    return [part for part in name.split("_") if part]\n'
+        "\n"
+        "\n"
+        "def render_code_map(files, mentioned_idents=None):\n"
+        '    """Return a ``path:`` listing of the symbols found in ``files``."""\n'
+        "    mentioned_idents = mentioned_idents or set()\n"
+        "    lines = []\n"
+        "    for path, symbols in sorted(files.items()):\n"
+        "        lines.append(f\"{path}:\")\n"
+        "        for symbol in sorted(symbols):\n"
+        "            marker = \"*\" if symbol in mentioned_idents else \" \"\n"
+        "            lines.append(f\"{marker} {symbol}\")\n"
+        "    return \"\\n\".join(lines)\n"
+        "\n"
+        "\n"
+        "def count_symbols(files):\n"
+        '    """Count how often each symbol appears across all files."""\n'
+        "    counter = Counter()\n"
+        "    for symbols in files.values():\n"
+        "        counter.update(symbols)\n"
+        "    return counter\n"
+    ),
+    "src/app.py": (
+        '"""Entry point that ranks and renders the miniature code-map."""\n'
+        "\n"
+        "from src.codemap import count_symbols, render_code_map, tokenize_symbol\n"
+        "\n"
+        "\n"
+        "def main(files):\n"
+        "    summary = count_symbols(files)\n"
+        "    for ident in list(summary):\n"
+        "        tokenize_symbol(ident)\n"
+        "    return render_code_map(files, mentioned_idents=set(summary))\n"
+    ),
+    "generated/schema_pb2.py": (
+        '"""Generated protocol-buffer module (must never reach the code-map)."""\n'
+        "\n"
+        "\n"
+        "def generated_symbol_should_be_hidden():\n"
+        '    return "generated/schema_pb2.py"\n'
+    ),
+    "ignored_secret.py": (
+        '"""Locally ignored file (must never reach the code-map)."""\n'
+        "\n"
+        "\n"
+        "def ignored_symbol_should_be_hidden():\n"
+        '    return "ignored_secret.py"\n'
+    ),
+    "build/artifact.py": (
+        '"""Build artifact (must never reach the code-map)."""\n'
+        "\n"
+        "\n"
+        "def build_artifact_symbol_should_be_hidden():\n"
+        '    return "build/artifact.py"\n'
+    ),
+    "notes.log": "generated by the build; ignored via *.log\n",
+}
+
+
+def ensure_fixture():
+    """Materialize the supplied miniature repository if it is missing."""
+    for rel, text in FIXTURE.items():
+        path = MINI_REPO / rel
+        if not path.exists():
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(text)
+
+
+# --------------------------------------------------------------------------
+# step 1: discovery with ignore filtering (aider/repo.py contract)
+# --------------------------------------------------------------------------
+def load_ignore_matchers():
+    """Return a predicate implementing the fixture's .gitignore rules."""
+    ignore_file = MINI_REPO / ".gitignore"
+    lines = ignore_file.read_text().splitlines()
+    try:
+        import pathspec
+
+        spec = pathspec.PathSpec.from_lines(
+            pathspec.patterns.GitWildMatchPattern, lines
+        )
+        return lambda rel: bool(spec.match_file(rel))
+    except Exception:  # pragma: no cover - pathspec is present in this env
+        import fnmatch
+
+        patterns = [ln.strip() for ln in lines if ln.strip() and not ln.startswith("#")]
+
+        def matches(rel):
+            rel = rel.replace("\\", "/")
+            for pat in patterns:
+                if pat.endswith("/"):
+                    if rel == pat[:-1] or rel.startswith(pat):
+                        return True
+                elif fnmatch.fnmatch(rel, pat) or fnmatch.fnmatch(Path(rel).name, pat):
+                    return True
+            return False
+
+        return matches
+
+
+def discover_files(is_ignored):
+    """Walk the repo, dropping ignored/generated files (git ls-files semantics)."""
+    found, excluded = [], []
+    for path in sorted(MINI_REPO.rglob("*")):
+        rel = path.relative_to(MINI_REPO).as_posix()
+        if path.is_dir():
+            if rel == ".git" or is_ignored(rel) or is_ignored(rel + "/"):
+                continue
+            continue
+        if is_ignored(rel) or is_ignored(rel + "/"):
+            excluded.append(rel)
+            continue
+        if path.suffix.lower() in SOURCE_SUFFIXES:
+            found.append(rel)
+    return found, excluded
+
+
+# --------------------------------------------------------------------------
+# step 2: tags (RepoMap.get_tags_raw) -- ast stands in for tree-sitter
+# --------------------------------------------------------------------------
+def tags_for_file(rel):
+    """Yield (kind, name, lineno) tags, mirroring get_tags_raw's def/ref split."""
+    source = (MINI_REPO / rel).read_text()
+    if rel.endswith(".md"):
+        return
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            yield ("def", node.name, node.lineno)
+        elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Load):
+            yield ("ref", node.id, node.lineno)
+        elif isinstance(node, ast.Attribute) and isinstance(node.ctx, ast.Load):
+            yield ("ref", node.attr, node.lineno)
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                yield ("ref", alias.name.split(".")[0], node.lineno)
+        elif isinstance(node, ast.ImportFrom):
+            for alias in node.names:
+                yield ("ref", alias.name, node.lineno)
+
+
+# --------------------------------------------------------------------------
+# step 3: ranking (RepoMap.get_ranked_tags)
+# --------------------------------------------------------------------------
+def rank(files):
+    from collections import defaultdict
+
+    defines = defaultdict(set)
+    definitions = {}
+    references = defaultdict(list)
+    for rel in files:
+        for kind, name, lineno in tags_for_file(rel) or []:
+            if kind == "def":
+                defines[name].add(rel)
+                definitions[(rel, name)] = lineno
+            else:
+                references[name].append(rel)
+    if not references:
+        references = {k: list(v) for k, v in defines.items()}
+
+    idents = set(defines).intersection(references)
+    ordered = [(rel, name) for (rel, name) in definitions if name in idents]
+    try:
+        import networkx as nx
+
+        graph = nx.MultiDiGraph()
+        for ident in idents:
+            for referencer in references[ident]:
+                for definer in defines[ident]:
+                    graph.add_edge(referencer, definer, weight=1.0, ident=ident)
+        if graph.number_of_nodes() == 0:
+            raise ValueError("empty graph")
+        ranked = nx.pagerank(graph, weight="weight")
+        ordered.sort(key=lambda item: (-ranked.get(item[0], 0.0), item))
+    except Exception:
+        counts = {ident: len(references[ident]) for ident in idents}
+        ordered.sort(key=lambda item: (-counts.get(item[1], 0), item))
+    return ordered
+
+
+# --------------------------------------------------------------------------
+# step 4: render (RepoMap.render_tree / RepoMap.to_tree)
+# --------------------------------------------------------------------------
+def render_map(ordered, files, max_defs=12):
+    selected = ordered[:max_defs]
+    lines, cur = [], None
+    files_with_defs = set()
+    for rel, name in selected:
+        lineno = None
+        for kind, tag_name, tag_line in tags_for_file(rel) or []:
+            if kind == "def" and tag_name == name:
+                lineno = tag_line
+                break
+        if lineno is None:
+            continue
+        if rel != cur:
+            if cur is not None:
+                lines.append("")
+            lines.append(f"{rel}:")
+            cur = rel
+        files_with_defs.add(rel)
+        source_line = (MINI_REPO / rel).read_text().splitlines()[lineno - 1]
+        lines.append(source_line.rstrip())
+
+    # RepoMap.to_tree() also emits bare relative names for other files that carry
+    # no ranked tags, so the map still accounts for every discoverable file.
+    for rel in files:
+        if rel not in files_with_defs:
+            lines.append("")
+            lines.append(rel)
+    return "\n".join(lines) + "\n"
+
+
+# --------------------------------------------------------------------------
+# demo driver
+# --------------------------------------------------------------------------
+def probe_upstream():
+    """Check whether the real aider RepoMap can be imported/used here."""
+    repo_root = str(HERE.parent)
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    try:
+        from aider.repomap import RepoMap  # noqa: F401
+
+        return True, ""
+    except Exception as err:  # optional runtime dependency missing
+        return False, f"{type(err).__name__}: {err}"
+
+
+def main():
+    ensure_fixture()
+    is_ignored = load_ignore_matchers()
+    files, excluded = discover_files(is_ignored)
+    ordered = rank(files)
+    code_map = render_map(ordered, files)
+
+    missing_on_disk = [rel for rel in HIDDEN_FILES if not (MINI_REPO / rel).exists()]
+
+    checks = {
+        "relevant_file_present": RELEVANT_FILE in code_map,
+        "relevant_symbol_present": RELEVANT_SYMBOL in code_map,
+        "ignored_files_exist_on_disk": not missing_on_disk,
+        "ignored_files_absent": not any(rel in code_map for rel in HIDDEN_FILES),
+        "hidden_symbols_absent": not any(sym in code_map for sym in HIDDEN_SYMBOLS),
+    }
+    status = "pass" if all(checks.values()) else "fail"
+
+    repomap_importable, repomap_error = probe_upstream()
+    result = {
+        "operation": "build_code_map",
+        "mode": "demo",
+        "repository": {"upstream": "aider", "mini_repo": "mini_repo"},
+        "ignore_source": "mini_repo/.gitignore",
+        "discovered_files": files,
+        "excluded_files": excluded,
+        "ranked_definitions": [
+            {"file": rel, "symbol": name} for rel, name in ordered
+        ],
+        "code_map": code_map,
+        "checks": checks,
+        "upstream_repomap_importable": repomap_importable,
+        "upstream_repomap_error": repomap_error,
+        "status": status,
+    }
+    OUTPUT.write_text(json.dumps(result, indent=2) + "\n")
+
+    print(code_map)
+    print("---")
+    print(f"discovered : {files}")
+    print(f"excluded   : {excluded}")
+    for name, ok in checks.items():
+        print(f"{'PASS' if ok else 'FAIL'} {name}")
+    if not repomap_importable:
+        print(
+            "LIMITATION: aider.repomap.RepoMap unavailable "
+            f"({repomap_error}); used the dependency-free normalized operation."
+        )
+    print(f"status: {status}")
+    return 0 if status == "pass" else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

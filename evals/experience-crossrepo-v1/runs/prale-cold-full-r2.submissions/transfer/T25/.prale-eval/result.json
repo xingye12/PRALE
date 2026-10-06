@@ -1,0 +1,134 @@
+{
+  "task_id": "T25",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "syncUserSessionsFromGateway",
+      "start_line": 118,
+      "end_line": 178,
+      "observation": "Single sync pass for one user. It resolves the owned/admin agent ids, lists gateway sessions per agent through sessions.list (bounded by perAgentLimit, agents fetched with mapWithConcurrency), normalizes every raw delivery, drops keys whose agent is outside the ownership set or that are in recentlyDeletedSessionKeys, and then delegates each surviving delivery to upsertSyncedUserSession. The pass increments changed/inserted/updated ONLY when the upsert reports result.changed (lines 162-168), so replaying an already-applied session update adds nothing to the change counters even though scanned still counts each delivery. The returned report { changed, inserted, updated, scanned, agents } is therefore the idempotency surface: a duplicated event can only ever move 'scanned'."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "scheduleUserSessionSync",
+      "start_line": 179,
+      "end_line": 216,
+      "observation": "Duplicate-event guard around the sync pass. A replayed event that arrives inside cooldownMs returns { changed: 0, skipped: true, reason: 'cooldown' } without touching the gateway (lines 188-193), and a duplicate event that arrives while the same user's sync is still running receives the SAME in-flight promise from inFlightByUserId (lines 195-197, 214) instead of starting a second scan. The promise is registered synchronously (line 214) and removed in .finally (lines 210-212), and lastSyncAtByUserId is stamped only after success (lines 202-205), so a replayed event cannot produce a duplicate state change or a duplicate gateway round-trip."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "normalizeGatewaySessionForSync",
+      "start_line": 59,
+      "end_line": 77,
+      "observation": "Deterministic mapping from a raw gateway session envelope (key/sessionKey/session_key/id, agentId/agent_id/agent, displayTitle/label/title/name, lastMessageAt/last_message_at/updatedAt/...) to exactly { sessionKey, agentId, channel, peer, label, lastActivity }. Identical inputs always normalize to identical fields, which is what makes the replay comparison in upsertSyncedUserSession stable instead of flapping between 'inserted' and 'updated' for the same event."
+    },
+    {
+      "path": "server/core/session-sync.js",
+      "symbol": "DEFAULT_SESSION_SYNC_OPTIONS",
+      "start_line": 7,
+      "end_line": 12,
+      "observation": "Frozen defaults for the sync contract: perAgentLimit 50, cooldownMs 60_000, overallTimeoutMs 8_000, gatewayConcurrency 2. The 60s cooldown is the concrete window in which a replayed session update is dropped by scheduleUserSessionSync, and gatewayConcurrency bounds how many agents (never how many times one session is applied) are listed concurrently."
+    },
+    {
+      "path": "server/user-manager.js",
+      "symbol": "upsertSyncedUserSession",
+      "start_line": 614,
+      "end_line": 689,
+      "observation": "The idempotent write behind the sync contract. First delivery inserts and returns { changed: true, action: 'inserted' }; an identical replay is detected by field-by-field comparison (nextAgentId/nextChannel/nextPeerId/nextLabel/nextDisplayTitle/nextTenantId/nextLastMessageAt) and returns { changed: false, action: 'unchanged' } BEFORE any UPDATE runs (lines 668-672), so a replayed update does not rewrite the row or bump updated_at. last_message_at is advanced with Math.max(currentLastMessageAt, lastMessageAt) (lines 662-665), so a re-delivered older snapshot can never move the watermark backwards or add a second timeline entry."
+    },
+    {
+      "path": "server/core/usage-sync.js",
+      "symbol": "syncSessionUsageNow",
+      "start_line": 111,
+      "end_line": 202,
+      "observation": "Usage counterpart of the duplicate-event contract. Duplicate concurrent deliveries of the same session.usage event are coalesced: inFlightSessionSyncs.get(sessionKey) returns the existing promise (lines 112-113) and the new promise is registered synchronously (lines 200-201), so exactly one gateway usage fetch (callGatewayUsage with { key, limit: 1 }) and exactly one write run. Path A resolves the owner, writes the snapshot through updateSessionUsageForUser, and calls broadcastSessionUsageUpdate once for a successful update (lines 148-170); the broadcast payload carries the authoritative absolute messageCount from the snapshot, never an accumulated delta."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "updateSessionUsageForUser",
+      "start_line": 89,
+      "end_line": 117,
+      "observation": "Absolute (non-additive) usage persistence: the entry is built from the delivered snapshot and _persistOwnerScopedUpdate issues 'token_total = ?, cost_total = ?, msg_total = ?, ...' (lines 122-156) - plain assignment, never 'x = x + ?'. Replaying the same usage update therefore rewrites the same numbers (1604 tokens, 4 messages) instead of double-counting them (3208, 8). The UPDATE is owner-scoped (WHERE user_id = ? AND session_key = ?) and returns updated only when changes === 1, so a duplicate event can neither invent a second row nor land on another user's row."
+    },
+    {
+      "path": "server/core/session-usage-cache.js",
+      "symbol": "batchUpdateMatchedGatewayUsage",
+      "start_line": 158,
+      "end_line": 225,
+      "observation": "Batch/fallback path used when a usage event is delivered without a resolvable single owner. It scans each delivered session once per event, skips keys with no matching row (skippedUnmatched) and skips ambiguous keys owned by more than one user (skippedConflict, lines 176-178), then applies the same absolute owner-scoped write. Because ambiguous keys are skipped rather than written twice, replaying a batch cannot multiply one gateway snapshot across several rows."
+    },
+    {
+      "path": ".prale-eval/fixtures/duplicate-session-event.json",
+      "symbol": "duplicate-session-event-fixture",
+      "start_line": 2,
+      "end_line": 2,
+      "observation": "The distinct duplicate-event fixture used by the executable demo: a dedicated user id (user-duplicate-fixture), agent id (agent-duplicate-fixture) and session key marked with the 'duplicatefixture' segment, one logical session update delivered twice (deliveries: 2, same eventId), the usage snapshot for that session, expected single-delivery totals (1604 tokens / 4 messages / 1 tool call / 1 state-change row) and the forbidden double-count totals (3208 / 8 / 2 / 2) that an additive implementation would produce."
+    },
+    {
+      "path": ".prale-eval/duplicate-event.contract.test.mjs",
+      "symbol": "assertNoDoubleCount",
+      "start_line": 211,
+      "end_line": 218,
+      "observation": "Assertion helper of the executable contract test: it asserts the stored row equals the delivered absolute snapshot and explicitly asserts it does NOT equal the forbidden double-count values, plus that exactly one session row exists for the fixture key. It is reused after the first delivery, after the sequential replay and after concurrent duplicate deliveries."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "A replayed session update produces zero state changes: session-sync counts an update only when upsertSyncedUserSession reports result.changed, and that upsert returns { changed: false, action: 'unchanged' } with an early return for an identical row, so no UPDATE is issued and updated_at is not bumped.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/user-manager.js"
+      ]
+    },
+    {
+      "claim": "Two deliveries of the same session update inside one gateway payload are materialized once: the fixture run reports scanned=2 but changed=1, inserted=1, updated=0, and exactly one user_sessions row for the fixture key; replaying the whole event reports changed=0 with the row's updated_at unchanged.",
+      "evidence_paths": [
+        "server/core/session-sync.js",
+        "server/user-manager.js",
+        ".prale-eval/duplicate-event.contract.test.mjs"
+      ]
+    },
+    {
+      "claim": "Duplicate concurrent session events are coalesced before any gateway work: scheduleUserSessionSync returns the same in-flight promise for the second caller and, once the pass completed, answers a replay inside cooldownMs with { changed: 0, skipped: true, reason: 'cooldown' } without a second sessions.list call.",
+      "evidence_paths": [
+        "server/core/session-sync.js"
+      ]
+    },
+    {
+      "claim": "Usage is stored as an absolute snapshot, so replaying one usage event cannot double-count: updateSessionUsageForUser writes token_total/msg_total/cost_total by assignment (not accumulation), leaving the fixture totals at 1604 tokens, 4 messages and 1 tool call after both the first delivery and the replay, instead of the forbidden 3208 / 8 / 2.",
+      "evidence_paths": [
+        "server/core/session-usage-cache.js",
+        "server/core/usage-sync.js",
+        ".prale-eval/duplicate-event.contract.test.mjs"
+      ]
+    },
+    {
+      "claim": "Duplicate concurrent usage deliveries emit exactly one state change: syncSessionUsageNow reuses the per-session in-flight promise, so three simultaneous deliveries of the same event cause one callGatewayUsage call, one owner-scoped write and one session.usage.updated broadcast whose messageCount equals the snapshot's absolute count (4, never 8).",
+      "evidence_paths": [
+        "server/core/usage-sync.js",
+        ".prale-eval/duplicate-event.contract.test.mjs"
+      ]
+    },
+    {
+      "claim": "The fixture is distinct and sensitive: it uses a dedicated session key/user id carrying the 'duplicatefixture' marker (absent from the existing session-sync, usage-sync and session-usage-cache suites) and pins both the expected absolute totals and the forbidden double-count totals, so a mutated additive writer fails the suite.",
+      "evidence_paths": [
+        ".prale-eval/fixtures/duplicate-session-event.json",
+        ".prale-eval/duplicate-event.contract.test.mjs"
+      ]
+    },
+    {
+      "claim": "The batch/fallback usage path cannot spread one replayed snapshot over several rows: batchUpdateMatchedGatewayUsage skips keys with no owning row and keys owned by more than one user before applying the same absolute, owner-scoped write.",
+      "evidence_paths": [
+        "server/core/session-usage-cache.js"
+      ]
+    }
+  ],
+  "conclusion": "The duplicate-event contract holds for the session sync path in wattclaw. Replaying one session update cannot double-count usage and cannot emit a duplicate state change: (1) session metadata is applied through an idempotent upsert that returns changed=false/action='unchanged' for an identical row and returns before writing, so a second delivery of the same payload (whether inside the same sessions.list batch or as a replayed event) contributes only to 'scanned' (scanned=2, changed=1 for two deliveries; changed=0 on full replay, one row, updated_at untouched); (2) duplicate concurrent session events are coalesced by the in-flight guard and post-completion replays are dropped by the 60s cooldown, so no second gateway scan or second state change is produced; (3) usage is persisted as an absolute owner-scoped snapshot (token_total = ?, msg_total = ? - never additive), so replaying the same usage event leaves 1604 tokens / 4 messages / 1 tool call rather than 3208 / 8 / 2; (4) duplicate concurrent usage events collapse onto one in-flight promise, yielding exactly one gateway fetch, one write and one session.usage.updated emission carrying the authoritative absolute messageCount. All six assertions of the executable fixture suite pass, and two mutation checks (removing the 'unchanged' early return in upsertSyncedUserSession, and making the usage write additive) each made the corresponding test fail, confirming the fixture actually detects double counting; both mutations were reverted and the working tree is unmodified apart from .prale-eval/.",
+  "validation": {
+    "command": "node --experimental-test-module-mocks --test .prale-eval/duplicate-event.contract.test.mjs",
+    "status": "passed",
+    "notes": "6/6 tests pass (2 suites): fixture distinctness, fixture sensitivity to double-count values, duplicated session update -> one state change plus unchanged replay, cooldown/in-flight replay skip, usage replay keeps absolute totals, concurrent duplicates -> one fetch/one write/one emission. Environment limits, recorded because the optional dependency is unavailable: node_modules is absent and dependencies must not be installed, so vitest (npm run test:server) and better-sqlite3 cannot run here. The demo therefore injects an in-memory node:sqlite database (sanctioned node --experimental-test-module-mocks module injection) in place of server/database.js and stubs only the external edges (gateway-client, multi-tenant-gateway, sse, openclaw-config-sync); all repository code under test - server/core/session-sync.js, server/user-manager.js, server/core/usage-sync.js, server/core/session-usage-cache.js - is the real, unmodified source. The module-mocking flag and the experimental SQLite module both emit ExperimentalWarning lines on stderr; they do not affect results. Mutation evidence: deleting the 'if (!changed) return { changed: false, action: \"unchanged\" }' guard in server/user-manager.js fails 'a duplicated session update produces exactly one state change and replays as unchanged'; changing token_total assignment to 'user_sessions.token_total + ?' in server/core/session-usage-cache.js fails 'replaying one usage event keeps the absolute totals (no double count)'. Both mutations were reverted (git status shows only the new .prale-eval/ directory)."
+  }
+}

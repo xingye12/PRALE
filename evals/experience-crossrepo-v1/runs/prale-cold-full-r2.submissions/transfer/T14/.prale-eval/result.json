@@ -1,0 +1,96 @@
+{
+  "task_id": "T14",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "search_and_replace",
+      "start_line": 434,
+      "end_line": 445,
+      "observation": "The exact-match edit engine: it counts occurrences of search_text in original_text (line 437) and, when the count is non-zero, returns original_text.replace(search_text, replace_text). Because the guard `# if num > 1: raise SearchTextNotUnique()` is commented out at lines 438-439, a unique search text is applied exactly once, a search text that appears twice would be rewritten at every occurrence, and a search text that appears zero times makes the function return None so nothing is mutated. This is the primitive the T14 contract pins down: exact (byte-for-byte, whitespace/newline-significant) matching, and the fact that uniqueness must be enforced by the caller."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "SearchTextNotUnique",
+      "start_line": 524,
+      "end_line": 525,
+      "observation": "The designated failure signal for an ambiguous edit: a ValueError subclass exported from this module and imported by aider/coders/udiff_coder.py (line 8). It is the contract's distinction between 'edit failed cleanly' (raise / falsy result, file untouched) and 'edit silently applied to several places' (multi-occurrence str.replace). The demo asserts it stays a ValueError subclass so callers can keep translating it into the UnifiedDiffNotUnique error message."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "flexible_search_and_replace",
+      "start_line": 565,
+      "end_line": 577,
+      "observation": "Dispatcher over (strategy, preproc) pairs that returns the first truthy result, i.e. the exact-match search_and_replace strategy is always attempted first (see editblock_strategies/udiff_strategies at lines 547-563 and the caller udiff_coder.flexi_just_search_and_replace at lines 201-206, which uses only (search_and_replace, all_preprocs)). Consequently a unique, byte-exact match is resolved once by search_and_replace without ever reaching the fuzzy diff-match-patch strategies, and a non-matching attempt returns None so the caller's refusal path stays clean."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "strip_blank_lines",
+      "start_line": 611,
+      "end_line": 614,
+      "observation": "Whitespace/newline normalisation used by the preproc tuples in all_preprocs (lines 528-538) and applied by try_strategy (lines 586-608). It only trims leading/trailing blank lines of the three texts, so interior whitespace - such as the trailing spaces that make the T14 fixture's two blocks distinct - remains significant, and a whitespace-blind search text still fails to match. This is why the fixture's exact edit succeeds exactly once instead of being normalised onto the near-twin block."
+    },
+    {
+      "path": "aider/coders/udiff_coder.py",
+      "symbol": "directly_apply_hunk",
+      "start_line": 261,
+      "end_line": 279,
+      "observation": "The caller-level uniqueness guard: after building before/after from the hunk it computes the non-whitespace context length (lines 267-268) and returns None, i.e. refuses the edit, when `len(before_lines) < 10 and content.count(before) > 1` (line 270) - the exact situation of the T14 non-unique edit, whose search text `    return 1\\n` occurs twice with only 8 non-whitespace characters. It also catches SearchTextNotUnique (lines 275-278) and turns it into None, so ambiguity always yields a clean failure rather than a partial rewrite."
+    },
+    {
+      "path": "aider/coders/udiff_coder.py",
+      "symbol": "apply_edits",
+      "start_line": 69,
+      "end_line": 118,
+      "observation": "The write path that makes 'fails without partial mutation' concrete: `content = do_replace(...)` (line 94), and on SearchTextNotUnique (line 95) or a falsy result (line 103) it appends an error and `continue`s, reaching `self.io.write_text(full_path, content)` (line 112) only on SUCCESS. A hunk refused by directly_apply_hunk therefore never reaches the filesystem, which the demo checks by simulating this contract on a temporary file and comparing bytes."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "An exact edit whose search text occurs exactly once is applied exactly once and does not touch the near-twin block: search_and_replace([search, replace, original]) returns original with a single substitution (the demo compares against original.replace(search, replace, 1) and confirms the second block `def second():` survives verbatim).",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "Matching is byte-exact with respect to whitespace and newlines: the fixture's two blocks differ only by trailing spaces after `paint()` plus the surrounding blank lines, and a whitespace-blind search text (`paint()` without the trailing spaces) occurs 0 times, so search_and_replace returns None and leaves the text unchanged.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "A non-unique edit fails instead of being applied: for the ambiguous search text `    return 1\\n` (2 occurrences, 8 non-whitespace characters) directly_apply_hunk returns None via its `len(before_lines) < 10 and content.count(before) > 1` refusal, and SearchTextNotUnique remains the module-level exception used when the ambiguity is detected by the search/replace strategy itself.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py",
+        "aider/coders/udiff_coder.py"
+      ]
+    },
+    {
+      "claim": "The failure is free of partial mutation: apply_edits writes the file only on the SUCCESS branch, so a refused hunk leaves the target file byte-for-byte identical (verified by the demo, which applies the contract on a temporary copy and asserts the bytes are unchanged).",
+      "evidence_paths": [
+        "aider/coders/udiff_coder.py",
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "Uniqueness is decided on the exact text first, before any whitespace-normalising or fuzzy retry: flexible_search_and_replace returns the first truthy strategy result and the udiff path tries (search_and_replace, all_preprocs) before any diff-match-patch strategy, while strip_blank_lines only trims outer blank lines so the fixture's interior whitespace distinction is preserved.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "Documented limitation recorded by the demo: the SearchTextNotUnique raise inside search_and_replace is commented out (lines 438-439), so a raw non-unique call rewrites all occurrences; the contract's refusal is therefore enforced one level up by udiff_coder.directly_apply_hunk, which the demo observes as `observed_hazard_raw_nonunique_call_replaces_all_occurrences`.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py",
+        "aider/coders/udiff_coder.py"
+      ]
+    }
+  ],
+  "conclusion": "Contract satisfied for the distinct newline/whitespace edit fixture. Using the repository's own code (aider/coders/search_replace.py search_and_replace plus the uniqueness guard in aider/coders/udiff_coder.py directly_apply_hunk/apply_edits): (C1) the fixture's exact edit is unique only because of whitespace/newline detail (trailing spaces after `paint()`, blank-line layout); it matches once and is applied exactly once, leaving the sibling block byte-identical, and a whitespace-blind variant matches zero times and is refused; (C2) the non-unique edit (`    return 1` occurring twice with an 8-character non-whitespace context) is refused - directly_apply_hunk returns None - and applying the apply_edits write rule on a temporary copy leaves the file byte-for-byte unchanged, so no partial mutation occurs. The demo runs green (exit 0, 7/7 checks PASS) with the repository sources imported via in-memory shims because diff_match_patch, GitPython and oslex are absent from this sandbox; the fuzzy dmp_* and git-cherry-pick strategies are outside the scope of this contract and were not exercised.",
+  "validation": {
+    "command": "python .prale-eval/demo_search_replace_contract.py",
+    "status": "pass",
+    "notes": "Run from the repository root (/tmp/prale-real-eval-jl54twwo/workspace); exit code 0, all 7 checks PASS and contract_satisfied=true (both `python .prale-eval/demo_search_replace_contract.py` and `... --json` runs are captured in .prale-eval/validation-log.txt). The demo reads fixtures from .prale-eval/fixtures/ and never modifies a repository file; its write-path check uses a temporary directory created under .prale-eval/ and removes it again. LIMITATION: the optional dependencies diff_match_patch and GitPython are not installed and `import oslex` fails, so aider/coders/search_replace.py and aider/coders/udiff_coder.py cannot be imported directly; the demo installs in-memory stand-in modules for them (and for the heavy aider/aider.coders package __init__ files) and then imports the unmodified repository sources, which it asserts via sr.__file__/uc.__file__. The exact-match search_and_replace path and the directly_apply_hunk refusal guard - the behaviour this contract is about - need none of the missing packages; the fuzzy dmp_* and git-cherry-pick strategies were not exercised. No dependencies were installed."
+  }
+}

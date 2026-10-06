@@ -1,0 +1,92 @@
+{
+  "task_id": "T06",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+      "symbol": "requireAnyString",
+      "start_line": 87,
+      "end_line": 95,
+      "observation": "Shared local guard for metadata operations (listTeams, listTasks). When a selector field is absent/blank it throws ParamError synchronously, so malformed requests fail as a typed local error and never reach the HTTP transport where a raw response shape could leak."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+      "symbol": "MetadataClient.listTeams",
+      "start_line": 176,
+      "end_line": 189,
+      "observation": "Team listing overloads build the payload through body(...) and then call requireAnyString(payload, ['user_id','user_key'], 'listTeams'); calling listTeams({}) therefore rejects with ParamError instead of issuing a request that returns an unvalidated envelope."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+      "symbol": "MetadataClient.checkAcl",
+      "start_line": 271,
+      "end_line": 271,
+      "observation": "ACL permission-check metadata operation. It delegates to this.http.post and returns PermCheckResult on success; on any remote failure the injected transport converts the response into a normalized TDAMError, so the caller never observes a raw HTTP/envelope object."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+      "symbol": "MetadataClient",
+      "start_line": 112,
+      "end_line": 133,
+      "observation": "The class overloads its constructor to accept either a config or an injected Transport ('post' in configOrTransport). That seam lets the failure contract drive the real normalization path deterministically with a stubbed fetch, without changing production code."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "V3HttpTransport.request",
+      "start_line": 58,
+      "end_line": 121,
+      "observation": "The single normalization point for metadata calls: non-JSON bodies become TDAMError(code=status|-1), and any envelope with code!==0 or a non-2xx status is rejected as TDAMError(code, message, requestId, details). It always throws the typed error class rather than returning/ rejecting with the Response or parsed envelope."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/errors.ts",
+      "symbol": "TDAMError",
+      "start_line": 12,
+      "end_line": 33,
+      "observation": "Typed remote-failure class carrying code, requestId and optional normalized details; message is formatted as '[code] message (request_id=...)'. This is the shape callers receive instead of a raw response shape."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/errors.ts",
+      "symbol": "ParamError",
+      "start_line": 5,
+      "end_line": 10,
+      "observation": "Typed local-validation failure (extends TypeError, name='ParamError') thrown by the metadata client's own guards before any network call."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "MetadataClient.checkAcl surfaces a remote failure as a normalized TDAMError (name 'TDAMError', numeric code, formatted message, requestId), never as a Response or a raw parsed envelope: an HTTP 200 body {code:40001,message:'acl denied',request_id:'body-req-1'} yields code 40001, the server message and the envelope request_id, with no leaked `data` field.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+        "sdk/memory-core/typescript/src/v3/http.ts",
+        "sdk/memory-core/typescript/src/errors.ts"
+      ]
+    },
+    {
+      "claim": "The metadata client's local guards (body/requireAnyString) fail fast with ParamError before any HTTP call: listTeams({}) and listTasks({}) throw synchronously, and a fetch spy records zero calls, so bad input can never leak an unvalidated response shape.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+        "sdk/memory-core/typescript/src/errors.ts"
+      ]
+    },
+    {
+      "claim": "Non-JSON transport failures are still typed: an HTTP 503 body 'upstream boom' becomes TDAMError code 503 with the body text in message and the requestId taken from the x-qcloud-transaction-id header, and a 200 OK non-JSON body becomes TDAMError code -1.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/metadata-client.ts",
+        "sdk/memory-core/typescript/src/v3/http.ts"
+      ]
+    },
+    {
+      "claim": "MetadataClient injects a Transport via its overloaded constructor, which is the seam the executable contract uses to exercise the real V3HttpTransport normalization path deterministically with a stubbed global fetch.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/metadata-client.ts"
+      ]
+    }
+  ],
+  "conclusion": "The v3 MetadataClient satisfies the contract: every failure is typed and normalized. Remote failures (business code != 0, non-2xx, or non-JSON bodies) are raised as TDAMError with code, message, requestId and optional normalized details; local validation failures are raised as ParamError before any request is sent. Neither path leaks a raw HTTP Response or a parsed-but-unvalidated {code,message,data} envelope. The executable contract at .prale-eval/validation/metadata-client.contract.ts drives the real sources and passes 24/24 checks (exit 0).",
+  "validation": {
+    "command": "node --import ./.prale-eval/validation/register.mjs ./.prale-eval/validation/metadata-client.contract.ts",
+    "status": "passed",
+    "notes": "Run from the workspace root with Node v24.14.0 (native TypeScript type-stripping). 24/24 checks passed, exit code 0. The project's vitest/npm dependencies (vitest, undici) are not installed and installing them was out of scope, so a dependency-free loader (.prale-eval/validation/loader.mjs) shims the missing `undici` package and maps the project's ./x.js specifiers to ./x.ts; only globalThis.fetch is stubbed. The real MetadataClient, V3HttpTransport and error classes are imported and executed unmodified. A vitest-native variant (npm test) was not run because vitest is unavailable in this workspace."
+  }
+}

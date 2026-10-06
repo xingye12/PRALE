@@ -1,0 +1,308 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..47dbd30
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,97 @@
++{
++  "task_id": 17,
++  "repository": "wattclaw",
++  "mode": "explore",
++  "evidence": [
++    {
++      "path": "server/core/request-context.js",
++      "symbol": "runWithRequestContext",
++      "start_line": 5,
++      "end_line": 7,
++      "observation": "runWithRequestContext(context, fn) is the single writer of request-scoped state: it runs fn inside an AsyncLocalStorage store initialized with the supplied context object (or {} when the context is falsy). The store is created at module scope with `new AsyncLocalStorage()`, so there is no global mutable tenant variable; the tenant identity lives only on the async continuation. Because the store is created per run() invocation, nested/concurrent requests cannot overwrite each other's tenant."
++    },
++    {
++      "path": "server/core/request-context.js",
++      "symbol": "getRequestTenant",
++      "start_line": 17,
++      "end_line": 19,
++      "observation": "getRequestTenant() returns `getRequestContext()?.tenant || null`, and its sibling getRequestUser() (lines 13-15) returns `?.user || null`, while getRequestContext() (lines 9-11) returns `requestContext.getStore() || null`. All three are total: outside any runWithRequestContext scope they return null rather than throwing or leaking a previous request's tenant. This null-on-absence contract is what lets the gateway distinguish 'no tenant pinned by the request' from 'tenant explicitly pinned'."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "getGatewayForCurrentRequest",
++      "start_line": 397,
++      "end_line": 411,
++      "observation": "getGatewayForCurrentRequest() is the tenant-boundary enforcement point for WS RPC. It reads getRequestUser() and getRequestTenant() from the request context and resolves the tenant with the precedence `contextTenant || (user ? await this.ensureUserTenant(user) : await this.getDefaultTenant())`. So a tenant pinned on the request always wins; otherwise a logged-in user is mapped to their assigned tenant via ensureUserTenant(); only with no user and no pinned tenant does it fall back to getDefaultTenant() (lines 496-499: first listed tenant, else a new 'tenant-1' record). It then builds the per-tenant client and awaits ensureConnected(tenant.id, gateway) before returning. MultiTenantGatewayProxy.call (lines 148-151) routes every generic call through this method, so the tenant isolation of ordinary traffic depends entirely on this function."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "getHttpTargetForCurrentRequest",
++      "start_line": 448,
++      "end_line": 466,
++      "observation": "getHttpTargetForCurrentRequest() applies the identical context-precedence rule to HTTP traffic: `contextTenant || (user ? ensureUserTenant(user) : getDefaultTenant())`, then returns `{ baseUrl: http://<tenant.host>:<tenant.port>, headers: { Authorization: Bearer <tenant.token> }, tenant }`. Both the tenant host/port and the per-tenant bearer token are derived from the resolved tenant, so request-scoped HTTP calls carry the tenant's own credentials rather than a shared/global one. server/core/gateway-client.js `_buildGatewayHttpOptions` consumes this and only falls back to envConfig.OPENCLAW_WS_URL/OPENCLAW_AUTH_TOKEN when the function returns falsy (i.e. multi-tenant disabled), which is the single-tenant degradation path."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "callGatewayForTenant",
++      "start_line": 417,
++      "end_line": 424,
++      "observation": "callGatewayForTenant(tenantId, method, params, timeout) is the deliberate escape hatch from context-derived selection: the comment at lines 413-416 states it 'bypasses request-context tenant selection' and is used for cross-tenant admin operations. It bootstraps, loads the tenant row by explicit id, and throws `Tenant <id> not found` (line 420) when the id does not resolve, so an invalid/cross-tenant id is a hard failure rather than a silent fallback to the default tenant. Its all-tenant sibling callGatewayForAllTenants (lines 429-446) fans out with Promise.allSettled and maps each outcome back to `{ tenantId, ok, value|error }`, so one tenant's failure is attributed and does not abort the others."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "ensureConnected",
++      "start_line": 704,
++      "end_line": 780,
++      "observation": "ensureConnected(tenantId, gateway) is the failure-behavior core of gateway selection. It short-circuits when gateway.isConnected, coalesces concurrent attempts through this.connecting (lines 714-717, cleared in .finally at 774-776) so parallel requests never open duplicate sockets, and otherwise races a connect against a timer. On timeout it rejects with `Gateway for <tenantId> did not connect in time` after cleanup() detaches listeners (lines 727-740); on an 'error' event it rejects with the underlying error unless the error matches isPairingOrScopeError (lines 2586-2589: pairing required / scope upgrade / pending approval / missing scope), in which case it approves the pending backend device once and retries before rejecting (lines 746-760). Because getGatewayForCurrentRequest/getHttpTargetForCurrentRequest/getHttpTargetForTenantId all await this method, an unreachable tenant surfaces as a propagated rejection to the caller rather than a partial or cross-tenant response; server/core/auth.js turns such failures into HTTP 503."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "moveUserToTenant",
++      "start_line": 335,
++      "end_line": 351,
++      "observation": "moveUserToTenant(userId, tenantId, beforeAssign) guards the assignment boundary: it throws `Tenant <id> not found` when the target row is absent (line 337) and `Tenant <id> is full (count/maxUsers)` when the tenant already holds maxUsers other users (lines 341-344), so capacity is enforced before the UPSERT in assignUserToTenant (lines 613-620). The optional beforeAssign callback runs before the write and its return value is surfaced as `sync`, giving callers (server/handlers/tenants.js) a hook for per-tenant config sync around an authorized admin move."
++    },
++    {
++      "path": "server/core/multi-tenant-gateway.js",
++      "symbol": "MultiTenantGatewayProxy",
++      "start_line": 130,
++      "end_line": 152,
++      "observation": "MultiTenantGatewayProxy is the facade the rest of the server treats as 'the gateway'. Its `call` (lines 148-151) delegates to manager.getGatewayForCurrentRequest() rather than to any tenant-specific client, so every generic RPC is automatically scoped to the request's tenant; `isConnected` (136-138) is true when ANY tenant client is connected, and `connect`/`disconnect` (140-146) bootstrap or tear down all tenant clients. This is why callers that must address a specific tenant use the explicit callGatewayForTenant/getGatewayHttpTargetForTenantId APIs instead of the proxy."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "Request-scoped tenant identity is carried only via AsyncLocalStorage in server/core/request-context.js: runWithRequestContext is the sole writer and getRequestTenant/getRequestUser/getRequestContext read the store, returning null outside a request scope. This makes tenant selection per-continuation rather than a global, and the null sentinel is what the gateway uses to mean 'no tenant pinned'.",
++      "evidence_paths": [
++        "server/core/request-context.js",
++        "server/core/multi-tenant-gateway.js"
++      ]
++    },
++    {
++      "claim": "Tenant boundary enforcement for request traffic is centralized in multi-tenant-gateway.js: getGatewayForCurrentRequest (397-411) and getHttpTargetForCurrentRequest (448-466) resolve the tenant with precedence request-context tenant > user's assigned tenant via ensureUserTenant > getDefaultTenant, and derive both connection target and bearer token from that single resolved tenant. Because MultiTenantGatewayProxy.call (148-151) routes through getGatewayForCurrentRequest, ordinary WS RPC cannot address a tenant other than the one the request resolved.",
++      "evidence_paths": [
++        "server/core/multi-tenant-gateway.js",
++        "server/core/request-context.js"
++      ]
++    },
++    {
++      "claim": "Cross-tenant access is explicit and validated, not accidental: callGatewayForTenant (417-424) documents that it bypasses request-context selection and throws `Tenant <id> not found` for unknown ids, while callGatewayForAllTenants (429-446) uses Promise.allSettled and returns per-tenant { tenantId, ok, value|error } so a single tenant failure is attributed instead of aborting the fan-out.",
++      "evidence_paths": [
++        "server/core/multi-tenant-gateway.js"
++      ]
++    },
++    {
++      "claim": "Failure behavior is fail-closed and per-tenant: ensureConnected (704-780) coalesces concurrent connects via this.connecting, rejects with `Gateway for <tenantId> did not connect in time` on timeout, retries once on pairing/scope errors identified by isPairingOrScopeError (2586-2589), and otherwise propagates the underlying error; moveUserToTenant (335-351) throws on unknown/full tenants before writing the assignment. Callers therefore propagate rejection rather than degrading to a shared/default tenant, and server/core/auth.js maps such failures to HTTP 503.",
++      "evidence_paths": [
++        "server/core/multi-tenant-gateway.js"
++      ]
++    }
++  ],
++  "conclusion": "Tenant boundary enforcement in wattclaw is layered. server/core/request-context.js provides a per-continuation AsyncLocalStorage store with runWithRequestContext as its only writer and getRequestTenant/getRequestUser/getRequestContext as total readers returning null when no request scope is active. server/core/multi-tenant-gateway.js consumes that store at exactly two request-facing entry points, getGatewayForCurrentRequest and getHttpTargetForCurrentRequest, which resolve a single tenant using precedence request-context tenant > user's assigned tenant (ensureUserTenant) > getDefaultTenant, and then build both the connection target and the Authorization bearer from that tenant; the MultiTenantGatewayProxy.call facade routes generic RPC through the same method, so ordinary traffic is tenant-isolated by construction. Deliberate cross-tenant/admin operations must call the explicit APIs callGatewayForTenant / callGatewayForAllTenants / getHttpTargetForTenantId, which validate the id (throwing 'Tenant <id> not found') and, for the fan-out, attribute failures per tenant via Promise.allSettled. Failure behavior is fail-closed: ensureConnected rejects on connect timeout or socket error (retrying once only for pairing/scope errors), coalescing concurrent attempts to avoid duplicate sockets, and moveUserToTenant rejects unknown or full tenants before mutating the assignment table. The net effect is that an unreachable or unspecified tenant produces a propagated error (surfaced as HTTP 503 by auth middleware) rather than a silent fallback to another tenant.",
++  "validation": {
++    "command": "node --check server/core/multi-tenant-gateway.js && node --check server/core/request-context.js && python3 (programmatic check that each cited start_line/end_line range contains its named symbol)",
++    "status": "passed",
++    "notes": "node --check parsed both modules without syntax errors, and a script re-read each cited inclusive line range and confirmed the named symbol (getGatewayForCurrentRequest, callGatewayForTenant, callGatewayForAllTenants, getHttpTargetForCurrentRequest, ensureConnected, moveUserToTenant, MultiTenantGatewayProxy, runWithRequestContext, getRequestTenant, getRequestUser, getRequestContext) falls inside it. A focused unit-test run was NOT possible: no node_modules are installed in this workspace, so vitest and its dependency graph are unavailable; per instructions no dependencies were installed and this limitation is recorded here instead. Static inspection of server/core/auth.js and server/core/gateway-client.js was used to confirm how the cited gateway functions are consumed at runtime."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+snapshot .prale-eval/result.json - 249e019ec3458e17176ae77f45177208b1c283195441b75501f5ad9af808ac39

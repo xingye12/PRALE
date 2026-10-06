@@ -1,0 +1,59 @@
+{
+  "task_id": "T02",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_process",
+      "start_line": 24,
+      "end_line": 37,
+      "observation": "Serial FIFO drain loop and the only place job promises settle. `_running` guards against concurrent drains, `this._queue.shift()` takes the oldest job, `await this._execute(item)` is awaited, and the outcome is routed per-item: `result.ok === true` -> `item.resolve(result.data)` else `item.reject(result.error)`. Because the rejection is scoped to the single `item`, the `while (this._queue.length > 0)` loop continues into the next job, so a job enqueued before the failure still runs and settles; `this._running = false` is only reached after the queue is drained, so a failing job cannot wedge the queue."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "_execute",
+      "start_line": 60,
+      "end_line": 100,
+      "observation": "Per-job execution body, and the reason `_process` can never be aborted by a failing job: every `throw` raised by a bad gateway response is caught and converted into a value `{ ok: false, error: err }` (line 96); `_execute` therefore resolves instead of rejecting. Non-retryable errors (anything whose message is neither 'config changed since last load' nor 'rate limit') reject the job immediately on the first attempt, whereas OCC/rate-limit errors wait and re-run the fresh `config.get` up to `maxRetries = 3`. The success shape is also deterministic: a patch/apply success returns `{ ok: true, data: undefined }`, while a `transformFn` that returns a falsy value short-circuits to `{ ok: true, data: null }` (line 69) without any patch or apply call. A job failing at `config.get` (line 65-66) or at the patch call (line 73-74) never reaches `_recordPatch()`/`config.apply`, so the failed job leaves no mutation behind."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "enqueue",
+      "start_line": 15,
+      "end_line": 21,
+      "observation": "Entry point that wraps each config modification in a Promise, pushes `{ transformFn, label, method, resolve, reject }` onto the shared `_queue` array, and fires `_process()` (a no-op while `_running`). Because resolve/reject are parked in the queue entry, a job that is enqueued *before* an earlier job fails is still owned by the queue and will be settled later by the drain loop - this is exactly the 'first job fails, next job must still settle' contract the fixture pins."
+    },
+    {
+      "path": "server/core/config-queue.js",
+      "symbol": "configQueueExecute",
+      "start_line": 104,
+      "end_line": 106,
+      "observation": "Module-level export used by all callers (server/handlers/channels.js, system.js, agent-team.js). It delegates to the single `configQueue` singleton created at line 102, so every caller shares one FIFO queue and therefore the same settle ordering; the contract fixture calls `configQueueExecute` (not the private class) to exercise that shared path, including the fact that a rejection is delivered only to the enqueuing caller."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "A queued job that fails settles only itself while the shared FIFO queue keeps draining: `_process` catches the failure as a result value and calls `item.reject(result.error)` for that item alone, then continues its `while (this._queue.length > 0)` loop, so the next job - enqueued before the failure happened - is still dequeued and settled.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "The failure cannot abort the drain: `_execute` converts every gateway error into `{ ok: false, error: err }` instead of throwing, and non-retryable messages skip the OCC/rate-limit retry branch, so the failing job rejects on the first attempt and `_running` is still released at the end of `_process`, leaving the queue live for later jobs (proved by the post-failure no-op liveness probes).",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "Settlement values are deterministic and distinguishable per outcome, which is what makes the fixture a contract rather than a smoke test: patch+apply success resolves `undefined`, a no-op transform resolves `null` without any `config.patch`/`config.apply` RPC, and a failure rejects with the original gateway error message (no wrapper, no retry delay for non-retryable errors).",
+      "evidence_paths": ["server/core/config-queue.js"]
+    },
+    {
+      "claim": "A failed job leaves no partial configuration behind: the failure is raised before `_recordPatch()` and before `config.apply`, so the gateway config the next job reads is exactly the pre-failure config plus the next job's own transform - the stub's recorded gateway state shows job A's mutation absent and job B's applied.",
+      "evidence_paths": ["server/core/config-queue.js"]
+    }
+  ],
+  "conclusion": "Contract pinned and executable. The fixture at server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs drives the unmodified ConfigQueue from server/core/config-queue.js and covers three scenarios of the requested 'first job fails, next job must still settle deterministically' contract: (1) the first job fails at the write stage (`config.patch` returns 'rpc transport closed') and is rejected while the second job, enqueued before the failure, still runs the full config.get -> patch -> config.get -> config.apply sequence and resolves `undefined` with exactly one patch and one apply recorded; (2) the first job fails at the read stage (`config.get` returns 'gateway offline: econnrefused') and the second job still settles, again with one patch/apply and the failed job's mutation absent from the gateway state; (3) two post-failure no-op jobs resolve `null` in FIFO order without patching, proving `_process` released `_running` and the queue is not wedged. Settlement order, RPC trace, rejection messages, resolve values and the final gateway config are asserted exactly, no unhandled rejection leaks, and a clean child-process replay of the whole fixture produces a byte-identical snapshot, which is the determinism evidence. Validation ran with the stock Node 24 binary: the run passed (exit 0) and exited cleanly; a negative control in which the stub is programmed to fail the second job's patch showed the second job is then `REJECTED:boom-b`, confirming the 'next job settles' assertions discriminate. node_modules is absent in this checkout, so the repository's vitest suites could not be run and the fixture instead uses node:test-free plain-node assertions plus a narrow ESM resolve hook that redirects only config-queue.js's `./gateway-client.js` edge to a deterministic in-memory gateway stub; the module under contract itself is never modified or copied.",
+  "validation": {
+    "command": "node server/core/contract-fixtures/config-queue-failure-settlement.demo.mjs",
+    "status": "passed",
+    "notes": "Executed from the repository root with the workspace Node v24.14.0 binary; exit code 0, console output '[contract] PASS - first job failed, subsequent jobs settled deterministically; replay snapshot identical.'. The same command was re-run three times to confirm stability (exit 0 each time). Scope of what was exercised: the fixture imports the real server/core/config-queue.js unmodified via a node:module register() hook (server/core/contract-fixtures/gateway-client-loader.mjs) that redirects the single `./gateway-client.js` specifier - and only that edge - to server/core/contract-fixtures/gateway-client-stub.mjs, a deterministic in-memory gateway implementing config.get/config.patch/config.set/config.apply with OCC baseHash checks and scripted one-shot failures; method-level RPC traces, patch/apply counts and the resulting gateway config are asserted. Determinism check: the driver spawns itself in a child process with CONTRACT_REPLAY=1 and asserts deepStrictEqual between the two snapshots (identical). Negative controls run separately (not persisted as files): (a) running `node -e \"import('./server/core/config-queue.js')\"` without the loader fails with ERR_MODULE_NOT_FOUND, confirming the hook is what makes the fixture runnable in this dependency-less checkout; (b) scripting the stub to fail the second job's patch yields REJECTED:boom-b, confirming the 'next job still settles' assertions fail when the behaviour is broken. Limitations: node_modules is not installed, so vitest (devDependency) and the repo's `npm run test:server` suite were unavailable and could not be used as an additional harness; the real gateway-client.js -> multi-tenant-gateway.js chain therefore could not be loaded, which is why the dependency is stubbed rather than exercised. The fixture is dependency-free plain Node ESM and does not depend on the unavailable packages."
+  }
+}

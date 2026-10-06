@@ -1,0 +1,83 @@
+{
+  "task_id": "T14",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "search_and_replace",
+      "start_line": 434,
+      "end_line": 445,
+      "observation": "The core apply primitive. It counts occurrences of search_text in original_text (num = original_text.count(search_text)) and, with the guard restored, raises SearchTextNotUnique when num > 1 before ever calling original_text.replace. Returning None when num == 0 makes an absent search a clean refusal. Because the raise happens before the replacement, a non-unique block produces no output at all, so no occurrence can be partially mutated. For a block that occurs exactly once it returns the text with exactly one substitution, leaving whitespace-identical sibling blocks untouched."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "SearchTextNotUnique",
+      "start_line": 524,
+      "end_line": 525,
+      "observation": "Typed ValueError subclass that is the contract's failure signal for a non-unique search block. It is raised by search_and_replace (line 439) and caught by callers, which is how 'fails without partial mutation' is expressed: the exception unwinds before any buffer is rewritten."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "flexible_search_and_replace",
+      "start_line": 565,
+      "end_line": 577,
+      "observation": "Strategy driver: iterates the (strategy, preprocs) pairs and returns the first truthy result via try_strategy. It does not swallow SearchTextNotUnique, so a non-unique exact search raises out of the whole flexible pipeline instead of falling through to a lossier strategy that would apply the wrong edit. This is the entry point exercised by the fixture at the same shape as udiff_coder.flexi_just_search_and_replace ([(search_and_replace, all_preprocs)])."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "try_strategy",
+      "start_line": 586,
+      "end_line": 608,
+      "observation": "Runs one strategy under one preproc combination (strip_blank_lines / relative_indent / reverse_lines). The non-unique fixture hits this with the first preproc (False, False, False), so the uniqueness check sees the raw newline/whitespace text and raises before any preprocessing could blur the count. Returning falsy (None) for misses and letting SearchTextNotUnique propagate is what makes the refusal atomic."
+    },
+    {
+      "path": "aider/coders/search_replace.py",
+      "symbol": "all_preprocs",
+      "start_line": 528,
+      "end_line": 538,
+      "observation": "The preproc combinations paired with search_and_replace by both editblock_strategies (line 547) and udiff_strategies (line 558); the first entry (False, False, False) is the literal, whitespace-exact interpretation. It anchors the fixture's use of find/replace as the exact-edit path before any flexible newline/whitespace normalization."
+    },
+    {
+      "path": "aider/coders/udiff_coder.py",
+      "symbol": "directly_apply_hunk",
+      "start_line": 261,
+      "end_line": 279,
+      "observation": "Caller-side contract: it invokes flexi_just_search_and_replace inside a try/except SearchTextNotUnique and maps the exception to new_content = None (lines 274-277). A None result makes do_replace/apply_hunk skip writing the file, which is the concrete 'no partial mutation' behavior the fixture models. It also short-circuits repeated tiny-context hunks (content.count(before) > 1) at line 271."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "An exact newline/whitespace-distinct edit succeeds exactly once: when search_text occurs once in original_text, search_and_replace substitutes it a single time, the byte-identical sibling block is unchanged, and the input buffer is not mutated in place.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "A non-unique edit fails without partial mutation: when search_text occurs more than once, search_and_replace raises SearchTextNotUnique from the num > 1 guard at line 438-439 before original_text.replace is reached, so the caller observes None and the buffer stays byte-identical to its input rather than being rewritten at every occurrence.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py"
+      ]
+    },
+    {
+      "claim": "The dependency-free minimal source change was to restore the uniqueness guard in search_and_replace that the fixture baseline had commented out; the SearchTextNotUnique class at line 524 and the except handler at udiff_coder.py:276 were otherwise unreachable, and re-running the non-unique scenario without the guard silently applies 2 substitutions (over-application) instead of refusing.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py",
+        "aider/coders/udiff_coder.py"
+      ]
+    },
+    {
+      "claim": "flexible_search_and_replace and try_strategy propagate the typed SearchTextNotUnique error instead of falling through to a lossier strategy, and the caller directly_apply_hunk maps that error to a None result, which is the mechanism that turns a non-unique edit into an atomic, no-mutation refusal.",
+      "evidence_paths": [
+        "aider/coders/search_replace.py",
+        "aider/coders/udiff_coder.py"
+      ]
+    }
+  ],
+  "conclusion": "The contract for the distinct newline/whitespace edit fixture holds. search_and_replace now rejects a non-unique search block by raising SearchTextNotUnique before any replacement, so the operation is atomic: an exact (unique) block is applied exactly once while a block occurring twice fails with the original buffer returned unchanged. The executable fixture .prale-eval/contract_fixture.py drives the real production functions over the alpha/beta newline-and-indent fixture and all 10 checks pass (exit 0); a counterfactual re-run with the guard disabled shows the over-application (2 substitutions) that the contract forbids. The only source change is the restored 2-line uniqueness guard in aider/coders/search_replace.py; no task metadata, oracle files, locks, or git config were modified.",
+  "validation": {
+    "command": "python .prale-eval/contract_fixture.py",
+    "status": "passed",
+    "notes": "Exit code 0; 10/10 checks PASS: exact_edit_succeeds, exact_edit_applied_once (count == 1), exact_edit_leaves_sibling_untouched, exact_edit_original_immutable, non_unique_edit_fails, non_unique_no_partial_mutation (buffer byte-identical), non_unique_no_replacement_leaked, non_unique_original_immutable, non_unique_raises_typed_error, no_match_clean_refusal. The fixture loads aider/coders/search_replace.py by file path and stubs the optional imports (diff_match_patch, plus unused aider.dump/aider.utils symbols) because diff_match_patch, GitPython and oslex are not installed and installing dependencies is out of scope; the functions under test do not touch those stubs. Consequently the broader repository suite (pytest tests/basic/test_udiff.py) could not be executed in this environment, and the focused fixture above is the recorded validation. A counterfactual run against the pre-fix guardless body produced refused=0 and 2 compute(2) substitutions, confirming the guard is what enforces the no-partial-mutation clause."
+  }
+}

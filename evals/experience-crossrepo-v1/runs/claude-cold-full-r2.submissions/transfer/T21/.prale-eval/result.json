@@ -1,0 +1,78 @@
+{
+  "task_id": "T21",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryCore/src/core/index.ts",
+      "symbol": "InstanceConfigProvider",
+      "start_line": 31,
+      "end_line": 34,
+      "observation": "The core barrel is the public, host-neutral surface of MemoryCore. Lines 31-34 re-export `InstanceConfigProvider` (and `LocalConfigSource`) from `./instance-config-provider.js`, which is what makes the provider's cache-gated `resolveVdb` operation part of the recorded core contract. Because the provider takes its upstream `IConfigSource` by dependency injection, this exported symbol is the exact seam a fake client can be substituted into without touching production code."
+    },
+    {
+      "path": "MemoryCore/src/core/instance-config-provider.ts",
+      "symbol": "InstanceConfigProvider.fetchAndStoreVdb",
+      "start_line": 215,
+      "end_line": 238,
+      "observation": "This private method is where the success state is committed. It first `await`s the client effect at line 216 (`await this.source.fetchVdb(instanceId)`), rejects an unusable payload at lines 219-223, and only then writes the cache entry with `this.vdbPool.set(...)` at lines 231-235. A rejecting client fetch propagates out of the method, so no cache entry is ever written for a failed operation — the ordering of await-before-set is the commit gate under test."
+    },
+    {
+      "path": "MemoryCore/src/core/instance-config-provider.ts",
+      "symbol": "InstanceConfigProvider.resolveVdb",
+      "start_line": 179,
+      "end_line": 209,
+      "observation": "The public entry point of the operation. It returns an existing cache entry only when one is already present and unexpired (lines 181-190), dedupes concurrent first access onto a single in-flight client promise via `vdbFetchPromises` (lines 193-197), and deletes that in-flight marker in a `finally` block (lines 204-208) so a rejected fetch cannot strand the instance. Together with `fetchAndStoreVdb` this is what the fake-client test drives and observes through the public `poolSize` accessor."
+    },
+    {
+      "path": "MemoryCore/src/core/__tests__/instance-config-provider.fake-client.test.ts",
+      "symbol": "FakeConfigClient",
+      "start_line": 62,
+      "end_line": 95,
+      "observation": "The fake client used by the test. It implements the real `IConfigSource` contract but its `fetchVdb` never settles on its own — it parks a {resolve, reject} pair that the test later drives through `completeEffect()` / `failEffect()`. This is what turns 'before the client effect completes' into an observable instant instead of a race, and what lets the test assert both halves of the contract: no success state committed pre-effect, and failure observably propagated."
+    },
+    {
+      "path": "MemoryCore/src/core/__tests__/instance-config-provider.fake-client.test.ts",
+      "symbol": "describe(\"InstanceConfigProvider fake client — commit gating\")",
+      "start_line": 114,
+      "end_line": 198,
+      "observation": "The five executable contract cases, all against the real provider: (1) no cache entry while the effect is pending, with poolSize re-asserted after a microtask drain so a premature `set()` would be caught; (2) concurrent callers share one effect and commit once, after it completes; (3) a failing effect rejects and caches nothing; (4) after a failure a retry reaches the client again (no stranded in-flight marker) and can then commit; (5) an unusable payload surfaces as an observable failure with no cached state. A companion case at lines 204-210 asserts the barrel in `src/core/index.ts` really re-exports `InstanceConfigProvider`."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The operation under contract is public MemoryCore API: `InstanceConfigProvider` is re-exported from the core barrel `MemoryCore/src/core/index.ts` (lines 31-34), and it receives its client (`IConfigSource`) by constructor injection, so a fake client can exercise the real production object.",
+      "evidence_paths": [
+        "MemoryCore/src/core/index.ts",
+        "MemoryCore/src/core/instance-config-provider.ts"
+      ]
+    },
+    {
+      "claim": "No success state is committed before the fake effect completes: `resolveVdb` only serves cache hits for entries that already exist, and `fetchAndStoreVdb` awaits `source.fetchVdb()` before it writes `vdbPool`, so `poolSize` remains 0 for the entire window in which the fake client's fetch promise is pending.",
+      "evidence_paths": [
+        "MemoryCore/src/core/instance-config-provider.ts",
+        "MemoryCore/src/core/index.ts"
+      ]
+    },
+    {
+      "claim": "Failure remains observable: a rejecting client fetch propagates out of `resolveVdb` (nothing is swallowed into a cached success), no cache entry is written for the failed instance, and the in-flight dedupe marker is cleared in a `finally` block so a subsequent retry re-issues the client operation instead of awaiting a permanently rejected promise.",
+      "evidence_paths": [
+        "MemoryCore/src/core/instance-config-provider.ts",
+        "MemoryCore/src/core/__tests__/instance-config-provider.fake-client.test.ts"
+      ]
+    },
+    {
+      "claim": "The delivered test proves the contract executably: it drives the real `InstanceConfigProvider` through a manually-settled fake `IConfigSource` and asserts poolSize stays 0 until the effect settles, that rejection surfaces to the caller, that the failed instance is not stranded, and that the barrel exposes the symbol under test.",
+      "evidence_paths": [
+        "MemoryCore/src/core/__tests__/instance-config-provider.fake-client.test.ts",
+        "MemoryCore/src/core/index.ts"
+      ]
+    }
+  ],
+  "conclusion": "MemoryCore's exported `InstanceConfigProvider` satisfies the requested contract. Driven by a fake `IConfigSource` client whose operation only settles when the test says so, the real provider commits no success state (no VDB cache entry; `poolSize` stays 0) while the client effect is pending, commits exactly once after the effect resolves, and keeps failure observable: a rejected effect propagates to the caller, leaves no cached state, and clears its in-flight dedupe marker so a retry can still succeed. A negative control confirmed the gating assertion is not vacuous — a mutant that writes the cache entry before awaiting the client fetch is caught by the same assertion.",
+  "validation": {
+    "command": "node --experimental-transform-types .prale-eval/run-fake-client-demo.mjs",
+    "status": "passed",
+    "notes": "Ran the dependency-free executable demo, which mirrors the delivered vitest cases against the real `MemoryCore/src/core/instance-config-provider.ts`: 6/6 checks passed (no cache entry while the effect is pending; microtask drain does not commit; concurrent callers share one effect and commit once after completion; failing effect rejects and caches nothing; retry after failure reaches the client and can commit; unusable payload surfaces as an observable failure; core barrel re-exports the symbol). Limitation: the project's vitest runner is NOT installed in this workspace (MemoryCore/node_modules is absent) and installing dependencies is out of scope, so `npx vitest run src/core/__tests__/instance-config-provider.fake-client.test.ts` could not be executed; the `.test.ts` file is the primary deliverable and the demo is a faithful Node-native mirror of it using `--experimental-transform-types` plus the small `.prale-eval/ts-resolve.mjs` hook that maps the repo's `./x.js` specifiers onto `x.ts`. Negative control: a temporary mutant of `fetchAndStoreVdb` that sets the cache entry before awaiting `source.fetchVdb` was correctly caught by the gating assertion (mutant file removed afterwards; no production source was modified)."
+  }
+}

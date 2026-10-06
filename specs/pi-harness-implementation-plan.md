@@ -14,7 +14,7 @@
 - 小而稳定的 Python 库 API、事件和 hook；
 - 存储一致性与崩溃恢复测试。
 
-第一版明确不包含：多主写入、分布式一致性、外部副作用的 exactly-once 保证，以及 pi 的实验性 `pico3/` 运行时。跨会话长期记忆和 Skill 自进化作为阶段 10 的可选扩展实现，其范围和不变量分别见 [长期记忆实现规范](long-term-memory-implementation-spec.md) 与 [Skill 自进化功能接入](skill-self-evolution-integration.md)。
+第一版明确不包含：多主写入、分布式一致性、外部副作用的 exactly-once 保证，以及 pi 的实验性 `pico3/` 运行时。跨会话长期记忆和 Skill 自进化作为阶段 10 的可选扩展实现，其范围和不变量分别见 [长期记忆实现规范](long-term-memory-implementation-spec.md) 与 [Skill 自进化功能接入](skill-self-evolution-integration.md)。本地 Subagent 系统作为阶段 11 的可选扩展设计，定义、控制调用、父子生命周期与恢复验收见 [Subagent 系统实现方案](subagent-system-implementation-plan.md)；该阶段尚待实现，不属于当前已交付能力。
 
 ## 2. 规范来源与优先级
 
@@ -168,6 +168,7 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 | 8. 观察与扩展 | hooks、watch、telemetry、文档与示例 | handler/listener 失败隔离；hook 结果遵守持久化边界 |
 | 9. 服务层（后置） | HTTP/RPC、认证、远程订阅、TUI 适配 | 仅复用库 API；不得把传输状态混入 domain/runtime。Web UI 的 catalog、durable trace 查询、指标与适配实施见 [Web UI 实施计划](web-ui-implementation-plan.md)；该计划已交付 REST/SSE 适配、SPA 与部署入口（`api/serve.py` 的 `prale-web`，配置与运维契约见其 §4.3），本文件不重复其 schema |
 | 10. 长期资产（可选） | 持久化调度器与 runtime 生命周期、Session→L0 trace archive、L1--L3、Skill buffer/review、资产检索、保留/GC 与 SQLite | 跨 Session 资产经 scope 隔离；后台失败不阻塞 Drive；冻结 source snapshot、召回/Skill 版本进入 effect intent；进程重启后延迟任务不丢失且只执行一次 |
+| 11. 本地 Subagent（可选，已实现） | 定义加载、独立子 lane、原生控制调用、前台/后台、查询/停止/续跑、通知与恢复 | 父子接纳同事务且幂等；子终态与 run result/outbox 原子提交；取消级联；子权限只收缩；后台通知不自动启动父模型；细分实施顺序与故障注入见 [Subagent 方案 §6](subagent-system-implementation-plan.md#6-实施顺序与验收) |
 
 每阶段顺序固定为：先写规格化/崩溃测试，再实现 memory backend 或 runtime，再接入 SQLite 或外部适配器。阶段完成前不得提前把服务框架或 UI 作为运行时依赖。
 
@@ -188,6 +189,7 @@ Hook 是同步等待型状态机扩展点，按注册顺序串行执行：`befor
 - 调用方取消等待不等于 operation 取消；operation 取消必须先关闭 effect gate，再持久化取消，再终止本地任务；
 - snapshot/event 非权威，重新挂载 lane 必须只依赖 durable state；
 - hook 重放不得产生未受控制的外部副作用。
+- 启用 Subagent 时，父控制调用与子接纳原子关联；同一请求恢复不得创建第二个 run；子 Operation terminal 与 run result、后台通知 outbox 必须同事务；子级能力不得超出父级；普通 lane 写入口不得操作内部子 lane；前台等待不占子执行槽，且不持有 Session mutation lock。
 
 ## 9. 架构决策记录
 
@@ -373,7 +375,7 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 
 **背景：** memory retrieval 工具曾在 memory store 启用时自动注册，绕过了 `PRALE_TOOLS`。因此空工具配置仍可调用记忆，运营者也无法从环境文件看出或选择完整的工具权限集合。
 
-**决策：** `PRALE_TOOLS` 是所有 AgentTool 的唯一 allow-list，包含本地工具、`repository_explore`、`skill_load` 以及 `memory_search`、`conversation_search`、`memory_read_scene`。默认空集合意味着没有 AgentTool。配置 memory retrieval 工具时必须启用 memory store；配置 `skill_load` 时必须启用 Skill store。store 启用本身不再隐式扩大模型可调用工具集。
+**决策：** `PRALE_TOOLS` 是所有 AgentTool 的唯一 allow-list，包含本地工具、`repository_explore`、`skill_load` 以及 `memory_search`、`conversation_search`、`memory_read_scene`。显式空集合意味着没有 AgentTool；未配置时的 Subagent 默认工具见 ADR-032。配置 memory retrieval 工具时必须启用 memory store；配置 `skill_load` 时必须启用 Skill store。store 启用本身不再隐式扩大模型可调用工具集。
 
 **后果：** `/root/web.env` 或其他部署环境可完整、可审计地表达工具权限；现有部署若需要 memory retrieval，须将对应名称加入 `PRALE_TOOLS`。memory/Skill 的后台 capture、promotion、UI 查询不受 AgentTool allow-list 影响。
 
@@ -384,6 +386,46 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 **决策：** Skill keyword retrieval 不再执行 FTS `MATCH`。它先按 scope、visibility 和 active 状态读取元数据，在进程内把 ASCII 标识符与单个汉字规范化为词元，再对 name、description、triggers 做 BM25 排序。在线 `<available_skills>` listing 最多返回 10 项；`embedding`/`hybrid` 未接入向量后端时仍显式降级到此 BM25 路径。
 
 **后果：** 自然语言 prompt 不再是数据库查询语言，混合中英文提问可稳定发现相关 Skill。小规模 repository-scoped Skill 集合须在每次检索时读取并计分；若将来规模使其不适用，必须引入同样不接受原始 FTS 语法的受控索引查询，而不是恢复直接 `MATCH`。
+
+### ADR-028：Subagent 使用同 Session 的独立 lane 与原子接纳
+
+**背景：** 现有多 lane 与 fork 只管理历史分支，没有委派身份、父子生命周期或恢复关联。独立子 Session 会把父工具 intent 和子接纳分成两个数据库事务，必须额外引入跨库协调才能避免重启后重复创建。
+
+**决策：** 首版本地 Subagent 使用同一 Session 内的保留内部 lane；agent 身份与一次 run 分离，每次 run 对应一个子 Operation。父控制 intent、请求幂等映射、子 lane/Operation/run 与索引在一次 Session mutation 中接纳。子从任务和显式背景开始，不 fork 父历史。原终态写入构造同时生成 run result 与后台 notification outbox。完整契约见 [Subagent 方案](subagent-system-implementation-plan.md)。
+
+**后果：** 单写与 SQLite 原子性可直接覆盖父子关系，子执行前不会缺少恢复点；需抽取可组合的 admission/terminal writes，不能在 mutation 中递归调用 Lane.prompt。内部 lane 不对普通写接口开放；跨 Session/远程执行和工作树隔离留待后续设计。
+
+### ADR-029：Subagent 控制调用由 runtime 原生分派并按请求恢复
+
+**背景：** 普通 AgentTool 只有 execute(arguments)，不知道父 Operation/tool-call，也无法把子接纳与父 intent 一起提交。将委派包装为 safe 工具可能重复创建子运行；标为 never 则无法在已知子结果上恢复父等待。
+
+**决策：** 保持普通工具协议，新增描述性 runtime 控制工具及 dispatcher。父身份由 Drive 注入，控制参数经过 before_tool 后重新校验；父 tools state 持久化关联 run、等待阶段与截止时间。恢复按同一幂等映射查询/等待/停止原 run，不走普通工具重放分支。所有子级控制入口根据持久身份拒绝递归，工具集合为父级、部署与定义能力交集；恢复和续跑只能再次收缩。
+
+**后果：** 前台等待和后台接纳可可靠恢复，普通 safe/never 语义不变；混合工具批次以控制调用为串行边界，保持源序。首版权限仅为能力收缩与既有 hook 拦截，不引入完整审批或文件系统沙箱。
+
+### ADR-030：后台结果通过 durable inbox 交付，显式父取消级联
+
+**背景：** 进程内完成通知会在重启时丢失；完成即自动调用父模型又会产生未经接纳的新 Operation。另一方面，调用方断开、服务关闭与用户显式取消必须遵守现有不同语义。
+
+**决策：** 后台 run terminal 与通知 outbox 同事务；投递以 run 去重，在一次事务内追加父 inbox 并标 delivered。父下一 checkpoint 或下一轮 prompt 消费，idle 时不自动调用模型，查询不消费通知。父 Operation 显式取消在同一 mutation 中标记其所有非终态子 runs，先关闭 effect gate，再落取消状态，再中止本地任务。父正常结束或等待断开不取消后台；服务关闭仅停止本地任务并保留恢复点。
+
+**后果：** 已提交结果和通知可跨进程查询、投递与消费；需扩展兼容旧 prompt 的类型化 inbox 和 supervisor 生命周期。父级取消只影响该 Operation 接纳的 runs，下一父轮取消不会误停上一轮后台任务；续跑绑定新的父 Operation。
+
+### ADR-031：恢复保留工具重放策略与取消后的历史配对
+
+**背景：** 重启时工具注册实现可能变化；仅读取当前 replay_policy 会将原 never intent 当成 safe 重放。取消前台委派时若只结算 Operation，assistant 已声明的工具调用仍没有结果，续跑历史无法完整表达中断。
+
+**决策：** 普通工具 intent 冻结 replay_policy，恢复以持久策略为准；旧格式缺失字段时使用既有注册策略兼容。取消结算按源序补全尚未配对的工具结果，并将已发出的未确认效果 span 结算 unknown。子 run 存在未知效果时终态为 unknown；取消请求仍持久保存。原生控制调用继续按 durable run 恢复，不应用普通工具重放策略。
+
+**后果：** 接纳后的策略变化不会扩大重放能力；取消后可继续同一子历史且不伪造远端成功。`OperationResult` 移入 domain 并由原 API 路径重导出，保持旧 storage discriminator 和公开导入兼容。真实进程退出测试覆盖 intent/effect/terminal、取消请求与通知消费边界。
+
+### ADR-032：Subagent 默认开启，显式工具配置仍为完整 allow-list
+
+**背景：** 首版需要同时开启 runtime 和配置模型控制工具才能委派。用户要求功能默认开启，让新部署直接可用。
+
+**决策：** `SubagentConfig.enabled` 和未设置的 `PRALE_SUBAGENTS_ENABLED` 默认 true。部署未配置 `PRALE_TOOLS` 时，启用状态使用五个控制工具为默认集合，关闭状态使用空集合；显式配置（包括空字符串）完全替代默认集合，不追加工具。library 的 tools 参数仍由调用者显式传入，默认开启 facade 与恢复不隐式改变已有模型工具集合。未配置 provider resolver 且没有控制工具时不自动绑定 provider，普通 Drive 保持逐轮传入 provider 的行为。
+
+**后果：** 新部署可直接委派；现有显式工具配置继续决定全部权限。`PRALE_SUBAGENTS_ENABLED=false` 可关闭，显式关闭时配置控制工具或定义目录仍拒绝启动。重开 library Harness 默认恢复已接纳子运行，不注册新工具、不启动 idle 父模型。
 
 ## 10. 首个可执行里程碑
 

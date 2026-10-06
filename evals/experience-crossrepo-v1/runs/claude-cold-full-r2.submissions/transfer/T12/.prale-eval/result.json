@@ -1,0 +1,81 @@
+{
+  "task_id": "T12",
+  "repository": "wattclaw",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "activateWattClawProjectRuntime",
+      "start_line": 207,
+      "end_line": 256,
+      "observation": "The lifecycle activation entry point. It requires a project and a gatewayRpc function (throwing 'WattClaw project and gateway RPC are required' otherwise), lists current gateway agents via agents.list, and re-creates only the members that are missing by calling 'wattclaw.team.project.member.update' for each one (lines 225-237). When any member was missing it refreshes agents.list (239-242) and throws 'WattClaw agents were not restored: ...' if a member agent id is still absent (244-249). It returns the normalized { project, agents, restored } result, where restored is true only when the incoming project status is 'archived' (251-255). The demo drives its create -> activate -> stop flow through this function and asserts the restore call is made for the worker only, the full agent set is returned, and restored is false for a fresh non-archived project."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "trackWattClawProjectOwnership",
+      "start_line": 344,
+      "end_line": 374,
+      "observation": "Binds a project's members to a user as owned agents and main sessions. For every member with a non-empty agentId it calls trackAgent(userId, agentId, name, ...) and trackSession(userId, `agent:${agentId}:main`, agentId, project.name, 'main'), returning { agentIds, sessionKeys } (353-373); it returns empty arrays when the project or userId is absent (351). The demo uses this as the 'create' operation's ownership binding step and asserts that both project members are registered and that exactly one 'agent:<id>:main' session is produced per member."
+    },
+    {
+      "path": "server/services/wattclaw-project-runtime.js",
+      "symbol": "getWattClawProjectAgentIds",
+      "start_line": 59,
+      "end_line": 64,
+      "observation": "Derives the de-duplicated, trimmed list of member agent ids from project.members, returning [] for a missing/non-array members field. It is the shared source of truth used by activation and ownership tracking, so the demo compares its create-time bound agent ids against this helper to prove no member was dropped or duplicated."
+    },
+    {
+      "path": "server/services/wattclaw-project-events.js",
+      "symbol": "createWattClawProjectEventService",
+      "start_line": 55,
+      "end_line": 192,
+      "observation": "The realtime project-event service. subscribe({clientId, projectId, tenantId, projectDir}) registers the client, creates one fs.watch watcher per project and force-publishes the current config.json and task-list.json (166-175); unsubscribe() detaches a client and closes the watcher once its last subscriber leaves (156-164); stop() closes every watcher and clears client bookkeeping (177-180); getActiveProjectCount() reports live watchers (182-184). The demo uses subscribe -> getActiveProjectCount() === 1 at create, then stop() -> count 0 at stop, and proves no events are emitted after stop."
+    },
+    {
+      "path": "server/services/wattclaw-project-events.js",
+      "symbol": "publishFile",
+      "start_line": 67,
+      "end_line": 115,
+      "observation": "The event emission contract. It reads and JSON-parses the watched file, skips republishing unchanged contents unless forced, and otherwise increments entry.revision and publishes: for config.json either 'wattclaw.team.project.updated' with payload { projectId, tenantId, revision, project } or 'wattclaw.team.project.deleted' when the file is gone (78-92); for task-list.json 'wattclaw.team.tasks.updated' with payload { projectId, tenantId, revision, tasks } after enforcing that the file contains an array (95-107). The demo asserts exactly these event names, that payload.projectId is 'p-demo', and that revisions increase monotonically across the lifecycle."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "Create binds a fresh project fixture's members to the owning user by producing { agentIds, sessionKeys } with one 'agent:<agentId>:main' session per member; trackWattClawProjectOwnership returns empty arrays when project or userId is missing, and getWattClawProjectAgentIds is the shared de-duplicated member-id source used to cross-check it.",
+      "evidence_paths": [
+        "server/services/wattclaw-project-runtime.js"
+      ]
+    },
+    {
+      "claim": "Activate restores only the missing project agents: activateWattClawProjectRuntime lists agents, issues 'wattclaw.team.project.member.update' strictly for members whose agent id is not loaded, refreshes agents.list when anything was missing, throws if any member id remains unloaded, and returns the normalized { project, agents, restored } result where restored is true only for an archived source project.",
+      "evidence_paths": [
+        "server/services/wattclaw-project-runtime.js"
+      ]
+    },
+    {
+      "claim": "Stop is the only path that reaches silence: createWattClawProjectEventService.closeProjectWatcher closes the fs.watch watcher and clears its debounce timers, unsubscribe tears down a watcher once the last client leaves, and stop() closes every watcher so getActiveProjectCount() drops to 0 and later file writes fan out to no clients and emit no events.",
+      "evidence_paths": [
+        "server/services/wattclaw-project-events.js"
+      ]
+    },
+    {
+      "claim": "The emitted-event contract is exactly 'wattclaw.team.project.updated' / 'wattclaw.team.project.deleted' for config.json and 'wattclaw.team.tasks.updated' for task-list.json, each carrying { projectId, tenantId, revision } with a monotonically increasing revision; unchanged file contents are suppressed unless the publish is forced (as subscribe does on attach).",
+      "evidence_paths": [
+        "server/services/wattclaw-project-events.js"
+      ]
+    },
+    {
+      "claim": "A fresh local fixture driven create -> activate -> stop performs only the legal transition sequence absent -> created -> active -> stopped; every out-of-order operation (stop from absent, stop/activate/create from stopped) is rejected with the state left unchanged, and the three emitted events (project.updated pending, tasks.updated [], project.updated in_progress) are the only ones observed.",
+      "evidence_paths": [
+        "server/services/wattclaw-project-runtime.js",
+        "server/services/wattclaw-project-events.js"
+      ]
+    }
+  ],
+  "conclusion": "The executable demo .prale-eval/demo-lifecycle.mjs builds a fresh local WattClaw project fixture in a temp directory and drives it through the three lifecycle operations. Create bind the fixture's members via trackWattClawProjectOwnership and subscribes a client, which force-publishes wattclaw.team.project.updated (status pending) and wattclaw.team.tasks.updated ([]) from a single active project watcher. Activate runs activateWattClawProjectRuntime against an in-memory gateway whose agents.list omits the worker; the runtime issues exactly one wattclaw.team.project.member.update for that missing worker, refreshes agents.list, returns the full agent set with restored:false, and a status write then emits a monotonic-revision project.updated with status in_progress. Stop calls the event service's stop(), dropping the active watcher count to 0 and proving that a subsequent config write emits nothing. A four-state machine (absent/created/active/stopped) rejects every illegal transition (stop before activate, and any operation after stop) without mutating state. All 26 assertions pass and the demo exits 0.",
+  "validation": {
+    "command": "node .prale-eval/demo-lifecycle.mjs",
+    "status": "pass",
+    "notes": "Run on Node v24.14.0; exit code 0 with 26/26 checks passing. The demo imports the repository modules server/services/wattclaw-project-runtime.js and server/services/wattclaw-project-events.js directly and uses only Node built-in modules (fs/promises, path, os), so it needs no installed dependencies. The repository's configured test framework (vitest) and its test file server/services/wattclaw-project-runtime.test.js could not be executed because node_modules is not installed in this environment; the hidden acceptance oracle and package installation were intentionally avoided, and this built-in-only demo is the focused executable validation instead."
+  }
+}

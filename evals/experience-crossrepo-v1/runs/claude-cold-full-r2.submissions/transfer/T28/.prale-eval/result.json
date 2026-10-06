@@ -1,0 +1,55 @@
+{
+  "task_id": "T28",
+  "repository": "aider",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "aider/llm.py",
+      "symbol": "LazyLiteLLM",
+      "start_line": 21,
+      "end_line": 42,
+      "observation": "LazyLiteLLM is a proxy for the external litellm model library. __getattr__ (lines 24-28) defers loading until the first attribute access, so `import aider.llm` performs no external import and no network I/O. _load_litellm (lines 30-42) is idempotent and, once loaded, sets the request/config fields the helper contracts on: suppress_debug_info=True, set_verbose=False, drop_params=True, and calls _logging._disable_debugging(). The module-level `litellm = LazyLiteLLM()` (line 45) is the helper every caller uses. This is the external/model helper that the fake-transport test drives."
+    },
+    {
+      "path": "aider/llm.py",
+      "symbol": "LazyLiteLLM._load_litellm",
+      "start_line": 30,
+      "end_line": 42,
+      "observation": "_load_litellm resolves the external library via importlib.import_module('litellm'). Because resolution goes through the import system, injecting a fake module into sys.modules['litellm'] makes the helper bind to a recording double instead of the real library, giving the test a fake transport without any real dependency or network access. The guard `if self._lazy_module is not None: return` (lines 31-32) makes repeated loads no-ops, which the demo asserts."
+    },
+    {
+      "path": "aider/sendchat.py",
+      "symbol": "sanity_check_messages",
+      "start_line": 5,
+      "end_line": 26,
+      "observation": "sanity_check_messages validates the request message fields before a completion is sent: it walks the {role, content} message list, ignores system messages, raises ValueError when two consecutive non-system turns share a role (calling format_messages for the error text), and returns True only when the last non-system message is from the user. This is the validation half of the chat-request field contract the demo drives and asserts."
+    },
+    {
+      "path": "aider/sendchat.py",
+      "symbol": "ensure_alternating_roles",
+      "start_line": 29,
+      "end_line": 61,
+      "observation": "ensure_alternating_roles produces the request message fields by walking the messages list and, whenever the current role equals the previous role, inserting an empty message of the opposite role before the current one. The resulting list strictly alternates user/assistant (ending on the original last message), which is exactly the shape sanity_check_messages accepts. The demo builds a request from this helper and asserts the emitted role/content fields."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "aider's external/model helper (LazyLiteLLM in aider/llm.py) stays lazy: importing `aider.llm` neither imports the external litellm library nor performs network access, and the first attribute access loads the library and sets the contracted request/config fields (suppress_debug_info=True, set_verbose=False, drop_params=True, _logging._disable_debugging called once, idempotent reload).",
+      "evidence_paths": ["aider/llm.py"]
+    },
+    {
+      "claim": "aider/sendchat.py supplies the request-field shaping and validation used before a model completion: ensure_alternating_roles inserts empty opposite-role turns so the {role, content} message fields strictly alternate, and sanity_check_messages returns True only for a validated alternating request ending on a user turn, raising ValueError otherwise.",
+      "evidence_paths": ["aider/sendchat.py"]
+    },
+    {
+      "claim": "A distinct external/model helper can be exercised through a fake transport with no hidden network access: by injecting a recording fake into sys.modules['litellm'], LazyLiteLLM binds to it, the shaped sendchat messages are dispatched as a request, and the transport captures exactly the expected request fields (model, messages, stream, temperature, timeout) while a socket-level guard proves no real connection was opened.",
+      "evidence_paths": ["aider/llm.py", "aider/sendchat.py"]
+    }
+  ],
+  "conclusion": "The transferred experience is implemented against aider's external/model boundary. An executable demo (.prale-eval/contract_demo.py) drives the LazyLiteLLM helper from aider/llm.py through a fake, recording litellm transport installed in sys.modules, and shapes/validates the chat request with ensure_alternating_roles and sanity_check_messages from aider/sendchat.py. It asserts (a) laziness -- importing aider.llm performs no external import or network I/O, (b) the request/config fields the helper contracts on the transport, (c) the emitted chat-request fields (model, messages, stream, temperature, timeout) with role/content message entries, and (d) absence of hidden network access via a socket.connect guard. All 24 checks pass, so the contract holds without the real litellm library or any network.",
+  "validation": {
+    "command": "python .prale-eval/contract_demo.py",
+    "status": "pass",
+    "notes": "24/24 checks passed, exit code 0. The demo imports only the stdlib and aider.llm/aider.sendchat; litellm and oslex are not installed in this environment, so a recording fake litellm module is injected into sys.modules and a minimal oslex stand-in is registered to satisfy aider.utils' import chain. No dependencies were installed and the network guard (socket.socket.connect/connect_ex raising) was never tripped, confirming no hidden network access."
+  }
+}

@@ -1,0 +1,179 @@
+{
+  "task_id": 15,
+  "repository": "tdam",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/kernel/headers.ts",
+      "symbol": "META_HEADER_SERVICE_ID",
+      "start_line": 5,
+      "end_line": 7,
+      "observation": "Single source of truth for the three memory-kernel header names used on both the inbound panel edge and the outbound kernel call: META_HEADER_SERVICE_ID = 'x-tdai-service-id' (instance selector), META_HEADER_USER_KEY = 'x-tdai-user-key' (caller identity) and META_HEADER_REQUEST_ID = 'x-request-id' (correlation id). Both validate-panel-headers.ts (inbound) and transport-fetch.ts (outbound) import these same constants, so the accepted request headers can never drift from the headers the panel forwards to the kernel."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 63,
+      "observation": "Hono middleware factory mounted on every credential-bearing panel route (/meta/*, /skill/*, /chat-memory/*, /knowledge/*, /task/*, /agent/*). It derives the action from the path via readAction, requires x-tdai-service-id (META_HEADER_SERVICE_ID) and resolves it through deps.instanceRegistry, returning respondControlError 400 MISSING_INSTANCE_ID / INVALID_INSTANCE on failure. It then requires x-tdai-user-key (META_HEADER_USER_KEY) unless the action is 'auth/verify' (400 MISSING_USER_KEY), and finally publishes the normalized 'panelMeta' context variable {instanceId, gatewayEndpoint, gatewayApiKey, userKey} that route handlers copy into a MetaCallContext. This is the gate that turns raw HTTP request headers into kernel credentials."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "PanelMetaContext",
+      "start_line": 11,
+      "end_line": 16,
+      "observation": "Declares the per-request credential bundle stored under c.set('panelMeta', ...): instanceId, gatewayEndpoint, gatewayApiKey and optional userKey. These are exactly the fields routes copy into MetaCallContext and that toKernelCredentials later maps to outbound endpoint/apiKey/userKey."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "readAction",
+      "start_line": 24,
+      "end_line": 29,
+      "observation": "Slices the kernel action suffix after the '/meta/' marker of the request path, returning '' when the marker is absent. Because /skill/* paths yield '' (never 'auth/verify'), the reuse of this middleware on the skill proxy forces x-tdai-user-key to be present, matching the skill data-plane requirement for owner identity."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+      "symbol": "registerMetaProxyRoutes",
+      "start_line": 148,
+      "end_line": 219,
+      "observation": "Registers api.post('/meta/*', validatePanelMetaHeaders(deps), handler): the handler reads the action, rejects not-in-scope/unknown actions, builds MetaCallContext {instanceId, gatewayEndpoint, gatewayApiKey, userKey, reqId} from panelMeta + c.get('reqId'), optionally performs a duplicate check, then forwards to deps.metaKernel.invoke(action, body, ctx) and returns the kernel envelope through respondEnvelope. This is the canonical route -> adapter hand-off point."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+      "symbol": "invoke",
+      "start_line": 6,
+      "end_line": 17,
+      "observation": "Meta adapter: sanitizes the body (drops top-level limit/offset for non-list actions), flags omitUserKey for action 'auth/verify', converts the MetaCallContext into KernelCredentials via toKernelCredentials, then calls this.http.postEnvelope(`/v3/meta/${action}`, payload, cred). It maps an abstract action name to the concrete kernel /v3/meta/* path."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/types.ts",
+      "symbol": "toKernelCredentials",
+      "start_line": 21,
+      "end_line": 31,
+      "observation": "Maps the request-scoped MetaCallContext plus the configured timeout into KernelCredentials {endpoint: gatewayEndpoint, apiKey: gatewayApiKey, instanceId, userKey, timeoutMs, requestId}; when opts.omitUserKey is set (auth/verify) the user key is dropped. This is the adapter-to-transport bridge that decides which identity material is forwarded."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+      "symbol": "postEnvelope",
+      "start_line": 10,
+      "end_line": 46,
+      "observation": "KernelHttpPort implementation: delegates to executeMetaFetch({endpoint, apiKey, serviceId: instanceId, userKey, timeoutMs, requestId, logger}, path, body, 'envelope'), so business code!=0 responses pass through as envelopes instead of throwing. On KernelFetchError it synthesizes a MetaEnvelope with code 504 -> message KERNEL_TIMEOUT or 502 -> KERNEL_UNAVAILABLE, guaranteeing callers always receive an envelope shape."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/transport-fetch.ts",
+      "symbol": "executeMetaFetch",
+      "start_line": 125,
+      "end_line": 232,
+      "observation": "Outbound transport: builds the header map using the constants from headers.ts (Content-Type, [META_HEADER_SERVICE_ID]=serviceId, [META_HEADER_REQUEST_ID]=reqId, Authorization: Bearer <apiKey>, optional [META_HEADER_USER_KEY]), POSTs JSON to `${endpoint}${path}` with an AbortController timeout, parses the raw kernel envelope and normalizes it to MetaEnvelope {code, message, request_id, data}. In 'envelope' mode non-zero codes are returned rather than thrown (transparent proxy); timeout/network failures become KernelFetchError(504/502)."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "MetaEnvelope",
+      "start_line": 3,
+      "end_line": 8,
+      "observation": "Defines the kernel envelope contract {code, message, request_id, data} that every adapter returns and every route responds with; request_id carries the correlation id aligned with the x-request-id header."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "mapHttpStatusFromEnvelopeCode",
+      "start_line": 11,
+      "end_line": 15,
+      "observation": "Envelope-to-HTTP status mapping used on the response edge: 0 -> 200, 400-599 -> the code itself, anything else -> 502. This is how a kernel business code becomes the HTTP status seen by the browser."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondEnvelope",
+      "start_line": 18,
+      "end_line": 20,
+      "observation": "Response helper that serializes a MetaEnvelope as JSON with the status produced by mapHttpStatusFromEnvelopeCode; respondControlError (22-25) wraps controlEnvelope(code, message, c.get('reqId')) through the same path, so header-validation failures and kernel responses share one response contract."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-skill-kernel-adapter.ts",
+      "symbol": "invoke",
+      "start_line": 12,
+      "end_line": 20,
+      "observation": "Skill data-plane adapter: same credential mapping as the meta adapter but always forwards userKey (no auth/verify exception) and posts to `/v3/skill/${action}` with the body untouched (skill pagination is nested). Shows the shared-credential / different-kernel-path branch of the flow."
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/http-knowledge-client.ts",
+      "symbol": "post",
+      "start_line": 49,
+      "end_line": 72,
+      "observation": "Knowledge-service branch of the same credential model: sends Content-Type, Authorization: Bearer <authToken> and x-tdai-service-id = instanceId, then parses the CoreEnvelope; non-zero code throws CoreUpstreamError (mapped to a control envelope by runKs in routes/knowledge/common.ts), demonstrating that the service-id header identity is reused across kernel and KS callers."
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/app.ts",
+      "symbol": "buildPanelApp",
+      "start_line": 17,
+      "end_line": 37,
+      "observation": "Composes the panel app: installs requestLogger on all paths (correlation id), registers health, meta-proxy, skill-proxy, chat-memory, task, agent and knowledge routes under /api/v1, and defines the onError handler that emits the same {code, message, request_id, data} envelope with code 500. This is the entry point of the diagrammed request flow."
+    },
+    {
+      "path": "MemoryPanel/src/panel/panel-deps.ts",
+      "symbol": "buildPanelDeps",
+      "start_line": 32,
+      "end_line": 49,
+      "observation": "Wiring that gives the diagram its concrete objects: a single FetchKernelHttpAdapter (KernelHttpPort) shared by FetchMetaKernelAdapter and FetchSkillKernelAdapter, plus a knowledgeClientFactory that stamps each HttpKnowledgeClient with the resolved instanceId as x-tdai-service-id. Explains how the abstract `deps.metaKernel`/`deps.skillKernel` in routes become real adapters."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "headers.ts is the single source of truth for the three memory-kernel header names: META_HEADER_SERVICE_ID ('x-tdai-service-id'), META_HEADER_USER_KEY ('x-tdai-user-key') and META_HEADER_REQUEST_ID ('x-request-id'); the same constants are imported by the inbound validation middleware and the outbound fetch transport, so inbound header parsing and outbound header emission cannot diverge.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/headers.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/kernel/transport-fetch.ts"
+      ]
+    },
+    {
+      "claim": "validatePanelMetaHeaders gates every credential-bearing panel route: readAction derives the action from the path, x-tdai-service-id must be present and resolvable in the InstanceRegistry (else 400 MISSING_INSTANCE_ID / INVALID_INSTANCE), x-tdai-user-key is required unless the action is 'auth/verify' (else 400 MISSING_USER_KEY), and the resolved entry is published as the panelMeta context variable {instanceId, gatewayEndpoint, gatewayApiKey, userKey} for downstream adapters.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts"
+      ]
+    },
+    {
+      "claim": "Route handlers build a MetaCallContext ({instanceId, gatewayEndpoint, gatewayApiKey, userKey, reqId}) from the panelMeta variable plus the requestLogger correlation id and hand it to a kernel adapter (deps.metaKernel.invoke for /meta/*, deps.skillKernel.invoke for /skill/*); the adapter maps that context to outbound KernelCredentials via toKernelCredentials, dropping the user key only for auth/verify.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-skill-kernel-adapter.ts",
+        "MemoryPanel/src/panel/kernel/types.ts"
+      ]
+    },
+    {
+      "claim": "Adapters delegate to KernelHttpPort.postEnvelope, implemented by FetchKernelHttpAdapter, which calls executeMetaFetch; the transport attaches x-tdai-service-id, x-request-id, Authorization: Bearer <api_key> and the optional x-tdai-user-key, POSTs to {endpoint}/v3/<surface>/<action>, and normalizes the kernel response into a MetaEnvelope {code, message, request_id, data}, even converting transport failures into 504 KERNEL_TIMEOUT / 502 KERNEL_UNAVAILABLE envelopes.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+        "MemoryPanel/src/panel/kernel/transport-fetch.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts"
+      ]
+    },
+    {
+      "claim": "On the response edge, handlers return the envelope through respondEnvelope, which serializes it as JSON using mapHttpStatusFromEnvelopeCode (0 -> 200, 400-599 -> code, otherwise 502); pre-adapter failures such as missing headers route through respondControlError into the identical envelope shape, so the whole flow from HTTP route to adapter to envelope terminates in one response contract.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/envelope.ts",
+        "MemoryPanel/src/panel/kernel/envelope.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts"
+      ]
+    },
+    {
+      "claim": "Knowledge routes reuse the same header gate (validatePanelMetaHeaders) but reach the knowledge service through HttpKnowledgeClient.post, which sends Authorization: Bearer <authToken> plus x-tdai-service-id = instanceId and throws CoreUpstreamError on non-zero envelope codes; routes/knowledge/common.ts runKs maps that error into a control envelope, confirming the service-id identity header is the common thread across kernel and KS branches.",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/adapters/http-knowledge-client.ts",
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts"
+      ]
+    }
+  ],
+  "diagram": {
+    "format": "ascii",
+    "body": "Browser / SDK client\n  |  POST /api/v1/<route>   headers: X-Tdai-Service-Id, X-Tdai-User-Key, x-request-id\n  v\napp.ts :: buildPanelApp (17-37)  ->  requestLogger (middleware/request-logger.ts:36)\n     reqId <- x-request-id (or uuid); c.set('reqId'); echo x-request-id; ctx.log\n  v\nHono route table (all under /api/v1)\n  +-- POST /meta/*            registerMetaProxyRoutes      (routes/meta/proxy.ts:148-219)\n  +-- POST /skill/*           registerSkillProxyRoutes     (routes/skill/proxy.ts:26-52)\n  +-- POST /chat-memory/*     registerChatMemoryRoutes     (routes/chat-memory.ts)\n  +-- POST /knowledge/...     registerKnowledgeRoutes      (routes/knowledge/index.ts)\n  +-- POST /task/* , /agent/* aggregate routes             (routes/task.ts, agent-*.ts)\n  |\n  v  middleware: validatePanelMetaHeaders(deps)   (http/middleware/validate-panel-headers.ts:31-63)\n  |    . readAction(path) -> action                              (:24-29)\n  |    . header x-tdai-service-id  (kernel/headers.ts:5)\n  |         -> deps.instanceRegistry.resolve(instanceId)\n  |            fail -> respondControlError 400 MISSING_INSTANCE_ID / INVALID_INSTANCE\n  |    . header x-tdai-user-key    (kernel/headers.ts:6)  required unless action=='auth/verify'\n  |            fail -> respondControlError 400 MISSING_USER_KEY\n  |    . c.set('panelMeta', {instanceId, gatewayEndpoint, gatewayApiKey, userKey})  (:55-60)\n  v\nroute handler  ->  MetaCallContext {instanceId, gatewayEndpoint, gatewayApiKey, userKey, reqId}\n  |\n  +-- meta:      deps.metaKernel.invoke(action, body, ctx)     FetchMetaKernelAdapter (:12-17)\n  |                 sanitizeBody(action); omitUserKey = action==='auth/verify'\n  |                 toKernelCredentials(ctx, {timeoutMs}, {omitUserKey})   (kernel/types.ts:21-31)\n  |                 -> http.postEnvelope('/v3/meta/{action}', payload, cred)\n  +-- skill:     deps.skillKernel.invoke(action, body, ctx)    FetchSkillKernelAdapter (:18-20)\n  |                 -> http.postEnvelope('/v3/skill/{action}', body, cred)  (user_key always sent)\n  +-- knowledge: deps.knowledgeClientFactory(instanceId).wiki*/codeGraph*  HttpKnowledgeClient.post (:52-72)\n  |                 -> POST {base}/v3/wiki/* | /v3/code-graph/*   (Bearer + x-tdai-service-id)\n  +-- aggregate: multiple deps.metaKernel.invoke(...) gathered, then okEnvelope/respondEnvelope\n  v\nKernelHttpPort = FetchKernelHttpAdapter.postEnvelope (:13-46)\n  -> executeMetaFetch(cfg, path, body, 'envelope')            (kernel/transport-fetch.ts:125-232)\n       headers: Content-Type, x-tdai-service-id, x-request-id,\n                Authorization: Bearer <api_key>, [x-tdai-user-key]\n       POST {endpoint}/v3/...   (AbortController timeout; code!=0 returned, transport error -> KernelFetchError 504/502)\n  v\nMetaEnvelope {code, message, request_id, data}                (kernel/envelope.ts:3-8)\n  v\nrespondEnvelope(c, envelope)                                  (http/envelope.ts:18-20)\n  mapHttpStatusFromEnvelopeCode: 0->200 ; 400-599->code ; else 502   (kernel/envelope.ts:11-15)\n  v\nHTTP response: JSON envelope {code, message, request_id, data} + x-request-id echo\n\n(Pre-adapter failures short-circuit at the middleware/handler via respondControlError -> same envelope shape.)"
+  },
+  "conclusion": "The MemoryPanel request flow is a header-driven, single-envelope pipeline. A browser/SDK POST enters buildPanelApp in MemoryPanel/src/panel/http/app.ts, where requestLogger assigns/reuses x-request-id. Every credential-bearing route (/meta/*, /skill/*, /chat-memory/*, /knowledge/*, /task/*, /agent/*) is guarded by validatePanelMetaHeaders (MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts). That middleware is the single inbound normalizer: it extracts the action from the path, reads x-tdai-service-id and x-tdai-user-key (names defined once in MemoryPanel/src/panel/kernel/headers.ts), resolves the instance to gatewayEndpoint + api_key via InstanceRegistry, exempts the 'auth/verify' action from the user-key requirement, and publishes panelMeta for handlers. Handlers assemble a MetaCallContext (plus the requestLogger reqId) and invoke a kernel adapter: FetchMetaKernelAdapter -> /v3/meta/{action} for metadata, FetchSkillKernelAdapter -> /v3/skill/{action} for skills, or HttpKnowledgeClient -> /v3/wiki|cod-graph for knowledge. Adapters convert the context to KernelCredentials (toKernelCredentials) and delegate to KernelHttpPort.postEnvelope, implemented by FetchKernelHttpAdapter, which runs executeMetaFetch: it re-emits the very same header constants outbound (x-tdai-service-id, x-request-id, Authorization: Bearer, optional x-tdai-user-key), POSTs JSON, and normalizes the reply into a MetaEnvelope {code, message, request_id, data}. Handlers finally return that envelope through respondEnvelope, which maps envelope.code to HTTP status (0->200, 400-599->code, else 502); pre-adapter failures use respondControlError and produce the identical envelope, so the route -> adapter -> envelope contract is uniform. See the 'diagram' field for the full ASCII request-flow diagram from HTTP route to adapter to envelope.",
+  "validation": {
+    "command": "python3 - <<'PY' (static checks: JSON parse; task_id==15, repository=='tdam', mode=='explore'; required evidence paths present; each evidence start_line<=symbol line range<=end_line by reading the cited files and confirming the named symbol appears within the inclusive range; each claim's evidence_paths non-empty and resolvable)",
+    "status": "passed",
+    "notes": "Runtime/build validation was not possible in-workspace: MemoryPanel/node_modules is absent and dependencies must not be installed, so `npm run typecheck` (tsc) and `npm test` (vitest) could not be executed. Validation therefore used static checks: (1) result.json parsed as JSON; (2) task_id/repository/mode verified against the current TASK.md; (3) the two contract files MemoryPanel/src/panel/kernel/headers.ts and MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts each have an evidence entry whose inclusive line range contains its named symbol (verified by reading the files); (4) all cited path/line ranges were re-read and the named symbols confirmed present; (5) every claim lists at least one existing evidence_path. Limitation: no compiler/vitest execution because the optional test dependency tree is unavailable and installing it is out of scope."
+  }
+}

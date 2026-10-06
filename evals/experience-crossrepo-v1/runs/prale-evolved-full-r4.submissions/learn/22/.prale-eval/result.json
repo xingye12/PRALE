@@ -1,0 +1,48 @@
+{
+  "task_id": "22",
+  "repository": "aider",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd",
+      "start_line": 11,
+      "end_line": 23,
+      "observation": "Top-level dispatcher used to operate a shell command. When stdin is a tty, a pexpect spawn exists and the platform is not Windows it delegates to run_cmd_pexpect (line 14); otherwise it delegates to run_cmd_subprocess (line 16). Both branches return a two-tuple (exit_status, output) and an OSError is converted into (1, error_message) at line 23. This is the entry point the demo calls to operate the failing stub, and it shows the repo ships only two result fields (exit status + one combined output), not separate stdout/stderr."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd_subprocess",
+      "start_line": 42,
+      "end_line": 86,
+      "observation": "Non-interactive execution path actually used by the demo. It builds subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, shell=True, ...) at lines 62-73, streams the output one character at a time to the real stdout while accumulating it (lines 75-81), then returns process.returncode and the joined output at line 84. Because stderr is redirected to STDOUT (line 65), operating a failing command through this function preserves the exit code and the combined output but merges stderr into stdout, which is exactly why the demo adds a separate-pipe capture to keep all three fields distinct."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd_pexpect",
+      "start_line": 89,
+      "end_line": 132,
+      "observation": "Interactive branch of the command contract. It spawns the user's shell (pexpect.spawn(shell, args=[\"-i\", \"-c\", command], ...) or the command directly), captures the terminal stream through child.interact(output_filter=output_callback) at line 124, closes the child and returns child.exitstatus together with the decoded captured stream at line 128. Like run_cmd_subprocess it yields exactly two fields (exit status and one merged output stream), and its pexpect.ExceptionPexpect/TypeError/ValueError handler returns (1, error_msg) at line 132."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "aider/run_cmd.py exposes only a two-field operation result: run_cmd (and both run_cmd_subprocess and run_cmd_pexpect) return a tuple of (exit_status, output), and run_cmd_subprocess merges stderr into stdout via stderr=subprocess.STDOUT, so operating a failing command through the repository alone loses the stdout/stderr distinction.",
+      "evidence_paths": ["aider/run_cmd.py"]
+    },
+    {
+      "claim": "A failing stub command can be operated and its three observable fields preserved: the executable demo .prale-eval/operate_demo.py runs a stub that writes STUB_STDOUT to stdout, STUB_STDERR to stderr and exits 3, then captures the same command with separate pipes and records exit_code=3, stdout, and stderr as distinct, non-leaking fields in .prale-eval/operate-result.json.",
+      "evidence_paths": ["aider/run_cmd.py"]
+    },
+    {
+      "claim": "The repo's own contract is preserved side by side with the normalized result: the demo drives the real aided run_cmd/run_cmd_subprocess code and asserts exit_status == 3 with a combined_output containing both the stdout and stderr markers, documenting that stderr is folded into the single output field rather than dropped.",
+      "evidence_paths": ["aider/run_cmd.py"]
+    }
+  ],
+  "conclusion": "Operating a failing stub command through aider's run_cmd machinery preserves the exit status and one combined output stream: run_cmd dispatches to run_cmd_subprocess, which sets stderr=subprocess.STDOUT and returns (process.returncode, joined_output). To preserve all three fields, the demo .prale-eval/operate_demo.py runs the stub (stdout marker, stderr marker, exit code 3) through the real aider/run_cmd.py code and also captures it with separate pipes, writing a normalized operation result with distinct exit_code=3, stdout='STUB_STDOUT: stub wrote to stdout' and stderr='STUB_STDERR: stub wrote to stderr' to .prale-eval/operate-result.json. Because pexpect and psutil are not installed in this image, the demo injects inert sys.modules stand-ins to import the unmodified module; no dependency was installed and no repository source, metadata, lock file or git configuration was modified.",
+  "validation": {
+    "command": "python .prale-eval/operate_demo.py",
+    "status": "passed",
+    "notes": "The demo exits 0 and prints 'OK: preserved exit_code=3, stdout=..., stderr=...'; it internally asserts exit_code == 3, that STUB_STDOUT is in stdout and absent from stderr, that STUB_STDERR is in stderr and absent from stdout, and that the repo path returns exit_status == 3 with both markers present in the merged combined_output. A second focused check re-read .prale-eval/operate-result.json and re-verified the same invariants ('FOCUSED VALIDATION OK: three fields preserved and distinct'). LIMITATION: pexpect and psutil are optional aider runtime dependencies that are NOT installed here (importing aider.run_cmd raises ModuleNotFoundError: No module named 'pexpect', and the repository test tests/basic/test_run_cmd.py cannot be collected for the same reason), so the repo's own pytest test could not be executed. No dependency was installed; instead the demo injects inert pexpect/psutil stand-ins into sys.modules so the real, unmodified aider/run_cmd.py body is exercised."
+  }
+}

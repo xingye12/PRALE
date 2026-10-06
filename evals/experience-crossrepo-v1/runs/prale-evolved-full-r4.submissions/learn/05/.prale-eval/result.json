@@ -1,0 +1,181 @@
+{
+  "task_id": "05",
+  "repository": "pi",
+  "mode": "explore",
+  "evidence": [
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "scripts.build:offline",
+      "start_line": 54,
+      "end_line": 64,
+      "observation": "The `scripts` block separates refresh from offline build. `generate-models` runs `node scripts/generate-models.ts --strict` (network refresh of every upstream catalog), `hydrate-model-data` adds `--data-only` to rewrite only the internal JSON values, and `generate-model-catalog` uses `--json-only --json-output ../../.artifacts/model-catalog` to emit the publishable bundle. `build` chains `generate-models` (network) then `build:offline`; `build:offline` runs only `check:model-data`, `tsgo -p tsconfig.build.json`, and a `shx` copy of the already-present `src/providers/data` into `dist`, so it never reaches the network. `check:model-data` is a pure local validation of the generated JSON."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "validateBundle",
+      "start_line": 85,
+      "end_line": 176,
+      "observation": "`validateBundle(inputDir)` is the offline core of the catalog publisher: it reads only local files (`models.json`, `models.all.json`, `providers.json`, and `providers/<id>.json` / `<id>.all.json`), checks that the provider index matches `models.all.json`, enforces `REQUIRED_PROVIDERS` (anthropic/openai/openrouter) and `MINIMUM_MODEL_COUNT` (500 chat models), verifies `models.json` is exactly the chat projection of `models.all.json`, checks model `type` against `MODEL_TYPES`, and derives `revision` as `sha256-<sha256 of models.all.json>`. No network, AWS, or git access is used here, so this validation is safe to run offline on a generated bundle."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "main",
+      "start_line": 263,
+      "end_line": 325,
+      "observation": "`main()` is the only entry point with side effects. After `validateBundle` it writes `publication.json` from local data; when `--dry-run` is set it returns before any `aws s3` invocation, which is exactly how the root `check:model-catalog` script (`node scripts/publish-model-catalog.mjs --input .artifacts/model-catalog --dry-run`) validates a bundle offline. Without `--dry-run`, `parseArgs` (lines 36-71) requires `--bucket` and `--endpoint`, and the script downloads the current index and uploads revision artifacts via `aws` (lines 290-321), so only that publish path needs S3/network access. `gitSourceCommit()` (line 178) is likewise skipped because `--source-commit` is supplied by the dry-run call."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "buildIndex",
+      "start_line": 238,
+      "end_line": 261,
+      "observation": "`buildIndex(existingIndex, publication)` merges the new revision entry into the parsed index, replacing any entry for the same `minimumPiVersion`, sorting by `compareModelCatalogPiVersions`, and re-validating with `parseModelCatalogIndex`. It is a pure transformation over JSON values, so index construction itself is offline; only the surrounding download/upload of `index.json` in `main()` requires the remote bucket."
+    },
+    {
+      "path": "packages/ai/scripts/generate-models.ts",
+      "symbol": "readGeneratorOptions",
+      "start_line": 48,
+      "end_line": 91,
+      "observation": "`readGeneratorOptions` defines the three modes that drive all generated inputs: `--strict` (fail on any upstream fetch error instead of silently degrading), `--data-only` (hydrate only the ignored `src/providers/data` JSON), and `--json-only` + `--json-output` (emit the publishable catalog bundle). Line 88-89 enforce the contract: `--json-only` requires `--json-output`, and `--data-only` cannot be combined with JSON catalog output, so hydration never rewrites the committed TypeScript shards."
+    },
+    {
+      "path": "packages/ai/scripts/generate-models.ts",
+      "symbol": "generateModels",
+      "start_line": 2649,
+      "end_line": 2659,
+      "observation": "`generateModels()` unconditionally performs live network fetches before any output is written: `loadModelsDevData()` (https://models.dev/api.json, plus the NVIDIA NIM /models endpoint), `loadModelsDevClassifierModels()` (models.dev decision models), `fetchOpenRouterModels()` (openrouter.ai/api/v1/models), `fetchAiGatewayModels()` (AI Gateway /models), and `fetchRadiusModels()`. Under `--strict` any of these errors becomes fatal, so `generate:models` and even `hydrate:model-data` are not offline operations; they require network access to hydrate fresh values."
+    },
+    {
+      "path": "packages/ai/scripts/generate-models.ts",
+      "symbol": "generatedDataProviderIds",
+      "start_line": 3325,
+      "end_line": 3331,
+      "observation": "In `--data-only` (hydration) mode the generator does not derive the provider list from the freshly fetched catalogs; it reads the provider IDs back out of the committed `src/models.generated.ts` via `readModelDataProviderIds(packageRoot)`. It then throws `Cannot hydrate missing providers: ...` if any provider referenced by the committed aggregator is absent from the current upstream fetch, which is why hydration is a refresh of existing providers rather than an offline regeneration."
+    },
+    {
+      "path": "packages/ai/scripts/generate-models.ts",
+      "symbol": "jsonOutputDir branch",
+      "start_line": 3484,
+      "end_line": 3498,
+      "observation": "When `--json-output` is set, this branch wipes and recreates the output directory and writes `models.json` (chat catalog keyed by id), `models.all.json` (all types per provider as arrays), `providers.json` (sorted provider ids), and per-provider `providers/<id>.json` / `<id>.all.json` shards. These are exactly the inputs `scripts/publish-model-catalog.mjs --input <dir>` expects, so `generate:model-catalog` -> `check:model-catalog` composes an end-to-end path whose only network step is generation."
+    },
+    {
+      "path": "packages/ai/scripts/model-data.ts",
+      "symbol": "MODEL_DATA_SCHEMA_VERSION",
+      "start_line": 5,
+      "end_line": 6,
+      "observation": "The internal generated-data contract is versioned (`MODEL_DATA_SCHEMA_VERSION = 6`) and stamped with `.manifest.json`. The manifest carries `generatedAt`, a structure hash, and per-file sha256 hashes, which lets `check:model-data` detect stale or tampered provider JSON without any network call."
+    },
+    {
+      "path": "packages/ai/scripts/model-data.ts",
+      "symbol": "validateGeneratedModelData",
+      "start_line": 303,
+      "end_line": 306,
+      "observation": "`validateGeneratedModelData(packageRoot)` recomputes the expected provider/model/API structure from the committed `src/models.generated.ts` aggregator (via `readModelDataStructure`, line 100) and compares it against the on-disk `src/providers/data` directory plus manifest hashes. It reads only local files, so it is the offline gate used by both `check:model-data` and `build:offline`."
+    },
+    {
+      "path": "packages/ai/scripts/check-model-data.ts",
+      "symbol": "validateGeneratedModelData",
+      "start_line": 9,
+      "end_line": 16,
+      "observation": "This small CLI calls `validateGeneratedModelData(packageRoot)` (line 10) and, on failure, exits non-zero while telling the operator to run `npm run hydrate:model-data`. In a fresh checkout with no `src/providers/data` it fails with `ENOENT ... amazon-bedrock.json`, confirming that the ignored data snapshot must be hydrated before `build:offline` can succeed."
+    },
+    {
+      "path": "scripts/check-browser-smoke.mjs",
+      "symbol": "generatedCatalogDataPlugin",
+      "start_line": 10,
+      "end_line": 26,
+      "observation": "The browser smoke check explicitly compensates for the offline/empty-data case: when `packages/ai/src/providers/data/*.json` does not exist it resolves the import into an `empty-generated-model-catalog` namespace that loads `{}`. This is the documented behavior that \"fresh checkouts do not materialize provider JSON until model data is hydrated\", and it keeps the check offline-capable on a fresh clone."
+    },
+    {
+      "path": "scripts/create-source-archive.sh",
+      "symbol": "model_data_dir check",
+      "start_line": 82,
+      "end_line": 94,
+      "observation": "The release source archive requires the hydrated snapshot `packages/ai/src/providers/data/.manifest.json` plus provider JSON and fails with `Generated model data is missing. Run npm run hydrate:model-data first.` otherwise. It force-adds those ignored files into a temporary index, so the released archive ships a hydrated data snapshot that lets consumers use `--offline-model-data`."
+    },
+    {
+      "path": "scripts/build-binaries.sh",
+      "symbol": "OFFLINE_MODEL_DATA",
+      "start_line": 92,
+      "end_line": 94,
+      "observation": "`--offline-model-data` selects `npm run build:offline` instead of `npm run build`, and the flag's help text (line 12) describes it as \"Build with bundled model data instead of refreshing it\". This is the supported offline build entry point for the released source archive; it depends on the hydrated `src/providers/data` snapshot already being present."
+    },
+    {
+      "path": "packages/ai/src/providers/anthropic.models.ts",
+      "symbol": "ANTHROPIC_MODELS",
+      "start_line": 4,
+      "end_line": 8,
+      "observation": "Each committed provider shard is auto-generated by `scripts/generate-models.ts` and imports its values from the gitignored `./data/<provider>.json`, flattening them through `flattenChatModelCatalog`. Because this JSON payload is not tracked by git (`git ls-files packages/ai/src/providers/data` returns nothing), the generated shards are only buildable after model data has been generated/hydrated; the offline path reuses that previously materialized data."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "packages/ai/package.json defines two distinct build paths: `build` refreshes model data over the network (`generate-models` -> `--strict`) before `build:offline`, while `build:offline` is network-free and consists only of validating the already-present generated JSON (`check:model-data`), running `tsgo -p tsconfig.build.json`, and copying `src/providers/data` into `dist`.",
+      "evidence_paths": [
+        "packages/ai/package.json",
+        "packages/ai/scripts/check-model-data.ts",
+        "packages/ai/scripts/model-data.ts"
+      ]
+    },
+    {
+      "claim": "`generate:models` (generate-models.ts --strict) always fetches live upstream catalogs (models.dev, OpenRouter, AI Gateway, Radius) and fails on fetch errors under --strict, so model catalog generation is inherently an online operation; it produces both the committed TypeScript shards (`src/providers/*.models.ts` and `src/models.generated.ts`) and the ignored raw values `src/providers/data/*.json` plus `.manifest.json`.",
+      "evidence_paths": [
+        "packages/ai/scripts/generate-models.ts",
+        "packages/ai/package.json"
+      ]
+    },
+    {
+      "claim": "`hydrate:model-data` (`generate-models.ts --strict --data-only`) is not offline either: it still performs the same network fetches and only limits which providers are written by reading provider IDs from the committed `src/models.generated.ts`, throwing when a committed provider is missing from the fetched catalogs. It rewrites just the ignored `src/providers/data` JSON snapshot and leaves the committed shards untouched.",
+      "evidence_paths": [
+        "packages/ai/scripts/generate-models.ts",
+        "packages/ai/package.json",
+        "scripts/check-browser-smoke.mjs"
+      ]
+    },
+    {
+      "claim": "`generate:model-catalog` (`--json-only --json-output ../../.artifacts/model-catalog`) emits the publish bundle (`models.json`, `models.all.json`, `providers.json`, per-provider shards) consumed by `scripts/publish-model-catalog.mjs`; the generation step is the only network step, and the produced bundle can then be validated entirely offline.",
+      "evidence_paths": [
+        "packages/ai/scripts/generate-models.ts",
+        "packages/ai/package.json",
+        "scripts/publish-model-catalog.mjs"
+      ]
+    },
+    {
+      "claim": "`scripts/publish-model-catalog.mjs` is offline-safe in `--dry-run` mode: `validateBundle` only reads local bundle files, enforces required providers and a 500-model minimum, verifies the chat projection, and derives the revision from a sha256 of `models.all.json`, and `main()` returns after writing `publication.json` before any `aws s3` call. This is why root `check:model-catalog` runs it with `--input .artifacts/model-catalog --dry-run`; a real publish additionally needs `--bucket`, `--endpoint`, S3 access, and a source commit.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs",
+        "package.json",
+        "packages/ai/package.json"
+      ]
+    },
+    {
+      "claim": "`scripts/publish-model-catalog.mjs` validates a bundle that must be generated first: it requires `providers.json` to equal the sorted keys of `models.all.json`, requires `models.json` to be exactly the chat-type projection of `models.all.json`, requires the per-provider `.json`/`.all.json` shards to match, and rejects duplicate `type:id` identities, unknown model types, and fewer than 500 chat models. These are all local integrity checks with no network dependency.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs"
+      ]
+    },
+    {
+      "claim": "The generated JSON provider data under `packages/ai/src/providers/data/` is gitignored and untracked, so a fresh checkout has no model data: `check:model-data` fails with ENOENT until `hydrate:model-data` runs, and `check-browser-smoke.mjs` substitutes `{}` for missing shards specifically to keep offline checks working on fresh checkouts.",
+      "evidence_paths": [
+        "scripts/check-browser-smoke.mjs",
+        "packages/ai/src/providers/anthropic.models.ts",
+        "packages/ai/scripts/check-model-data.ts"
+      ]
+    },
+    {
+      "claim": "The released offline build depends on a hydrated data snapshot: `scripts/create-source-archive.sh` refuses to archive unless `src/providers/data/.manifest.json` and provider JSON exist, force-adds them to the archive, and `scripts/build-binaries.sh --offline-model-data` then routes to `npm run build:offline` to build with bundled model data instead of refreshing it.",
+      "evidence_paths": [
+        "scripts/create-source-archive.sh",
+        "scripts/build-binaries.sh",
+        "packages/ai/package.json"
+      ]
+    }
+  ],
+  "conclusion": "Model catalog inputs in `pi` fall into three tiers. (1) Generated online: `generate:models` (`generate-models.ts --strict`) fetches models.dev (+ NVIDIA NIM), models.dev classifiers, OpenRouter, Vercel AI Gateway, and Radius, and writes the committed TypeScript shards `packages/ai/src/providers/*.models.ts` plus the `packages/ai/src/models.generated.ts` aggregator, the ignored raw values `src/providers/data/*.json` with a versioned `.manifest.json`, and, with `--json-only --json-output`, the publishable bundle at `.artifacts/model-catalog` (`models.json`, `models.all.json`, `providers.json`, per-provider shards). (2) Hydrated online-but-scoped: `hydrate:model-data` (`--strict --data-only`) re-runs the same network fetches but only rewrites the ignored `src/providers/data` JSON for providers already listed in the committed aggregator; it does not touch the committed shards. (3) Safe offline: once that data snapshot exists, `check:model-data` (local manifest/hash/structure validation), `build:offline` (`check:model-data` + `tsgo` + copying `src/providers/data` to `dist`), `check:model-catalog`/`publish-model-catalog.mjs --dry-run` (local bundle validation + deterministic sha256 revision, no AWS), and `check-browser-smoke` (empty `{}` fallback for missing shards) all run without network. The publish path without `--dry-run` and any fresh generation/hydration are the only steps that require network or S3. This is why `build-binaries.sh --offline-model-data` and `create-source-archive.sh` exist: they bundle a previously hydrated `src/providers/data` snapshot so the rest of the pipeline is reproducible offline.",
+  "validation": {
+    "command": "node --test scripts/publish-model-catalog.test.mjs",
+    "status": "passed",
+    "notes": "The focused offline suite passed (1 test, `publishes explicit per-type and total model counts`), exercising the same local-bundle path as `check:model-catalog`: it creates a synthetic catalog (500 chat + 1 image + 1 classifier model) and runs `node scripts/publish-model-catalog.mjs --input <dir> --source-commit test-commit --dry-run`, asserting status 0 and publication counts of modelCount=500, chatModelCount=500, imageModelCount=1, classifierModelCount=1, totalModelCount=502. Additional offline probes were recorded: `node packages/ai/scripts/check-model-data.ts` exits 1 with `Model data is missing or stale. Run npm run hydrate:model-data...` because `packages/ai/src/providers/data/` is gitignored and absent in this checkout (confirming hydrated data is a prerequisite for `build:offline`), and `node scripts/publish-model-catalog.mjs --input .artifacts/model-catalog --dry-run` exits 1 with ENOENT on `.artifacts/model-catalog/models.json` because no catalog has been generated here (generation would require network). Limitation: `npm run build:offline`, `tsgo`, and `scripts/check-browser-smoke.mjs` (esbuild) could not be executed because `node_modules` is not installed in this workspace and dependencies must not be installed; their offline behavior was established by source inspection rather than execution."
+  }
+}

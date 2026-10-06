@@ -16,6 +16,22 @@ _Avoid_: Run, worker
 Lane 中一个可恢复、可终止的工作单元，拥有不可变元数据和可整体替换的状态。
 _Avoid_: Task, job
 
+**Subagent definition**:
+描述一种专用执行角色的任务用途、行为指引与能力限制的配置；它不是一次正在执行的委派。
+_Avoid_: Skill, worker
+
+**Subagent**:
+由父级委派创建、拥有独立对话历史并可继续工作的执行身份；同一身份可以经历多次委派运行。
+_Avoid_: Lane, task, teammate
+
+**Subagent run**:
+一次面向 Subagent 的委派或续跑，拥有确定的父级归属、输入与可查询终态；它不等同于 Subagent 身份。
+_Avoid_: Agent, Drive, promotion job
+
+**Subagent notification**:
+后台 Subagent run 的终态向父级交付的结果通知；查询结果不等于消费通知，通知也不形成新的授权。
+_Avoid_: Event, user instruction
+
 ## Telemetry
 
 **Telemetry fact**:

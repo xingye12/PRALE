@@ -1,0 +1,650 @@
+{
+  "schema": "memorypanel.precedence-demo/v1",
+  "task_id": "T05",
+  "repository": "tdam",
+  "mode": "contract",
+  "subject": "MemoryPanel instance/panel configuration precedence",
+  "precedence_order": [
+    "1. explicit request input (per-request env override / x-tdai-service-id header) — highest",
+    "2. config (env values at load time; instance registry JSON entries)",
+    "3. built-in default (env()/envInt()/envBool() fallbacks; client-side gateway_endpoint fallback) — lowest"
+  ],
+  "sources_under_test": [
+    "MemoryPanel/src/panel/config/panel-config.ts",
+    "MemoryPanel/src/panel/config/instance-registry.ts",
+    "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts"
+  ],
+  "shims_applied": [
+    "dotenv",
+    "hono/factory",
+    "zod"
+  ],
+  "checks": [
+    {
+      "id": "A0",
+      "layers": {
+        "explicit": "unset",
+        "config": "unset",
+        "default": "built-in fallbacks"
+      },
+      "input": {},
+      "expected": {
+        "host": "0.0.0.0",
+        "port": 8123,
+        "metadataInstancesConfig": "./config/metadata-instances.json",
+        "log": {
+          "level": "info",
+          "format": "json"
+        },
+        "knowledgeBaseUrl": "http://127.0.0.1:8421",
+        "knowledgeTimeoutMs": 15000,
+        "llmBindingSync": true
+      },
+      "actual": {
+        "host": "0.0.0.0",
+        "port": 8123,
+        "metadataInstancesConfig": "./config/metadata-instances.json",
+        "log": {
+          "level": "info",
+          "format": "json"
+        },
+        "knowledgeBaseUrl": "http://127.0.0.1:8421",
+        "knowledgeTimeoutMs": 15000,
+        "llmBindingSync": true
+      },
+      "pass": true,
+      "observation": "Baseline: with no explicit input at all, loadPanelConfig() returns the built-in defaults baked into env()/envInt()/envBool()."
+    },
+    {
+      "id": "A1",
+      "layers": {
+        "explicit": "HOST/PORT/METADATA_INSTANCES_CONFIG/KNOWLEDGE_LLM_BINDING_SYNC/LOG_LEVEL",
+        "config": "same layer (env)",
+        "default": "built-in fallbacks"
+      },
+      "input": {
+        "HOST": "10.9.9.9",
+        "PORT": "9000",
+        "METADATA_INSTANCES_CONFIG": "./config/instances.alt.json",
+        "KNOWLEDGE_LLM_BINDING_SYNC": "false",
+        "LOG_LEVEL": "debug"
+      },
+      "expected": {
+        "host": "10.9.9.9",
+        "port": 9000,
+        "metadataInstancesConfig": "./config/instances.alt.json",
+        "llmBindingSync": false,
+        "level": "debug"
+      },
+      "actual": {
+        "host": "10.9.9.9",
+        "port": 9000,
+        "metadataInstancesConfig": "./config/instances.alt.json",
+        "llmBindingSync": false,
+        "level": "debug"
+      },
+      "pass": true,
+      "observation": "Explicit input beats every built-in default, including the boolean default `sync: true` which an explicit \"false\" overrides."
+    },
+    {
+      "id": "A2",
+      "layers": {
+        "explicit": "PORT=\"\" (blank)",
+        "config": "same layer (env)",
+        "default": "8123 / 15000"
+      },
+      "input": {
+        "PORT": "",
+        "METADATA_REMOTE_TIMEOUT_MS": ""
+      },
+      "expected": {
+        "port": 8123,
+        "metadataRemoteTimeoutMs": 15000
+      },
+      "actual": {
+        "port": 8123,
+        "metadataRemoteTimeoutMs": 15000
+      },
+      "pass": true,
+      "observation": "Blank explicit input is treated as absent by envInt() (`raw === \"\"` -> fallback), so the default wins for numeric settings."
+    },
+    {
+      "id": "A3",
+      "layers": {
+        "explicit": "PORT=\"not-a-number\"",
+        "config": "same layer (env)",
+        "default": "8123"
+      },
+      "input": {
+        "PORT": "not-a-number"
+      },
+      "expected": {
+        "port": 8123
+      },
+      "actual": {
+        "port": 8123
+      },
+      "pass": true,
+      "observation": "A non-numeric explicit value fails safe to the default instead of producing NaN (`Number.isFinite` guard)."
+    },
+    {
+      "id": "A4",
+      "layers": {
+        "explicit": "LOG_LEVEL=\"verbose\"",
+        "config": "whitelist in loadPanelConfig",
+        "default": "info"
+      },
+      "input": {
+        "LOG_LEVEL": "verbose"
+      },
+      "expected": {
+        "level": "info"
+      },
+      "actual": {
+        "level": "info"
+      },
+      "pass": true,
+      "observation": "An out-of-enum explicit value is rejected and the whitelist default is used — the only enum-style setting in PanelConfig."
+    },
+    {
+      "id": "A5",
+      "layers": {
+        "explicit": "KNOWLEDGE_LLM_BINDING_SYNC=\"\" and \"TRUE\"",
+        "config": "envBool()",
+        "default": "true"
+      },
+      "input": {
+        "blank": "",
+        "upper": "TRUE"
+      },
+      "expected": {
+        "blank": true,
+        "upper": false
+      },
+      "actual": {
+        "blank": true,
+        "upper": false
+      },
+      "pass": true,
+      "observation": "envBool(): blank explicit input falls back to the default `true`, while any non-\"true\"/\"1\" explicit value (even \"TRUE\") beats the default with false."
+    },
+    {
+      "id": "A6",
+      "layers": {
+        "explicit": "KNOWLEDGE_SERVICE_URL=\"\"",
+        "config": "env() string layer",
+        "default": "http://127.0.0.1:8421"
+      },
+      "input": {
+        "KNOWLEDGE_SERVICE_URL": ""
+      },
+      "expected": {
+        "baseUrl": ""
+      },
+      "actual": {
+        "baseUrl": ""
+      },
+      "pass": true,
+      "observation": "Conflict case: for STRING settings `env()` uses `??`, so an explicit empty string DOES shadow the default (unlike envInt/envBool). The resulting empty baseUrl then forces the KS client to be explicitly reconfigured — the precedence rule is deliberately \"explicit wins\"."
+    },
+    {
+      "id": "A7",
+      "layers": {
+        "explicit": "conflicting mix (see input)",
+        "config": "env layer",
+        "default": "built-in fallbacks"
+      },
+      "input": {
+        "HOST": "10.9.9.9",
+        "PORT": "",
+        "METADATA_INSTANCES_CONFIG": "./config/instances.alt.json",
+        "LOG_LEVEL": "trace",
+        "KNOWLEDGE_SERVICE_URL": "",
+        "KNOWLEDGE_LLM_BINDING_SYNC": "false"
+      },
+      "expected": {
+        "host": "10.9.9.9",
+        "port": 8123,
+        "metadataInstancesConfig": "./config/instances.alt.json",
+        "level": "info",
+        "knowledgeBaseUrl": "",
+        "sync": false
+      },
+      "actual": {
+        "host": "10.9.9.9",
+        "port": 8123,
+        "metadataInstancesConfig": "./config/instances.alt.json",
+        "level": "info",
+        "knowledgeBaseUrl": "",
+        "sync": false
+      },
+      "pass": true,
+      "observation": "Normalized end-to-end resolution: valid explicit input wins, blank/invalid explicit input degrades to the default per-field (except the empty-string case of A6)."
+    },
+    {
+      "id": "B1",
+      "layers": {
+        "explicit": "request header x-tdai-service-id=\"proxy-split\"",
+        "config": "registry entry proxy-split",
+        "default": "n/a (no default instance)"
+      },
+      "input": {
+        "requestHeader": "proxy-split"
+      },
+      "expected": {
+        "instance_id": "proxy-split",
+        "gateway_endpoint": "http://127.0.0.1:8420",
+        "proxy_endpoint": "http://127.0.0.1:8096",
+        "api_key": "cfg-key-proxy"
+      },
+      "actual": {
+        "instance_id": "proxy-split",
+        "gateway_endpoint": "http://127.0.0.1:8420",
+        "proxy_endpoint": "http://127.0.0.1:8096",
+        "api_key": "cfg-key-proxy"
+      },
+      "pass": true,
+      "observation": "The request header is a selector, not a value source: it is resolved against the registry config, which supplies gateway_endpoint/api_key for the forwarded call."
+    },
+    {
+      "id": "B2",
+      "layers": {
+        "explicit": "request header x-tdai-service-id=\"does-not-exist\"",
+        "config": "no matching registry entry",
+        "default": "NO silent fallback"
+      },
+      "input": {
+        "requestHeader": "does-not-exist"
+      },
+      "expected": {
+        "name": "InstanceRegistryError",
+        "code": 400,
+        "message": "INVALID_INSTANCE"
+      },
+      "actual": {
+        "name": "InstanceRegistryError",
+        "code": 400,
+        "message": "INVALID_INSTANCE"
+      },
+      "pass": true,
+      "observation": "Conflict between explicit request input and config fails closed with 400 INVALID_INSTANCE; the panel never borrows a default instance when the explicit id is unknown."
+    },
+    {
+      "id": "B3",
+      "layers": {
+        "explicit": "n/a",
+        "config": "entry default (no proxy_endpoint)",
+        "default": "gateway_endpoint fallback (client-side)"
+      },
+      "input": {
+        "publicKey": "proxy_endpoint"
+      },
+      "expected": {
+        "present": false
+      },
+      "actual": {
+        "present": false
+      },
+      "pass": true,
+      "observation": "When the config omits proxy_endpoint the key is not emitted at all (`...(proxy_endpoint ? {proxy_endpoint} : {})`), so the client `?? gateway_endpoint` fallback (the default) applies for the default instance."
+    },
+    {
+      "id": "B4",
+      "layers": {
+        "explicit": "n/a",
+        "config": "entry proxy-split (proxy_endpoint set)",
+        "default": "gateway_endpoint fallback (client-side)"
+      },
+      "input": {
+        "publicKey": "proxy_endpoint"
+      },
+      "expected": {
+        "value": "http://127.0.0.1:8096"
+      },
+      "actual": {
+        "value": "http://127.0.0.1:8096"
+      },
+      "pass": true,
+      "observation": "An explicit config value for proxy_endpoint beats the gateway_endpoint fallback and is the value the UI/CLI must consume."
+    },
+    {
+      "id": "B5",
+      "layers": {
+        "explicit": "n/a",
+        "config": "registry entries",
+        "default": "n/a"
+      },
+      "input": {
+        "secrets": [
+          "api_key"
+        ]
+      },
+      "expected": {
+        "leaked": []
+      },
+      "actual": {
+        "leaked": []
+      },
+      "pass": true,
+      "observation": "Precedence is also a disclosure boundary: listPublic() only exposes non-secret routing fields, so a client-side default can never resurrect the credential."
+    },
+    {
+      "id": "C1",
+      "layers": {
+        "explicit": "header \"  proxy-split  \"",
+        "config": "registry entry proxy-split",
+        "default": "none"
+      },
+      "input": {
+        "header": "  proxy-split  "
+      },
+      "expected": {
+        "nextCalled": true,
+        "meta": {
+          "instanceId": "proxy-split",
+          "gatewayEndpoint": "http://127.0.0.1:8420",
+          "gatewayApiKey": "cfg-key-proxy",
+          "userKey": "u-1"
+        }
+      },
+      "actual": {
+        "nextCalled": true,
+        "meta": {
+          "instanceId": "proxy-split",
+          "gatewayEndpoint": "http://127.0.0.1:8420",
+          "gatewayApiKey": "cfg-key-proxy",
+          "userKey": "u-1"
+        }
+      },
+      "pass": true,
+      "observation": "The trimmed request header selects the instance; every downstream value (endpoint, credential) is taken from the config entry, so no default leaks in."
+    },
+    {
+      "id": "C2",
+      "layers": {
+        "explicit": "absent / blank header",
+        "config": "registry entry default exists",
+        "default": "no fallback to it"
+      },
+      "input": {
+        "absent": "no x-tdai-service-id",
+        "blank": "\"   \""
+      },
+      "expected": {
+        "absent": {
+          "status": 400,
+          "message": "MISSING_INSTANCE_ID",
+          "nextCalled": false
+        },
+        "blank": {
+          "status": 400,
+          "message": "MISSING_INSTANCE_ID",
+          "nextCalled": false
+        }
+      },
+      "actual": {
+        "absent": {
+          "status": 400,
+          "message": "MISSING_INSTANCE_ID",
+          "nextCalled": false
+        },
+        "blank": {
+          "status": 400,
+          "message": "MISSING_INSTANCE_ID",
+          "nextCalled": false
+        }
+      },
+      "pass": true,
+      "observation": "A blank explicit header is trimmed to empty and rejected with MISSING_INSTANCE_ID — it never silently resolves to the configured \"default\" instance."
+    },
+    {
+      "id": "C3",
+      "layers": {
+        "explicit": "header \"does-not-exist\"",
+        "config": "no matching entry (a \"default\" entry does exist)",
+        "default": "must NOT be used"
+      },
+      "input": {
+        "header": "does-not-exist"
+      },
+      "expected": {
+        "status": 400,
+        "message": "INVALID_INSTANCE",
+        "nextCalled": false
+      },
+      "actual": {
+        "status": 400,
+        "message": "INVALID_INSTANCE",
+        "nextCalled": false
+      },
+      "pass": true,
+      "observation": "Explicit input that conflicts with config fails closed with INVALID_INSTANCE; the configured default instance is not borrowed."
+    },
+    {
+      "id": "C4",
+      "layers": {
+        "explicit": "configured id without x-tdai-user-key",
+        "config": "n/a",
+        "default": "n/a"
+      },
+      "input": {
+        "action": "agent/list"
+      },
+      "expected": {
+        "status": 400,
+        "message": "MISSING_USER_KEY",
+        "nextCalled": false
+      },
+      "actual": {
+        "status": 400,
+        "message": "MISSING_USER_KEY",
+        "nextCalled": false
+      },
+      "pass": true,
+      "observation": "After instance precedence is settled, the user-key requirement still applies to business routes."
+    },
+    {
+      "id": "C5",
+      "layers": {
+        "explicit": "configured id, no user key, action auth/verify",
+        "config": "AUTH_VERIFY exception",
+        "default": "n/a"
+      },
+      "input": {
+        "action": "auth/verify"
+      },
+      "expected": {
+        "nextCalled": true,
+        "instanceId": "default"
+      },
+      "actual": {
+        "nextCalled": true,
+        "instanceId": "default"
+      },
+      "pass": true,
+      "observation": "The auth/verify exception only relaxes the user-key rule; it does not change which layer supplies the instance."
+    },
+    {
+      "id": "C:loadPanelConfig",
+      "layers": {
+        "explicit": "n/a",
+        "config": "n/a",
+        "default": "n/a"
+      },
+      "input": {
+        "path": "MemoryPanel/src/panel/config/panel-config.ts",
+        "symbol": "loadPanelConfig",
+        "range": [
+          43,
+          69
+        ]
+      },
+      "expected": {
+        "containsSymbol": true
+      },
+      "actual": {
+        "containsSymbol": true
+      },
+      "pass": true,
+      "observation": "Citation integrity: MemoryPanel/src/panel/config/panel-config.ts:43-69 really contains `loadPanelConfig`."
+    },
+    {
+      "id": "C:env",
+      "layers": {
+        "explicit": "n/a",
+        "config": "n/a",
+        "default": "n/a"
+      },
+      "input": {
+        "path": "MemoryPanel/src/panel/config/panel-config.ts",
+        "symbol": "env",
+        "range": [
+          6,
+          8
+        ]
+      },
+      "expected": {
+        "containsSymbol": true
+      },
+      "actual": {
+        "containsSymbol": true
+      },
+      "pass": true,
+      "observation": "Citation integrity: MemoryPanel/src/panel/config/panel-config.ts:6-8 really contains `env`."
+    },
+    {
+      "id": "C:envInt",
+      "layers": {
+        "explicit": "n/a",
+        "config": "n/a",
+        "default": "n/a"
+      },
+      "input": {
+        "path": "MemoryPanel/src/panel/config/panel-config.ts",
+        "symbol": "envInt",
+        "range": [
+          10,
+          15
+        ]
+      },
+      "expected": {
+        "containsSymbol": true
+      },
+      "actual": {
+        "containsSymbol": true
+      },
+      "pass": true,
+      "observation": "Citation integrity: MemoryPanel/src/panel/config/panel-config.ts:10-15 really contains `envInt`."
+    },
+    {
+      "id": "C:envBool",
+      "layers": {
+        "explicit": "n/a",
+        "config": "n/a",
+        "default": "n/a"
+      },
+      "input": {
+        "path": "MemoryPanel/src/panel/config/panel-config.ts",
+        "symbol": "envBool",
+        "range": [
+          37,
+          41
+        ]
+      },
+      "expected": {
+        "containsSymbol": true
+      },
+      "actual": {
+        "containsSymbol": true
+      },
+      "pass": true,
+      "observation": "Citation integrity: MemoryPanel/src/panel/config/panel-config.ts:37-41 really contains `envBool`."
+    },
+    {
+      "id": "C:resolve",
+      "layers": {
+        "explicit": "n/a",
+        "config": "n/a",
+        "default": "n/a"
+      },
+      "input": {
+        "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+        "symbol": "resolve",
+        "range": [
+          96,
+          102
+        ]
+      },
+      "expected": {
+        "containsSymbol": true
+      },
+      "actual": {
+        "containsSymbol": true
+      },
+      "pass": true,
+      "observation": "Citation integrity: MemoryPanel/src/panel/config/instance-registry.ts:96-102 really contains `resolve`."
+    },
+    {
+      "id": "C:listPublic",
+      "layers": {
+        "explicit": "n/a",
+        "config": "n/a",
+        "default": "n/a"
+      },
+      "input": {
+        "path": "MemoryPanel/src/panel/config/instance-registry.ts",
+        "symbol": "listPublic",
+        "range": [
+          104,
+          112
+        ]
+      },
+      "expected": {
+        "containsSymbol": true
+      },
+      "actual": {
+        "containsSymbol": true
+      },
+      "pass": true,
+      "observation": "Citation integrity: MemoryPanel/src/panel/config/instance-registry.ts:104-112 really contains `listPublic`."
+    }
+  ],
+  "summary": {
+    "total": 24,
+    "passed": 24,
+    "failed": 0
+  },
+  "normalized_panel_config": {
+    "server": {
+      "host": "10.9.9.9",
+      "port": 8123
+    },
+    "metadataInstancesConfig": "./config/instances.alt.json",
+    "metadataRemoteTimeoutMs": 15000,
+    "ui": {
+      "distDir": "./web/dist"
+    },
+    "log": {
+      "level": "info",
+      "format": "json"
+    },
+    "knowledge": {
+      "baseUrl": "",
+      "authToken": "",
+      "timeoutMs": 15000
+    },
+    "knowledgeLlmBinding": {
+      "sync": false,
+      "proxyBaseUrl": "http://127.0.0.1:8096"
+    },
+    "agentTemplateDir": "./data/agent-templates"
+  },
+  "normalized_instance_resolution": {
+    "request_header": "proxy-split",
+    "resolved_instance_id": "proxy-split",
+    "gateway_endpoint": "http://127.0.0.1:8420",
+    "proxy_endpoint": "http://127.0.0.1:8096",
+    "secret_exposed": false
+  },
+  "status": "pass"
+}

@@ -1,0 +1,113 @@
+{
+  "task_id": "T24",
+  "repository": "wattclaw",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getHttpTargetForCurrentRequest",
+      "start_line": 448,
+      "end_line": 466,
+      "observation": "The per-request tenant router. It reads the request tenant from getRequestTenant() (or falls back to the requesting user's tenant / the default tenant), and returns { baseUrl: `http://${tenant.host}:${tenant.port}`, headers: { Authorization: `Bearer ${tenant.token || ''}` }, tenant }. It only ever builds a target for the request's own context tenant and attaches that tenant's own token, which is exactly the allow path the demo replays: resolve the backend from the context tenant, then dispatch with its bearer credential."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getHttpTargetForTenantId",
+      "start_line": 468,
+      "end_line": 485,
+      "observation": "Explicit-tenant target resolver. It looks the tenant up by id and throws `Tenant ${tenantId} not found` when the tenant does not exist, before ensureGatewayClient()/ensureConnected() are reached, so an unknown tenant produces no downstream dispatch. This is the deny boundary the demo mirrors for the unknown-tenant scenario (403 unknown_tenant, zero fake-backend hits)."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "callGatewayForTenant",
+      "start_line": 417,
+      "end_line": 426,
+      "observation": "Cross-tenant RPC entry point that resolves the tenant by id and throws `Tenant ${tenantId} not found` before ensureGatewayClient()/ensureConnected() and gateway.call(). It confirms rejection happens in-process before any dispatch when the requested tenant identity is not a known tenant."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "getTenantForUser",
+      "start_line": 501,
+      "end_line": 509,
+      "observation": "Resolves a user's owning tenant through user_tenant_assignments joined to openclaw_tenants and normalizes the row. This is the ownership lookup that binds a request to exactly one tenant (host/port/token), so the request context tenant used by getHttpTargetForCurrentRequest() is tenant-scoped rather than global."
+    },
+    {
+      "path": "server/core/multi-tenant-gateway.js",
+      "symbol": "ensureConnected",
+      "start_line": 704,
+      "end_line": 780,
+      "observation": "The connection gate that runs only after a tenant target/client has been resolved (creates/reuses the tenant client, approves a pending device on pairing/scope errors, and times out otherwise). It has no path for an unknown or mismatched tenant, which shows the tenant lookup/rejection happens upstream of dispatch."
+    },
+    {
+      "path": "server/core/request-context.js",
+      "symbol": "getRequestTenant",
+      "start_line": 17,
+      "end_line": 19,
+      "observation": "Returns the tenant stored in the AsyncLocalStorage request context (null when unset). Paired with runWithRequestContext (lines 5-7), it is the dependency-free mechanism multi-tenant-gateway.js uses to scope routing to a tenant. The demo imports these real symbols so the request-context binding is not a re-implementation."
+    },
+    {
+      "path": ".prale-eval/demo/run-demo.mjs",
+      "symbol": "authorizeAndDispatch",
+      "start_line": 85,
+      "end_line": 121,
+      "observation": "The demo's dispatch gate. It reads the context tenant via the real getRequestTenant(), rejects missing context (401), unknown tenant (403 unknown_tenant, via resolveTenantTarget), and credential/context tenant mismatch (403 tenant_mismatch) without any network call, and only fetches the tenant baseUrl with `Authorization: Bearer <token>` when the credential tenant equals the context tenant."
+    },
+    {
+      "path": ".prale-eval/demo/run-demo.mjs",
+      "symbol": "resolveTenantTarget",
+      "start_line": 73,
+      "end_line": 83,
+      "observation": "Replays the getHttpTargetForCurrentRequest contract against the fake fixture registry: it looks up the context tenant and builds { baseUrl: `http://${tenant.host}:${tenant.port}`, headers: { Authorization: `Bearer ${tenant.token}` }, tenant }, throwing `Tenant <id> not found` for an unknown tenant."
+    },
+    {
+      "path": ".prale-eval/demo/fixtures/fake-config.json",
+      "symbol": "tenants",
+      "start_line": 16,
+      "end_line": 33,
+      "observation": "Fake config fixture: the tenant registry with tenant-a/tenant-b ids, hosts, per-tenant bearer tokens, container names, and `port: null` placeholders; plus a policy block requiring context/tenant match and reject-before-dispatch. It is the local stand-in for the DB-backed tenant records the gateway module reads."
+    },
+    {
+      "path": ".prale-eval/demo/fake-gateway.mjs",
+      "symbol": "server",
+      "start_line": 42,
+      "end_line": 61,
+      "observation": "Local fake backend gateway. It binds 127.0.0.1:0, attributes the Authorization bearer token to a tenant via tenantFromAuthorization(), appends one JSON hit line per accepted request (method, path, authorization, tenantId, body) and returns 200 {ok:true, receivedBy:'fake-backend', tenantId}. Counting hit lines is how the demo proves a request was dispatched or rejected before dispatch."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The gateway module routes a request strictly through its own tenant context: getHttpTargetForCurrentRequest() takes the tenant from getRequestTenant() (server/core/request-context.js) and returns that tenant's baseUrl with an Authorization: Bearer of that same tenant's token, so an allowed request is bound to one tenant and one credential.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js",
+        "server/core/request-context.js"
+      ]
+    },
+    {
+      "claim": "Tenant identity is the rejection boundary that runs before dispatch: getHttpTargetForTenantId() and callGatewayForTenant() throw `Tenant <id> not found` for an unknown tenant before ensureGatewayClient()/ensureConnected() and before any RPC, and getTenantForUser() binds a user/request to exactly one tenant row.",
+      "evidence_paths": [
+        "server/core/multi-tenant-gateway.js"
+      ]
+    },
+    {
+      "claim": "The demo's authorizeAndDispatch gate rejects a mismatched tenant in-process: with a tenant-a request context and a tenant-b credential it returns 403 tenant_mismatch with dispatched=false, and an unknown context tenant (tenant-ghost) returns 403 unknown_tenant via resolveTenantTarget's `Tenant tenant-ghost not found`.",
+      "evidence_paths": [
+        ".prale-eval/demo/run-demo.mjs"
+      ]
+    },
+    {
+      "claim": "The allowed path is end-to-end against the fake backend: the allowed scenario (tenant-a context + tenant-a credential) returns HTTP 200 from the fake gateway and the backend's hit log contains exactly one entry with `Bearer fake-token-tenant-a` and tenantId tenant-a, while the mismatch and unknown-tenant scenarios add no hits, proving they were rejected before dispatch.",
+      "evidence_paths": [
+        ".prale-eval/demo/run-demo.mjs",
+        ".prale-eval/demo/fake-gateway.mjs",
+        ".prale-eval/demo/fixtures/fake-config.json",
+        "server/core/multi-tenant-gateway.js"
+      ]
+    }
+  ],
+  "conclusion": "The demo proves the multi-tenant routing boundary described by server/core/multi-tenant-gateway.js using only local fake gateway/config fixtures. The allowed tenant request (context tenant-a + credential tenant-a) is dispatched to the fake backend, which returns 200 and records exactly one hit carrying `Bearer fake-token-tenant-a`; the mismatched request (context tenant-a + credential tenant-b) and the unknown-tenant request (tenant-ghost) are both rejected with 403 before any network call and produce zero additional backend hits. The exercised contract is grounded in the repository: getHttpTargetForCurrentRequest() derives the target from the request-context tenant with that tenant's host/port/token, getHttpTargetForTenantId()/callGatewayForTenant() reject unknown tenants before connecting, and request-context.js's runWithRequestContext/getRequestTenant are imported directly. The demo is executable via `node .prale-eval/demo/run-demo.mjs`, exits 0, and writes the normalized result to .prale-eval/demo-output.json. Limitation: the real module cannot be imported here because node_modules/better-sqlite3 is absent, so the gateway target contract is replayed against the fixtures rather than executing the Docker-backed module; no dependencies were installed and no task metadata, lockfile, hidden-oracle file, or git configuration was modified.",
+  "validation": {
+    "command": "node .prale-eval/demo/run-demo.mjs",
+    "status": "passed",
+    "notes": "Ran the demo end-to-end: exit 0, all checks true (allowed_reached_backend, allowed_backend_saw_tenant_a, mismatch_rejected, mismatch_not_dispatched, unknown_tenant_rejected, unknown_tenant_not_dispatched), backend_hit_count = 1. Also ran `node --check server/core/multi-tenant-gateway.js` and confirmed `node -e import('./server/core/request-context.js')` succeeds. Limitation: the official suite could not run and server/core/multi-tenant-gateway.js cannot be imported directly because its transitive ../database.js -> better-sqlite3 dependency and node_modules are absent (import fails with ERR_MODULE_NOT_FOUND); no dependency was installed, so this dynamic demo plus the static citation checks are limited-strength substitute evidence, not equivalent to the full test suite. Every cited symbol/range was re-verified against the working tree; only .prale-eval/ is new."
+  }
+}

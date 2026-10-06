@@ -1,0 +1,50 @@
+{
+  "task_id": "T26",
+  "repository": "pi",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "main",
+      "start_line": 263,
+      "end_line": 288,
+      "observation": "`main` is the publisher entrypoint. It resolves --input, validates the local bundle via validateBundle(), builds the publication record and writes publication.json, then at lines 285-288 the `--dry-run` branch prints a confirmation and returns BEFORE the temporary directory / downloadIndex / uploadJson / aws spawnSync calls. Every S3 or network touch (aws at line 185, downloadIndex at 200/293, uploadJson at 215/314/320) is reachable only after that return, so --dry-run is a purely local, offline-safe validation of the fixture."
+    },
+    {
+      "path": "scripts/publish-model-catalog.mjs",
+      "symbol": "parseArgs",
+      "start_line": 36,
+      "end_line": 71,
+      "observation": "`parseArgs` recognizes the `--dry-run` flag (lines 47-50) and gates the credential/target requirements: `--bucket` and `--endpoint` are only mandatory when NOT dry-running (lines 68-69). This makes an offline run possible with neither an S3 bucket nor a network endpoint, i.e. operation against a fixture that intentionally carries no network configuration."
+    },
+    {
+      "path": "packages/ai/package.json",
+      "symbol": "build:offline",
+      "start_line": 54,
+      "end_line": 64,
+      "observation": "The `scripts` block defines the offline model-data toolchain: `check:model-data` (line 59) runs scripts/check-model-data.ts, which imports only node:fs-based local validators, and `build:offline` (line 61) composes `check:model-data` with the tsgo build while copying local src/providers/data into dist. `generate-model-catalog` (line 58) emits the ../../.artifacts/model-catalog input that scripts/publish-model-catalog.mjs consumes. All three operate on checked-in local data with no network fetch, so this package's catalog pipeline is the offline fixture the publisher validates."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "scripts/publish-model-catalog.mjs supports a fully offline operation mode: with --dry-run it validates a local model-catalog fixture (500 chat + 1 image + 1 classifier models across 3 providers) and returns from main() before any aws/S3/network call, so the fixture never needs network data.",
+      "evidence_paths": [
+        "scripts/publish-model-catalog.mjs",
+        "packages/ai/package.json"
+      ]
+    },
+    {
+      "claim": "packages/ai/package.json defines the offline model-data scripts (check:model-data, build:offline, generate-model-catalog) that read only local checked-in data and produce the catalog input directory consumed by publish-model-catalog.mjs; no script in this pipeline performs a network fetch.",
+      "evidence_paths": [
+        "packages/ai/package.json",
+        "scripts/publish-model-catalog.mjs"
+      ]
+    }
+  ],
+  "conclusion": "The `pi` repository can be operated offline against its self-contained model-catalog fixture. The narrowest valid local check is the dry-run publisher test `node --test scripts/publish-model-catalog.test.mjs`, which builds a fixture in a temp dir and invokes `scripts/publish-model-catalog.mjs --input <fixture> --source-commit test-commit --dry-run`. It passed with 1/1 tests green. The same dry-run was also run directly against .prale-eval/fixture, producing the normalized publication result (revision sha256-a9e95677...77918, providerCount 3, chatModelCount 500, imageModelCount 1, classifierModelCount 1, totalModelCount 502) with exit code 0 and the message 'no objects uploaded'. The check is offline-safe because --dry-run returns from main() at lines 285-288 before any aws spawnSync, downloadIndex, or uploadJson call; the only non-local helper gitSourceCommit() is bypassed by passing an explicit --source-commit, and the publisher imports solely node builtins plus the local ./model-catalog-protocol.ts.",
+  "validation": {
+    "command": "node --test scripts/publish-model-catalog.test.mjs",
+    "status": "passed",
+    "notes": "Ran inside the workspace with Node v24.14.0 (native TypeScript type-stripping loads the local ./model-catalog-protocol.ts import). Result: 1 test, 1 pass, 0 fail. No node_modules are installed and none are required: the test and publisher use only node:assert, node:child_process, node:fs, node:os, node:path, node:crypto, node:util, node:test. Offline safety: the fixture is constructed in a tmpdir and passed with --dry-run, which short-circuits main() before every aws/S3 call site; --source-commit is supplied explicitly so the local git rev-parse helper is not invoked. An independent direct run `node scripts/publish-model-catalog.mjs --input .prale-eval/fixture --source-commit offline-fixture --dry-run` also exited 0 and wrote .prale-eval/operation-result.json. No network access, dependency install, or filesystem scan outside the workspace was performed."
+  }
+}

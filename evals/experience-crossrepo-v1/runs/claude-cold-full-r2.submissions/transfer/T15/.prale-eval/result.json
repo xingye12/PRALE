@@ -1,0 +1,83 @@
+{
+  "task_id": "T15",
+  "repository": "wattclaw",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "isGeneratedFilePathAllowed",
+      "start_line": 39,
+      "end_line": 45,
+      "observation": "Normalizer/policy gate for the user-controlled relative path that survives resolution. It lowercases every path segment, rejects any segment in GENERATED_FILE_DENIED_SEGMENTS ('.git', '.openclaw' declared at lines 26), rejects a final segment equal to '.env' or starting with '.env.', and rejects the deny-listed metadata/identity file names declared at lines 27-37 (agents.md, soul.md, user.md, identity.md, tools.md, bootstrap.md, memory.md, workspace-state.json, openclaw-workspace-state.json). It is pure and dependency-free, so it is the authoritative contract for which user-named attachments may be read back."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "generatedFileMimeType",
+      "start_line": 47,
+      "end_line": 70,
+      "observation": "Normalizes the user-supplied file extension to a MIME type for the response metadata, falling back to 'application/octet-stream' for unknown extensions; the extension is lowercased and taken through path.extname so a user-controlled name cannot inject a non-extension token."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "createFileRoutes",
+      "start_line": 72,
+      "end_line": 173,
+      "observation": "The generated-file download route treats attachment metadata as user-controlled input end to end: line 75 trims req.query.path and rewrites backslashes to '/', line 89 rejects an empty path, a missing sessionKey/agentId and any NUL byte, line 112 delegates normalization to resolveGeneratedFileCandidatePath, lines 122-132 canonicalize with realpath, and lines 134-139 re-verify containment with posix.relative (rejecting '..', '../'-prefixed and absolute results) before isGeneratedFilePathAllowed runs. This is exactly why the normalizer itself must not be relied on as a sandbox."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "allFiles",
+      "start_line": 209,
+      "end_line": 220,
+      "observation": "`allFiles` (declared at line 209) is the array that the batch-list handler builds by parsing the shell-produced fixture lines of the form '<type>|<path>|<size>|<mtimeEpoch>' returned by `find -printf '%y|%P|%s|%T@\\n'` (command built at line 207) into normalized metadata records: { name (basename of the relative path), path, type ('directory' when the %y field is 'd' else 'file'), isDirectory, size (parseInt, defaulting to 0) and updatedAtMs (seconds rounded to integer milliseconds) } and drops '.', '..' and empty names. File names here are user-controlled."
+    },
+    {
+      "path": "server/handlers/files.js",
+      "symbol": "files",
+      "start_line": 264,
+      "end_line": 274,
+      "observation": "`files` (declared at line 264) is the second, single-directory variant of the same normalizer for `find -mindepth 1 -maxdepth 1 -printf '%y|%f|%s|%T@\\n'` output (command at line 260). It produces the same record shape but composes the returned path from the caller-supplied relative directory prefix (line 268: `${relPath}/${name}`) and uses the '%f' basename field, which is the duplicate implementation of the parser exercised by the focused test fixture."
+    },
+    {
+      "path": "server/utils/generated-file-path.js",
+      "symbol": "resolveGeneratedFileCandidatePath",
+      "start_line": 1,
+      "end_line": 15,
+      "observation": "Pure parser/normalizer for the user-controlled requested path: it strips trailing slashes from workspaceReal, rewrites backslashes to '/', and classifies the fixture as 'workspace-absolute' (equal to the workspace or prefixed by it), 'workspace-root-relative' (starts with '/', e.g. '/etc/passwd' which is folded back under the workspace rather than treated as a host-absolute path) or 'workspace-relative'. Leading slashes are stripped only for the workspace-relative join, and no segment is collapsed or dropped, so traversal segments and NUL bytes pass through unchanged and must be handled by the caller in server/handlers/files.js."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "server/utils/generated-file-path.js is a pure normalizer, not a sandbox: it rewrites backslashes and classifies the user-controlled path into workspace-absolute / workspace-root-relative / workspace-relative modes, but it deliberately preserves '..' segments, NUL bytes and deny-listed names such as '.env' verbatim, so containment and name policy must be enforced downstream by server/handlers/files.js (posix.relative check at lines 134-139 and isGeneratedFilePathAllowed at lines 39-45).",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js",
+        "server/handlers/files.js"
+      ]
+    },
+    {
+      "claim": "A leading-slash fixture such as '/etc/passwd' is never interpreted as a host-absolute path: resolveGeneratedFileCandidatePath reports pathMode 'workspace-root-relative' and returns '<workspace>/etc/passwd', which keeps user-controlled attachment paths inside the per-agent workspace root before realpath.",
+      "evidence_paths": [
+        "server/utils/generated-file-path.js"
+      ]
+    },
+    {
+      "claim": "The generated-file download route in server/handlers/files.js is the enforcement point for the user-controlled attachment path: it rejects NUL bytes and empty values before normalization (line 89), calls resolveGeneratedFileCandidatePath at line 112, then rejects any realpath that escapes the workspace via posix.relative (lines 134-136) and any deny-listed name or segment via isGeneratedFilePathAllowed (lines 39-45, called at line 136).",
+      "evidence_paths": [
+        "server/handlers/files.js",
+        "server/utils/generated-file-path.js"
+      ]
+    },
+    {
+      "claim": "server/handlers/files.js parses user-controlled file/attachment metadata out of shell output in two places (lines 209-220 for the recursive batch listing and lines 264-274 for the single-directory listing), normalizing '<type>|<path>|<size>|<mtime>' fixture lines into {name, path, type, isDirectory, size, updatedAtMs}; the focused test added by this task pins the normalization contract that both parsers depend on.",
+      "evidence_paths": [
+        "server/handlers/files.js"
+      ]
+    }
+  ],
+  "conclusion": "WattClaw's user-controlled attachment path flow has exactly the two pieces the transferred task targets: a pure parser/normalizer (resolveGeneratedFileCandidatePath in server/utils/generated-file-path.js) and its enforcing consumer (the generated-file route plus the 'find -printf' metadata parsers in server/handlers/files.js, which also normalizes denies via isGeneratedFilePathAllowed). I added server/utils/generated-file-path.user-controlled.test.js, a dependency-free focused parser/normalizer test that feeds nine attacker-shaped, user-controlled fixtures (Windows backslash paths, drive-absolute paths, leading-slash host paths, traversal sequences, NUL bytes, trailing-slash workspaces, workspace-equal and empty fixtures, and a deny-listed '.env' name) through the normalizer and asserts the exact normalized result, documenting that policy enforcement is intentionally deferred to the handler. The suite passes 9/9 with node --test; the pre-existing vitest suites could not be executed because node_modules is absent in this workspace.",
+  "validation": {
+    "command": "node --test --test-force-exit server/utils/generated-file-path.user-controlled.test.js",
+    "status": "pass",
+    "notes": "9 tests, 9 pass, 0 fail (see also the wired `npm run test:server` entry, which now runs this file before server/services/external-session-projection.test.js). Limitation: node_modules is not installed in this workspace and dependencies must not be installed, so the repo's vitest suites (including the existing server/utils/generated-file-path.test.js) were not executable; `node --test server/services/external-session-projection.test.js` fails pre-existing and unrelated with ERR_MODULE_NOT_FOUND for 'better-sqlite3' from server/database.js. The added test imports only the dependency-free server/utils/generated-file-path.js, so it runs and passes with the stock Node 24 test runner. No task metadata, hidden-oracle file, package lock or git configuration was modified."
+  }
+}

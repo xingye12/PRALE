@@ -12,6 +12,7 @@ deployment should fail with an explanation, at startup, before anything opens;
 a value read from inside a driver fails much further from its cause.
 """
 
+import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -19,6 +20,7 @@ from pathlib import Path
 from agent_harness.api.errors import ProjectConfigError
 from agent_harness.api.project import ProjectRuntimeConfig
 from agent_harness.domain.context_management import ContextManagementConfig
+from agent_harness.domain.subagents import CONTROL_NAMES, SubagentConfig
 from agent_harness.integrations.langfuse import LangfuseConfig
 from agent_harness.integrations.repository_explorer import RepositoryScanLimits
 
@@ -37,7 +39,7 @@ DATA_DIR_NAME = ".prale"
 """Where the stores live when ``PRALE_DATA_DIR`` does not say otherwise."""
 
 MEMORY_TOOLS = ("memory_search", "conversation_search", "memory_read_scene")
-BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore", "skill_load", *MEMORY_TOOLS)
+BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore", "skill_load", *MEMORY_TOOLS, *CONTROL_NAMES)
 """The local tool set, named individually because enabling ``bash`` is a decision."""
 
 DEFAULT_MAX_CONCURRENT_DRIVES = 8
@@ -77,7 +79,7 @@ DEFAULT_LANE = "main"
 DATA_DIR_NAME = ".prale"
 """Where the stores live when ``PRALE_DATA_DIR`` does not say otherwise."""
 MEMORY_TOOLS = ("memory_search", "conversation_search", "memory_read_scene")
-BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore", "skill_load", *MEMORY_TOOLS)
+BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore", "skill_load", *MEMORY_TOOLS, *CONTROL_NAMES)
 """The local tool set, named individually because enabling ``bash`` is a decision."""
 
 
@@ -122,6 +124,8 @@ class Settings:
     max_connections: int | None
     graceful_shutdown_seconds: float
     log_level: str
+    subagent_config: SubagentConfig = SubagentConfig()
+    subagent_dirs: tuple[Path, ...] = ()
 
     @property
     def config(self) -> ProjectRuntimeConfig:
@@ -176,6 +180,10 @@ class Settings:
                 f"traces            {'on' if self.traces else 'off'}",
                 f"memory_prompt     {prompt}",
                 f"max_drives        {self.max_concurrent_drives}",
+                f"subagents         {'on' if self.subagent_config.enabled else 'off'}",
+                f"subagent_limits   running={self.subagent_config.max_running} "
+                f"nonterminal={self.subagent_config.max_nonterminal}",
+                f"subagent_dirs     {list(map(str, self.subagent_dirs))}",
                 f"repository_explore {'on' if 'repository_explore' in self.tools else 'off'}",
                 f"repository_scan   files={self.repository_scan_limits.max_files} "
                 f"bytes={self.repository_scan_limits.max_total_bytes} "
@@ -226,10 +234,36 @@ class Settings:
             )
         except ValueError as error:
             raise ProjectConfigError(str(error)) from error
-        tools = _tools(environ.get("PRALE_TOOLS", ""))
+        raw_enabled = environ.get("PRALE_SUBAGENTS_ENABLED", "true").strip().lower()
+        if raw_enabled not in {"true", "false", "on", "off", "1", "0", "yes", "no"}:
+            raise ProjectConfigError("PRALE_SUBAGENTS_ENABLED must be boolean")
+        subagent_config = SubagentConfig(
+            enabled=raw_enabled in {"true", "on", "1", "yes"},
+            max_running=_int(environ, "PRALE_SUBAGENT_MAX_RUNNING", 4),
+            max_nonterminal=_int(environ, "PRALE_SUBAGENT_MAX_NONTERMINAL", 64),
+            max_result_tokens=_int(environ, "PRALE_SUBAGENT_MAX_RESULT_TOKENS", 4096),
+        )
+        default_tools = ",".join(CONTROL_NAMES) if subagent_config.enabled else ""
+        tools = _tools(environ.get("PRALE_TOOLS", default_tools))
         unknown = sorted(set(tools) - set(BUILTIN_TOOLS))
         if unknown:
             raise ProjectConfigError(f"PRALE_TOOLS names unknown tools: {unknown}; known: {list(BUILTIN_TOOLS)}")
+        if set(tools).intersection(CONTROL_NAMES) and not subagent_config.enabled:
+            raise ProjectConfigError("subagent control tools require PRALE_SUBAGENTS_ENABLED")
+        try:
+            dirs = json.loads(environ.get("PRALE_SUBAGENT_DIRS", "[]"))
+            if not isinstance(dirs, list) or any(not isinstance(item, str) or not item for item in dirs):
+                raise ValueError("directories must be non-empty strings")
+            subagent_dirs = tuple(
+                (
+                    Path(item).expanduser() if Path(item).expanduser().is_absolute() else root / Path(item).expanduser()
+                ).resolve()
+                for item in dirs
+            )
+        except (ValueError, TypeError) as error:
+            raise ProjectConfigError("PRALE_SUBAGENT_DIRS must be a JSON array of paths") from error
+        if subagent_dirs and not subagent_config.enabled:
+            raise ProjectConfigError("subagent directories require enabled subagents")
         tokens = _tokens(environ.get("PRALE_TOKENS", ""))
         # Parsed here, with the rest, so that an enabled-but-unconfigurable
         # tracing setup stops the process before it serves a single turn — and
@@ -287,6 +321,8 @@ class Settings:
         if not 256 <= repository_export_tokens <= 6_000:
             raise ProjectConfigError("PRALE_REPOSITORY_MAX_EXPORT_TOKENS must be between 256 and 6000")
         return cls(
+            subagent_config=subagent_config,
+            subagent_dirs=subagent_dirs,
             project_root=root,
             repository_id=repository_id,
             project_id=environ.get("PRALE_PROJECT_ID", "").strip() or None,

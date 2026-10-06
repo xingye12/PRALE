@@ -1,0 +1,77 @@
+{
+  "task_id": "T22",
+  "repository": "wattclaw",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "server/core/system.js",
+      "symbol": "localExec",
+      "start_line": 111,
+      "end_line": 148,
+      "observation": "localExec spawns the backend command with spawn(cmd, { stdio: 'pipe', shell: true }), accumulates stdout/stderr, and on a non-zero exit rejects with new Error((stderr || stdout || `Command failed with exit code ${code}`).trim()). The rejection is a bare Error, so exit code, signal and the accumulated stdout/stderr are collapsed into one message and never reach a structured server result. The timeout branch (lines 140-146) does the same: it SIGTERMs/SIGKILLs the child and rejects a message-only error, discarding partial output and the timedOut fact."
+    },
+    {
+      "path": "server/core/system.js",
+      "symbol": "gatewayExec",
+      "start_line": 150,
+      "end_line": 152,
+      "observation": "gatewayExec is a one-line pass-through to localExec, so every handler that shells out (server/handlers/files.js, skill-store.js, workspace.js, backup.js) inherits the same lossy rejection surface; this is the call site the new normalization must be able to stand in for."
+    },
+    {
+      "path": "server/core/gateway-client.js",
+      "symbol": "gatewayAdminRpcForTarget",
+      "start_line": 60,
+      "end_line": 122,
+      "observation": "Existing precedent for normalizing a backend failure into a structured server result: on transport/HTTP failure it never throws, resolving { ok: false, error } (including the 404 -> WebSocket fallback at lines 90-101 and the catch branch returning { ok: false, error: err.message } at line 118) and { ok: true, payload } on success. The child-process path had no equivalent normalizer for local command failures."
+    },
+    {
+      "path": "server/core/gateway-client.js",
+      "symbol": "_sanitizeLogParams",
+      "start_line": 32,
+      "end_line": 53,
+      "observation": "Failure/observation logging in this module is defensive (redacts sensitive keys, depth-limited, try/catch fallback). It shows the file's convention of keeping diagnostic context available while never leaking it into executable paths, which the new normalizer mirrors by returning diagnostics as data rather than interpolating them into a message."
+    },
+    {
+      "path": "server/core/process-result.js",
+      "symbol": "normalizeProcessFailure",
+      "start_line": 69,
+      "end_line": 103,
+      "observation": "New normalizer: total (never throws) conversion of any child-process/fake-backend error into { ok:false, error:{ code, kind, message, diagnostics } }, classifying spawn_error vs nonzero_exit vs timeout and delegating diagnostics to buildProcessDiagnostics so exitCode/signal/stdout/stderr/timeoutMs/spawnCode/errno survive."
+    },
+    {
+      "path": "server/core/process-result.js",
+      "symbol": "runCommandResult",
+      "start_line": 114,
+      "end_line": 193,
+      "observation": "New executor that keeps localExec's spawn semantics (shell:true, piped stdio, SIGTERM then SIGKILL after 5s) but always resolves: { ok:true, payload:{ command, exitCode, signal, stdout, stderr, durationMs } } on success and the normalizeProcessFailure envelope on failure. options.spawnImpl injects a fake child process so a fake backend failure (non-zero exit, ENOENT error event, hang) is produced deterministically."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "system.js#localExec (and its gatewayExec pass-through) rejects a child-process/fake-backend failure as a message-only Error, so the exit code, signal and partial stdout/stderr are lost before any handler can build a server result; this is the defect T22 normalizes.",
+      "evidence_paths": ["server/core/system.js"]
+    },
+    {
+      "claim": "system.js#gatewayExec is a thin pass-through to localExec, so every shelling-out handler inherits the same lossy failure surface rather than a structured { ok, error } result.",
+      "evidence_paths": ["server/core/system.js"]
+    },
+    {
+      "claim": "gateway-client.js#gatewayAdminRpcForTarget is the repository's precedent for normalizing backend failures into { ok:false, error } / { ok:true, payload } without throwing, and _sanitizeLogParams shows the file's diagnostic-preserving convention; the local child-process path lacked the equivalent.",
+      "evidence_paths": ["server/core/gateway-client.js"]
+    },
+    {
+      "claim": "The new server/core/process-result.js#runCommandResult resolves instead of rejecting and returns { ok:true, payload } or a normalized { ok:false, error:{ code, kind, message, diagnostics } } that retains exit code, signal, stdout, stderr, timeoutMs, timedOut, spawn code/errno — verified by the executable demo, which asserts all three fake-backend failure kinds and the success path.",
+      "evidence_paths": [
+        "server/core/system.js",
+        "server/core/gateway-client.js",
+        "server/core/process-result.js"
+      ]
+    }
+  ],
+  "conclusion": "In wattclaw, a fake backend command/child-process failure is now normalized into the repository's structured server-result envelope without losing diagnostics. Two files were added: server/core/process-result.js exports normalizeProcessFailure(error, context) (total, never throws) and runCommandResult(cmd, options) (same spawn semantics as system.js#localExec but always resolves), returning { ok:true, payload:{ command, exitCode, signal, stdout, stderr, durationMs } } on success and { ok:false, error:{ code, kind, message, diagnostics } } on failure, where kind is spawn_error | nonzero_exit | timeout and diagnostics retains command, cwd, exitCode, signal, stdout, stderr, timedOut, timeoutMs, durationMs, spawnCode, errno and syscall. This mirrors the existing normalization contract in gateway-client.js#gatewayAdminRpcForTarget (never throw; return { ok, error } / { ok, payload }) and closes the gap left by system.js#localExec, which rejects with a single collapsed message. server/core/process-result.demo.mjs executes three deterministic fake-backend failures (non-zero exit with stdout+stderr, injected ENOENT spawn error, and a hang that trips the timeout) plus a success and a bare-error case; all assertions pass (exit 0). No existing file, task metadata, lockfile or git configuration was modified and no dependency was installed.",
+  "validation": {
+    "command": "node server/core/process-result.demo.mjs",
+    "status": "pass",
+    "notes": "Exit code 0; output ends with 'ALL CHECKS PASSED'. Scenarios: (1) fake backend exits 3 after writing stdout 'partial payload' and stderr 'fake-backend: upstream 503' -> PROCESS_NONZERO_EXIT with exitCode 3 and both streams preserved; (2) injected spawn 'error' event (ENOENT, errno -2) -> PROCESS_SPAWN_ERROR with spawnCode/errno/command preserved; (3) hanging backend with timeoutMs 500 -> PROCESS_TIMEOUT with timedOut true, timeoutMs 500 and partial stdout preserved; (4) success -> { ok:true, payload:{ exitCode:0, stdout:'ok' } }; (5) normalizeProcessFailure(new Error('boom')) is total; (6) cited symbols localExec, gatewayExec, gatewayAdminRpcForTarget, _sanitizeLogParams still resolve via grep in the source files. Supporting checks: `node --check server/core/process-result.js` and `node --check server/core/process-result.demo.mjs` (syntax OK), plus a programmatic symbol-in-range assertion that each cited symbol text occurs inside its inclusive start_line/end_line range in server/core/system.js, server/core/gateway-client.js and server/core/process-result.js. LIMITATION: the repository's official suite (`npm run test:server`, vitest + node --test) could not be executed because node_modules is absent in this sandbox and installing dependencies is disallowed; the demo uses only Node built-ins (node:assert/strict, node:events, node:child_process) and is therefore the strongest available focused validation, but it is not equivalent to the full suite."
+  }
+}

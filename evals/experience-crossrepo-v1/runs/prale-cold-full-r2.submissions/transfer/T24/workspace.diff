@@ -1,0 +1,1771 @@
+diff --git a/.prale-eval/contract-deliverable.md b/.prale-eval/contract-deliverable.md
+new file mode 100644
+index 0000000..ddf66ed
+--- /dev/null
++++ b/.prale-eval/contract-deliverable.md
+@@ -0,0 +1,120 @@
++# Contract deliverable — explicit unknown-model handling (aider)
++
++- **task_id**: `T24`
++- **repository**: `aider`
++- **mode**: `contract`
++- **contract**: unknown model handling in `aider/models.py` is explicit and never
++  silently claims unsupported capabilities.
++- **fixture**: `.prale-eval/contract/local-model-metadata.json` (a local model
++  metadata file in the shape consumed by `--model-metadata-file` /
++  `.aider.model.metadata.json`).
++- **executable contract**: `.prale-eval/contract/check_unknown_model_contract.py`
++- **normalized operation result**: `.prale-eval/contract/contract-report.json`
++- **status**: `pass` (7/7 assertions) via
++  `python .prale-eval/contract/check_unknown_model_contract.py`
++
++## 1. The fixture (a *different* local model metadata fixture)
++
++```json
++{
++    "meta/aurora-1-mini": {
++        "max_input_tokens": 1234, "litellm_provider": "meta", "mode": "chat"
++    },
++    "meta/aurora-1-pro": {
++        "max_input_tokens": 32000, "max_output_tokens": 4000,
++        "litellm_provider": "meta", "mode": "chat",
++        "supports_function_calling": false
++    }
++}
++```
++
++`meta/aurora-1-mini` deliberately declares *partial* metadata (no cost keys, no
++capability flags). `meta/aurora-1-pro` deliberately declares an *explicit denial*
++(`supports_function_calling: false`). `meta/ghost-404` is declared nowhere at all.
++
++## 2. The contract, executed against the real code
++
++The check script imports the repository's `aider.models` module, registers the
++fixture through the public entry point `models.register_litellm_models([...])`
++(the same function `aider.main.register_litellm_models` calls), and then exercises
++lookup, `Model` construction and `sanity_check_model`. Each assertion produces a
++normalized record `{id, status, expectation, observed}`:
++
++| id | contract assertion | observed (normalized) | status |
++|----|--------------------|-----------------------|--------|
++| C1 | `register_litellm_models` stores fixture entries *verbatim* | `files_loaded == [fixture]`; registered exactly `meta/aurora-1-mini`, `meta/aurora-1-pro`; `fixture_entries_augmented == []` | pass |
++| C2 | undeclared model ⇒ metadata is an explicit empty mapping | `meta/ghost-404 → {}` (`dict`) | pass |
++| C3 | no silent basename/prefix inheritance | `aurora-1-mini → {}` (prefix stripping only when the entry's `litellm_provider` equals the prefix) | pass |
++| C4 | unknown model is reported *explicitly* | `Model("meta/ghost-404").info == {}`; `sanity_check_model` returned `True`; warnings: `"Unknown which environment variables are required."`, `"Unknown context window size and costs, using sane defaults."` | pass |
++| C5 | unknown model gets sane defaults and claims nothing | `max_chat_history_tokens == 1024`, `get_repo_map_tokens() == 1024`, `accepts_settings == []`, `extra_params is None` | pass |
++| C6 | partial fixture entry surfaces exactly as declared | looked-up keys `{max_input_tokens: 1234, litellm_provider: "meta", mode: "chat"}`; `invented_keys == []`; `supports_function_calling` and `input_cost_per_token` **absent** | pass |
++| C7 | explicit `false` capability is preserved, not upgraded | `info["supports_function_calling"] is False`; `Model(...).accepts_settings == []` (metadata never enables `thinking_tokens`/`reasoning_effort`) | pass |
++
++Failure semantics: the script exits `1` and the report's top-level `status`
++becomes `fail` if any assertion fails; the script prints one
++`[PASS]`/`[FAIL] <id>` line per assertion.
++
++## 3. Contract clauses (the normative reading)
++
++1. **Absence is explicit.** A model with no entry in any registered metadata
++   source resolves to `{}` — never to a synthesized cost/context/capability set.
++2. **Never claim support silently.** Missing keys stay missing
++   (`supports_function_calling`, `supports_tool_choice`, `input_cost_per_token`,
++   …). An explicit `false` stays `false`; only an explicit `true` asserts support.
++   Metadata never turns on optional request settings (`accepts_settings` stays `[]`).
++3. **Unknown models are announced.** `sanity_check_model` returns a truthy
++   "problem" flag and emits the two `Unknown …` warnings, so callers can tell the
++   difference between "known defaults" and "we do not know this model".
++4. **Defaults are documented constants, not inferences.** `max_chat_history_tokens`
++   and `get_repo_map_tokens()` fall back to the 1024-token sane default when
++   `info` has no `max_input_tokens`.
++5. **Registration is verbatim.** `register_litellm_models` only merges declared
++   dictionaries into `model_info_manager.local_model_metadata`; it does not
++   enrich or normalize capability keys.
++6. **Hermetic operation.** `HOME` is redirected to
++   `.prale-eval/contract/_home` (aider's metadata cache lives under
++   `$HOME/.aider/caches`) and outbound HTTP is disabled, so the contract touches
++   no network and writes only inside the workspace.
++
++## 4. Source citations (repository-relative)
++
++| file | symbol | lines | role in the contract |
++|------|--------|-------|----------------------|
++| `aider/models.py` | `ModelInfoManager.get_model_from_cached_json_db` | 223–247 | returns `dict()` for unknown models; prefix fallback guarded by `litellm_provider` |
++| `aider/models.py` | `ModelInfoManager.get_model_info` | 249–274 | returns `cached_info` (possibly `{}`) and never fabricates keys for unknown models |
++| `aider/models.py` | `Model.__init__` | 330–369 | `self.info = self.get_model_info(model)`; `max_input_tokens or 0` ⇒ 1024-token history default |
++| `aider/models.py` | `Model.configure_model_settings` | 385–435 | `accepts_settings` defaults to `[]`; optional settings only via explicit settings/name rules |
++| `aider/models.py` | `Model.get_repo_map_tokens` | 782–789 | documented 1024-token default when context window is unknown |
++| `aider/models.py` | `register_litellm_models` | 1112–1133 | public registration entry point; merges fixture data verbatim |
++| `aider/models.py` | `sanity_check_model` | 1164–1200 | explicit `Unknown …` warnings and truthy return for unknown models |
++
++## 5. Limitation of this run (optional validation dependency unavailable)
++
++`litellm`, `json5` and `oslex` are not installed in this environment
++(`pip install` / dependency installation is out of scope), so the harness
++installs narrow in-process shims before importing `aider.models`:
++
++- `litellm` — stub reproducing the behaviour the contract depends on:
++  `get_model_info` raises with the `model_prices_and_context_window.json`
++  message for unmapped models (the error `aider/models.py` catches and ignores),
++  `validate_environment` returns `{"keys_in_environment": False, "missing_keys": []}`,
++  `model_cost = {}`. Real litellm completions/encodings are never exercised.
++- `json5` — shim parsing strict JSON plus `//` line comments (the subset used by
++  aider metadata files).
++- `oslex` — `shlex`-based `join`/`split` shim; `aider.utils` only uses
++  `oslex.join` for shell escaping, which this contract does not call.
++
++These limitations are recorded verbatim in
++`.prale-eval/contract/contract-report.json` under `environment.limitations`, and
++the generic environment facts (`http_disabled: true`, `litellm_stubbed: true`)
++are recorded alongside them. Everything asserted about `aider/models.py` is real
++repository code; only the third-party boundary is simulated.
++
++## 6. Reproducing
++
++```bash
++python .prale-eval/contract/check_unknown_model_contract.py   # exit 0, status pass
++```
++
++Run from the repository root (the script also resolves the root itself from its
++own path). The command rewrites `.prale-eval/contract/contract-report.json`.
+diff --git a/.prale-eval/contract/_home/.aider/caches/model_prices_and_context_window.json b/.prale-eval/contract/_home/.aider/caches/model_prices_and_context_window.json
+new file mode 100644
+index 0000000..9e26dfe
+--- /dev/null
++++ b/.prale-eval/contract/_home/.aider/caches/model_prices_and_context_window.json
+@@ -0,0 +1 @@
++{}
+\ No newline at end of file
+diff --git a/.prale-eval/contract/check_unknown_model_contract.py b/.prale-eval/contract/check_unknown_model_contract.py
+new file mode 100644
+index 0000000..b1ff8db
+--- /dev/null
++++ b/.prale-eval/contract/check_unknown_model_contract.py
+@@ -0,0 +1,413 @@
++#!/usr/bin/env python3
++"""Executable contract: unknown-model handling in ``aider/models.py`` is explicit.
++
++This script drives the *real* repository code (``aider.models``) against a
++purpose-built local model metadata fixture
++(``.prale-eval/contract/local-model-metadata.json``) and asserts that:
++
++1. a model that appears in no metadata source resolves to an *empty* metadata
++   dict (explicit absence) instead of a fabricated cost/context/capability set;
++2. ``sanity_check_model`` reports the unknown model explicitly (it returns
++   ``True`` and emits the "Unknown ..." warnings) instead of staying silent;
++3. a model declared in the fixture with partial metadata is surfaced *exactly*
++   as declared - no capability key (``supports_function_calling``,
++   ``supports_tool_choice``, ``input_cost_per_token``, ...) is invented for it;
++4. an explicitly declared ``false`` capability stays ``false`` (explicit denial
++   is not silently upgraded to ``true``);
++5. unknown models fall back to the documented sane defaults
++   (``max_chat_history_tokens == 1024``, ``get_repo_map_tokens() == 1024``) and
++   claim no optional settings (``accepts_settings == []``);
++6. the public registration entry point ``register_litellm_models`` only stores
++   the declared metadata verbatim - it does not augment fixture entries.
++
++Run from anywhere:
++
++    python .prale-eval/contract/check_unknown_model_contract.py
++
++The script is hermetic: it points ``HOME`` at a sandbox inside this directory
++(so aider cache writes stay in the workspace) and disables outbound HTTP.  When
++the optional third-party dependency ``litellm`` is not installed, a minimal
++in-process stub that reproduces litellm's real behaviour for unmapped models
++(``get_model_info`` raises with the ``model_prices_and_context_window.json``
++message, ``validate_environment`` reports no keys) is installed and the
++limitation is recorded in the normalized report.
++
++Exit status is 0 when every contract assertion holds, 1 otherwise.
++"""
++
++from __future__ import annotations
++
++import contextlib
++import io as _io
++import json
++import os
++import re
++import sys
++import types
++from pathlib import Path
++
++CONTRACT_DIR = Path(__file__).resolve().parent
++REPO_ROOT = CONTRACT_DIR.parents[1]
++FIXTURE_PATH = CONTRACT_DIR / "local-model-metadata.json"
++REPORT_PATH = CONTRACT_DIR / "contract-report.json"
++SANDBOX_HOME = CONTRACT_DIR / "_home"
++
++# --- hermetic environment -------------------------------------------------
++# Point HOME inside the workspace *before* importing aider: ModelInfoManager
++# derives ~/.aider/caches from Path.home().
++SANDBOX_HOME.mkdir(parents=True, exist_ok=True)
++os.environ["HOME"] = str(SANDBOX_HOME)
++
++LIMITATIONS: list[str] = []
++
++# --- optional dependency shims -------------------------------------------
++try:  # json5 is an optional dependency of this checkout
++    import json5  # noqa: F401
++except ImportError:  # pragma: no cover - exercised in dependency-light runs
++    json5 = types.ModuleType("json5")
++
++    def _json5_loads(text, *args, **kwargs):
++        """Parse the JSON5 subset used by aider metadata files (``//`` comments)."""
++        without_comments = re.sub(r"(?m)^\s*//.*$", "", text)
++        return json.loads(without_comments)
++
++    json5.loads = _json5_loads
++    sys.modules["json5"] = json5
++    LIMITATIONS.append(
++        "json5 not installed: used an in-process shim that parses strict JSON plus "
++        "line comments (the subset used by aider metadata files)."
++    )
++
++try:  # transitive import of aider.models (via aider.utils)
++    import oslex  # noqa: F401
++except ImportError:  # pragma: no cover - exercised in dependency-light runs
++    import shlex as _shlex
++
++    oslex = types.ModuleType("oslex")
++    oslex.join = lambda args: " ".join(_shlex.quote(str(a)) for a in args)
++    oslex.split = lambda text: _shlex.split(text)
++    sys.modules["oslex"] = oslex
++    LIMITATIONS.append(
++        "oslex not installed: used a shlex-based shim (aider.utils only needs "
++        "oslex.join for shell escaping, which this contract does not exercise)."
++    )
++
++LITELLM_STUBBED = False
++try:  # aider.llm imports litellm lazily, but the contract exercises paths that need it
++    import litellm  # noqa: F401
++except ImportError:  # pragma: no cover - exercised in dependency-light runs
++    LITELLM_STUBBED = True
++    litellm = types.ModuleType("litellm")
++    litellm.model_cost = {}
++
++    def _stub_get_model_info(model, *args, **kwargs):
++        # Mirrors litellm's real behaviour for a model that is not in its map.
++        raise Exception(
++            f"Model {model} isn't mapped yet. Add it here or check "
++            "model_prices_and_context_window.json"
++        )
++
++    def _stub_validate_environment(model, *args, **kwargs):
++        # Mirrors litellm's real behaviour: provider unknown => no keys known.
++        return {"keys_in_environment": False, "missing_keys": []}
++
++    def _stub_encode(model=None, text=None, *args, **kwargs):
++        return [len(text or "")]
++
++    def _stub_token_counter(model=None, messages=None, *args, **kwargs):
++        return sum(len(str(message)) for message in (messages or []))
++
++    def _stub_completion(*args, **kwargs):
++        raise NotImplementedError("stub litellm: completions are out of contract scope")
++
++    litellm.get_model_info = _stub_get_model_info
++    litellm.validate_environment = _stub_validate_environment
++    litellm.encode = _stub_encode
++    litellm.token_counter = _stub_token_counter
++    litellm.completion = _stub_completion
++    litellm.suppress_debug_info = True
++    litellm.drop_params = True
++    litellm.set_verbose = lambda *args, **kwargs: None
++    litellm._logging = types.SimpleNamespace(_disable_debugging=lambda: None)
++    sys.modules["litellm"] = litellm
++    LIMITATIONS.append(
++        "litellm not installed: used an in-process stub reproducing litellm's "
++        "unmapped-model behaviour for get_model_info/validate_environment."
++    )
++
++# --- offline guard --------------------------------------------------------
++# The metadata cache prefers a network refresh when no cache exists; the
++# contract must not touch the network.
++try:
++    import requests
++
++    def _offline_get(*args, **kwargs):
++        raise ConnectionError("offline: outbound HTTP disabled by contract harness")
++
++    requests.get = _offline_get
++    HTTP_DISABLED = True
++except ImportError:  # pragma: no cover
++    HTTP_DISABLED = False
++    LIMITATIONS.append("requests not installed: HTTP was already unavailable.")
++
++sys.path.insert(0, str(REPO_ROOT))
++
++from aider import models  # noqa: E402  (import after the shims above)
++
++UNKNOWN_MODEL = "meta/ghost-404"
++PARTIAL_MODEL = "meta/aurora-1-mini"
++EXPLICIT_FALSE_MODEL = "meta/aurora-1-pro"
++
++
++class RecordingIO:
++    """Minimal stand-in for ``aider.io.InputOutput`` that records messages."""
++
++    def __init__(self):
++        self.warnings: list[str] = []
++        self.outputs: list[str] = []
++
++    def tool_warning(self, message, *args, **kwargs):
++        self.warnings.append(str(message))
++
++    def tool_output(self, message, *args, **kwargs):
++        self.outputs.append(str(message))
++
++    def tool_error(self, message, *args, **kwargs):
++        self.outputs.append(str(message))
++
++
++def fresh_manager():
++    """Return a ModelInfoManager whose cache lives inside the sandbox HOME."""
++    models.model_info_manager = models.ModelInfoManager()
++    return models.model_info_manager
++
++
++def check_metadata_registration():
++    fixture = json.loads(FIXTURE_PATH.read_text())
++    manager = fresh_manager()
++    loaded = models.register_litellm_models([str(FIXTURE_PATH)])
++    registered = manager.local_model_metadata
++    mutated = {
++        name: dict(value)
++        for name, value in registered.items()
++        if name in fixture and value != fixture[name]
++    }
++    observed = {
++        "files_loaded": loaded,
++        "registered_models": sorted(registered),
++        "fixture_entries_augmented": sorted(mutated),
++    }
++    ok = (
++        loaded == [str(FIXTURE_PATH)]
++        and sorted(registered) == sorted(fixture)
++        and not mutated
++    )
++    return (
++        "C1.register_litellm_models_stores_metadata_verbatim",
++        ok,
++        "register_litellm_models returns the loaded filename and stores each fixture "
++        "entry exactly as declared (no capability keys injected).",
++        observed,
++    )
++
++
++def check_unknown_model_metadata_is_empty():
++    manager = fresh_manager()
++    info = manager.get_model_from_cached_json_db(UNKNOWN_MODEL)
++    observed = {"type": type(info).__name__, "value": info}
++    ok = isinstance(info, dict) and info == {}
++    return (
++        "C2.unknown_model_metadata_is_empty",
++        ok,
++        "An undeclared model resolves to an empty dict: absence is explicit, no "
++        "cost/context/capability values are fabricated.",
++        observed,
++    )
++
++
++def check_unknown_model_not_matched_by_basename():
++    manager = fresh_manager()
++    models.register_litellm_models([str(FIXTURE_PATH)])
++    info = manager.get_model_from_cached_json_db("aurora-1-mini")
++    observed = {"value": info}
++    ok = info == {}
++    return (
++        "C3.basename_is_not_silently_matched",
++        ok,
++        "Prefix-stripping only applies when the declared entry's litellm_provider "
++        "matches the prefix, so a bare name does not inherit another model's metadata.",
++        observed,
++    )
++
++
++def check_unknown_model_warnings_are_explicit():
++    manager = fresh_manager()
++    model = models.Model(UNKNOWN_MODEL)
++    io = RecordingIO()
++    problem = models.sanity_check_model(io, model)
++    observed = {
++        "model.info": model.info,
++        "sanity_check_model_returned": problem,
++        "warnings": io.warnings,
++        "outputs": io.outputs,
++    }
++    ok = (
++        model.info == {}
++        and problem is True
++        and any("Unknown context window size and costs, using sane defaults." in w
++                for w in io.warnings)
++        and any("Unknown which environment variables are required." in w
++                for w in io.warnings)
++    )
++    return (
++        "C4.unknown_model_is_reported_explicitly",
++        ok,
++        "sanity_check_model flags the unknown model (returns True) and emits the "
++        "explicit 'Unknown ...' warnings instead of silently continuing.",
++        observed,
++    )
++
++
++def check_unknown_model_defaults_not_claims():
++    manager = fresh_manager()
++    model = models.Model(UNKNOWN_MODEL)
++    observed = {
++        "info": model.info,
++        "max_chat_history_tokens": model.max_chat_history_tokens,
++        "repo_map_tokens": model.get_repo_map_tokens(),
++        "accepts_settings": model.accepts_settings,
++        "extra_params": model.extra_params,
++    }
++    ok = (
++        observed["info"] == {}
++        and observed["max_chat_history_tokens"] == 1024
++        and observed["repo_map_tokens"] == 1024
++        and observed["accepts_settings"] == []
++        and observed["extra_params"] is None
++    )
++    return (
++        "C5.unknown_model_uses_sane_defaults_and_claims_nothing",
++        ok,
++        "Unknown models fall back to the documented 1024-token defaults and claim no "
++        "optional settings (accepts_settings == []), so no unsupported capability is "
++        "advertised.",
++        observed,
++    )
++
++
++def check_partial_fixture_metadata_is_exact():
++    fixture = json.loads(FIXTURE_PATH.read_text())
++    declared = fixture[PARTIAL_MODEL]
++    manager = fresh_manager()
++    models.register_litellm_models([str(FIXTURE_PATH)])
++    info = manager.get_model_from_cached_json_db(PARTIAL_MODEL)
++    model_info = models.Model(PARTIAL_MODEL).info
++    invented = sorted(set(info) - set(declared))
++    observed = {
++        "declared": declared,
++        "looked_up": info,
++        "model.info": model_info,
++        "invented_keys": invented,
++        "has_supports_function_calling": "supports_function_calling" in info,
++        "has_input_cost_per_token": "input_cost_per_token" in info,
++    }
++    ok = (
++        info == declared
++        and model_info == declared
++        and not invented
++        and "supports_function_calling" not in info
++        and "input_cost_per_token" not in info
++    )
++    return (
++        "C6.partial_fixture_metadata_surfaces_exactly_as_declared",
++        ok,
++        "A fixture entry with only context/provider/mode yields exactly those keys on "
++        "lookup: missing capability and cost keys stay absent rather than defaulting "
++        "to permissive values.",
++        observed,
++    )
++
++
++def check_explicit_false_capability_preserved():
++    fixture = json.loads(FIXTURE_PATH.read_text())
++    manager = fresh_manager()
++    models.register_litellm_models([str(FIXTURE_PATH)])
++    info = manager.get_model_from_cached_json_db(EXPLICIT_FALSE_MODEL)
++    model = models.Model(EXPLICIT_FALSE_MODEL)
++    observed = {
++        "declared": fixture[EXPLICIT_FALSE_MODEL],
++        "looked_up": info,
++        "value": info.get("supports_function_calling", "<absent>"),
++        "accepts_settings": model.accepts_settings,
++    }
++    ok = (
++        info.get("supports_function_calling", None) is False
++        and isinstance(info.get("supports_function_calling"), bool)
++        and model.accepts_settings == []
++    )
++    return (
++        "C7.explicit_false_capability_is_preserved",
++        ok,
++        "An explicit 'supports_function_calling: false' survives lookup as False "
++        "(explicit denial), and metadata never silently enables settings such as "
++        "thinking_tokens/reasoning_effort on the Model object.",
++        observed,
++    )
++
++
++CHECKS = (
++    check_metadata_registration,
++    check_unknown_model_metadata_is_empty,
++    check_unknown_model_not_matched_by_basename,
++    check_unknown_model_warnings_are_explicit,
++    check_unknown_model_defaults_not_claims,
++    check_partial_fixture_metadata_is_exact,
++    check_explicit_false_capability_preserved,
++)
++
++
++def main() -> int:
++    results = []
++    for check in CHECKS:
++        with contextlib.redirect_stdout(_io.StringIO()), contextlib.redirect_stderr(_io.StringIO()):
++            check_id, ok, expectation, observed = check()
++        results.append(
++            {
++                "id": check_id,
++                "status": "pass" if ok else "fail",
++                "expectation": expectation,
++                "observed": observed,
++            }
++        )
++
++    report = {
++        "contract": "aider unknown-model handling is explicit (no silent capability claims)",
++        "repository": "aider",
++        "fixture": str(FIXTURE_PATH.relative_to(REPO_ROOT)),
++        "environment": {
++            "repo_root": str(REPO_ROOT),
++            "python": sys.version.split()[0],
++            "home_sandbox": str(SANDBOX_HOME),
++            "http_disabled": HTTP_DISABLED,
++            "litellm_stubbed": bool(LITELLM_STUBBED),
++            "limitations": LIMITATIONS,
++        },
++        "results": results,
++        "status": "pass" if all(r["status"] == "pass" for r in results) else "fail",
++    }
++
++    REPORT_PATH.write_text(json.dumps(report, indent=4, sort_keys=False) + "\n")
++
++    for result in results:
++        print(f"[{result['status'].upper()}] {result['id']}")
++    print(f"\nnormalized report: {REPORT_PATH}")
++    if LIMITATIONS:
++        print("limitations:")
++        for limitation in LIMITATIONS:
++            print(f"  - {limitation}")
++    print(f"contract status: {report['status'].upper()}")
++    return 0 if report["status"] == "pass" else 1
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/.prale-eval/contract/contract-report.json b/.prale-eval/contract/contract-report.json
+new file mode 100644
+index 0000000..3925620
+--- /dev/null
++++ b/.prale-eval/contract/contract-report.json
+@@ -0,0 +1,126 @@
++{
++    "contract": "aider unknown-model handling is explicit (no silent capability claims)",
++    "repository": "aider",
++    "fixture": ".prale-eval/contract/local-model-metadata.json",
++    "environment": {
++        "repo_root": "/tmp/prale-real-eval-78b2ltx2/workspace",
++        "python": "3.12.3",
++        "home_sandbox": "/tmp/prale-real-eval-78b2ltx2/workspace/.prale-eval/contract/_home",
++        "http_disabled": true,
++        "litellm_stubbed": true,
++        "limitations": [
++            "json5 not installed: used an in-process shim that parses strict JSON plus line comments (the subset used by aider metadata files).",
++            "oslex not installed: used a shlex-based shim (aider.utils only needs oslex.join for shell escaping, which this contract does not exercise).",
++            "litellm not installed: used an in-process stub reproducing litellm's unmapped-model behaviour for get_model_info/validate_environment."
++        ]
++    },
++    "results": [
++        {
++            "id": "C1.register_litellm_models_stores_metadata_verbatim",
++            "status": "pass",
++            "expectation": "register_litellm_models returns the loaded filename and stores each fixture entry exactly as declared (no capability keys injected).",
++            "observed": {
++                "files_loaded": [
++                    "/tmp/prale-real-eval-78b2ltx2/workspace/.prale-eval/contract/local-model-metadata.json"
++                ],
++                "registered_models": [
++                    "meta/aurora-1-mini",
++                    "meta/aurora-1-pro"
++                ],
++                "fixture_entries_augmented": []
++            }
++        },
++        {
++            "id": "C2.unknown_model_metadata_is_empty",
++            "status": "pass",
++            "expectation": "An undeclared model resolves to an empty dict: absence is explicit, no cost/context/capability values are fabricated.",
++            "observed": {
++                "type": "dict",
++                "value": {}
++            }
++        },
++        {
++            "id": "C3.basename_is_not_silently_matched",
++            "status": "pass",
++            "expectation": "Prefix-stripping only applies when the declared entry's litellm_provider matches the prefix, so a bare name does not inherit another model's metadata.",
++            "observed": {
++                "value": {}
++            }
++        },
++        {
++            "id": "C4.unknown_model_is_reported_explicitly",
++            "status": "pass",
++            "expectation": "sanity_check_model flags the unknown model (returns True) and emits the explicit 'Unknown ...' warnings instead of silently continuing.",
++            "observed": {
++                "model.info": {},
++                "sanity_check_model_returned": true,
++                "warnings": [
++                    "Warning for meta/ghost-404: Unknown which environment variables are required.",
++                    "Warning for meta/ghost-404: Unknown context window size and costs, using sane defaults."
++                ],
++                "outputs": []
++            }
++        },
++        {
++            "id": "C5.unknown_model_uses_sane_defaults_and_claims_nothing",
++            "status": "pass",
++            "expectation": "Unknown models fall back to the documented 1024-token defaults and claim no optional settings (accepts_settings == []), so no unsupported capability is advertised.",
++            "observed": {
++                "info": {},
++                "max_chat_history_tokens": 1024,
++                "repo_map_tokens": 1024,
++                "accepts_settings": [],
++                "extra_params": null
++            }
++        },
++        {
++            "id": "C6.partial_fixture_metadata_surfaces_exactly_as_declared",
++            "status": "pass",
++            "expectation": "A fixture entry with only context/provider/mode yields exactly those keys on lookup: missing capability and cost keys stay absent rather than defaulting to permissive values.",
++            "observed": {
++                "declared": {
++                    "max_input_tokens": 1234,
++                    "litellm_provider": "meta",
++                    "mode": "chat"
++                },
++                "looked_up": {
++                    "max_input_tokens": 1234,
++                    "litellm_provider": "meta",
++                    "mode": "chat"
++                },
++                "model.info": {
++                    "max_input_tokens": 1234,
++                    "litellm_provider": "meta",
++                    "mode": "chat"
++                },
++                "invented_keys": [],
++                "has_supports_function_calling": false,
++                "has_input_cost_per_token": false
++            }
++        },
++        {
++            "id": "C7.explicit_false_capability_is_preserved",
++            "status": "pass",
++            "expectation": "An explicit 'supports_function_calling: false' survives lookup as False (explicit denial), and metadata never silently enables settings such as thinking_tokens/reasoning_effort on the Model object.",
++            "observed": {
++                "declared": {
++                    "max_input_tokens": 32000,
++                    "max_output_tokens": 4000,
++                    "litellm_provider": "meta",
++                    "mode": "chat",
++                    "supports_function_calling": false
++                },
++                "looked_up": {
++                    "max_input_tokens": 32000,
++                    "max_output_tokens": 4000,
++                    "litellm_provider": "meta",
++                    "mode": "chat",
++                    "supports_function_calling": false
++                },
++                "value": false,
++                "accepts_settings": []
++            }
++        }
++    ],
++    "status": "pass"
++}
+diff --git a/.prale-eval/contract/local-model-metadata.json b/.prale-eval/contract/local-model-metadata.json
+new file mode 100644
+index 0000000..9d15dcc
+--- /dev/null
++++ b/.prale-eval/contract/local-model-metadata.json
+@@ -0,0 +1,14 @@
++{
++    "meta/aurora-1-mini": {
++        "max_input_tokens": 1234,
++        "litellm_provider": "meta",
++        "mode": "chat"
++    },
++    "meta/aurora-1-pro": {
++        "max_input_tokens": 32000,
++        "max_output_tokens": 4000,
++        "litellm_provider": "meta",
++        "mode": "chat",
++        "supports_function_calling": false
++    }
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..edb7aba
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,94 @@
++{
++    "task_id": "T24",
++    "repository": "aider",
++    "mode": "contract",
++    "evidence": [
++        {
++            "path": "aider/models.py",
++            "symbol": "ModelInfoManager.get_model_from_cached_json_db",
++            "start_line": 223,
++            "end_line": 247,
++            "observation": "Resolves a model name against model_info_manager.local_model_metadata first, then the cached litellm price/context JSON database. When nothing matches it returns dict() (line 247) rather than a default capability/cost record, so an unknown model surfaces as an explicitly empty mapping. The only name-shortening path (lines 242-245) returns the shorter entry solely when its litellm_provider equals the requested prefix, so a bare name like aurora-1-mini cannot silently inherit meta/aurora-1-mini metadata."
++        },
++        {
++            "path": "aider/models.py",
++            "symbol": "ModelInfoManager.get_model_info",
++            "start_line": 249,
++            "end_line": 274,
++            "observation": "Combines the cached lookup with litellm.get_model_info. If litellm raises for an unmapped model (the exception mentioning model_prices_and_context_window.json) it is caught and swallowed, and the function falls through to 'return cached_info' (line 274) - which is {} for an unknown model. No cost, context-window or supports_* key is ever synthesized here, so 'unknown' cannot masquerade as 'known with permissive capabilities'."
++        },
++        {
++            "path": "aider/models.py",
++            "symbol": "Model.__init__",
++            "start_line": 330,
++            "end_line": 369,
++            "observation": "Stores the metadata lookup in self.info (line 348) and derives max_chat_history_tokens from 'self.info.get(\"max_input_tokens\") or 0' (line 354), clamped to the documented min 1024 / max 8192 band (line 357). For an unknown model info is empty, so the chat-history budget is the 1024-token sane default instead of an invented context window."
++        },
++        {
++            "path": "aider/models.py",
++            "symbol": "Model.configure_model_settings",
++            "start_line": 385,
++            "end_line": 435,
++            "observation": "Initializes accepts_settings to [] when it is None (lines 400-401) and only appends optional settings such as thinking_tokens/reasoning_effort for explicitly matched settings or openrouter models (lines 415-435). Local metadata registration therefore cannot silently switch on an unsupported capability, which is exactly what the contract asserts for meta/aurora-1-pro (accepts_settings == [] despite declared metadata)."
++        },
++        {
++            "path": "aider/models.py",
++            "symbol": "Model.get_repo_map_tokens",
++            "start_line": 782,
++            "end_line": 789,
++            "observation": "Returns the documented 1024-token default when info carries no max_input_tokens (lines 783-784, 785 guard). This is the second observable 'sane default' the contract pins: an unknown model gets 1024 repo-map tokens rather than a value inferred from a fabricated context window."
++        },
++        {
++            "path": "aider/models.py",
++            "symbol": "register_litellm_models",
++            "start_line": 1112,
++            "end_line": 1133,
++            "observation": "Public registration entry point used by aider.main.register_litellm_models. It parses each metadata file (json5), skips missing/empty files, and merges the declared dictionaries verbatim into model_info_manager.local_model_metadata (line 1127). It neither invents missing capability keys nor rewrites declared ones, and an explicit 'supports_function_calling: false' from the fixture is preserved as False."
++        },
++        {
++            "path": "aider/models.py",
++            "symbol": "sanity_check_model",
++            "start_line": 1164,
++            "end_line": 1200,
++            "observation": "Makes unknown-model handling explicit: when no environment keys are known it emits 'Warning for <model>: Unknown which environment variables are required.' (line 1183), and when metadata is empty it emits 'Warning for <model>: Unknown context window size and costs, using sane defaults.' (lines 1190-1192), returning show=True (line 1200) so callers see a problem flag instead of silence."
++        }
++    ],
++    "claims": [
++        {
++            "claim": "An unknown model is represented explicitly as an empty metadata mapping: ModelInfoManager.get_model_from_cached_json_db returns dict() and ModelInfoManager.get_model_info returns that empty dict when litellm has no mapping, so no cost/context/capability values are fabricated. Executed: 'meta/ghost-404' -> {} through both the manager and Model(...).info.",
++            "evidence_paths": [
++                "aider/models.py"
++            ]
++        },
++        {
++            "claim": "Registering the local metadata fixture is verbatim and minimal: register_litellm_models stores exactly the two declared entries (meta/aurora-1-mini with only max_input_tokens/litellm_provider/mode, meta/aurora-1-pro with an explicit supports_function_calling: false) into model_info_manager.local_model_metadata without adding, defaulting or deleting keys; lookup returns those entries unchanged, so missing keys stay absent rather than becoming permissive defaults.",
++            "evidence_paths": [
++                "aider/models.py"
++            ]
++        },
++        {
++            "claim": "Unknown model handling is announced, not silent: sanity_check_model returns True for 'meta/ghost-404' and emits the two explicit warnings ('Unknown which environment variables are required.' and 'Unknown context window size and costs, using sane defaults.'), while an unknown model also receives only documented sane defaults (max_chat_history_tokens == 1024, get_repo_map_tokens() == 1024) and claims no optional settings (accepts_settings == [], extra_params is None).",
++            "evidence_paths": [
++                "aider/models.py"
++            ]
++        },
++        {
++            "claim": "Metadata cannot silently enable unsupported capabilities: Model.configure_model_settings initializes accepts_settings to [] and only appends thinking_tokens/reasoning_effort via explicit model settings or openrouter name rules, so neither the partial fixture entry nor the entry declaring supports_function_calling: false yields any advertised optional setting; the explicit False is preserved as a bool False rather than being upgraded to True.",
++            "evidence_paths": [
++                "aider/models.py"
++            ]
++        },
++        {
++            "claim": "Lookup does not silently transfer another model's metadata: the prefix-stripping branch of get_model_from_cached_json_db requires the candidate entry's litellm_provider to equal the requested provider prefix, so querying the bare name 'aurora-1-mini' returns {} instead of inheriting 'meta/aurora-1-mini'.",
++            "evidence_paths": [
++                "aider/models.py"
++            ]
++        }
++    ],
++    "conclusion": "The contract holds for the new local model metadata fixture (.prale-eval/contract/local-model-metadata.json). Driving the real aider.models code shows explicit unknown-model handling at every layer: an undeclared model resolves to an explicit empty metadata dict ({}), is reported through sanity_check_model's explicit 'Unknown ...' warnings with a truthy problem flag, and receives only documented sane defaults (1024 chat-history/repo-map tokens) while claiming no optional settings (accepts_settings == []). Fixture-declared metadata is stored verbatim, so partial entries keep their missing capability/cost keys absent and an explicit supports_function_calling: false stays False - nothing silently claims an unsupported capability. The executable contract .prale-eval/contract/check_unknown_model_contract.py passes 7/7 assertions and emits the normalized result .prale-eval/contract/contract-report.json; no repository source, task metadata, lockfile or git configuration was modified.",
++    "validation": {
++        "command": "python .prale-eval/contract/check_unknown_model_contract.py",
++        "status": "pass",
++        "notes": "Executed from the repository root: 7/7 contract assertions passed (C1 registration verbatim, C2 unknown model -> {}, C3 no basename inheritance, C4 explicit sanity-check warnings + True, C5 sane 1024 defaults with accepts_settings == [], C6 partial fixture metadata exact with no invented keys, C7 explicit False capability preserved), exit code 0; the normalized report was written to .prale-eval/contract/contract-report.json with top-level status 'pass'. LIMITATION: the optional third-party dependencies of this checkout are not installed and dependency installation is out of scope, so the harness installs narrow in-process shims before importing aider.models - json5 missing -> JSON-plus-line-comment shim, oslex missing -> shlex-based join/split shim, litellm missing -> stub whose get_model_info raises the model_prices_and_context_window.json error for unmapped models and whose validate_environment returns {'keys_in_environment': False, 'missing_keys': []}. The aider.models code paths under test are the real repository code; only the third-party boundary is simulated, and the limitations are recorded verbatim in contract-report.json under environment.limitations. The run is hermetic: HOME is redirected to .prale-eval/contract/_home (all aider cache writes stay in the workspace) and outbound HTTP is disabled, so no network access or writes outside the workspace occur."
++    }
++}
+diff --git a/aider/__pycache__/__init__.cpython-312.pyc b/aider/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..0999b0286cf1c41aeed0c8d64858d71dac14a712
+GIT binary patch
+literal 751
+zcmZ`$&u<bz82yG>*j*MX5(JC!S4C4GK+_sq6Kg_<rzSmHE}OMG63POb*)6|L=!qsx
+zJlbPVhQ>tw7dU%DE@YD?O+1+xv)YTni!%tC9{dh(=lkB9_r2_V3<mwc>Z=yoa}mI2
+z-posw9nQb8!)wq%M+Q_;5h2h$MGx^5vCOB~5UQ+4-~r+zp0~`07ZLXnl?m3p9oBJu
+z2^HnGBy%0w3r$5A;NRW<D)8LB;sKyu=I*=beg}v*0aQZ3IN=Ys1Bcs9XyF}bq8YDD
+zd2!Cqv&~gW`3p~$M2^@X)GF6&9sf#p<3V;UtCI#BE2=spRJ9|f%T=>Z?T$BXw@t!6
+z2C=M;FKuenBHKy7Bb(Z8MJttSC5o9Z<-gVmSlV+kw{aG<vQB9BZ!bS-?Gn>ws~v&6
+zI@q$Q<DFVMqN-|!p{gfv&T~#4=IpAOGpS~f3?-V8Aq@uW8_!k^yS18Y)@j9J5lC*j
+zB&Vw7TG>|Btl6GOkE(Tj-yn}Ee-Zw6);k6+MhKn4^|OU|R~cW5cLT0~QTkL!eV0Ix
+zdddh#jtWD3a~!^L92<t0yIXDu0<m7^h3EzaZ+5I)?XADsJlH(CHd5~PgMIOR@Fe)b
+z7%dk*DTQ(TUOzUBuk^NDX?E+Uy9m<dAAnGrdoB*csh3+kM*5c<hQJlZFxTkP@zY^6
+rbD*3l(djOcO()h8i+t$IN8n8=pMXKcpTCU<w-CpKKYt$&))2$rq1L}a
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/dump.cpython-312.pyc b/aider/__pycache__/dump.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..06e9ce77846fffa8dff9e1c0ca2fd4998ca0b6d7
+GIT binary patch
+literal 1577
+zcmb6ZOKcleaNh3v7u#{_*a@KsISu(NGzm091QZ2@xJYfKR1hwWR8?EQRk7>X=Dm#*
+zTWiTeJ=ATgxFRA!9PkkukT@c4J@=B56v8$KBznLShbX?ZJ`m<PUMEyYh>>RI&Cch|
+zo6kP*``ZBFPpu<yM*{d=2sWVHfLa9E8c?7l33G>>%n>TxfH{fENaY++m8vkFi4nn?
+zpdgnKYqyZBfzi^LVA#=Nqj_SI3A5k<!_oAHgwsA9aTBxnR<eC&p$`nVt$hVpI{`!7
+z*Z>nYnm5LzOBj0*mgGyYNK|>IDpFI4<&3AOo-$O2)fVUR6gRX~Ot)liFiT1Bbjotj
+zh4~D(JRjvU`dP-(44nw)B5tJq=BP2B8O<;)sSh(<OAhN<ByWvhJ(Dz+&WtXm*>#@L
+zV*02Sr#c%Ip++(}OO9m?=En%)rTkqaMc8$nDEF?;Zo7JR0v$Kqdy?$v+6{EB<V*SW
+z-pbT=U|`cd@O0N3+6N*u!SWlov$y<vGD>wGz!<AtufaxWN|Nsrf;5JoS|AGPLahCO
+zi63u7qSc0$Eo?N81!59PdQhU0papDpqSc%uds9k?*v|o#?c!5~!i%j|U=+vyh~j8P
+z0qQ&+#e^uV$T8^}#H7nu%z|uq>=ew_-FKzsfC2@f_1aqMx&gx5ey4pyK`|Ak8lo``
+zpl(yjW94i;j@FUR^RI7c*&g}ij(asD(*N>qc7;F=Uq=uN@*=2hGu6Ki4i2hf!0TkF
+zDu%F5)GB^E_{ZJ}gE7R~t4J;Y!IqnF84FM#6iku@PL|!2d`{K~fn~n}Iq5rD?1e?z
+zSP*??z5!LTq><MxlI0?qNQC*2)jbo}^pw7oVUzjp#yC$T(=jc{Cr4U}7toG(A^8KI
+z7U8Gx*!tAhq3=)J>si$vhR2?9v96zbI?1xDljP-o{!U&x9Z_AD$6&ZBSGCx6%dam9
+z!MK9^h@z56$8i&RCK*568(h$ZdCQSu@y6;ZxOE)$hsIfraVF-~@_wxGD=B?38Bgh4
+z3~od~;~|zJvS<DHu^o~Bh@=QleBobweGh$oTfY9{*&T03IaqqT{6T4=7~OM%FR(IR
+z8ZSrJ&fh)1&Of_YnX0_E85-R34i%$2-uCB|)0Gc5Lql6$wHW>FrO40T-ts5Q(`9n!
+z{Y`IgF^Xh27{+>3Lfhf7t>9Sk!mqC2uG@c8FVj+T+kH};=}Np5UsrCYAGu$CV(ZqU
+zU!D8nT!nsl@sa!Vvwc7KPI0l{_XmU1-HNI(QDAmb5HYTeH?nR#)ezyZjqZv0G+jvQ
+ilWY*bi8<n7B=|QW<S}?3L&v_;NxEvm02yWjsQDY0;!QFD
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/llm.cpython-312.pyc b/aider/__pycache__/llm.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..4edd74b33a57b742d7d788199f8bf29cf4557e29
+GIT binary patch
+literal 1943
+zcmZ`(&2JM&6rWkIy%VqF1gBsEZk3|a##IwjJ_KrM)U<>ul}S(nt+bcX#xpTCYkNDp
+z0c_=9q)1rm1*xj&pFou!dhGwu3ob#n1`d&04wZVKO4TAxeY0yj0g*Ypd2imE_wjpg
+z=GWojID++;Jz8GW5&B&T{T1yoJKMnALkuzOAS>Llg#%f$G}tvKQqe6PBMot_9C++I
+z33nFZF{b|%-He1XMl5C-%&-VII4-ANwpJ1&=Yevvk9J6DS$rR@8E6w$Tti<VHoSpY
+za#K@Y5wc9k(cBCLWF>f_h^^r|&W`-4&K9y*>TIpz%2=sbtqCrPTW5CFFBP(yBn8{&
+z#hR$gSf$3+9NtJ>^L^L*D3`NKjEm{QHQSfbS;b3pafvR^Uzwv<m-2xyd-*b5n7uS7
+z<Cm8fFI@fn%KYMjOyt2NpT9&eEnb+rSm@;yY`u)p&LoI;paUE!)B$m9MOtVTGi`%d
+zI*V)|E80T0uoYWISzVfWyHU@Vd=73G3VkoiC3G064(wEce2?#;b<FT}a4+IMhNEEh
+zu~|mzsNCyUU#IrI9wWa$A<8ng*CyoGaUXTaOM_ae1DVkfI!H9?t+@cyFm-A+qYh;3
+zI2CCWxo`Wv5ToEF8<D!lomHt<?FyGelolM@^C<OHW)l<57pHT6#m%|GcKDRwwll?V
+z06BYZ<)q`^I+?p!6W2Z0F7U8JIfyXr)}={lFASxP^d7*b_b3iS2=7B6&zq=gj@+I3
+z&3yaG*x~Qawidc1(IH3L<j5AuJQ+E3*YBh!+v&;s?>rpIJs`OqxP%G=NI_8P2GAda
+zQve>7mB}mXHm)Oo&@f@{0?hDc&l|vQ^skjkpWEG;*0)?oba2cfua8IvEoAyW7K6s_
+z>tm45>phfJBVSqNu~!a2+#Res%0?F&sXUBDsal-qO~&-}v^0ABm5bSUFd)+SYHsPX
+z#pO8}bw#P_%b`-mtqI>Lt;pe!?G2n9gK={Ohv{K_Wvxg{)zz9bJ?_&RT&&bQE=?wC
+zE_H2TS3F5zEQ>{mFH@A2JbT6A;YD?p#o`S}*;7rK5NV)7ePWIAmquytT)(Bv1(0Bt
+zI%cMAW*(T6-9+lCnR=2q@F4Z>R^q)sGRHfaQ|-*DpXVQDW?K3d8Q(r}x}|r>c$<uG
+zk*V(F)UI^AJNdz0Ne!j4>yTq@a;!tnw8@!A<g6Hnuvr5tqUse<D&w>V3h)U^zge@L
+zP!nJ()Zhp8z}pNTTmhaYrBL-DRfeki)3EBKGF9ZDQYZ|bZ=mj2x|#n+*P|!?O(de{
+zg7|?^HYpSiQmX;JH*HY`C_NbuKTq}T3iU>0a<%06Tnr4%s~#6$hvqUlJAYwr&)3?M
+z2fwSqt2aubRuvg=6+{(Bl~aRKTNUvm3iDA-dqK{JztN011){3UYXEr`!5BYAqmR+h
+zV>I#<9o<IhCh4Gb8>N3B_doun@d$mnec*UA**$Q$ncU92-_-8JZ^v7ow9$C?W$Ddq
+nPdC#>N1hR6jy8?|Vh8cLzmXy*ka_6asiv`QrdrwCMv&Y85A(Xf
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/models.cpython-312.pyc b/aider/__pycache__/models.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..321470fdb0a66bec873f145e08674febc98068b7
+GIT binary patch
+literal 49674
+zcmc${33OXmdM1dK1PBlS2@u>#a2L3Wn<!GdNJ^p>O4j0qE*A^p10_n_`~XTKigc-#
+zPN<3!Q?V0KZD&kRRi@}E=aj0GOq5LbiELLTPG?SnN6-O;Fd5c~don(!XO2p8Iu%!+
+z>G}TqHV}N0T}gW8iMqJ&?)ScX|NGy6yMLaYou$L`p98K-8NaX7{T;o?k5%$K{x3$I
+z?zWE8ar$xHkoc<~(zAENkdghGhD_|&JY;6S8ABQDH*+YH{aS`B?AJPE#jjyJYr-~U
+zo3Ibr^;Dj5JbNO0D4Y3B<BkdEkdyh%<F1LEp`3}_p<MQ^A9oMASvj5|4}LSo^CrAQ
+zUKW=*o<C7ARKWa}@xqCsp(5tDju%gq43#i{)_Cbe*-#nt+s4Z$d_%s8ilGYjZXd6l
+zs2Zw*KYOT}a}3pR&Y@b)HB`st3~dW;yL3h#7WMc0lDALys&2$^0smjB(&^@PbGl3C
+z)Ks!hP94(U^gKPqEyK+k6H1%c4Q=CchZ=$n|3B5<Fs9?&oaZ$?m&bYG=5qyb3%Me=
+z#hepv30DfYj4OxhV{Qd=E4eC!RC6_OYq>hO+c-bmdaeO(Bi97CnQMW&ow==C8`sWt
+zylMPx{ZM1jX3!nhah>1NaXY?m5XVm*y`iQHx}oNv@zR&&aaDgW1ysN6<GQ$=av7bv
+zp;m(~=()tnvFdNI_4|79ZKyri-lu!1P^TN}2sU53tfrBDD5HrxGNuc5d{_T#dO4q7
+zceB`}vtpIdKe<l5j`gJ*ed&?IhIXKY9ZHY7Sc+Xpu{+rGeXKQlhIVp$zNH)L=Jvwv
+z;r7AZ#qEc?n>zq^4|fpmUalAJKCTb$ey$(x0qzjogTY?z@a1hf9dAKR2j!adx>^0K
+ze#D?>bL%Qx*;l1&)rIs|@&1BNkAF8`yk>kscUA8n_=FlW=r<&-Tp%1684rX)$&Asl
+z;5ZlZ>ys7)2E$_$LHJFl0^y5DXgN6@9-EpBj3>?KCgDMpd0--NfzsH9hpz<r5JHEC
+zDGN6<F^%8M@v(4le0&04@5$-l<msuIaF9PS#RbPt1SXM{N4W*T$<PcR91e^lZZZ%a
+zo4hd0PmKpd$-Gctax6SMJaREOa(Q?n7z!Z^H7{QbnI4-S9-9n>1LNbv!E0eY@X2m;
+zYV3JTtw_d&>2OoWRK!2cPffr(5*WFNlAGGLw{<ja?`mpqZJg#tL(+S9Q(I@?uP{-v
+zrdsjWG|dOEj0LZfcVcXEENiM={AGn^iA764QVE?+t?gn+Q+S3yKcy7G5;tvcZ|#tx
+zx9?C=wzplD0^v(d!(P>Nti(;Fi`_s^x~1UO*6lme>uhc7Obfa)M&BqckY&}1nM&!j
+z=vRiXbtkL0v$<3LMWIuQf8=5y+%%3k6biGj_U2A;ST?_*%iCMigXC^2d77w!>8a4S
+zw4l}<;$Wua+kru);sP0%5?Pq!GhDE#P4P6h%HH;-i-EDrGpu`PQ<oavnG(~wy-ms7
+z-ZV8mBTgTLcB>geQ<IayuvpTjh|Z?es2y$F)jXS`HrLXXlB;ujTdPu&R9FYq)VaMA
+z(@W|fYu6Kll`c!kTE+Z3w|A!H-}259;!~uTup=$w4obLVd)t;0l~I+d?h+Grv??Vi
+zeNrk{L&SD=t3$0sDcQwu*wLiqRszJfZ%5mc8DhRjjx=0qF-bE^A8|=BO75hITKt)F
+z^8j}x^&Js52eAw>%aR6wo6HVzo=0-Ub)UK{lbP+EY$ZpsDN>oI5lg$YI+FT!fZkwm
+zIus0Ej(BBXi|lElb(J)a0$N{;6kP}sY-$mInpmK;<|0|r8^CX*WOKSUEJZaonep;W
+zAQa#ul~aJvJcG|IDPA$QDKI{LF_1Lyt&t+REo!6qU;u*{<RcELDO3fZK_qW$%@pjB
+zlC@JJ85Tu~Hz(c{namI)BjuYDNfk8(uT2A#G_`d`oYw*v5q|1&Q+w0-U^oz|O6kld
+zFLpPqU)C|d5#NywCY6*lQ~vg3<`nijq#2=|QhuaeT=)1AHjCT3ppNk6A;URc&=@pv
+zdfI<D!;qQ18QGg@C?l8|Gy?6=A%&TRWeiz@R=j0OZ&~ckBE8wzn^k(Vv$rhvW*f?8
+zCEKMq2aC&QZ>Aw9>TyZ+IHVLgEQM2g%Vlpa_Lei`W^cLDn<touckie{D#0y<=d)BE
+z_GTI?Na;(S6jqoL=9R*VQo{13u;P@k0x7H{C9F^iD@9nD)QTbsn>G21li3VyI1>yL
+zf)GlYCIb_}r1|PaU<yfFkQ)mRk52Iuf$(6`c{LaSx<FXQFr_+_w9kZs!+dahYIq_r
+zopgqRlicvkBsWE2<FiTAcpx&Hv`ztq2@+D0G$B2owD2@1IQZPbYk`Srpd`bA&~Rur
+zG&~WykhC+DV|Y5i2PQ(vY(g-C!y{9ZVIVKb9QGO-K0iCm1xEuj<KeT(9BKt}hl3Nt
+znEAj;l1>W3`*e^G05k-X)=(I2K(!Z=In=2sKBXhcTq!7}yUA>E`4QF>4qQmO&}ei7
+zJ)=cQ<#;w#iJF6>W7m?dz{p5&I*jf}BkC_tT87zp4G$-?hN;?_@gV&6;bB05aT-ay
+z8PUL`b9gu~IXM*uvNkmt8Xo3r@Rj&lax%%OgOfC!pPCxyfvoCyKRNZ}G?LRqPBR=J
+zien>TzJ=bmlhaC08#xv@1nH&%VZNOLI>_lHX9qc5<m@D;8xB6<SSb9C?lJtj&$?Q|
+z6Volzd|*7-gmD;e3SNQJwex)2c=%dd%hf6Va%eg*5^M>K;p?`rnG$NAp5-g4JaWE<
+z{~=(_x__g4n4z;dzB!P{FS~wh(H%3DC2IWFPcA;cG;-^un8}|gEW3Vuv6{k5DiD4)
+zW~xZ!c(3;@Ak3Ta7GED&2**st2~W}WBMT!jQ&GZK6E)>8d19uTL{%L!Z(HiP)f_X`
+zC5p<gpIGdOnaUGoRZ&ykBJx!w$|@yqWum?r6`Wh@Sk7D8CFIq`Ow9>zkyw6FqOO6`
+zU0XKZnva<p65AT1ChwAE*?lKFW@@C0PAu+R>b<pxDyprInmmgamqNEDVy1eO8#NUy
+zZCh@?(?n%bNfaBtHMwSL;QQo3i8$GKHS@vH)C@lo3`KI;&^5_ZsCjl`d=s>kPF}jl
+zdr^i8Ejc}?3kFaYj5yPnITPFr&I~t`%YbX)GT~Y|3*0Qu3fDH9<+mkWCum6zOpZ=T
+zhlj|E7sKJ{P)|z>AGq3lVJv)c<~*%jT7<#LaP!F2M9aY-&yO7#Xpv4LEfayUN%4zg
+zC5)jHn8_Slwph-?SFzrwt~OtyrE~omoTB6&p#3=T>2w7DAK!;_TNhU1E>TR{BcIJU
+zeZ)q40=aX#VI?If1*Wttc;$>zI(eS~6$QDJlw<T}mh*8Yyk#hFX1vkzV^26o_Q@?l
+ztW5dQ&FcIagOQA8_Cb>wBCz_bntjgC8JDw%{8>CznlxRU0tmK>fR7vFlUbs7bPOOl
+zQ~C%=&-m0xU|fP?6WEgJyqU}btQ{Mj9S()Yli9;!KCE>v$nn`!cCNZt17@?M;yXB3
+zhJxdxAsTld-%rT^v48@FhleAD>64>bj#@#&5YcU}>(&cP-zvOQ_(t*aHKDNO?lz&Y
+zXTfySktiyAtNBiIwBZ?{=oth!6ZysXu_vl)7ffrG3dFO}(n@+Q`ZPmV)g7xu){iXZ
+zY<Y|*pB2^6$70juJUq8`b9xLseBu*UKI|L_3Nqn<FVUV3mz2*b=f@;UAxzBDhcpcG
+zrxEQp@u%>U%)AJEE*$1rVA6rLNk?;Oto;W5EE2JlA!@Ww97z6o_#@?8#&C1)-$kMj
+z0q^U&L{T*j$+|6fu_Id8v}S8g*j;gZm0+)m+uH<t+ufdz?0X*?b@mo<gp|dC?8*rJ
+zKM2JL=`JBK{o(bqAi5wfb!??Xmy{)-<|5+Ey9Rkg^^{Xt8fvOb$`Vk+<ORZiHH<|n
+zK9?BzRDKhG<#bOdndWWUBj>o}NQ=O01U1a-X?9$4ZH>K*Ui0l%UDz$hUGm62_4f%a
+z$yZazKDi|_Q44d@F2`}3X6UT0N*B(R<1Q7+KJ~X+$7c~~HMNWvbT_N7>O|ra@|Vb|
+z#k4PAuBWboS)H8LZyY=e8c-&%C_wB`(h|IejeL0Ovfs%+gF^V@aFXVU%YZNZ3G!#K
+z6hHupJOzjVBqV7;mI?N5?LE+Yq<{GA+2ctQLGh%Sph_rd1s=cw(*l)fkV<hLJ#%uf
+zFF1l7rJv`g_+;kEGt48c5E-ly!6{{(fY3$di2y57vSq!b#NI<Sp}&BG#bR^DZKbQW
+z(u6(tp~+^=!CHBB@Wx==?i1|370*3W)b3le?@2h_uYT>u*W%6^!CABBtXnVfy)|%W
+z;EiJ|)jw!?rzKv$SE%0`tKT259}w_YGO%b(xJ#D8Z@qHol~s4sLxU-=alNkLdy%&z
+zcdP%P<%cctwqruuu~^%QSl!@~=}r4Xhpr4T>?2Fj&pyr8mH6VtEkbe2Bb_0yaigwb
+z$@D+iADZF+IUt-X|B+75TDnnM!LmHe#QSF<!qZ+ou&>vzd*9jCYt?;VE$Xc`eo$pV
+z$Okog^4A*4@3;2uHh!>64|mfxN~@B=$46}SGs3EFoUMgR3Uovo>A@T)c#-yS2JN~3
+zu2Ckm&Ku?omk5hYdpHv#pgx0GWwonG<aL7Csz470g)~<1C1s0M^QS-%WeusZXtT2F
+z)KJd+ZiWoE<n;-XF8*O9DXShU$w*{eb?qS5E0==Ulk>(fotoGaE|z_BM!8J+S1-cV
+zFW4h4Q_VN&(Q478NnXuZ=el|0E5=#0Q}&6!SM_olzh#i874-?h@OQBEY2AYEkjxOb
+zsZTznNc!a1@H6QAH5rZ=zB=!B(1Gmb8ITl1N#liJIO#ZXvakR6@W9}qlf&mu9~ZYj
+z8v%rw5HLER_UBOwTkj(1$hyjdAi|(P(o7`k5I>3(No)T#It$?}lQaV<#0hQ>g0Z2p
+zy^^OSs5&%_vraH+2wn?O>wI`bBqV!yW}4{b5>zPL3Kdf0{~UQke+lQh?x7*an)lcC
+zVjM9Fe7EOr%`NxEtGk5iuKPJ3cKqeOKijuB7t4Qf;Yh-nA9q#>&Z_0ms<S>(Uia4g
+zo%uJuwrG0Y{?K5|DNJ|@ZlAn$GVW;>Jk9The-L>ma<BT28~?EJ!<W}up83dg`eCNd
+z)$p@VExLkotm>S?2cCk5M*RN#V`sr5U4}Jp-JbJ$)#CZr>TV7Kie%?)xIDL=x14cT
+zz2K@}>G;UC{b%d$BIM1^d*JdQZ+6~i>n_iyW?fF}&mUS*!e^l&^ywQ1TnEc^@40&p
+zIsqQ62aApG7w8f4evzL1#YXa%S$lUF->>uZwi@5xUEEt>_#j^o{|5!u-fHs)6$bKG
+z>B(PhB!8<J={KQRG<6sVNjwFC&;%w5@<iZ)$Nw{gC}^M)G9Y*oA`x;S-&2r@C+5pi
+zL4;ffYl8xA&^PJP?!nglGVqu;&Kc1sBg)fX(m+Rma7t*{yeaIIYne02p`3w%#%^uU
+zs@WQx;Rxo)C9oD0&Kb4Ra!NgOpo38^RvT;Y);^t~6Ut}$mQNV0pk^ms(ix73Cs*j?
+z&ftjO!k<JeA0p=>Ikds^bL8xYlQf5>kuhl;4^H~cY)J#3ppzu14|EhUjp0O@%$Obv
+z;xrhdsX$9xTHB=nG}75+6eJsQiF3n*S`2gNBh6dZ`cu>Y?<hR<V>rMGobI@Do8a6Q
+zcQy*n#+7q1XZwQbfz6q4=Pw)sM6hPZEd_$500)i@;01Hvo?{qxnP4wlv-_l=b$9-2
+zI~Go`w;OYDXSv`kUp9X?{GBT?XR}(|MvnJ(@vY*eGqIeCg^YEZW8uoL>{_Z=wH2eb
+z+q-Y=j=QS_ch&NtmDaZhV(#XJz6VbClIbnW9ZR&LJyy_hFXP_Je`sATIDnJUqU~d+
+z`&X_kWN$tCC|mn=d0k5L4P90q^#C((pv@snUzj~w8+{0CG~@*$te^&3XnjhV>KZVF
+z`mqj_c`nyNr*V0{@*SA#8tC`a4_@=;IWyLonXOv|L08L9X^ol^kOrHlf{<XtZkPwf
+zSe^OmI=rIiJz-`2YNe3dPY40V(DaJw=A8JOve6m``J-smXEyaL-Ga0G0>XGgLqORh
+z!ly*(OM-eYPjy-m{548P8zDbSiL<b=^5M``P+7#IW$|b*JaTbZEnHeBl-Zvl?w#MF
+zoHlm6=WtTTI<w1*nAP!Big%_IL7^d<Mr;jAhtr#Q*EpPRZtp)KQRv^p!P@c`#l1TP
+z@6LO9G4H+w+XjyFb{tjXw(?b5`P*NmEv{<4yf$9mDU^5K4aUlMFWP^arLz|#+~rYw
+z`A?ihOEdBE7NNZ5ZuVOF-i@-#cv+`V))_DB6UzGTpNo|pTR8c^S(eDJjk;>FSj(&8
+zWqXCPz4vBfW&J5p8_uFAA=@=NPbtvs?5c#j`$z8kr$5LS+(*_ug>P0Zoqwb5^}+x4
+zGa%mCRiB0E==Qz5gI3-9R_nn%#`kk84(>F*ztar=rX7$718fI83zvutDm6-l@|>Ya
+zhc#xLGenSl-Uw9N1Q{LuylKv)wdc(lIna=_))x>|Y5mdM*F>u`FM}k@8^&~46=tpD
+z^Lz%YJ!3v|E>m+=S`e;*QqL)?^$i_o{Vn5M2GVID*K!N_oNykx%N{Ok&VXFD-%^lZ
+zy^ggo^OD9PnX_}*b81hiJzCJiF=tVBT<e^bZ<@1SqU|j0;hgd+y`&)HY7)-H<tU|O
+zg-hj_xhy%?ylv9J8Rl(IXhrTEweKn8FmHcCPWR{L%$~FJrQvd=P4=hvPi`^iA?oF%
+z9<6rFWp64W`xh?3IcNL2Y0mL=!<_TFIIC=P^v^Np<nrD$&%5Sa45IqvRsy0{%%^^P
+zZ@5a1o6C{gD33YKgAoIur(r(lm7FuuZwmCx4;;qkl_kO<pYIR>J0HUvd<3L?=VyJP
+z5k4>t7K<-@G3Zl)n3QT7w1Z|PfB&`V;7B;g`EXL{@yT>+H4{j&ExTFq5PpG_%-)oo
+zjQ7-&QbWtjSA&zxX(ASASKIj}l7r!AM#4R#d@!iwJskvBX)@#s_=wTsBjD}39GngH
+z_$C6^hQm{rA$!xv{9}{TGvQ4kXhlkpQlyx0WC|n~aIM4~jXo*y=3uq={I~HX1|weW
+zelt9dzl0?GWpXCrL>y-^sBA#K6sm8okGPxbePbaXxK6&nmB83|;QV+n;x2x%yLEyQ
+zZhCwS7xUFcymea=7QeWCB9giL#V_xDsbOzY?~CMad+|$L<4X;G6wWBsAPikcwMl(r
+z5_`>;su4~}n#Ck7C-BiR8a{EzB0h}-;t)tF#`fa`<Toc>G|s7Go6J&2KAA)QP2-&O
+zXpL_&Pjh@D<*esEwh_}jRHqZ0qdopy{+l$Qbc7WV<WuCEp^ln}7zUPp5E2o=06%gO
+zl(o=EU^<x08aO<7@^pXi0Z_!))^7~WoM&9|ndxLEu}r}`OB(5%e1M8m5Cv4nPRwlA
+zx6JV4#2f|Y4WHNq+J?Y32v3ajZ&J=T=sjB+f6)1{#DFaj_XfNeVl>*7m$67N=}H+J
+zF>y}nxQIbnYNDhqB^nsM$f?x_Lj*PDg{}Uw(>(uch>J9`xio-vF0q=LpMvao04G8}
+zhJzEmONUL}z4TJ7umNQ8C{Srj!cn_YAUIkVj1LVpRxi%`8~NqzwBLI-=U&Gj@B2e`
+z&Of&0oS$Dv^u6NSdv5Jn==*DX-i9;h)!7@f33tVE<@fw=`&W*{Dm$YUJEA)VqOPMK
+z_C-&hjh`MCP7i--G`Jj~;pKRv1<fnhRxU+%J`?qxUUQvEh-K#8-f?TkQvLGCN=MAS
+zeW5Q=QbvTvXzi|hXJaJ?7fw8ImL$p=;$^KuS?k@3SXoEBY`0Lh``(%Rl|XP7ZR_Qg
+z%e!LbEw}6&<yDLJM0v$qvv+2r{$n4Wjh;CdKl2sg%vWONfvCMC;j8?f^=)gk{=|pj
+z=(*?O=gte~&c}QsQG4lw!_U2$7cFm*(6B(Pd}pk%``+Qz!rtghfrX<F28Q0OiTYaO
+zzAnMnbx$Aj^~8#H-Mg?_)F1r{w{R@sERKRE5{cGz-+M8-=M?MQM)meYS$(3WHL<NN
+z;qUmVEyL?rI0V9{r)c5C&(?|FVX%5Z?}+BM|K6E<IluetntgY|o%gE)KL-kC^?nv=
+z#RT|`w*Ec3_bdlo_<6suw-7%+Znu)V$9kyF_$L|OLzTuqDbbU^(hPUdZ|8fEk>5qm
+zZgRrp1jr%g6XURm=TmkxWmq^Nwrs-jz2xg7r=Og|vhy}PA!2xcOZU*Ex3++zVs<~Y
+z=yFQ04?Hqi&AT3XjpluivU1Fok7{$xd5^Xgn7xlW3eCljceI$jVv$tZ2>vUNeByfi
+zdk9kbvcL~ZIm5SzJ4>8d6XVR98D}<wab`0aXV$_vvsT8L&Em3%Kg-$R+BrMiY%UwF
+zgLA-ja!$A|&ILDz%YmEA<-&DyZnz%K12>P$gX`tIaPzr*xCLAR+(NDpZV^`mw-}Ph
+z#b{RvSAw_FSv`am%xsAcj-=8}l=CNt9)d%wbXbcX0oIGcfD;)pDco7&r5fezjCo;F
+z-iYy`P>dKGL}`OcRlzvw!ph0APbbrQIGv1vpcI9E1gu-ZS><|CS$#+g%u0NaRs-9V
+z%b(Af%h2jAr(nP+OF3IUA+1WO(G4qPV$`dUo8`9XbeeUUzYl0g&ow<sQE<TdRcta`
+zA;zJ9m`{v5u6zeh!K~3rWyDc)m7GWYRZrQVwHY|;41`A5*HCcc$sFXYQ*+2Z^+bW3
+z#*~~MImIkd1smiy^>@yQQ@XTzh(zzt8vI0uc5Y&D(7b8K|Hu2`9MkC;i}NLn9nCVr
+za?&4;QNo}<;GWa}rvA1ba@qwZ$aMdX5t7=5&vHdE72;h5Bypp`cl10B30P-_=Iu$t
+zL@1R@^_g||h2SJa+4#MY3bsrXW_a^%#*Po|ZB~-JfNvElL1F)=?q}C^tM=oI2UiaM
+z;P5+#qg}^hjmK`D7VO9WDMW;eZ+Ob|w=>K1N&CcDC`1xRgi9vf<O0bV4o+Sf<EJJk
+zK(Xh46X``dKP`e!bUvN#klza_E=IFIaC`vR#TgMNp^hXoLH$2J1^RkE;Y1|oID8SD
+zz$t!KLQ0cas#q6fuTo^AAPYvQjKmH&(|`8tz~JFCNsl;S6GZA$q?~vLa({_x^gt+R
+zjM42=+x<s~;{R8QH$n;vPT*Ry09eTA*aZ?&Pb;mK5;DSx+BhbulynhwBDIyEQ=X-=
+zzeUb_<h)N#Cpmu%CuszWfejlQYZ)yO_XFBNB96_U@+f_`ayZv@pzP<A#a$JGt75rk
+zB`@Y`Suk&S3c;bbLT-sf8Nl8n*@bFZl%d2&uZ2JoYWxrE$KPyTvmgJEdu%k+WHFHk
+zY%zI-aZjD#sar9}JfJ1sw1Un7qNSrwaMZ;d{sm*Ar2MVJcMdNP#!5iCL}`ht+V6F}
+z-4$)vAFDb*A-;{`^0&J0bicLd&Yq}$SFCvVYVm>l`lzJ<6>n>Jw>{dj?|!Aw(s!SW
+zH2`;r)t#nn)f*Oj+)^W0YL<g*md1oFZz)f(l|hJUq3<KmK1tG`T(FlfXRX;AHf;Gz
+zor28=u`G(MWU&>3y<)jBy8Yls_TH^zN?M@w|8XOn&)+6wV0H!^Dbkn_rJfi$OO{Px
+z(@GYupf8-d99d+<BYwTjL@SbI2@wSmvMJ7rxO2PU+<rGN=In}Ey0*4k+1}R0b|bU+
+zs3cUmtx$An0l+bYm5mD9ok5GVBZD&#VpFyw?X=(}(zxLPh-x(vkjxU_Q{C(32)Cz(
+zi2kqVYKH^VE3G6&7Hsc^$gU&7ahxx4obruKP0#v9nQDrUi15CEc+@*1NiO271KQ-|
+zNRSefgwUWrlQ*GGz7kF{6GP4fVyf61L|WJzAyrI@P~!8EU^q#&LFkaGN*Vzk(inYq
+za22O#hsCBua;4>%5_W|?=O_xkuKPHz_{|fsym~@68y5Q4a|@ShmutRP|8{*Ww`rkw
+z-R@rOTdH}h{tmG4kL>k?dp10@>oB!#rGl+AYO7hPj@R!K>i0$Kk0mN<;uSlDiXAk=
+z%YXwm9M>boQ)b8-z7tgY^q2u?j`(0s0A7JbqX&aV+Qj5I`XzP@+k`Y3Vk#dQ8@gd0
+z+xn!Q%>bH}Y0ve{3xp&|bA=F@r?JYgEgC|!RVyftTHK~hUUOFQaqU^9C3C~S_k^?>
+zqrn*&dujza6ck8pS16N-;t?5^Jx?fCBc~RLQ%2tKg(h{nFQGN_rg^g}`!i=&<pAXM
+z${$UM*KDH}iBn}VXp~q%ebVafoQW{b-`3BW@&5@ab|b~jugnnvS)<o;CKf-<W{k#Y
+zYoW9%!;t?bO8o-!>`CNnFjTs@43wc!GvfSQ<`d(JwQJTS=_+V1R)|GAA8I36KaIX<
+zmS~aTxhM|;gwr~B=q&&H7;8pSOFF~QYP(FRm_(V{tfbQ1#nZWhq{1a}@ZsPncspUg
+zgZ~i~LNJm4D{{Ii9i*kMLf*Y3Fb%o*VL~DyBb$!&{FstAv*Zw`fb4q~w8|t9%<rd2
+z#*6(`N|Aw*AZ@>y9|URo5wMzw+{2TYRMH3xGHC|Dg>(lEjfnh+sL!9_JyIsZ+9%;*
+zUnjULQeZZ`#S6CeT;C&|+3H<5xZ(6H8Q#jglNocCCtMy0N2*+N)j+U%(e}WV_t1uf
+zpxY4S^#PBF+P0D0XWyE=V#Aep+jh(LTK0nZr;vy$W(?RS!QQkIT(froMas^J+iO<s
+zHLPU6;PS^^J62sgQeK+{S97%O(5mYYuqRJJ++Druu15KbrZrcE#5n2_%DP0(QoQV_
+zP<Av{b{s+(+3mNo7LAMN*4?E`!S9}3bJxEMsg8KhF`?&Jyyv9Qb257BOswbZ+OtDz
+zEiY~~ow{p^Z$BVxKXAWF*nTM5bn3$zIE#I8PmSQISsq#S)T6%U_RS&LsOMoWI{#|-
+zjc)MA1Y7xXHc4|5d%9Y1R!5zUiEZ`N+?own#fm5H-z(tHwKw6ZSvmWI7v6b6@a#zS
+zLv$qWsu5f@aaW_@YK%7RU32YAIMuAqy=;6^lkEG*wI92hYu`h+A~2e|RB1D(&E)Ya
+z04{B7bNVYf{sakusiL*ubLoZ^l!(bjD`gO1P`9JBHv$ZFyh(eoRB7>R#At0)Tt@0r
+z1wf$|f|~M_76L@5LT0SJ%62jfPS?M*1Z=t*+%!(%FL5>k>Ldrl+0oXWX(P6|<^Mg#
+zD4X@r`_%7767C9GicxWVfl;A6>X%P1!O2SaMdl8bprE<`AIu#WYheYK^9B04c@EJE
+zNS#AsNsU}Cl@u~@pfBJ{S3h-DZYm>fPQbo_N{7PN$dk(TvT`f9eD?eFSx@CFhXeNQ
+zQ(IiXO0;l=tRztX*sqtvN_^r<-&7)6Rl>?Jaivn;%`=%&t5706Z<&;rl>vIvrtwAD
+z<t*O9`J{9etd7%99Z{M;N*~3Xd}i9nR%$~Uz@RFw3U%oDa;}>F{vt4`auZCdVQoG1
+z)V9)isBNvqn}VuvPj2HszfE=2Cd|xjtZkn^bDq#P(ChS?2$WwQ0n|~?>Tt4=S76HK
+z?|?7dz*5z6jqJCQYocG|Zf5UATnqd4rj6oujFf`*ZiZ+mvz6uPlk)E8+VHODcYpCR
+zxJ@f>^Qz(6QMUr`R5~ly@ouNwd!$fk(P+;O)}BVLi~Vj(YscmlvJ-iggB%ChK(#Ke
+zhug*N=JvcvIa12UTu$3d=~a?0w4{#?klMY25lf3?V}W!6M@P>disT<+`kbWh>EnY<
+z!Aauya?L*e0Sb%QnSOP%XrBREiL;?drWC}#f&`!ZH$0#tm?^L`;$lBc4ZLalP8fio
+z3dPJ38~G%Q4-q3?_#zaLG+b%tNi2iu4oJF`W`=GjGsedQ6M^<fCi`t_Pa3<npO4sB
+z{gVE-Xn&$9Vv$QunrEnEVuLy&*^)B3Xh%S7J2b*0R@6lH13H=_P(X%;GCUSp6P-^`
+z*Nq*`U2vMZB3bQCvV8!asMQF7IDl9JMJj$HdKfWLKa(bs9Y~s)e00PJ@c}qZok?SR
+z8+srTESspIN#n~`Uxs3aXbIy&JA3|a--S{3{NMXvhQl15njVI}G?mz%G_|#No{v~t
+zCZ~qkC`l>*k9~jtZ|~6a$-YmBzJ3A!+2c3zKZQpu<uYV4K|!AO=ZLzbb%+raL3fgm
+z4k!HIl0zgrQGxUu<RfOCs2|GcIiO(Zcsh89bk+Ujqmv5iQi!h*K?^{5Ar!nogz6B@
+zZJam6!^U6ZB~mFKHlB6{`h7ZZ{29<vQtptbljSvZXaK{rntn?YRom#-m)LfIeruH9
+z&q0OPT>GIWvSBM+Iw#mF6X~UvR4nw}Jdvntq(ZA%O3#uR6r(SYGQZ^ZS8siFxjmL&
+zw_*_T8y4&dTYj{7r(oNuv{tU~3${|~dwQR1>Zy5^ta$}X{erDxOY`L6Nlofn?7y-1
+zi7BCe*LQR97ad2jh07f)op0~iQnWmp4eDr0>HAjt-#&5o#ryq2=fIY1Af~g?m-|q`
+zK6M#&*G^x<Ub<Yk5)>-h@8#XE`NOg;`H7HCQ$sF?zPC6`%NOs~2(?}Jj(%7p>^_+&
+zX9v-gIVEMJ47rOz!B)KVHDoC7dSVrnQk)>m`78ZGMJv>l*$kox?@|pN_`2_!g{sbb
+zMfYcf?&DiZlBb%JTIj66)T7g2b^2+ra5+!#)FwRQul6aB>XfMU@;sAgjyx14^pQ^_
+zoW2!PeA^xYf6hHy&Wr3wsTQ_;{BFNc-MzKt(r1#&qzpLZ7t^Tquh}Y>NAH^7o=V6Q
+zQ2v<E(aO+eyBC8uP9|K`T9*$B-AgsM%9cAZDR6ql6uITtkb6+uP9L*MS@*0On#fDR
+z<(WH^cMI>=2(5>e#-%5h=Z-u8RqT`d)_v709cw-aXAmr*GR5z`oUu~#wo@rh9=>g?
+z5l|=>b0_MX?iuc%5qtx3e)Neb9IW$KR&6yY&3$Or*=t2wvVs@`4w9c8x@k9jl9uKf
+z9sd`I=KmLR&cI34&dnSqAs#5_inbfTgk-N|pD9E~044=bA}wGDZKY)^hkmMnL|l0s
+zs)1<WO?<S`j1W+Eq*8jqSh;eRlwahg8qyv{^W9QHSV23r>rB-=O|2WL6~s)f2&xUn
+z!9(ESzK1YyA8PR<as;c$_d^O5^>mX3lBxqYtnwF`jfPG9rT>T=sr)51?Ta+jUqSSB
+z-A`;)iK<-;?m%4t`b4WvGA@ACc9Kmms3<b(PsjJV-|k+uHL7tR7nL*07bz<y@=HE7
+z8;ijtyy*l1%;h14#i*rh>-3?Hv*}X?&y%LlobCeT;>9WSUy*Lh6v~4R{{$4gCF5Tr
+zDKZo(mg#{Sk(1PCqI_U_iE2#Co~W}nYLVtRHA;SzId&fNMRSfBFze_5smv$s8Ne56
+zha>dqvrK8tWJxOjO%s7m(QihJl$_eLEVKvV%Hd7!Fa$OfQid9q)<2Co%Nap9@X%pN
+zYeq*<R9YDtHDlhJ2M_u6jPVVO?C+3^uZ9z`5yIIt8UzoIi)2bjC}_qVl%kWIDstW@
+zhn5G!5ha{1S){CyRCYUCB`oh|4DZj8J>nIoPdbbKWtut5NI<KlCQ-AGR!ijr;8wLe
+z$y>!1PR**bhUlRC1pmJK9e>*WUiYg1I0L62*-Jn6iNxSq!Bv|mt;AZXa4-=3Fbj(%
+z?yOyP*24ToytWIwe7v?-sO@DXGkR;SfN5HPRB#?m)VJT|;yX?V_^Urb`)wVo+b1}E
+zQH$>>z_Jg`|2*3i+LLll|E?m3gHL4ut6LOScmqXZunA&AMs$*$9O!$<{BDX*g-1y%
+z<3&JXlaDyXkyZkJnTD7|?}_2<ef5<auPpa{Z{Y2LyM1fU?x>}EYtM)^OjG^wzhz4_
+ztS&@Fn@weZLk6f4x<U#&S!)5H_Zl?a&Amq&<us4Fr6&ZF1e*0LXJ6D0_UgQGGEZgB
+zX)5k3Z6~dau%e5AdNni-RMx9}o@bKp%0h<ZdjS}|ic}ZQ^U!+uEk$oa(h@SfVwg2T
+zO9;QJoI7-q{#DBHo8<YDw8)kkBL(N!p<QI+&rHhV(>*>>bI%ST<XJHJ4`O`9>6OhU
+z3fSyO4E;W~>X~@)EG04F+lv}W=jrt-Ip2gMYwBhoK50b0qzML^LTTK4TT0oHoRoPf
+zR`+e1nSX%NFf(n=Ma!@3ee*2NEu<?{xSn4Y&u<j+8}D}fLH7^4?_XQXKNWSIVr%-<
+zSHArUHqeiyJZDH0#a(=(?_+4z_1x-Nx)^f<X@6)kLCe<dT@2rT<<=|9Tr9sK=5CDI
+z8-Mm`v7{SRxbDh}7Hq%kzH5$pcdWU(*7FNUCN;b8=bx77T!kb_K#ICiPvgp&mHudM
+z+nT+7-R+??q<;%}58Z3NgJ#`(4TT4xoo}`ttTn#xa2%{KzF%P`KQ!{QjPJKOdd<cU
+z%x3sEsT7%zpDnaew$LyYm8FIl=~4Odj7x2R)ClEa5B5o;%$+6`BTj!A(1@=9yT(Lf
+ze&A>;3lnM05xmJ0dXuDzF)hxRf`6sfk%5Vx@h>b{Ap~mfi%_1T@|9L*s(Z9%dI-*L
+zN)HvCISci39*RPoiF}-ycFXy!xhw$LjL3h^5}BPoUvFT1WQJ^JGIbI*St0ro3j4sX
+z^#vw<V`OX92Rp4Zpp;zjT^ze`(Z@lUWo%s4vml*`l$_9)K#Cxb4A4A*#tJE_gaDX*
+zQ=`n!%2c!WFcEp*DB1ez@lj!9%ZJ{cl!0doCSux@imAy|S6caFIzZkrnq^~TP3e>W
+z86)w@IXM0dQHqYGAEp-aA0n9l4mp1c2P+y@Xp^Rq;Mlm|#)vr()S;Ha2HY5jsEmt2
+zj7T_{P4a^rYzj=0snet#It?&mHVTe2tbAk>kx7lTh0(nbtUgfzcJW0j#yUAOG0Z}e
+zSu)^&<pE3vq87;yqZ%di<OG0PWQA^+bwfr{H6xb^+N`25=nOb?g{AR=2BDx~r9W2C
+zb_49@g)0z{D=b;+U)~Wbs9(rVfIQFv-Ni(4`EnCXb}SrU_v9~`m+eA9W6aY8`J%jn
+zCGT>hP}m&HYgssymOH;_=_Mh*9!iid_hSFjalx}K=JGF?*K<6J&n}G%dG)cJhJ_5|
+z$}he>c57_eykdOY7V|cOm5z|vTeHjFm8!Q(V)@OW8F|W45kvw>AkbUB?7lU;%nNz`
+zg{*|LFls5>x`h)i$RNu!JfDl4C|hGEV@_(}&m#u1_M_TQ(nIMm-PG}{UNUuTi2P7l
+zW6+1<$AVYHB_=Nfd2Rh`tb+r-@C*zE`nIt-)#wvvlOF_Z5K>`xkWsUhl_9Rhu}R<b
+z*tOtzNNvC%@GXK&WO)?SS`#%@!gqO?Ovf%aHgRDyVhhXan+}2MQu<?>YeWTwpr~Ev
+zaKAcqV`#}7%PxDU(_2fHp_A&pz4O-2e>CFlA1R0|zm$B&#87|J-e`Q++?lyaz?oXc
+zzUO{<r$9jZ!-SnFRobJfr*4Az3bFz=0qq(YU`sR80zjq=oC*7kat7zjTn3lPSvV_~
+z#o6Aqe_x7$IyI!GpbD#?cQ~^cA$)G01UpYfb6BVqp*c{4RgfmNnJT(P%C3BKSV09f
+zRmHVRP$YqPhuZEr^9B6{-MiWH9(e|aEn(Wy5!rPJ1Zm$i033t$bmX0y6m{Q1&AtOy
+zrpCAs#f%W#m-MFrTBjk$)6AG1{B^XR;Z%dk+>@vJ2Tz|oceelZ@PShU!^iqxNIEF&
+zz<~1Z>g(@6b*8`nm=fYR+<#(VP)(6@VDRjb(<e_2^eRd0hfkk;MtRFQG;q5Axs#`l
+zoson5naM0w0WFz9{=gXHrSL=pNLmAv&>f$e9vexTU}E*<q<wUZ4>D_v!-27P3{32r
+z|05*zTSe6G8`Q0DlCvL9GF$2flOaEobg69=LzvuA(l8ZDW=bO6sd7jBFH;#7*?2@U
+z142h+4iti(e7e+8vT&4m1X>c}k|KKZ6BB$$%kBH93!oi3Sb4Xtx2zDy)-=J8^X+|!
+z{L-bst=St#NK5_5$2ob4{Dy?PDv?)5uGgQ)DNhtOe(JR3W-VkuRLALt<h9N9`UxVc
+z=T_e6O=Rb;d25C2+C*;6joyvig4^}C>X)96<<>6r{>0{Zy^YY&+k0>AU9MVl*TP~1
+zVUPC>Ywq5ty%$n9p1Otht>hcR)YuvyM0XhZMgtq9UeZHr9R?Bf%pd~Nr$4DHUGqq$
+ztbQtq)01EdA5n2FQl^o^RaF`pE8~OOwwzRz7f6?CT6;>7FzgL0LJ3+&KTS~@b(MoP
+zFSZ(2MgXg3S4IE|kvSAD1FT+Pt+@Oli(USJ10ts<X-GLw$V}ow95eq*zpVG-Xv$+D
+zkFBEGqK>d;%K#Z=D5IrVq<lBR(rt|9X;%-Soc)5b2jh#Hxa=({9BC<>TT-|-rNGRP
+zE+sHt)%kM<*(%?(r_fwuN;B2)C`vOlhBPB|S9FqM48~AajDhi}oCD7R{`B_tpE*N-
+zZg`+CnMXlq`g>3JpG}Dw<a<#rC>C_W<2T@>QY`pCL_nlTJQHdydJVOiN3_g~k&mg(
+z;BZ!#l{hr8&>M9hShFAasS)r0#7>~!aJclJS<b_<<<!XKmPqzYs96Do%}E<I_tfc=
+zhX#)K^W9iuXGJjhb(GBi1{_j|y$Hj^OeZGk=skI)|8&0$a~WXeYmkj^B&QAzG!b`@
+zzlutrNzMNW6=Muc&WfzjR*G#ShskOF5+zAel3b<h0EuJ7ZVyQobNK&_5`Bvj=`Zu`
+z$eU&;ht&}&dh!VVJq_0hWCT^#ksEh33XaB@qj|yjz~%q~vT&4?8YNh{?#PQf>IFyr
+zN@tAe&4PE~TzF;GR`%WYpR$2IaVq-EuyEol&~&ZK`c!AA&H|`)<w*u`veujpD>Lzy
+zeFD@=oNFzo*4=pu5Nuj=Z%5+Fn&mGG6&?S@Y-;dsl$0ilOQO}Mh2qnX%(}v&M@ED$
+z_AWV~{(?h(N%_(%tHsTU&h8~+w4_xiXxp$kqRwh!qfpZmFsMVVV=o&x_jljwCaqoA
+z&bfO!=H3~1?-ks8WA6P>2DZ5u=T~jj>+YIpU01YrXUyFlwRcnSHQ@Ie!C=;uB6#_g
+zXzh-eyDMt%+HmGBWc|~l2DFjwTkjWS_f?uUttJz`6s@SoBnrXw07z~d{`5yveNTnP
+zASCgngo&|Jwm#+jt_SRtApN{P1;+uzQp0IS0L_>GT~y0dn?51bY)l7w8E7_a;;|`6
+zCp>oGlWDq8lAo6Kz8rL*gHpHjz6tA1x`~Dh<eFLbmSvztTd>U<Q4S1Bs2{aq7UmV=
+z#3CAmeXI0NDYS@VFbC^+U@J@%)~!?sg$)Zw*Kr0LTJgjRn>YKPbkd<QXX8GInNIwK
+zuYc#CGwyspa?v+TdnBy`WrrnE8m)BLahyz+U!x4pNP7<``T8-M6PhV#2NF%y&psi|
+zzg|m-r}varWKe6FPEclK4>W!lSwWFz_leT%z@1@)ohTg)fu10hzYtOe!oJYVG~vm<
+zvGAZMF`p%>1)iVcW<kwn!tngxqYfrkg!xxRekMXfM<$uZ&6MqE+-1XH9x{!qv_q1r
+zmjR$wTs}>`-$4o2bsM&vD3}Vc>IL4XWZCb;nzIeYwc`2PR`a)!#C6}A2hgQ_IUKLs
+zDd5k&GqGc*BD_5=c-j;Dk9=4g-S^C*NfK*^ymiZ6+p23fP|07YphL$ul>xoERafuB
+zLY-aW>nRfs%~ue^W;VrB>ES9JUIqaoQn)FNGU4PjAzKOwF%|L9YgyrvQJ2qADAH@n
+zXe*^dvJ)yyKrD=$2{w}Slf{r9w4rxt52vDd791o~a~QZxptZEv*`re5RT3%eE@8A}
+zG!>xG68XOrQp72oIzY~o$aPHj!3Xv@9r0jUV~SDyKm^Bi1S(nJfM~OyCOODqu;Q|F
+zd-sk;U**orm2g|PH+M1*eou%2$M6HgHO*N{wFmeMp&sRp=vb`k9^V<UZV>KJeQK-J
+zyplDU&DjUUMsCU>lgE<!V+{5W^8X2gl+>U2L<iW<PODJS`x}Ib6h5*t20MLd0i?;W
+zVCnJ&XpM-*#ttA-rhWW`5@t={I)yP9^}~%*H2$bfq{HO^4A6ZFWY&hxZZpA1zKD@*
+ziKwI1_-n`vnuu3t_bvwCJhO%amAhc!_{Yw|rJC=$*PJy(u%CIY2ev8{Rgk!=N^n)h
+zTs1h-*<7#gg_uXx8n*tzQs4oe!lkOEw#B12`f(_G^~*QDywtmv?MoC^Z;IO}ELu1U
+zTAR!LdgoH!YrB{01$Sf2*%Y-jZKa)22kHOge<$xK9|2y%pZ=)R4ko|SIo8UeQ*)(5
+zaFj}Py0k}YnW^V0eu!~|HA;W#4rF4d9|LD*l%70jW*MHi7ctE<E>qkEn4XqKZ5&Gl
+zx(;a(J~5ul+{1Pf;4@;)ZisioaKM`wEzMk6Qmt9q@u<(C9m8dbH9?cr7WpG(waMF;
+ztg|Jpne#IoP?e|bT>lyXKwgrkz(DX-Zm&e$un83+Bp(~4s6!^UCzT9&i0zsD0OlJb
+zFY&iAKiGCjBo-!+iybl((aCJF8#2~rkqf001Z8idoV2B?JM89F%?R$yBGu+q?WWyS
+zE-ekk(}+4mEBj}t2jmy%(_*JB!QzY;wvfetbF6R&)}k!x<<8%tkOhgBv`zWxd$7B7
+zS^w*M6Md(mr@s{KeQDDMefQX^Xa7ci<uWJo`|sI>+I}IwKLN|zB~3y})5^F|vg_V4
+zq2vhYFa?M7IG1?JSb2L6MPC>ZIyj}gORJvNjr@w`v+<f80{-%MsHI#IO1i0lu7`Cx
+zd+AnMjsinOtQ1<ogmYnt(jWde5uUo)O9`}$1*RC$Jj(FU^uq9t71F~Xghrf5-9-vN
+zsnlq-Mogis?Yz%VC7P8biUAC|k;;-ry{NH@!4Zu(E`u;%q##Z8C&qJ`luE1xTl)6H
+z;^M`QO!nR6nYwv#kBzEU%S1#}TvQD6WQ*!~S|rcGdB>Q(OeA5j3~_~}5-yVY?2r?<
+zx@CcsiW}b(qR-PJA)*J6(VV=6j196-U$SZ|fs{$w{NM2S$SifIfIm-XqM%B~Nbi*h
+zb%%t4Ly3ZFlGW@MwsqfY6t*4y&?am<D-@jFD6NQ>HVdWAD|15W?t3o^r2`)}3Z>62
+zk~JomcOm<sRhLt|#Kp^61pEPYJ$XMIKm5FK_<5T9hdE6D4O+SNLSg+%k5IVd?$?CE
+z!;2Xk&OF)pEQU*Y2=23;@-N`|A{5K7p8*1>zx*YPJJe7(c2Ntd!>LG}YAA-$w;WnA
+zFfVENEixmGQ}P=yugUy49kUbjKc_TvN@>gw1&NG7{v^#0TEL$fn_EZ4BlSVN0{(uP
+zqP~M(%K-Hy3it^E(jY0#26=v_K~jyVt29ZzjZ$z}&dH1CGzmFPv78o~Ep&dtXILs;
+zbyg<|%9g>rY+f`2dwR2X+5E=QRnVEsV2b38OG{r`$%z&>L_G}~WmU_)OE0eIm-a<H
+z^&80Kxs&}1<-vjJDX{Gj`pmvM8l3*{zk&7qMd6xyNEjeIN(&A!xJGC1^osD#86+6u
+ze<I{#DHQnkB)FE6N`!&n7m>t+W~~gWJqeD=EqW4E6Ki57xv36+W~A;gV48Bel~38?
+zAte=*rJx54lF>1l9i#{OFOl~Q1|(G?7+3#2`P8fx_idVkL_VTZ^S=Z}DM0M*xKQ1D
+z|CmsHN+>u5`!w<5MxnTI<x4_w&%Iqj@!=0GLh&<E&ocz1JOrXjmrZeBtAIaOYr<1Y
+zW;u2V^}FsJr#m=21L9d*$ltb7f=xNvH6Y|4g*iUW$x2g@fhbZ&dD3LnBFV|8-g$s2
+zraPvG78g#VSIEK^#G<eP!;cfDX;5UiF~ucZS|Hxc2pCa?8X1*Wrf5*Wrme&=7Q$V1
+z;@y+Oxam<cShG3wx9EGcA}e5mxK)q<aLfsFLZk>o5>pU{Leye-VQ$sgx)fPC8!c~*
+zT3Vm7bopO!G*lKcdSA>e?W2VBM{68aqy=MT9E6G$)8J}}*hLQ`vbV^?#i&5(Q`m|D
+z5fjV8jY`0GXmA?P4rOp8;?4l9v9CIx#icC%ANu2MhlI96_g{&%JsY(=yY<9JWC#?b
+zd;GU>MH?>Ila$_R!Lcj)&}Ef2t5Rc`5xS@5oMUVM>8HG{95)djeIF~Fo|Kvu5{j1n
+zA9)gMi8#t}a+#O0R2KF8MezD{<Cb|NyGk3E!*QAF-9)l2BJlk!pEo|dEyXCbRj%b5
+z`lsg;d2u8Kpk+%%ZZim2dE!U_`YY=7-_UcmFH$-QY6APP)2@NvZ2ILKobyc+3}(Av
+zEZeAM8wGM@8SknFq%Ct6t(%&-TxOK}mtf|P07BX$w;w!9>#JEKMly)}l0&jTV}*p8
+zm2*>m*aWiAS?97|Gu(8Ubn~`(#Hnhga|(%!^Dtb>GKX)*d5WMOPLghuuo^RO=WKI!
+z)>9kjrc<?n_=;ZbRs*BTpUZ?>pqdK2RGHRzyw2IU!gq^gG9uC!qrB>^=}@m?N97xO
+zq^a1NMjng#>^W^y)g|(rfoW?;$imuRDu<y|$J4*{oPp62U^0;LL5=fS^Hy*|%Le%>
+ztfDQvn|8F2U7DzHLNUYW#Gys`fk{beB}zQfe3eI<)bAOD#Qir=9-taAKa=`vsbF7Z
+zeeRY{3+xI-vT`*xJ|$U$2A;@l{6j>8%>8L_Lf<8@SAe2L1A?AsmII5=+<xxXb4zD#
+ze@XB>Be6k?OZA`WcR@ZEb_r=C9KnC(kvgDz4Au~Uo_wz^-4r=%@Ebon`p;<K;j!?M
+zne)A3XU-C3ftgE=bob7{u;7F*DBt?SNH1b)pOjoYz2Wvy63FCykSU(xL(PNWTJ@lT
+zs+HFybey=U5nO@VOW}Rw5PvC||AgB4X>|36G-AXG`<Cv3>m+pL#Ed+mlAgl@XOEma
+zINS^2o8u?X4xc@FtbZ`lt`+J_F<b~TuE?@w7P3bnK+Q$kzIY}`isBa9@N6XWAdEqS
+zkMfzLpP5)}dKOex2vUCLl}4tC5qxo7EdrYcxQL7NWXDF>dkfu*;x{F;56pxwPVr+A
+z7RnR-pPzvfvG<Bsb2goY+;?QVYz`b&)TQe?*`1y8`~x96$WI2wTduUVFrqGWjx#Uf
+zA~!UN842gf;2JX=9x*mIH%A)MJ|g6wfW@*qqkN+fl*O0ac81*#)#Hm~`m>lV_DELN
+z5wT3jrGJe+;53{_W)@u$*W)AoWK5k%*=gwpD4%5f(pSeK>O|9YemAf3)xSff>?em7
+z9#1Tjq;YcUDl{V?m<nTc6VswWY?5tHT8;&0+05imQFlU=Wrmz}a=uB<d2+6j!;~?c
+zq5y2R$jXvNB<T<(u7)w1v{J<y*qpLo5EnLUFn^V5`E4qUarNmCnbco_q-<a`I4l<?
+zN#aZD-*n5cc>mQf-I>E*L!J<6D#&C-=~tZlRZ?~GcVyM3!I6mn3$N(^iB`)$qDCfA
+zRaC#=fOhnEbH7*gc9CFfShqW0Hv!7L+xCN=cY5wl3Jv}7hGPQEN%qDXPOW*KiMgJM
+zo_<bnJs-2bu<potecSEETaB+Z$8+n2To~hn6hhNuTxiw&7+RktpPG!>dGGo^)!_%^
+zLs#v)r++Z?&XC~jTKASk%g@HV=c2B29~YOt)pMsOTDw~)-m`EVY`VC+MsU}xx$9W6
+zGcoVksOv1qdDRVKyP`Xe3k@ft^@GuhlZncf==S|W<$*+fS9Iqoq5heKukEK+bG~EY
+zFisure*HpkBDaW|xfEJCyx17a?Lde#mr(6x=<U@cT6g|I=?_bPw>)0{!aJUooRtIj
+z4}4f2>wA7#zufw^DO&!*qFpF|VSV?$`}WxG6VYc*ukJp*Y+pIO5{UY?-|bxW?TkLp
+zEoLX$y6-jJE01m;ShOz<3$CUI-ll{X7Nq{P<-L~ZfzuEWJ)<vyozJCCcq>RL^?O-w
+zXRYkMuV3>WjF$Hzv`=4}DD}Pd{GI2Qjy}vZ=52dyH0S3&)R}W~(HX=XxpU-=qYEbz
+zo(jnn)djLA+W){^fZC$XgE8;PD1e~9`R2h_kKQ=C_{yri_Th7Se35^8yi?~J(lcGr
+zAMMCK?9ceI$qaXd7L@#u9}`6P_}|0bWXzK`nY2ffkf|Q{Z7S-lvQyakLQxY?3zSg?
+zpq4f{RLupU2t_ayM|Pl9>Cc=|y{;4}rsh3FoN-3ach8xwx2gI>+9@^6`GL1NZ-ORL
+zzFf0*P8oS1l?|Y7?1uU|!`G`o&|++r`3$uuAgX4(n<=AQ7l7J{Vrvk{wa(!`A+KY4
+zE)y&jGsoB`sFP5Gv<H^8%v$zZv{TD1WMASbh%89SwmCCcPc<p%sqRumTIG0EzY}Lq
+z<<WB4gtF2NHE6$$P&V}r5iQgbsT}V*<?+z6H7(DQc}v(Yx8qX1>{EYnrwkw*J@Z!1
+z#d={4H;N%>ubFdEYcM{<LP>it1L;W49u*zOXwmn{p?qBK)6r9qkLq9@ipI{#dBVi2
+zVGp6~Tps6T-;*KkXhEkOtNx-MH+_4#4|-h~2M6)Fv{Uw}zg#}VQ_SDh|C*kT8FN{q
+zAfWmS29pH`2KpekeCEL5z}Xjuag%HBvEj4lP7j^|^7<`ghmqDWh#C`z7zUZN!TcbY
+z#klYh*H~CaXC_AoD?wV~Nbw7BX!o8P4>9rwlEaT9{uJ*0PG%CnX(W8@g4n80_woM$
+zzOz6vV1k7YGt<`mID&XmE8~fZ#m~WsWCYl)@e$jV5UD~ojX=x<RVql1C}~)lf)219
+zopwu}RI7M`1tNA(MLxzD`y2A@Bj*4)^pTSp;<b_dMauLY3bv6?#RZIbW%oT_93MLm
+zC4q~9)}&Lycc8n%uGM6=rFjBSd=@$1q$2E8d=}))p{l?}Ow_1hJxyBWaSZXlM2UZy
+zYRR~KH2}#0Hm3ZqQ1AwoVZ&w9xB~3_CERVpunBDi87DL!=#q80zDS<9`KJXx00a+3
+zQ8=mKWxv{UqlftG(V~tuTjx3qI&Wj<o<RjHgEi<in{Pe8<*p@`-z|zw=X!7ZZ}}7M
+zLMYubS?MetSv+7$?K1)t+Hn_`vy#jyg5}UAl(qd{-<rESQCW5C*vFN1#KPDuY}*~H
+z+_QLWqZ&Fii+f;18pboCQ0U9|E$7^tTR5^_UbRwm@8Vkd;b_?rB<X^Uh^DUlqaR+3
+zKKGI^_~mH-uu%OKDKESBmzXM`h`oB^#)+lscu|8;)UalUNoyx{ZOvA^Y`yEn?H23a
+zLW-^zit1N(#)>-bhJ~VCG4JksVZqzGa5&+sL!sR;EVAy%ef83fOG{o@hj46<JGul%
+zSIp79V1y0u{Ic8Qx5i=L#ap*vOTg^MAy|-E_fcOcD^<Gt+q>88u0`+7<B8Img^Y!W
+zU?~EcVz2z}>F*7_JtWv#63(*aQQSzlv90;tudYl0$4NBr`l;F2kh_?%_%*>r0+D3*
+zvO}<U+<o@mNul%jn*GGbB(muf=&ycx2OJ2g;}*5vsIxq(bxAsj8sKY#$c0^+h+Mdr
+zOg8~@#d;zQ7!;@pg*reS6H=x<fLNNlH7KOm^^k{-S80#-PEFV0T8Z=mkvA^mP2;>7
+zEzmSI%w@|^izz>{o6PtE_09*n&p_S_c)ERy4zp<w=@4tjhyvtVH+pGl5YJmMW|nc=
+zgni!1#>|Ray>wbcAh|`PA_Zd7Q}$2j5x)U=Y`j#S)@Zz@-b<#EWz^kKjaT=8Ih)p=
+z$>*v0wNq>=p>}IqaI=}6cY%OpjpSm#1l|(fCZ}Q|B@pnSG$Hc~bUR|!D_PLnu8>pU
+zPB;j?gH>lwy%jFpAje-)c3n9Hy;p9;kaVe0=A!;)saX0|eOTF*F@^xksn<079pZ(@
+z*jaLp!(i_5<0q8+hC`7YndA;ygGj8GHl+Le4uPG=_MTrScuTN2nJI2wA(U0X2PdYk
+z1XE-X*<DGvdV$Wc5j&~6&5F`wKK?7n9I^RAxbPfeRX8e(n^Zy4#Wu5Mg%lFvZ&PJ#
+zV`BT%AEPjF`}hrtc#d9|SW_e|Z+;L#Nsm~L*ay@)91dW&xI<ZXP`pd6VVG&iC2hp+
+z36f+lq}gVv*gcfc#^Dw!$bpHsF+;tSpG{^%mjCn%!)FIh^h2+S|1zaBhsMFHNIDLL
+zAvJa$7pAcjv_D(4^TmdZdXmhN@0$!>OWIg*U~-HHX8G4B);vrb7*9x_co=3a#)867
+zOKros_~O*eIER5oTSA1?Z#wjfN8W-E^s%64%62rmW{o8u3x;IV#ZQWN0=9)nK<2vc
+zZ!9~0l2;qc+XlI0TiJ3o-SI>RTxFL_kZohI!DJ|2aC30Ok^9h4o?Wux+Xf@?iL$Dn
+zW}1ossd09#>RPUjSMCt#Z~r|noLkOC^WwD!`Q_iex^nGa;aXkqhdblPUR*u)BJ@fV
+z-m*B<h`hDSFAH9O+}kR6TjSnt!P~uP{2SN6PtXeE-Lvt|!$RlbSpJcy>&VYG+@*1M
+zv*2#VB~p)cj_krj5%#d{LJ^eMV?~{dnb2r|ePpTXwTrLgTHB(yyOtQk5R$8l7c~h*
+zO>3TJSh%9gtQYMM+~uTL+A4Ue7mp?KE5G~FYJMARO)c3U<X5d1m!qg9`|^u--O=jK
+zyDvt)2i9B%aRc@3tXo-2yI>yUZ(IdGUw2o~71bpV@{8$;YN#;MqJGcNd9XwG-p*Zc
+z-|ukuHyS_4JW$(TYWz`K4cs4>+7a~Q20dJ`&jtq%F>^HjvNTGcc#G3bnkj!p&YzL<
+z*W`Rg&VMB5zmfCj<S<hO3|%Y1x8+GWQ`E}%6N)`dugAz?qESQSV@&)2`G^`UVu}p&
+zV;CD-eD6?1FBQ;7PCq%!911xkqZL|$=Ucjsq2b5II&+`?(P_Qjyz^0p)!g;S+h#tX
+ze{@kFFqqws4w?1l!bcf7=JH3idUM^Q43D|uQKR16L%zI6jiu(IM|(5PC697TshGVr
+z$TO(VL};$Vd_w=oS88s4w6_T9ce-)kRDF)w^Qe|NCUe^(yWaeq{!vD&x#jVwzQgQ$
+zJg#prmxzs~rcwu$hxTcP3G8Q>zy%_6>tG1~?*Q39hwY_xnpZ_Oz_zGLInOIf4O+}D
+z8Q;*70hZ%X-Z9wfP*3$xLYDVds45#(JV0yTPf;p00n@-gIj>&#H52*^$eL>MpEJq0
+z2F~9ed9=W)$&}Q~pi;?hQuWGl>Mz(m8le&^r*tk8s%So@ik7LCOf4$bsqdOhrxY94
+zH(xL@tVuJSGS;{z<UhgWKg6-p)w6GYRaDQG)WR~a((TAaav!jZdU0YV^(yv&*G>1h
+z8s{uHkt%yJSZum^%PSVunhBIml6pQ;$u<Mu_*8(S9dLs50kHXnN&6a_v~-8aX9iGv
+zX)VDLJ`rw{Cepv<UqT2^$SKc}!w9lvEP6IDF^;1l(MYLWzLMg9L{1ese@hOLbN$w2
+z9;*<0fmq=%vr`Zvbyu=BK)Hil(xa6q=}r$tmMwwfxEN_mAYJg8bZpMftn2eXK&wJT
+zz*6=tanHh0@d8T1C7vu-i2nn0bdL#%o8SQt+nskEhK)KO={)APsHJ2b_YYpZag~hr
+zM9bRNob3s_2UmedVNAg3k2~81XM4=q8F%gyoV(Uwwa@N(XtG<stY6Q`i+bx<dSf};
+zK`+ccs*iRYUazhH-sIbp(as~WTHIb(1?6)@;3Tqb7umkwfuQw@W}%`#+S&(qk*+gr
+zKcN4s>XDU$_YeN*;r9-I_)7fbdEw;wSl{{o@$_o-$m@<fFGpP!AG>f764{ntp8Uww
+z`BT`p-vOmrYhK(^ELe)8CEGu;v_ABsLk}Bq-*eQI|Bt1tX4bI(`pBWH;q*Tv;cVDj
+z(Np7di=$=xqX*7K_dgqb7LsX0(dS=`mV7Ce`%={Y($BHaAkk-`gBafTa_qf(4eynD
+zdz;Mfwfo?I-(A+*ZF#@VMDC6XgnZCs?%iSipp8;~u-DpGYW`7XPG5ofM+Ij1wE^Qd
+z@HKA3ZmI+rf8$>RFanTeqRH%0LFUsyBk8h!4tN|?fulCTQ%39wWd}GNRWHcXJoe<t
+zEmVI~5pi%siRP5{sJ#L3xh(^qumTVnXfdlqQ3%u!XaT`;3urOFVom`q5ErS|f-78b
+zbZl~r@Kq7A@bBV#0TE^Fpx=RC3#cT`#479LN6>oyFUdJc&aYB(f+7r_z$%JeT+ku}
+z;eUweq%9?g|2IgRw2C2Uh`81Xeu-;cT<H1ALYI+YX~F*ol=nO>c*64K1)pE_NS9;w
+z!}N!`-j^<~IqTViwppLkLx+6H7IRlC$RBPH6|Eh;zB}P6ST87j%XY`M+!rhGFAO|z
+zmmmx)D!V*xZx`(CaeI$o@445#X77j2r@S(kj(ud=_OJ>SKdcoO=FdL0NvjYw(keW7
+zf7kt{5BccnGtp<xMoZ4ca-WUbpJhw%IV?c}!|(VHmK)x4=abt|4)^_X>%qO|_qXL7
+z>^8sOZH9l-8bjYj<l}XCQq~v_olFuGq2ludsT=)Gn7)5H8iHB4jb<UAt*$r{;!=tK
+zXHwQ8338>z03$ublcv>Ku%1;0Bin8EqiKF)(nR(Pl9>`$lJ7*~kP%Us0V0Zc03kd%
+z)AXrNAPS$_;ktepVp`B!Hv7n+faCS^w=dngv<hOE-Tms|jlre%kL=|zEoJuM?h}i1
+z-RWL2-#fhK?2B6ZU?6L`@9xz#+rFr2AH(akElJg)(o}mdu*|8TOwdwccTs7LEDwEp
+zt?)TL*dbn`w2BXvr<G1dt>%rW1DcLn1SEd9b~vj8#@@B^XxFCECYo1ikJ2X7oB?8M
+zIHArN#p^NWOp*yqe9YWX0I*~hMC#zkWpQ8T-$O~F%|vt3Fg8UuNW+Q|Tf#{@%vnH%
+zV*<D7;I=~LjVypB9dev#7cos^JL%q9Rfzu(V;iAq@~fy6WLS62^7)nen7i}(aVRze
+z9mvdyXO^sHmMj;EH<I1EBvc$(&-brXu3U;Y_X^FuvHZRT`$k^j^}!8GZroD7YJvGs
+zZ`@ub*sCDMZSPEZi#O~S@Mquuabd&C!Mj=U?T3Z!hhv3Dh{v11YU^Iw4QFL<)TCh<
+zkTx)y=#S?l8Y1cEX^G_Wzs9uvwC^g#f&=(BrP6}5O976)4`9I<RzB_*RhWVi2y@Ek
+zH}M88V-j34#`UwI2Wbz~l8k7Rb@P@4Kytv8a{kcTV&$_6m&F9uJ3$fDD&Hn=#JI$*
+z3cb~$Q|3Qq%<OE;vQx(_l|P9Rl@p8FHF*SxFQs)p2@QR2jgCz<Dx3ck>XX0(-H6LK
+zK4B!B>PXCG;0psyz^O`m)L_hw_+e@ex}|lFI9D!Q$`!Fb7vLvxz<_8;HDrsX!4e@I
+zWLSODl+y``)*Xyzg5gN!;1o2KgW=B%O+JP`Br~5Io8+dhh9b`+3bxo@n40lT1ZI7c
+zK~gc9f>aBnNTAj{i#rQ_K;dE6EHLha@+KJ%3QTf7tbNGyFv+H`pyX>`p<Lm>Wi)1V
+z6isW6*roQeG?Dfm-?_=lkWrcRUA;Iqa#6d@KF9_!i5eL0;hH0R)J%-{crEO^%Gxa&
+zwxV{B1-nqAZ-%am^#S4pVUcb$00quabEK$mjH4d-CW5fRHHA3QEL|wL5BSp`Vd}sr
+z8?o%bd!ms|*#L>9Ch_ycJKkZ~2clY}7z-ZZEKW5O;w`RT5t1STbU(U^3<gX=mJ<(c
+zzeJ_vj?P3Pv*LAR(n$z+wSIuvBeER9SDU)Z*j@ZjC_Pw^U^s@7uIVXUf(zg)W(|gL
+zg#le@rg44i`&1Y?Hwm=vh6g*a&2_zRBhwzwEL_bj#8wOmYD?Cu&Ku4p|8oCw7s-kg
+zoLsY<f>wnnUGhk0w6@~vNRRjS(OXAv58fJFZeKCPJh)!+L0Q$Ub1Q`lhZ1%N+q_RN
+z8<%F54=!I>z8EcT`N+N<q8ZlKPr(xNyt?nkzL>3K*}7`;OUWM^^f|@<U^Hesz}#`T
+z<Jq;VFejASq{ii$<qOfKuS5$1YnJoC=FG)QZA&w6Mean_O!cG*+w<+7)Eo&%(NgD9
+zU9{rMQ9E5oZ_NUOs-$@(_=8LDT#6OL)@#878*Wr%&5ag!t=V@b3jIXBYl2dUEBChJ
+zmSZ`W24ZRMBUdBQ^O}fJ<+^@sE5bntFWU(g;32aMnqrcwoQEq#kq4+hw7?B8S0ll7
+zT(xI;LJ11xf!|yLGf1|%gjtK<8u_y<AYr~<+RIh-&ZZDR!`SH92v&kRA))WhLGv1O
+zYkZub#)J=g7PQ*2&O{CD&6?X|Q=-wufs;Ow{mLqs2|;v^iOs>@Ax<Q$erkhwLQw5G
+zrrLC5aReUNQrX-ptQ%GaPm?xjK0g(nYL7I*W{vNlXwXJ7QzioiYPyf5f=z~z%dlA4
+z9Ld7f&S6l~17j_b{0mc47si9lBjZyuTyp?g+~T5*^c`jqK8PD4t?$5qR>5NCCYHHL
+z&8$`>6~83~*`_6ohNqnlep=nYquABZG!&a8Vg*F<<oqtJ*3-xV!LwW)keSR9Arl5c
+z)-t!P6H?<?%#0Qu`LOFl|3A<K$J)vA#I0q5wQOl_&DtoYN#N=a`{_h>ZPZ@(4^}gh
+z8Fg8bqBrVL9%T-1Fl+{UP-?7{Oy1w;b?OXO!cxq$gsC+4Xz@X{a00m$d3R&SA4Se8
+zOcDcPdBhb;d%j3{5ztMkOzg4v5R89n1Zr-4YA?+&(3g`|8D3TW4;TxCoC&YL+3<vv
+zkb#o%j;GcH903H0LC7$fSxYk@pXA<J^PEBfg`H>PeCDKiE@RF}>?2?edM#61bD8pp
+zGQ3BNq+wK3+<X-nUcOwfDy2lC-=O_kB-$^CdGmBhfdw~H>2E^#9~51i36etywelXd
+z1a+3oDM}A=Z8&xk%w$hWO<7?DuhQZsqt+}kzxb|2hL`i!FIt~O>$O1e-8u-1u2_Ds
+z=nC-}{_AK3!-vGXo2Xs<r*LrFwth01F)|aL8XX0tHi<A?_5@DcK}sUZv53o<5Digc
+zRwbt}!5doluztmHbi*@%3zy6!bMquJlS4d6Kob~^U|TorUD+6B0Ha%U13fD_BvVyk
+zU?xD)uP}4Sk6n-sU}m~ZI>ayqW)}-$NH0rK`iZ2I6${iwE-FJTQd3NZU&V@N&Yu(D
+zc?NHUCOAnD=2v!K@B276@3ori$JX---vk4#Q7CGR7qtmRZ4eiU<#k>kOqg<C=hljw
+z;>8Dr;)C(xBSP_!Sn<)A_n2ThhSOMS!y}#3TrF5&_-L^|;VO!|e7M{s=BivU0~?_m
+zKo_4S%phacRtsVe5D&6s6)kPKn;Ua?#N9oDyC>$}y<mCZ%%^yZYq9r+bHSost8!!w
+zCb9A>$e3X{%v$6(E*#mgxEWGoS+i6mB!AXNma2#4Xv?RSI(OkxaV!`8dg#$rHUE`&
+z*U~e0J@<0{UE#049QE$HeiF`uOz*mrIEgJWZ+*<!5VbS_199Xm7RRzn|KG;0HMXhi
+zj-Tt?8(+U4@eAkWIw7$Gd5~ryL|N8^yp#=?s#2j&YE%lSY=Ocxbl?@uRheccRE#u4
+zkeHh8%d%;jGHH))AEvEPjcM9y#|d#v5U$9+?Zd6h#L^Gbe*bg*3YckDbaKx1x#ym9
+zea`v)-zPS)?rB{0bf-Msi{j$3KMHqRmOcAp2R2NOAGRdkL>R=hsXZySZ{{7$JEYl?
+zS`6bm#M@pG=@!97$(HnIm@``h7bV((_Aq4^cIVRCLDj;C#5yEOtmIPojz?St*|Ai+
+z2m8p=Tm?V0q*`qVGw=kd@(J8MxZtf9DG={`+6979U2stOE9OzuvH#5?pq9Vu0uu5$
+z_jgo*e2LS%Kf+)jO(IGbWb#Fno`|FFK7}APh2wk6Gh0#7#=mLal6oGJ18ZR3leUIp
+zlWTe_5w_M#*5tO%g<}hc7GF$y2bSeM88?qK8;*~csa9$3+jB!J=Fn%5tA|1F8BE%Z
+z9Si*np~Ya*`=u4RUn2kuFP;A@fv2B?XUUw1!8H;}qFLPqL|(n1JC2`$jC;!PSlkQ&
+zOHekET)G-yzFmXsWIp%AhfFIkH;SZ~0?=>+P2K;FC=0_#Td|R{^!tc(k^Q{32vq3H
+zEczm$x3$mgEnx40Siy7?R95L>u}yB$T6Js%wP2V$%Br`)N4bYs-Kt|NK_URIYK^jg
+z5=0m$MKbWJDj=Yxaz!dY9E3aMcNY^b1BwA}2ClF~q)ZMyg{1+wlfPMl%i?<lflv|u
+zvJ`nz0_>QIrZ@^_DvR1f1!hzWf)ok!&3}u87_*uYA@DirCZFZ9TRg(%H>d+|t6AJs
+z;r0B5JcQ!{4<C7LIJ%PnN5d<C7*|KmycU@u-C~7fRiU;W+fjsm(->Ra_1pem_Qy2E
+zKc0}o)d_&3v(W#UV>q}Qrz@SGJ*r&B)1x)U&OlT&A`P2iQv=k(d4rJ%Rx}M<`3355
+z4JNQqW5+dyn9G$P(wDcXT8a`9ASpjaf~dUZn}3B$S-Hr|E6Y^rLrQ*4cYlgpR;FRm
+zkx$i>kN#)B31t&a=xFdxWMCH~1|N#HoWB9ux}41sn_6>tZ(7ohHgJnlC$Ouzm261j
+za>9Mxf7QPvH-KA|I&<D|Y%2b8N_1sJ@2c385}W4EEsG&Q2f*ajRCv#_buiBiP<7~X
+zO*mGie$8Efb6?usL5%hQVye69=SJrx@_67(b_QpOOYd85Skmyo=-mw!<^1?hrazco
+zvUd}AJwV!whE+M3l7q>X{$+W0POjIA^L?b;sKcXFA9Nb=GZbS3v3>8#LkZo&i$8t!
+z2hJsVC{rKEIK7YbqP;dYMX_sKh4Z>5=BLu8&ZOA6nKv=RmpO*r3h2jV`Bq3o`a0fr
+z=~Kcm@{Ov*uyS;^YNGApMu>nI*g_#wDyav{KGWE|N|;n_n=A*0LQS-yeX2dJ7}|wP
+zDLrNXi6R#Q{-*T&w=1m5VaNA>w7bRkVk>e7%k3iU3}I<)C6;ouCQhXy+<4h?1KStO
+zwa|xB-w;TK+K?;T03I9mYeslqIT!&4JQz529`10Zh~B5p2ZppgfLPCAlG;60p|g_~
+zj}pTxjMi!e7)=u>lN?PWB00z39@VuEMw<xUpZXR)fTcQJ2)OnxT2nTVWJMTrzs0TY
+zvf|Nm$ItL3$7un0@0p70mPBrAm_^DzDY=LnpCAQrD8uoS%75_fc3Q4CQ3J@YH(q}J
+z%D|<8cP}JPFX?^jvL$IHLDsr#x*}ha6OPNK4ZZRE=iWJ&5Z?Jt;*BMJ)4Hc8?dgTe
+zQMSatwIcgB+`j9Ft{y^Q>~F-4>;9b!ucZA0aoeXRKR*B^ywI`G05ZZku#DKL+d?EZ
+zYD`G55lbAsW(MtGX~ZhGIFqj4#lgj$A0AFRM^?<EoNma<GhA6xaM=uxDH}Ap_mE`k
+zw4mx>4Z0v;g=qD4Nc9Y*i<;@ZovL$H+$WTy_sLBXm48u@7KpY@(n7@fsjw<Rd)%fZ
+zTZ`jv=%v#9QONK~`5oOuyK%M#?w(rAe~H^ta&!HxQM0Q&auyzgv=JkSI(Z*-&CZ_C
+zxSxUnXF2e?g6Ye$R;?PDBXS0d+j0`+ku_=GoW<D|5iSl<KA=7%s1MGu@rjXxUwdhW
+z$5Wr#KeBHe@svxE;77+_8kw0IAAyU8(oOY^5x9PynZ@ZM5zSPlhno5W4J=5>ZF-=g
+z;#E>NXCU7>lNF$=rpkmP8fI|pnWWn|14o8p+#*FGEj8C)a_tnCqjK?#M!OQ-sZC#+
+zhumln*0H+TlN^D2xC#^qj3sk+_UN$U#QuSLEb@C~fD?jnk6HPj{~j~(Kf^s{yT^>k
+zKVaeetnohcJz&9y%#17dnfo7frJi4Z{sEi5&$@GVXUvjwx?{GSyD`a}8Q<O{bE{&&
+zA;v7~n84cmR@;VCZNurd7w*~*%<EvmGWDmakEavP>%ObLYyKts0aO&Xxx^&1tNpBF
+za5X%Z3Xi436L;$l&iCF4eiHgi=x-f~(d$!Jr>-Hs&OxeJ>vQOGqB&`OPL+@axh$EJ
+zmS$B?1(``E1TIt!R4_A1jyI?l%3GOah=)`g<?T#DAmbL*K?NrY@$ag2ly@=7mawUA
+z%6sVMX4Ol1KdvY3A+??g4g7gwwUG)<@c2tQd(>ts1ek<H->W`Hg&-c7G`6WNRA^-q
+ztbsb!?Nn%k7&(d9W$jc5@q2ctVJdX6y1tC1DP!x)ccYBAGr)AF$2yO&Q)Ng#uR&4e
+z#XjbA#jF|0x+?inl5bTCrX&DxU$TEXEqzsGHE>b9b2{S>&9%PYb)##+k@oKZC6Q_F
+zCHi4Z0PtsI&#K&*k{fTFNHvWnyGD?%$a}Go;QPlCweZ+{SSNTsV?3Rfm<NWs?f9)9
+z)t)v94e@=C82!(`;q?i=e7_q>k6w5|$h&O9V7|3gu)}`REg17X9YQGoil7&E=UoAz
+zD?cGPguMa=FPh`grJ8MPqWrxHhzLdhX8uGwb9`Oc%nvfx%fjQg1nP%2o-ZP;n8P1A
+j+>_hIkJ_C`Z`s|G9pbGvC(@5wc1?EI{JC429MJz4p85%e
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/openrouter.cpython-312.pyc b/aider/__pycache__/openrouter.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..65e4fc84e34a7f580abca9400066450633e94e5e
+GIT binary patch
+literal 6521
+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
+GuKpW~HTKH@
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/sendchat.cpython-312.pyc b/aider/__pycache__/sendchat.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..b32e0ec8e3e8c608c10381483cb152954a511f16
+GIT binary patch
+literal 1887
+zcma)-%WoS+7{F(}YsazO+Kp`TZicq0aYY<dBxoZjsvuRvBL`A}2#unxckFDk-d)X%
+z?K*7K2!Z5^N)&O34;*r&;-Bc9i=7tLT3RWH6A}m0+<M}h@gr#giIHaZ+u83qGr!rN
+zj~$C3Xn*R7^-BW?{Vra5EzlJXUIAeT8OTs9R8*D~MaTgwP*j&ykkzlyvSw&72CKnL
+z=nr9*QGCrP6<v77^A0WQe6>gz(+h;<l&)X#2trq(AJk!h7|NCcJ>a4D(8}8gZK<BR
+zepDZ{L^A?Eb!WFUPczgFNRcXc#yo|d^fXVA@1tCJmd!(b{U8@HWivD{xCv74+n0)`
+zZHXSZ^NxnRfDsgamQW_N`RluDB)5UhJnof&b&C^f>zv>lgjWc$afuO%b=$x?V<zLe
+z%`tT>!m<$zZK=vQDIVJAbQ>(OX@eW)LMLEoS1W6Tl8(h?i#fPVsF^nj!+eckOJ^M0
+zjy=PkbB0ZZ^VBIy9g#)H{$s*R)Moe^EkT?-F6)+Qyo#^r79-dJf3#vUl3nyQk)|K&
+zINf~xqwY>&!?DvGyVQa7tm=`9MU2^gm2;7ZuZgLQ>Z=99sRoPcM?TT55}Bvep_z~$
+z?yZ|YD2iB>5tCAcdR9B3JF{w$6=+Df2+I7Kki`mO{OsZ^FS@fX)h#kZiEhmhC~D@-
+z3pdVN{O0-DibFS;tLMn9ZW@pxBes!S(|Ojd`YEQ{Ca<pM#7_24BRv7m#fe}XhHcc2
+zpcAR>h1U2~LmSzT4?jhb;F+4*iVuBTxm~$i{^nLqYenOCFYHCfTe0MC(PTZjJGwV|
+z?s4+;?$rm$ncDp0p^3)iwZ^B{o0Hcc46QU`EBncj+F)zybTd5BPJzGn7>eQDH=5B*
+zL(3dMT=X0iqFxEb9tb<gLkxgeLIrdLj?ext99}@eknLlV@|5*H7$SD38JZC^LO=Au
+zQjnee4^8z&&41VP)E-z0l2CmPP$_`ZfPNL|owr$ul0zQ;$y2(2!qO6}v^Znw9#ayk
+z1skR~!=&i)>Y*<uFHvw@*I_0QDoz^)vTU4lz#>=TX8AC*^wc$Bda<jnLvneiWE<It
+zRJcqFY)(qzB=(N;9R3hc$6(!^!G@XRreo_=KwB~S8cvJw-4Y-^CpJ&x4N`@RLHg@*
+zdg%NGmt8l#1v2eIZw*8yi;@)@hHdl*`zz+7OrQhNKsO}34+@=-?z(_QCP<^=^?2UA
+zNsK-Z{-8@qS%OH9i|?^qiBiZ|PBB4>2#RS!d>kQi6IYL<*3qNm@OctC`x=IA^w$WA
+zC0p^~T6{k>yuH{;B)1nNU9sTHK-citPUX8wz5M;HTC5#Lv61@4z37=%e7s)Xi%+)_
+zCm$uIn~CWkzqn7EXW#!N@xgw7s(k-c^X&Y?#FhQ<OOL{n&G2MB_b_~_mBhCP+oRyV
+zJ%M6l4Q-STK_-iE6-DITkQKitDnRg~oe4M;7L#|EycA>!_mDJ`)jkWqRdkG!MJ~}P
+gFcUu@mV%+JDvI(1jXy!@r=gT`?%*}7j7hV<0bTM4>Hq)$
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/utils.cpython-312.pyc b/aider/__pycache__/utils.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..989f80274668a49203e19989d47ca193afbe20f6
+GIT binary patch
+literal 14768
+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
+Ncb;XPY*3%|{|6aeS}6bk
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/__pycache__/waiting.cpython-312.pyc b/aider/__pycache__/waiting.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..932be4c0d97e2e53b0e2e5b56b42dc0dea8cd955
+GIT binary patch
+literal 9332
+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
+
+literal 0
+HcmV?d00001
+
+diff --git a/aider/resources/__pycache__/__init__.cpython-312.pyc b/aider/resources/__pycache__/__init__.cpython-312.pyc
+new file mode 100644
+index 0000000000000000000000000000000000000000..48880a082007128ff609b6fb46ce60794e0a1447
+GIT binary patch
+literal 164
+zcmX@j%ge<81aA@rvigAZV-N=&d}aZPOlPQM&}8&m$xy@u<b4LI`Q@x%l3So(P?VUH
+zs#}zrn4_Co1|-Zal8kanDvb2Y^NX^J3lfu4^%FBwQj7G9Qj7CTi;`1|_2c6+^D;}~
+l<Mj$Ee{tC4=BJeAq}mm+0?lLu;$jfvBQql-V-Yiu1pqloDJK8`
+
+literal 0
+HcmV?d00001
+
+snapshot .prale-eval/contract-deliverable.md - 4005efbb7f42392c3349c5c60eb82b50bc483921e59e6ac445242c4be97f4053
+snapshot .prale-eval/contract/_home/.aider/caches/model_prices_and_context_window.json - 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
+snapshot .prale-eval/contract/check_unknown_model_contract.py - 807ba92ac22f438062cf7757f279b66a94aacc0d1051a73083e885d4fa2ab99b
+snapshot .prale-eval/contract/contract-report.json - 7b18dd7405c5928af1f29733fbf4f87a836aa1e4b3000703f06fe9c711157d6d
+snapshot .prale-eval/contract/local-model-metadata.json - 452d477025dcc7df4e4673e7a4b558d71a930d6417bd5da7ff279720d1d2b693
+snapshot .prale-eval/result.json - 294c0dd52c91d2b8cf59a207f2a498e4807bb0757c98180e011e067574e99d72
+snapshot aider/__pycache__/__init__.cpython-312.pyc - 0a90318566e8091ba41d35d3628898061fb6619ffb47d88e20e32df97f4ac174
+snapshot aider/__pycache__/dump.cpython-312.pyc - e0e4e3767de292ad7b4937b3519e0ee1b30865c4dc17f6471005b59d700c6245
+snapshot aider/__pycache__/llm.cpython-312.pyc - 3a2805681cf657ef1af241fda6fcd1b6b4807792825344a7abdb8899bd750ff1
+snapshot aider/__pycache__/models.cpython-312.pyc - 0a96f33602a52ec9b05d6e50c41681eef7efdaffb4bab3599c779de831259764
+snapshot aider/__pycache__/openrouter.cpython-312.pyc - bebf737a01d9bfb6356d75e8795d345ad204e218339e63e7172bebba0fc43c9c
+snapshot aider/__pycache__/sendchat.cpython-312.pyc - bb0af39eab6bbd38c9fa8fbadd7d2bf633e7e11232a6ce8c129500a1454eb258
+snapshot aider/__pycache__/utils.cpython-312.pyc - 5732dff42fe6d162990e9373b64be69a7741faf32ee5c9ba0c26a93040ee0e0d
+snapshot aider/__pycache__/waiting.cpython-312.pyc - d61060a425e55bc258852730d63a6a60bd09b7f327654648d767342ecf574d81
+snapshot aider/resources/__pycache__/__init__.cpython-312.pyc - 6beddc7000d61ad7be84026478aad60432a9c218cde6b71e3c7df71ef5d02a55

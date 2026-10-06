@@ -1,0 +1,74 @@
+{
+  "task_id": "T22",
+  "repository": "pi",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "packages/agent/test/harness/session-context.test.ts",
+      "symbol": "buildSessionContext",
+      "start_line": 51,
+      "end_line": 75,
+      "observation": "The `filters non-context assistant response entries while preserving valid messages` case builds an explicit ordered chain of entries (`user -> failed -> stopped -> aborted -> tool-use -> deferred -> length`, linked purely by `parentId`) and asserts `buildSessionContext(entries, undefined, BACKGROUND_CONTEXT)` projects exactly the messages on that chain (user, stopped, toolUse, length). The projection input is the *branch path array*, not the whole session: entries that are not on the walk from the tip to the root can never appear. This is the public contract the demo reproduces for a restored branch: the projected context is scoped to the ancestry of the supplied tip."
+    },
+    {
+      "path": "packages/agent/test/harness/session-context.test.ts",
+      "symbol": "messageEntry",
+      "start_line": 46,
+      "end_line": 48,
+      "observation": "`messageEntry(id, parentId, seq, message)` is the fixture helper that materializes a `MessageEntry` with an explicit `parentId`. Sibling branches in this repository differ only by the `parentId` they chain from, so this helper is the canonical way to express branch topology: two entries sharing an ancestor but with different parents are siblings, and only one of them lies on a given tip's ancestry path."
+    },
+    {
+      "path": "packages/agent/src/harness/session/context.ts",
+      "symbol": "buildSessionContext",
+      "start_line": 47,
+      "end_line": 64,
+      "observation": "The demo's projection entry point. `buildSessionContext(pathEntries, options, context)` applies `buildContextEntries` (latest-compaction truncation) then maps each path entry through `sessionEntryToContextMessages`; custom entries are routed to registered `entryProjectors`. It never consults storage and never scans parents itself, so it renders exactly the path it is handed — confirming the restored branch's context is determined by the restored tip's ancestry path."
+    },
+    {
+      "path": "packages/agent/src/harness/session/in-memory-storage-state.ts",
+      "symbol": "scanBranch",
+      "start_line": 273,
+      "end_line": 302,
+      "observation": "`scanBranch({ start, stopAtType, order })` resolves a branch path by walking `parentId` links from `start` back to the root (throwing `Corrupt branch: missing parent` on a broken link), then applies `stopAtType`/`type`/`cursor`/`limit` filters. Called with `start` set to the *restored* branch tip and `stopAtType: \"compaction\"`, it yields the restored branch's ancestry only; a sibling entry whose `parentId` is the shared ancestor is unreachable from that tip. This is the mechanism the demo relies on to prove sibling exclusion."
+    },
+    {
+      "path": ".prale-eval/demo/snapshot-restore-fixture.ts",
+      "symbol": "main",
+      "start_line": 80,
+      "end_line": 140,
+      "observation": "The executable demo. `fixtureWrites()` defines the tree `root -> feature-1 -> feature-2` (terminal entry) plus sibling `sibling-1` off `root`, with branch tips recorded via `setValue(branchTip(...))`. `snapshot()` commits the log and serializes the committed writes; `restore()` replays them into a *separate* `InMemoryStorageState`. `main()` checks the restored tip is `feature-2`, that the restored branch path is `root,feature-1,feature-2`, that `buildSessionContext` emits the terminal text but not the sibling text, and (control) that `sibling-1` still exists in restored storage and is reachable only from the sibling tip."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "A restored branch's projected context is scoped to the ancestry of the restored tip: it contains the terminal (tip) entry's message and excludes a sibling branch entry, because the context builder renders exactly the path array it is given and the path is resolved by walking parentId from the tip.",
+      "evidence_paths": [
+        "packages/agent/test/harness/session-context.test.ts",
+        "packages/agent/src/harness/session/context.ts",
+        "packages/agent/src/harness/session/in-memory-storage-state.ts",
+        ".prale-eval/demo/snapshot-restore-fixture.ts"
+      ]
+    },
+    {
+      "claim": "The exclusion of the sibling entry is branch scoping, not snapshot/restore data loss: after restoring the JSON snapshot into a separate empty storage state, all four entries (root, feature-1, feature-2, sibling-1) are present, yet scanning from the restored `feature` tip yields only `root,feature-1,feature-2` while scanning from the restored `sibling` tip yields `root,sibling-1`.",
+      "evidence_paths": [
+        "packages/agent/test/harness/session-context.test.ts",
+        "packages/agent/src/harness/session/in-memory-storage-state.ts",
+        ".prale-eval/demo/snapshot-restore-fixture.ts"
+      ]
+    },
+    {
+      "claim": "Branch membership is encoded solely by `parentId` links created through the same `messageEntry`-style construction used in the acceptance test, so the demo's topology exercises the real projection contract rather than a mock.",
+      "evidence_paths": [
+        "packages/agent/test/harness/session-context.test.ts",
+        ".prale-eval/demo/snapshot-restore-fixture.ts"
+      ]
+    }
+  ],
+  "conclusion": "The snapshot/restore demo passes. A durable session log for the tree `root -> feature-1 -> feature-2` (branch `feature`) with sibling `root -> sibling-1` (branch `sibling`) is snapshotted to JSON and restored into a separate empty `InMemoryStorageState`. The restored `feature` tip resolves to `feature-2`; `scanBranch` from that tip returns exactly `root,feature-1,feature-2`; and the repository's real `buildSessionContext` projects the terminal message `'terminal entry on the restored feature branch'` while omitting the sibling message `'entry on the sibling branch'`. A control scan shows `sibling-1` survived the restore and is reachable only from the sibling tip, proving the omission is branch scoping rather than restore data loss.",
+  "validation": {
+    "command": "node .prale-eval/demo/snapshot-restore-fixture.ts",
+    "status": "passed",
+    "notes": "Exit code 0; report `pass: true`, `failures: []`. The demo imports the repository's real `buildSessionContext`, `scanBranch`, `branchTip`/`setValue`, and the `prepareStorageCommit`/`validateCommitted`/`applyValidated` commit pipeline. Limitation: workspace dependencies are not installed (no `node_modules`), so `vitest` and the acceptance suite `packages/agent/test/harness/session-context.test.ts` cannot be executed here; `npm install` was not performed per task constraints. The demo therefore runs under Node 24 native TypeScript type-stripping, which is sufficient because every runtime import on the exercised path resolves to workspace-relative `.ts` files (bare-specifier modules such as `@earendil-works/chord` are imported type-only and erased). The `context` argument is `undefined` because no custom-entry projectors are registered, so `buildSessionContext` never dereferences it."
+  }
+}

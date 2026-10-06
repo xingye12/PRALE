@@ -1,0 +1,88 @@
+{
+  "task_id": "T23",
+  "repository": "aider",
+  "mode": "demo",
+  "request": "Build a code-map from a supplied miniature repository and prove ignored/generated files are absent while one relevant symbol is present.",
+  "evidence": [
+    {
+      "path": "aider/repomap.py",
+      "symbol": "RepoMap.get_repo_map",
+      "start_line": 103,
+      "end_line": 167,
+      "observation": "Public map entry point. It returns early when max_map_tokens <= 0 or when other_files is empty and otherwise forwards the caller-supplied chat_files/other_files lists to get_ranked_tags_map. It never enumerates the filesystem or consults git, so a file that the discovery layer filtered out as ignored/generated cannot reappear in the rendered map. The demo exercises exactly this contract: build_code_map() receives only the discovered list and renders only from it."
+    },
+    {
+      "path": "aider/repomap.py",
+      "symbol": "RepoMap.get_ranked_tags_map_uncached",
+      "start_line": 629,
+      "end_line": 706,
+      "observation": "Consumes the passed-in file lists, calls get_ranked_tags, then binary-searches the token budget over ranked tags to pick the best tree via to_tree. There is no directory walk, no git call and no ignore logic here, which is why the miniature-repo demo can replace this stage with a dependency-free renderer while preserving the 'renderer consumes the discovered list only' contract."
+    },
+    {
+      "path": "aider/repomap.py",
+      "symbol": "RepoMap.get_ranked_tags",
+      "start_line": 365,
+      "end_line": 574,
+      "observation": "Builds the ranking graph from fnames = chat_fnames | other_fnames only. Each candidate is guarded by Path(fname).is_file(); non-existent paths are warned about and skipped, and paths never present in the input lists are never scanned. This is the code-level guarantee that the demo's ignored/generated artefacts (build/generated_report.py, src/__pycache__/billing.cpython-312.pyc, src/scratch_notes.py) cannot contribute symbols once discovery has excluded them."
+    },
+    {
+      "path": "aider/repomap.py",
+      "symbol": "RepoMap.to_tree",
+      "start_line": 748,
+      "end_line": 784,
+      "observation": "Serializes the ranked tags into `<rel-fname>:` sections, one section per file present in the tag list, truncating long lines at 100 chars. Because sections are keyed by tag.rel_fname, the set of map keys is by construction a subset of the caller-supplied file list - the invariant asserted by the demo check map_keys_subset_of_discovered."
+    },
+    {
+      "path": "aider/repomap.py",
+      "symbol": "RepoMap.get_tags_raw",
+      "start_line": 279,
+      "end_line": 363,
+      "observation": "Per-file symbol extraction: resolves the language of one fname, loads the matching tree-sitter tags query and emits Tag(rel_fname, fname, line, name, kind) entries for defs/refs. This is the stage that makes a symbol 'present in the map'. In this workspace tree_sitter/grep_ast are not installed, so the demo substitutes a stdlib-ast extractor with the same per-file, supplied-list-only shape and records that limitation."
+    },
+    {
+      "path": "aider/repomap.py",
+      "symbol": "find_src_files",
+      "start_line": 787,
+      "end_line": 795,
+      "observation": "Module-level helper containing the only os.walk call in aider/repomap.py (line 792). It is invoked solely from the `if __name__ == \"__main__\":` debug block at lines 852-861, never from RepoMap methods. The demo verifies this statically (checks layering_single_os_walk_in_find_src_files and layering_find_src_files_not_called_outside_main), confirming the rendering layer stays free of file discovery."
+    },
+    {
+      "path": "aider/repo.py",
+      "symbol": "GitRepo.get_tracked_files",
+      "start_line": 433,
+      "end_line": 488,
+      "observation": "Discovery layer: builds the filename set from the HEAD commit tree plus the index, then returns only entries for which ignored_file() is false. Ignore filtering therefore happens before any file list reaches RepoMap. The demo mirrors this with `git ls-files --cached` minus ignore matches."
+    },
+    {
+      "path": "aider/repo.py",
+      "symbol": "GitRepo.ignored_file_raw",
+      "start_line": 542,
+      "end_line": 565,
+      "observation": "Applies the .aiderignore file through pathspec.PathSpec.from_lines(pathspec.patterns.GitWildMatchPattern, ...) after subset filtering, returning True for matched paths. The demo reuses installed pathspec with the same GitWildMatchPattern construction to prove that src/scratch_notes.py is excluded by this second ignore layer and therefore absent from the map."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "RepoMap renders only the file list handed to it: get_repo_map forwards caller-supplied lists, get_ranked_tags iterates that union and skips non-existent files, and to_tree keys sections by rel_fname, so ignored/generated files excluded by discovery can never appear as map keys or symbols.",
+      "evidence_paths": ["aider/repomap.py"]
+    },
+    {
+      "claim": "In the supplied miniature repository (.prale-eval/mini-repo) the executable demo proves absence and presence simultaneously: build/generated_report.py and src/__pycache__/billing.cpython-312.pyc exist on disk and are reported ignored by `git check-ignore`, but are absent from both the discovered file list and the rendered code map; the relevant symbol compute_invoice_total is present under src/billing.py (as is format_currency under src/util.py).",
+      "evidence_paths": ["aider/repomap.py"]
+    },
+    {
+      "claim": "Ignore filtering is a discovery-layer duty and is not re-implemented in the rendering layer: GitRepo.get_tracked_files filters with ignored_file() and GitRepo.ignored_file_raw applies .aiderignore via pathspec, while aider/repomap.py's single os.walk belongs to the module-level find_src_files helper reached only from the __main__ debug block.",
+      "evidence_paths": ["aider/repo.py", "aider/repomap.py"]
+    },
+    {
+      "claim": "Symbol presence in the map originates from per-file tag extraction (get_tags_raw); because tree_sitter/grep_ast/diskcache (and gitpython for aider.repo) are not installed in this workspace and installing dependencies is out of scope, the demo executes a contract-preserving normalization using stdlib ast for symbol extraction, real git for discovery and installed pathspec for .aiderignore - with the substitution recorded in the validation artifact.",
+      "evidence_paths": ["aider/repomap.py"]
+    }
+  ],
+  "conclusion": "Executed demo T23: .prale-eval/demo_code_map.py stages a deterministic miniature git repository (.prale-eval/mini-repo), normalizes aider's two-layer pipeline (git+pathspec discovery, then a supplied-list-only code-map renderer), and prints a 15/15 passing check suite. Generated/ignored artefacts that exist on disk - build/generated_report.py (git-ignored, carries GENERATED_BUILD_MARKER/render_generated_report) and src/__pycache__/billing.cpython-312.pyc (git-ignored bytecode) - are absent from the discovered list and from the rendered map, and src/scratch_notes.py is absent via the .aiderignore/pathspec layer. The relevant symbol compute_invoice_total is present in the map under src/billing.py, and the map keys are a subset of the discovered files, matching the layering contract of aider/repomap.py (RepoMap never walks the filesystem; find_src_files' os.walk is __main__-only).",
+  "validation": {
+    "command": "python .prale-eval/demo_code_map.py && python .prale-eval/validate_result.py",
+    "status": "pass",
+    "notes": "demo_code_map.py exited 0 with 15/15 checks passing and wrote .prale-eval/demo-output.json (status=pass). validate_result.py re-checked the result schema (task_id=T23, repository=aider, mode=demo), confirmed every cited inclusive range really contains the named symbol via AST (e.g. get_repo_map 103-167, get_ranked_tags 365-574, get_ranked_tags_map_uncached 629-706, to_tree 748-784, get_tags_raw 279-363, find_src_files 787-795, GitRepo.get_tracked_files 433-488, GitRepo.ignored_file_raw 542-565), confirmed aider/repomap.py coverage and that each claim's evidence_paths are backed by evidence entries, then printed 'result.json schema OK'. LIMITATION: the production code path could not be executed directly because optional dependencies are unavailable in this workspace and installing them is forbidden - diskcache, grep_ast and tree_sitter (needed to import aider.repomap) and gitpython (needed to import aider.repo) are all missing; pathspec 1.1.1 and the git 2.43.0 CLI are installed. The demo therefore runs a documented, contract-preserving normalization of the same operations and asserts the layering invariant statically; no filesystem scanning or dependency installation was performed, and only .prale-eval/ artifacts plus the demo fixture were written."
+  }
+}

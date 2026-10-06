@@ -1,0 +1,122 @@
+{
+  "task_id": "T27",
+  "repository": "tdam",
+  "mode": "demo",
+  "evidence": [
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "MemoryClientConfig",
+      "start_line": 8,
+      "end_line": 19,
+      "observation": "Shared config contract consumed by every SDK client: `endpoint` (base URL), `apiKey` (sent as `Authorization: Bearer <apiKey>`), `serviceId` (sent as the `x-tdai-service-id` header), optional `timeout` and `rejectUnauthorized`. The demo builds its client config from this interface (`sharedHttpConfig: MemoryClientConfig`) before adding the v3 isolation fields, which is why the fake backend observes exactly `Bearer sk-mem-demo-key`, `x-tdai-service-id: mem-instance-demo` and `content-type: application/json` at http://127.0.0.1:<ephemeral port>."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/client.ts",
+      "symbol": "Transport",
+      "start_line": 24,
+      "end_line": 28,
+      "observation": "The public transport seam: `post<T>(path, body?)` plus an optional `get<T>(path, query?)` for backward-compatible custom transports. `MemoryClient` has a dedicated constructor overload `(transport: Transport, isolation: V3IsolationContext)`, so tests/embedders can observe request paths without real HTTP; the demo uses it for its last check (a recording `Transport` receives zero calls while the backend still sees exactly two requests) and verifies that `withIsolation()` re-scopes through the same transport."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "addConversation",
+      "start_line": 193,
+      "end_line": 199,
+      "observation": "The write path: `POST /v3/conversation/add` with `...this.iso.baseBody()` (team_id/agent_id/user_id[/task_id]) plus `session_id: this.iso.resolveSessionForWrite(params.session_id)` and the caller's `messages`. Because the session must be non-empty on writes, the demo's first recorded request is exactly this call, carrying the full scope with `session_id: \"session-demo-42\"` and producing the normalized write result `{accepted_ids:[msg-1,msg-2],total_count:2,trace_id:trace-write-1}`."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/client.ts",
+      "symbol": "queryConversation",
+      "start_line": 201,
+      "end_line": 210,
+      "observation": "The scoped read: `POST /v3/conversation/query` spreads the same isolation body, resolves `session_id` via `resolveSession` (constructor default when the call omits it), forwards limit/offset/time_* and wraps everything in `stripUndefined`. That is why the second recorded request body has exactly the keys team_id, agent_id, user_id, session_id, limit — the demo asserts both the scope values and the absence of unset filter keys."
+    },
+    {
+      "path": "sdk/memory-core/typescript/src/v3/http.ts",
+      "symbol": "request",
+      "start_line": 58,
+      "end_line": 121,
+      "observation": "Normalization layer actually exercised over HTTP: JSON-stringifies the POST body, parses the `{code,message,data}` envelope, raises `TDAMError` when the HTTP status or business `code` is non-zero, and at lines 112-117 returns `envelope.data` (envelope keys dropped) with `trace_id` injected from the `x-trace-id` response header. The demo's normalized results (`{...data..., trace_id: \"trace-write-1\"}` / `\"trace-read-1\"`) are exactly this transformation, and no `code`/`data` keys survive."
+    },
+    {
+      "path": ".prale-eval/demo/demo.mts",
+      "symbol": "createServer",
+      "start_line": 99,
+      "end_line": 177,
+      "observation": "The local fake HTTP backend: a `node:http` server on 127.0.0.1:0 that records every request (sequence number, method, path, headers, raw JSON body), rejects bodies missing the isolation triple or (on the write path) a non-empty session_id, implements `/v3/conversation/add` and `/v3/conversation/query` with an in-memory store keyed by team+agent+user+session, and answers with the v3 envelope plus an `x-trace-id` header. Two seed rows in the same team+agent but a different user/session prove the scoped read filters by scope."
+    },
+    {
+      "path": ".prale-eval/demo/demo.mts",
+      "symbol": "check",
+      "start_line": 192,
+      "end_line": 194,
+      "observation": "Assertion harness used by the demo: each `check(name, passed, detail)` records a named verdict that is echoed in the JSON report and folded into the process exit code (`root passed = checks.every(...)`; a deliberately broken negative-control copy exited 1). The seven checks cover request order, write scope, auth headers, read scope (plus stripped undefined filters), the normalized write result, the normalized scoped read result, and the `Transport` seam."
+    },
+    {
+      "path": ".prale-eval/demo/run-demo.mjs",
+      "symbol": "register",
+      "start_line": 16,
+      "end_line": 29,
+      "observation": "Entrypoint: re-executes itself with `--experimental-transform-types` when the flag is missing (the SDK's `IsolationContext` uses TypeScript parameter properties), then calls `register(\"./sdk-resolve-hooks.mjs\")` and dynamically imports `demo.mts`, so `node ./.prale-eval/demo/run-demo.mjs` works as-is with no build step and no installed dependencies."
+    },
+    {
+      "path": ".prale-eval/demo/sdk-resolve-hooks.mjs",
+      "symbol": "resolve",
+      "start_line": 22,
+      "end_line": 35,
+      "observation": "Resolution hook that lets Node load the un-built SDK sources: it maps `.js` specifiers to the sibling `.ts` file when only the `.ts` exists (the SDK uses bundler-style `./errors.js` style imports) and satisfies the `undici` import of `src/v3/http.ts` with a local stub (`undici-stub.mjs`) so no dependency install is needed; the stub's `Agent` is never instantiated because the demo uses plain HTTP."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The demo issues exactly one write request, `POST /v3/conversation/add`, because `MemoryClient.addConversation()` builds its body from the shared client config plus `IsolationContext.baseBody()` and a write-only non-empty `session_id`; the recorded request is authenticated with `Authorization: Bearer <apiKey>` and `x-tdai-service-id: <serviceId>` from `MemoryClientConfig`.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/src/v3/client.ts",
+        ".prale-eval/demo/demo.mts"
+      ]
+    },
+    {
+      "claim": "The scoped read `POST /v3/conversation/query` reuses the identical isolation scope (`team_id`, `agent_id`, `user_id`, `session_id` = session-demo-42) and drops unset filters via `stripUndefined`, so the observed body keys are exactly team_id/agent_id/user_id/session_id/limit and the read returns only in-scope rows (the seeded foreign-user and foreign-session rows are excluded).",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/client.ts",
+        ".prale-eval/demo/demo.mts"
+      ]
+    },
+    {
+      "claim": "Results are normalized by `V3HttpTransport.request`: the `{code,message,data}` envelope is unwrapped into the bare `data` object and the `x-trace-id` response header is re-attached as `trace_id`, giving write `{accepted_ids:[msg-1,msg-2],total_count:2,trace_id:trace-write-1}` and read `{messages:[...in-scope messages...],total:2,trace_id:trace-read-1}` with no `code`/`data` keys remaining.",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/v3/http.ts",
+        ".prale-eval/demo/demo.mts"
+      ]
+    },
+    {
+      "claim": "Request order is verified against the wire, not against mocks: the fake backend records requests by sequence and the demo asserts the order array equals exactly [\"POST /v3/conversation/add\", \"POST /v3/conversation/query\"] with length 2 (one write, then one scoped read, in that order).",
+      "evidence_paths": [
+        ".prale-eval/demo/demo.mts",
+        "sdk/memory-core/typescript/src/v3/client.ts"
+      ]
+    },
+    {
+      "claim": "The `Transport` interface declared in `src/client.ts` is a working injection point: constructing `MemoryClient` with a custom `Transport` requires an isolation context, issuing no HTTP by itself, and `withIsolation()` re-scopes through the same transport (`injected-transport calls=0, backend requests=2`).",
+      "evidence_paths": [
+        "sdk/memory-core/typescript/src/client.ts",
+        "sdk/memory-core/typescript/src/v3/client.ts",
+        ".prale-eval/demo/demo.mts"
+      ]
+    },
+    {
+      "claim": "The demo is executable without installing dependencies or building the SDK: `run-demo.mjs` re-execs Node with `--experimental-transform-types` (needed for the SDK's TypeScript parameter properties) and registers a resolver hook that maps the SDK's `.js` specifiers to the un-built `.ts` sources while stubbing the uninstalled `undici` import of `src/v3/http.ts`.",
+      "evidence_paths": [
+        ".prale-eval/demo/run-demo.mjs",
+        ".prale-eval/demo/sdk-resolve-hooks.mjs"
+      ]
+    }
+  ],
+  "conclusion": "The T27 demo is implemented and passing: `node ./.prale-eval/demo/run-demo.mjs` starts a local fake HTTP backend (node:http on 127.0.0.1, ephemeral port), drives the real un-built SDK (`MemoryClient.addConversation()` then `MemoryClient.queryConversation()`), and exits 0 with 7/7 checks and `passed: true`. Verified: (1) request order is exactly one write then one scoped read — POST /v3/conversation/add followed by POST /v3/conversation/query; (2) both requests carry the full strict-isolation scope (team_id/agent_id/user_id/session_id = team-demo-42/agent-demo-42/user-demo-42/session-demo-42) and the configured credentials, with unset filters stripped by stripUndefined; (3) results are normalized by V3HttpTransport (envelope unwrapped to `data`, `x-trace-id` re-attached as `trace_id`) and the scoped read returns only the two in-scope messages, excluding seeded foreign-user and foreign-session rows. A negative control (one assertion deliberately broken) exited 1, confirming the checks are effective. Deliverables: .prale-eval/result.json, .prale-eval/demo-deliverable.md and the demo sources under .prale-eval/demo/; no repository source, task metadata, lockfile or git configuration was modified.",
+  "validation": {
+    "command": "node ./.prale-eval/demo/run-demo.mjs",
+    "status": "passed",
+    "notes": "Exit code 0, report `passed: true`, 7/7 checks green: request order [POST /v3/conversation/add, POST /v3/conversation/query]; write scope + credentials (Authorization: Bearer sk-mem-demo-key, x-tdai-service-id: mem-instance-demo, content-type: application/json); scoped read scope with limit=20 and undefined filters stripped; normalized write result {accepted_ids:[msg-1,msg-2],total_count:2,trace_id:trace-write-1}; normalized scoped read result {messages:[msg-1,msg-2],total:2,trace_id:trace-read-1} excluding foreign user/session seed rows; Transport seam with 0 injected-transport calls. Negative control: a throwaway copy of demo.mts with `limit === 99` failed the read-scope check and exited 1 (deleted afterwards). Limitation: dependencies are not installed and must not be installed, so the packaged vitest suite (`npm test`) and `npx tsc --noEmit` could not be run; the demo therefore relies only on Node built-ins (node:http) and Node 24 native TypeScript execution (`--experimental-transform-types`, triggered automatically by the entrypoint) plus the local resolution hook/undici stub. Verified on Node v24.14.0."
+  }
+}

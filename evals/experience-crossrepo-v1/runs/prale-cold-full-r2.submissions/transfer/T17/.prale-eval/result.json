@@ -1,0 +1,92 @@
+{
+	"task_id": "T17",
+	"repository": "pi",
+	"mode": "demo",
+	"evidence": [
+		{
+			"path": "packages/coding-agent/src/core/resource-loader.ts",
+			"symbol": "DefaultResourceLoader.loadProjectTrustExtensions",
+			"start_line": 435,
+			"end_line": 441,
+			"observation": "Bootstrap pass: forces `settingsManager.setProjectTrusted(false)` and reloads settings before calling `loadCurrentExtensionSet({ includeInlineFactories: true })`. Because project trust is off, project-scoped resources (.pi/settings.json and .pi/extensions) are excluded from the returned extension set while user/global extensions and temporary CLI extensions still load. This is exactly the state a fresh extension fixture is observed in during bootstrap."
+		},
+		{
+			"path": "packages/coding-agent/src/core/resource-loader.ts",
+			"symbol": "DefaultResourceLoader.reload",
+			"start_line": 443,
+			"end_line": 455,
+			"observation": "Trust-decision seam: when `ResourceLoaderReloadOptions.resolveProjectTrust` is provided, reload() first runs the untrusted bootstrap pass, hands that bootstrap result to the caller's callback (`const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions })`), and only then applies the explicit decision via `setProjectTrusted(projectTrusted)` before the final resolve/load pass. So the project extension set is a function of an explicit trusted decision, not of reload timing."
+		},
+		{
+			"path": "packages/coding-agent/src/core/resource-loader.ts",
+			"symbol": "DefaultResourceLoader.loadCurrentExtensionSet",
+			"start_line": 606,
+			"end_line": 634,
+			"observation": "Builds the extension path list from `packageManager.resolve()` plus CLI-provided extension sources and loads them through `loadExtensionsCached`. `packageManager.resolve()` auto-discovers project extensions only while the project is trusted, so the bootstrap call inside `loadProjectTrustExtensions` returns a set that cannot contain the fresh `.pi/extensions` fixture."
+		},
+		{
+			"path": "packages/coding-agent/src/core/resource-loader.ts",
+			"symbol": "DefaultResourceLoader.loadFinalExtensionSet",
+			"start_line": 639,
+			"end_line": 687,
+			"observation": "Final pass after the trust decision: extensions already loaded during the bootstrap pass are reused by resolved path (`preloadedByPath`) and only the remaining paths are loaded, then the ordered result is assembled. This is why the trusted fixture's project extension appears in the final result exactly once and alongside the user extension that was already available during bootstrap."
+		},
+		{
+			"path": "packages/coding-agent/src/core/resource-loader.ts",
+			"symbol": "DefaultResourceLoader.getExtensions",
+			"start_line": 359,
+			"end_line": 361,
+			"observation": "Read accessor the demo uses to inspect the observed extension set at each phase (`loader.getExtensions().extensions`), which is the normalized operation result: bootstrap -> user extension only; after explicit trusted decision -> project fixture extension plus user extension."
+		},
+		{
+			"path": "packages/coding-agent/src/core/settings-manager.ts",
+			"symbol": "SettingsManager.setProjectTrusted",
+			"start_line": 514,
+			"end_line": 535,
+			"observation": "State transition behind the decision: setting trust to `false` clears project settings and merges only global settings; setting it to `true` re-loads project settings from storage. This is the switch the bootstrap pass flips off and the explicit trusted decision flips on."
+		},
+		{
+			"path": "packages/coding-agent/src/core/package-manager.ts",
+			"symbol": "DefaultPackageManager.addAutoDiscoveredResources",
+			"start_line": 2382,
+			"end_line": 2470,
+			"observation": "Discovery gate: `const projectTrusted = this.settingsManager.isProjectTrusted()` and the `.pi/extensions` auto-discovery block is wrapped in `if (projectTrusted)`. Auto-discovered user extensions are added unconditionally, which is why the bootstrap snapshot contains the user extension but never the project fixture extension."
+		}
+	],
+	"claims": [
+		{
+			"claim": "During bootstrap the fresh project extension fixture is unavailable: `loadProjectTrustExtensions()` forces project trust off, `packageManager.resolve()` therefore skips `.pi/extensions`, and the returned `LoadExtensionsResult` contains only the user/global extension. The demo asserts this on a real DefaultResourceLoader instance (bootstrap extensions = [<agentDir>/extensions/user-extension.ts]).",
+			"evidence_paths": [
+				"packages/coding-agent/src/core/resource-loader.ts",
+				"packages/coding-agent/src/core/settings-manager.ts",
+				"packages/coding-agent/src/core/package-manager.ts"
+			]
+		},
+		{
+			"claim": "The project extension becomes available only through an explicit trusted decision: reload() passes the bootstrap result to the `resolveProjectTrust` callback, applies its boolean via `setProjectTrusted(projectTrusted)`, and only a `true` decision makes `.pi/extensions/fresh-project-extension.ts` discoverable in the final extension set. The fixture is never loaded merely because reload() ran.",
+			"evidence_paths": [
+				"packages/coding-agent/src/core/resource-loader.ts",
+				"packages/coding-agent/src/core/settings-manager.ts"
+			]
+		},
+		{
+			"claim": "The trust decision is scoped: a callback returning `false` leaves the project extension unavailable after the full reload while the user extension remains loaded, showing the gate is the trust flag and not an environment/path accident (the same fixture loads when the callback returns `true`).",
+			"evidence_paths": [
+				"packages/coding-agent/src/core/resource-loader.ts",
+				"packages/coding-agent/src/core/package-manager.ts"
+			]
+		},
+		{
+			"claim": "The observable contract is the extension identity list from `DefaultResourceLoader.getExtensions()`: bootstrap -> [user extension]; after the trusted decision -> [project fixture extension, user extension]; after an explicit denial -> [user extension]. The final pass reuses the pre-trust loaded extension (`loadFinalExtensionSet` preloadedByPath) instead of loading it twice.",
+			"evidence_paths": [
+				"packages/coding-agent/src/core/resource-loader.ts"
+			]
+		}
+	],
+	"conclusion": "The demo executes the repository's real bootstrap and reload paths (packages/coding-agent/src/core/resource-loader.ts, backed by package-manager trust gating and settings-manager trust state) against a throwaway fixture project. Observed contract: a fresh `.pi/extensions/fresh-project-extension.ts` is absent from the bootstrap extension set produced by `loadProjectTrustExtensions()` (only the user extension is present); it appears in `getExtensions()` after `reload({ resolveProjectTrust })` applies an explicit `true` decision, and stays absent when the callback returns `false`. 7/7 demo checks pass with exit code 0.",
+	"validation": {
+		"command": "node --import ./.prale-eval/demo/register.mjs .prale-eval/demo/run-demo.mjs",
+		"status": "pass",
+		"notes": "Ran from the workspace root; exit code 0, 7/7 checks passed (output captured in .prale-eval/demo/validation-output.txt). Limitation: this fixture checkout has no installed dependencies and none may be installed, so the npm packages transitively imported by the real source (chalk, ignore, minimatch, semver, proper-lockfile, jiti, @earendil-works/* workspaces, highlight.js, typebox) are not resolvable. The demo therefore registers Node module-resolution hooks (register.mjs/hooks.mjs) that map bare, non-builtin specifiers to deterministic in-memory offline stubs (functional shims for chalk/ignore/minimatch/semver/proper-lockfile/jiti; `VIRTUAL_MODULES = {}` for extensions/loader.ts). All repository-relative `.ts` files are still loaded, type-stripped, and executed unmodified by Node, so the trust-gating behavior under test is the repository's own code. The standard vitest suite (`npm test --workspace=@earendil-works/pi-coding-agent`) could not be used for the same dependency reason."
+	}
+}

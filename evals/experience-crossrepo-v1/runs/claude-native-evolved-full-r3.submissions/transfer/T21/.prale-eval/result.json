@@ -1,0 +1,65 @@
+{
+  "task_id": "T21",
+  "repository": "tdam",
+  "mode": "contract",
+  "evidence": [
+    {
+      "path": "MemoryCore/src/core/index.ts",
+      "symbol": "TdaiCore",
+      "start_line": 24,
+      "end_line": 26,
+      "observation": "The core barrel is the public acceptance surface: `export { TdaiCore } from \"./tdai-core.js\"` (line 25) publishes the facade whose lifecycle is built on promise gates (`storeReady`, `schedulerStartPromise`, `skillWiringPromise`). Those gates are the production form of the contract this task pins down: the in-flight effect promise is published before any await, and no success/ready state is written until the effect resolves. A fake-client test therefore targets the semantics re-exported here."
+    },
+    {
+      "path": "MemoryCore/src/core/index.ts",
+      "symbol": "StorePool",
+      "start_line": 43,
+      "end_line": 45,
+      "observation": "The same barrel re-exports `StorePool` and its `PooledStore` result type (line 44-45) from `./store/store-pool.js`. `getStore` returns a `PooledStore`, so the pooled-store lifecycle is part of the barrel's contract and is the concrete operation whose ordering (commit vs. effect) the fake-client test asserts."
+    },
+    {
+      "path": "MemoryCore/src/core/store/store-pool.ts",
+      "symbol": "getStore",
+      "start_line": 171,
+      "end_line": 221,
+      "observation": "`getStore` is the counter-example the contract guards against. It inserts the new entry into the pool with `this.pool.set(instanceId, {...})` at line 200, and only afterwards awaits the backing effect `await pooledStore.store.init()` at line 215; when that effect fails the error is swallowed by `this.logger.warn(...)` at line 217 and never reaches the caller. Success state is thus published before the effect completes and failure is not observable — exactly the two properties the fake-client test asserts against."
+    },
+    {
+      "path": "MemoryCore/src/core/tdai-core.ts",
+      "symbol": "schedulerStartPromise",
+      "start_line": 160,
+      "end_line": 179,
+      "observation": "The `TdaiCore` field/doc at lines 160-179 states the rule explicitly: a plain boolean flag is unsafe because the first caller \"flips the flag to `true` *before* the await completes\", letting later callers slip past while the effect is still running. The fix stored as `schedulerStartPromise` (line 178) and the sibling `storeReady` (line 179) publish the in-flight promise first and keep it as a sentinel only after it resolves. This is the correct behaviour the fake-client operation reproduces: pending until the effect settles, success committed only in the resolved branch."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "The public contract of MemoryCore's core barrel (TdaiCore facade and StorePool) is that an operation must not expose a committed success/ready state before the asynchronous effect it depends on has completed, and that a failed effect must remain observable rather than being converted into success.",
+      "evidence_paths": [
+        "MemoryCore/src/core/index.ts",
+        "MemoryCore/src/core/tdai-core.ts",
+        "MemoryCore/src/core/store/store-pool.ts"
+      ]
+    },
+    {
+      "claim": "StorePool.getStore is the concrete violation the contract forbids: it publishes the pooled store into the pool at line 200 before the initialisation effect resolves at line 215, and swallows an initialisation failure with a log warning at line 217 instead of surfacing it. The fake-client test makes both violations detectable by asserting committed==0 while the effect is in flight and by asserting the rejection is observable to the caller.",
+      "evidence_paths": [
+        "MemoryCore/src/core/store/store-pool.ts",
+        "MemoryCore/src/core/index.ts"
+      ]
+    },
+    {
+      "claim": "TdaiCore's documented promise-gate lifecycle (schedulerStartPromise/storeReady) shows the correct ordering: publish the in-flight effect promise before awaiting, write ready/success state only in the resolved branch, and clear the gate on failure so the failure stays observable and a retry can run. The executable fake-client demo encodes exactly these three properties as assertions.",
+      "evidence_paths": [
+        "MemoryCore/src/core/tdai-core.ts",
+        "MemoryCore/src/core/index.ts"
+      ]
+    }
+  ],
+  "conclusion": "The fake-client operation test is implemented in MemoryCore/__tests__/core/fake-client-operation.ts with the vitest wrapper in MemoryCore/__tests__/core/fake-client-operation.test.ts. A FakeClient exposes a single operation whose effect is settled only by the test; the CommitOperation under test shows status=pending and committed=0 while the effect is in flight (proving no success state is committed before the fake effect completes), commits status=ready exactly once after the effect resolves, and on effect rejection records status=failed with the error message, commits nothing, applies nothing, and clears the in-flight gate so a retry can run (proving failure remains observable). All five contract checks pass under Node's native TypeScript execution; the vitest runner itself is unavailable in this fixture (no node_modules and dependency installation is out of scope), which is recorded as the validation limitation.",
+  "validation": {
+    "command": "node --experimental-strip-types __tests__/core/fake-client-operation.ts",
+    "status": "pass",
+    "notes": "Run from MemoryCore/. Output: 5 contract checks passed (no-success-committed-before-effect, concurrent-caller-shares-inflight-effect, success-committed-only-after-effect, failure-observable-and-not-committed, failure-leaves-gate-clear-for-retry), exit code 0. The same check body is executed by the vitest wrapper. Limitation: the declared runner (vitest 4.x, see MemoryCore/vitest.config.ts include `__tests__/**/*.test.ts`) is not installed in this fixture and dependency installation is out of scope, so `npx --no-install vitest run __tests__/core/fake-client-operation.test.ts` fails with ERR_MODULE_NOT_FOUND for the vitest CLI; the demo entry point runs the identical assertion suite under `node --experimental-strip-types` so the contract is still executed and verified. Both files also pass `node --experimental-strip-types --check` (syntax/strip validation)."
+  }
+}

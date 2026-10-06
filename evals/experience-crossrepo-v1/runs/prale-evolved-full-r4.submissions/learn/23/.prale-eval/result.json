@@ -1,0 +1,158 @@
+{
+  "task_id": 23,
+  "repository": "tdam",
+  "mode": "explore",
+  "request": "Learn in TencentDB Agent Memory: trace a request through header validation, route, adapter and response envelope.",
+  "evidence": [
+    {
+      "path": "MemoryPanel/src/panel/http/app.ts",
+      "symbol": "buildPanelApp",
+      "start_line": 17,
+      "end_line": 59,
+      "observation": "Panel 应用装配入口。buildPanelApp 先 app.use('*', requestLogger(...)) 为每个请求建立 reqId 上下文，再 registerHealthRoutes，随后把 meta/knowledge/skill/chat-memory/task/agent 各路由注册到内层 Hono 实例 api，并用 app.route(API_PREFIX='/api/v1', api) 把全部业务 API 挂在 /api/v1 前缀下；onError 兜底把未捕获异常统一翻译为 {code:500,message:'INTERNAL',request_id,data:null} 的响应信封。它决定了 /api/v1/meta/* 请求的入口与中间件顺序（日志→路由级头校验→业务处理器）。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/app.ts",
+      "symbol": "API_PREFIX",
+      "start_line": 15,
+      "end_line": 15,
+      "observation": "常量 '/api/v1' 是 Panel 对外 API 的挂载前缀；app.route(API_PREFIX, api) 使 meta 代理路由最终暴露为 POST /api/v1/meta/:action，这是从 HTTP 入站到 kernel 转发路径的第一个锚点。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "MetaEnvelope",
+      "start_line": 3,
+      "end_line": 8,
+      "observation": "内核 HTTP 响应信封类型契约：{ code: number; message: string; request_id: string; data: T }。Panel 出站适配器/传输层构造它、入站 http/envelope.ts 回写它，是 header→route→adapter→envelope 全链路统一的数据形状（与 /v3/meta/* 一致）。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/envelope.ts",
+      "symbol": "mapHttpStatusFromEnvelopeCode",
+      "start_line": 10,
+      "end_line": 14,
+      "observation": "信封 code → HTTP 状态码映射：400–599 直接透传为 HTTP 状态；code===0 映射 200；其余（如 1、42201 等非 HTTP 语义 code）回落 502。http/envelope.ts 的 respondEnvelope 用它决定 c.json 的 HTTP status，因此业务错误码不会泄漏成非法 HTTP 状态。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/headers.ts",
+      "symbol": "META_HEADER_SERVICE_ID",
+      "start_line": 5,
+      "end_line": 7,
+      "observation": "入站校验与出站转发共用同一套内核头名：x-tdai-service-id（实例标识）、x-tdai-user-key（用户密钥）、x-request-id（请求追踪）。单一常量来源保证 middleware 读入与 transport-fetch 写出的头名不会漂移。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+      "symbol": "validatePanelMetaHeaders",
+      "start_line": 31,
+      "end_line": 63,
+      "observation": "meta 路由的 header 校验中间件：读取 x-tdai-service-id，缺失返回 400 MISSING_INSTANCE_ID；调用 deps.instanceRegistry.resolve 解析实例，未知实例返回 400 INVALID_INSTANCE；再读取 x-tdai-user-key，缺失返回 400 MISSING_USER_KEY，但 action==='auth/verify' 时通过 omitUserKey 放行（登录前无 user key）。校验通过后把 instanceId/gatewayEndpoint/gatewayApiKey/userKey 写入 c.set('panelMeta', ...)，供路由构造 MetaCallContext。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/middleware/request-logger.ts",
+      "symbol": "requestLogger",
+      "start_line": 35,
+      "end_line": 72,
+      "observation": "全局访问日志中间件：reqId = 入站 x-request-id 或 randomUUID()，写入 c.set('reqId', reqId)、响应头 x-request-id，并按状态分级记录日志。面板把所有入站 request_id 贯穿到内核调用，这是请求追踪的起点。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+      "symbol": "registerMetaProxyRoutes",
+      "start_line": 148,
+      "end_line": 220,
+      "observation": "meta 代理路由：api.post('/meta/*', validatePanelMetaHeaders(deps), handler)。handler 从路径解析 action，空/不在 META_ACTIONS/属于 NOT_IN_SCOPE(agent-fixed-asset/*) 分别返回 404 UNKNOWN_META_ACTION / 404 / 501 NOT_IN_SCOPE；解析 body；用 panelMeta + c.get('reqId') 组装 MetaCallContext；create 类 action 先 checkDuplicate，重复返回 409；本地模板 action（agent/set-default-template、agent/get-default-template）直接读写文件不转发；其余调用 deps.metaKernel.invoke(action, body, ctx)，最后 return respondEnvelope(c, envelope) 统一回写。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/ports/meta-kernel-port.ts",
+      "symbol": "MetaKernelPort",
+      "start_line": 4,
+      "end_line": 6,
+      "observation": "路由与适配器之间的端口契约：invoke(action, body, ctx) => Promise<MetaEnvelope>。路由只依赖该接口，具体 HTTP 适配器可替换，体现路由/适配器分层。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+      "symbol": "FetchMetaKernelAdapter",
+      "start_line": 6,
+      "end_line": 17,
+      "observation": "MetaKernelPort 的 fetch 适配器：invoke 先 sanitizeBody（list 类 action 保留 limit/offset；非 list 且带 limit/offset 时剥离），对 auth/verify 设 omitUserKey，再经 toKernelCredentials 组装凭证，最终委托 this.http.postEnvelope('/v3/meta/${action}', payload, cred)。它把业务 action 翻译为内核 /v3/meta/* 路径并决定 user_key 是否透传。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/types.ts",
+      "symbol": "toKernelCredentials",
+      "start_line": 23,
+      "end_line": 35,
+      "observation": "把运行时 MetaCallContext（来自 header 中间件）转换为 KernelCredentials：endpoint=gatewayEndpoint、apiKey=gatewayApiKey、instanceId、userKey（omitUserKey 时为 undefined）、timeoutMs、requestId=reqId。它是 header 校验结果进入出站 HTTP 调用前的最后一跳。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+      "symbol": "FetchKernelHttpAdapter",
+      "start_line": 10,
+      "end_line": 47,
+      "observation": "KernelHttpPort 实现：postEnvelope 以 mode='envelope' 调 executeMetaFetch，因此业务 code≠0 不抛错、原样透传信封；仅当 KernelFetchError（网络/超时/无效信封）时降级为本地信封 { code: err.code, message: 'KERNEL_TIMEOUT'(504) 或 'KERNEL_UNAVAILABLE'(502), request_id, data: null }。保证上游路由总能拿到一个合法信封。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/kernel/transport-fetch.ts",
+      "symbol": "executeMetaFetch",
+      "start_line": 125,
+      "end_line": 232,
+      "observation": "真正发起内核 HTTP 调用的传输层：以 x-tdai-service-id、x-request-id（入站 reqId 或新 UUID）、Authorization: Bearer <apiKey>、可选 x-tdai-user-key 组装头，POST 到 base+/v3/meta/*；响应非合法信封时抛 KernelFetchError(502)；合法则规整为 { code, message(默认 'ok'/'error N'), request_id(回落 reqId), data(回落 {}) }。mode='envelope' 下 code≠0 只记 error 日志并返回信封，超时/网络错误映射 504/502。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondEnvelope",
+      "start_line": 18,
+      "end_line": 20,
+      "observation": "入站响应信封回写：c.json(envelope, mapHttpStatusFromEnvelopeCode(envelope.code))，把内核信封 code 映射为 HTTP status 并原样返回 {code,message,request_id,data}。"
+    },
+    {
+      "path": "MemoryPanel/src/panel/http/envelope.ts",
+      "symbol": "respondControlError",
+      "start_line": 22,
+      "end_line": 25,
+      "observation": "校验/业务前置错误统一出口：以 c.get('reqId') 填充 request_id，构造 data=null 的控制面信封再走 respondEnvelope。header 校验的 400/404/501/409/403 与 onError 的 500 都经此保持信封形状一致。"
+    }
+  ],
+  "claims": [
+    {
+      "claim": "请求先经过 app.ts 的 buildPanelApp 装配：全局 requestLogger 生成/透传 x-request-id 并写入 c.set('reqId')，所有业务路由挂载在 /api/v1（API_PREFIX），meta 代理因此暴露为 POST /api/v1/meta/:action。",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/app.ts",
+        "MemoryPanel/src/panel/http/middleware/request-logger.ts"
+      ]
+    },
+    {
+      "claim": "header 校验由 validatePanelMetaHeaders 在 meta 路由层执行：x-tdai-service-id 缺失→400 MISSING_INSTANCE_ID，实例不存在→400 INVALID_INSTANCE，x-tdai-user-key 缺失→400 MISSING_USER_KEY（auth/verify 例外），通过后把实例与凭证写入 c.set('panelMeta', ...) 供后续路由使用。",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/middleware/validate-panel-headers.ts",
+        "MemoryPanel/src/panel/kernel/headers.ts"
+      ]
+    },
+    {
+      "claim": "路由层 registerMetaProxyRoutes 在 header 校验后判定 action 合法性（404 UNKNOWN_META_ACTION / 501 NOT_IN_SCOPE / 409 重复），用 panelMeta 与 reqId 组装 MetaCallContext，再通过 MetaKernelPort.invoke 交给适配器。",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/http/routes/meta/proxy.ts",
+        "MemoryPanel/src/panel/kernel/ports/meta-kernel-port.ts"
+      ]
+    },
+    {
+      "claim": "适配器 FetchMetaKernelAdapter.invoke 清洗 body、对 auth/verify 省略 user key，经 toKernelCredentials 组装凭证后由 FetchKernelHttpAdapter.postEnvelope 以 mode='envelope' 调 executeMetaFetch 请求 /v3/meta/{action}；传输失败降级为 504/502 本地信封。",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/adapters/fetch-meta-kernel-adapter.ts",
+        "MemoryPanel/src/panel/kernel/adapters/fetch-kernel-http-adapter.ts",
+        "MemoryPanel/src/panel/kernel/types.ts",
+        "MemoryPanel/src/panel/kernel/transport-fetch.ts"
+      ]
+    },
+    {
+      "claim": "响应统一走 MetaEnvelope 信封：kernel/envelope.ts 定义 {code,message,request_id,data} 并用 mapHttpStatusFromEnvelopeCode 把 code 映射为 HTTP 状态（0→200，400–599→原值，其余→502），http/envelope.ts 的 respondEnvelope/respondControlError 据此回写，使校验错误与内核错误信封形状一致。",
+      "evidence_paths": [
+        "MemoryPanel/src/panel/kernel/envelope.ts",
+        "MemoryPanel/src/panel/http/envelope.ts"
+      ]
+    }
+  ],
+  "conclusion": "请求全链路：入站 POST /api/v1/meta/:action 先由 buildPanelApp 注册的 requestLogger 建立 reqId（x-request-id 透传或生成），随后命中 registerMetaProxyRoutes 的 meta 路由；路由级 validatePanelMetaHeaders 校验 x-tdai-service-id 与 x-tdai-user-key（auth/verify 免 user key），把实例/凭证写入 panelMeta 上下文；路由判定 action 合法性与重复后构造 MetaCallContext，经 MetaKernelPort 交由 FetchMetaKernelAdapter 清洗 body 并 toKernelCredentials 组装凭证，再由 FetchKernelHttpAdapter 以信封模式调用 executeMetaFetch，向 gatewayEndpoint 的 /v3/meta/* 发起带同样内核头的 POST；内核返回的 {code,message,request_id,data} 被规整后，由 http/envelope.ts 的 respondEnvelope 经 mapHttpStatusFromEnvelopeCode 映射 HTTP 状态回写客户端。校验错误在中间件/路由处即用 respondControlError 生成 data=null 的控制面信封，保持全链路信封一致。",
+  "validation": {
+    "command": "node -e \"<static citation checker over .prale-eval/result.json>\"",
+    "status": "passed",
+    "notes": "本环境未安装项目依赖（MemoryPanel 下无 node_modules，PATH 无 tsc/vitest），无法运行 `pnpm typecheck` 或 `vitest run`，故以 Node 静态断言作为受限强度验证：逐条读取 result.json，确认 task_id=23/repository=tdam/mode=explore，并对每个 evidence 项按 path 读取源文件、检查所声明 symbol 出现在闭区间 [start_line,end_line] 内、每个 claim 的 evidence_paths 均存在。脚本可读全部引用且断言全部通过；依赖缺失导致的类型检查/测试缺口在此记录为限制。"
+  }
+}

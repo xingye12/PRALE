@@ -1,0 +1,769 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/operate-deliverable.md b/.prale-eval/operate-deliverable.md
+new file mode 100644
+index 0000000..f171d6b
+--- /dev/null
++++ b/.prale-eval/operate-deliverable.md
+@@ -0,0 +1,123 @@
++# Operate deliverable — canonical path resolution & unsafe-input rejection
++
++Task: `wattclaw` task `20` (mode `operate`).
++Subject: `server/utils/generated-file-path.js` plus the attachment utilities in
++`server/gateway-file-transfer.js`, exercised on a controlled file fixture.
++
++## Executable demo
++
++```
++node scripts/operate-generated-file-path-demo.mjs
++```
++
++- Exit code `0`; `DEMO OK: 35 assertions passed; fixture removed`.
++- The script creates a throwaway fixture inside the repository workspace
++  (`<workspace>/.operate-fixture-*/`), runs all operations, prints a JSON report
++  to stdout, and removes the fixture in a `finally` block.
++- Imported from the repository, not re-implemented:
++  `resolveGeneratedFileCandidatePath` (pure resolver) and
++  `sanitizeFilename`, `buildRemoteFileName`, `uploadToGateway`,
++  `deleteRemoteFile`, `writeRemoteFile` (attachment utilities).
++- Because `createFileRoutes` in `server/handlers/files.js` is not exported, the
++  demo replays the exact acceptance gates that route composes around the
++  resolver (`realpath -e`, `posix.relative` escape check, denied name/segment
++  check, regular-file check, size check).
++
++## Fixture
++
++```
++<fixture>/workspace/downloads/report.pdf          (regular file, 22 B)
++<fixture>/workspace/downloads/notes.txt
++<fixture>/workspace/downloads/.env                (denied by name)
++<fixture>/workspace/downloads/.git/config          (denied by segment)
++<fixture>/workspace/AGENTS.md                      (denied by name)
++<fixture>/workspace/downloads/escape-link.txt      -> <fixture>/outside/secret.txt (symlink)
++<fixture>/outside/secret.txt                        (outside the workspace root)
++<fixture>/media/inbound/                            (attachment target dir)
++```
++
++## Normalized operation result — path resolution
++
++`workspaceReal = <fixture>/workspace` (realpath, trailing slash removed).
++`canonicalPath` is the realpath of the resolved candidate (what the route would
++serve); it is `null` when `realpath -e` fails.
++
++| # | requested input | mode | canonical path | status | reason |
++|---|-----------------|------|----------------|--------|--------|
++| 1 | `downloads/report.pdf` | `workspace-relative` | `<ws>/downloads/report.pdf` | 200 | served (`application/pdf`, 22 B) |
++| 2 | `/downloads/report.pdf` | `workspace-root-relative` | `<ws>/downloads/report.pdf` | 200 | served |
++| 3 | `./downloads/notes.txt` | `workspace-relative` | `<ws>/downloads/notes.txt` | 200 | served |
++| 4 | `<ws>/downloads/report.pdf` | `workspace-absolute` | `<ws>/downloads/report.pdf` | 200 | served |
++| 5 | `downloads/../downloads/report.pdf` | `workspace-relative` | `<ws>/downloads/report.pdf` | 200 | served (interior `..` stays inside) |
++| 6 | `../outside/secret.txt` | `workspace-relative` | `<fixture>/outside/secret.txt` | 403 | File access denied: resolves outside workspace root |
++| 7 | `/../outside/secret.txt` | `workspace-root-relative` | `<fixture>/outside/secret.txt` | 403 | File access denied: resolves outside workspace root |
++| 8 | `downloads/../../outside/secret.txt` | `workspace-relative` | `<fixture>/outside/secret.txt` | 403 | File access denied: resolves outside workspace root |
++| 9 | `downloads/escape-link.txt` | `workspace-relative` | `<fixture>/outside/secret.txt` | 403 | File access denied: resolves outside workspace root (symlink followed by realpath) |
++| 10 | `downloads/.env` | `workspace-relative` | `<ws>/downloads/.env` | 403 | File access denied: denied name or segment |
++| 11 | `/downloads/.git/config` | `workspace-root-relative` | `<ws>/downloads/.git/config` | 403 | File access denied: denied name or segment |
++| 12 | `AGENTS.md` | `workspace-relative` | `<ws>/AGENTS.md` | 403 | File access denied: denied name or segment |
++| 13 | `/etc/hostname` | `workspace-root-relative` | `null` | 404 | File not found — host absolute path is re-rooted under the workspace, never reaches the host FS |
++| 14 | `downloads` | `workspace-relative` | `<ws>/downloads` | 400 | Only regular files can be downloaded |
++| 15 | `downloads/missing.pdf` | `workspace-relative` | `null` | 404 | File not found |
++| 16 | `downloads/report.pdf\0.txt` | — | — | 400 | Invalid generated file request (NUL byte, pre-resolution) |
++
++Canonical-path contract demonstrated:
++
++1. Relative and leading-slash inputs are both canonicalised **under the
++   workspace root**; the leading slash selects `workspace-root-relative` but does
++   **not** mean host-absolute (case 13).
++2. A workspace-absolute input is preserved verbatim (case 4).
++3. `..` segments are not stripped by the resolver; they are neutralised
++   downstream by `realpath` + `posix.relative`, which yields a 403 (cases 6–8).
++4. Realpath following makes symlink escapes indistinguishable from textual
++   traversal and rejected identically (case 9).
++5. Contained-but-sensitive names (`.env`, `.git/*`, `AGENTS.md`) are rejected
++   even though they never leave the workspace (cases 10–12).
++
++## Normalized operation result — attachment utilities
++
++| operation | input | result |
++|-----------|-------|--------|
++| `sanitizeFilename` | `../etc/passwd` | `.._etc_passwd` (no `/`, no `\`) |
++| `sanitizeFilename` | `报表 2026?.pdf` | `报表_2026_.pdf` (unicode kept) |
++| `sanitizeFilename` | `"  "` | `''` → caller falls back to `file` |
++| `sanitizeFilename` | 80×`a` + `.pdf` | 60 chars (truncated) |
++| `buildRemoteFileName` | `../../etc/passwd` | `{ fileName: ".._.._etc_passwd---<8hex>", baseName: ".._.._etc_passwd", ext: "" }` — single path segment |
++| `buildRemoteFileName` | `季度 报告 2026.pdf` | `{ fileName: "季度_报告_2026---<8hex>.pdf", ext: ".pdf" }` |
++| `uploadToGateway` | `Buffer("fixture payload")`, `季度 报告.pdf`, `GATEWAY_MEDIA_DIR=<fixture>/media/inbound` | `path` exactly `<mediaDir>/<fileName>`, `size` 15, bytes round-trip on disk |
++| `deleteRemoteFile` | uploaded path (twice) | `true`, `true` — removal is idempotent (ENOENT → true) |
++| `writeRemoteFile` | `<mediaDir>/nested/deep/note.txt` | `true` (parents created, content verified) |
++| `writeRemoteFile` | `<mediaDir>/blocked.txt/child.txt` where `blocked.txt` is a file | `false` (mkdir ENOTDIR, never throws) |
++
++## Contract summary
++
++- **Resolver** (`resolveGeneratedFileCandidatePath`): pure, normalises `\` → `/`,
++  strips trailing slashes from the workspace, preserves workspace-absolute
++  inputs, and otherwise joins the workspace root with the input after dropping
++  leading slashes. It returns `{ candidatePath, pathMode }` where `pathMode` is
++  one of `workspace-absolute`, `workspace-root-relative`, `workspace-relative`.
++  It performs **no** traversal checking — that responsibility is downstream.
++- **Route gate** (`GET /api/chat/generated-file`): `realpath -e` the candidate
++  (miss → 404), compute `posix.relative(workspaceReal, targetReal)`, reject with
++  403 if that is empty/`..`/`../*`/absolute **or** if the relative path hits a
++  denied segment (`.git`, `.openclaw`) or a denied name (`.env`, `.env.*`,
++  `AGENTS.md`, `SOUL.md`, `USER.md`, `IDENTITY.md`, `TOOLS.md`, `BOOTSTRAP.md`,
++  `MEMORY.md`, `workspace-state.json`, `openclaw-workspace-state.json`), then
++  reject non-regular files with 400 and files over 100 MiB with 413.
++- **Attachments** (`gateway-file-transfer.js`): filenames are flattened to a
++  single segment and the remote name is `{sanitized}---{8-hex-uuid}{ext}`;
++  uploads are confined to `GATEWAY_MEDIA_DIR` (or an explicit `targetDir`);
++  delete is idempotent; write returns `false` instead of throwing on failure.
++
++## Validation
++
++```
++node scripts/operate-generated-file-path-demo.mjs     # status: pass (exit 0, 35/35 assertions)
++```
++
++Optional repo-native validation **not run**: `npx vitest run
++server/utils/generated-file-path.test.js` requires `vitest`, which is declared in
++`package.json` but absent because `node_modules/` is not installed in this
++workspace; installing dependencies is out of scope, so the limitation is
++recorded instead. The demo independently re-asserts the three cases covered by
++that test file (leading-slash, relative, and workspace-absolute resolution).
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..21ce284
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,97 @@
++{
++  "task_id": 20,
++  "repository": "wattclaw",
++  "mode": "operate",
++  "evidence": [
++    {
++      "path": "server/utils/generated-file-path.js",
++      "symbol": "resolveGeneratedFileCandidatePath",
++      "start_line": 1,
++      "end_line": 15,
++      "observation": "The only exported symbol in this module. It takes the realpath'd agent workspace (workspaceReal) and a requested path, strips trailing slashes from the workspace, normalizes backslashes to forward slashes in the request, and decides whether the request is already workspace-absolute (equal to the workspace or prefixed by `${workspace}/`). Workspace-absolute inputs are returned verbatim with pathMode 'workspace-absolute'; everything else is joined onto the workspace root after leading slashes are dropped, labelled 'workspace-root-relative' when the original started with '/' and 'workspace-relative' otherwise. It is a pure string transform: it performs no realpath, no symlink resolution and no '..' rejection, so containment enforcement is deliberately deferred to the caller. The fixture run confirmed relative and leading-slash inputs both canonicalise under the workspace root, an in-workspace absolute path is preserved, and even a host-absolute path such as /etc/hostname is re-rooted under the workspace rather than escaping to the host filesystem."
++    },
++    {
++      "path": "server/gateway-file-transfer.js",
++      "symbol": "sanitizeFilename",
++      "start_line": 19,
++      "end_line": 27,
++      "observation": "Attachment filename sanitizer used before any generated remote name is built. It trims, returns '' for blank input, replaces every character that is not a Unicode letter/number/dot/hyphen/underscore with '_', collapses runs of underscores, strips leading/trailing underscores, and truncates to 60 characters. Because '/' and '\\\\' are replaced, traversal segments cannot survive as separators. Fixture results: '../etc/passwd' -> '.._etc_passwd', '报表 2026?.pdf' -> '报表_2026_.pdf', '  ' -> '', and 80 a's + '.pdf' -> a 60-character name, which is the rejection/neutralisation behaviour reported for unsafe attachment input."
++    },
++    {
++      "path": "server/gateway-file-transfer.js",
++      "symbol": "buildRemoteFileName",
++      "start_line": 36,
++      "end_line": 43,
++      "observation": "Builds the Gateway naming convention {sanitized-name}---{8-hex-uuid}{ext}: it lowercases the extension via extname, sanitizes the stem with sanitizeFilename (falling back to the literal 'file' when the sanitized stem is empty), appends an 8-character hex UUID suffix, and re-attaches the extension. The output is always a single path segment. On the fixture, '../../etc/passwd' produced fileName '.._.._etc_passwd---<8hex>' with ext '' (no separators, so it cannot traverse), while '季度 报告 2026.pdf' produced '季度_报告_2026---<8hex>.pdf'."
++    },
++    {
++      "path": "server/gateway-file-transfer.js",
++      "symbol": "uploadToGateway",
++      "start_line": 54,
++      "end_line": 63,
++      "observation": "Writes an uploaded buffer into the media directory. The upload directory is envConfig.GATEWAY_MEDIA_DIR or `${configDir}/media/inbound`, unless an explicit targetDir override is passed; the remote name comes from buildRemoteFileName, so the stored path is always `${uploadDir}/${sanitized}---{uuid}${ext}` and is confined to the media directory. It mkdir -p's the directory and returns { path, fileName, originalName, size }. Fixture run: a 15-byte buffer named '季度 报告.pdf' landed exactly at `<mediaDir>/季度_报告---<8hex>.pdf` with size 15 and byte-identical content, demonstrating the canonical remote path contract."
++    },
++    {
++      "path": "server/gateway-file-transfer.js",
++      "symbol": "deleteRemoteFile",
++      "start_line": 71,
++      "end_line": 79,
++      "observation": "Deletes the file at an absolute remotePath and returns true on success, true when the file is already absent (err.code === 'ENOENT'), and false for any other failure. Deletion is therefore idempotent, which the fixture confirmed by deleting the uploaded attachment twice and receiving true both times."
++    },
++    {
++      "path": "server/gateway-file-transfer.js",
++      "symbol": "writeRemoteFile",
++      "start_line": 88,
++      "end_line": 97,
++      "observation": "Writes utf8 content to remotePath after mkdir -p'ing its dirname, returning true on success and false (rather than throwing) on any failure. Fixture run: writing `<mediaDir>/nested/deep/note.txt` created the missing parents and returned true with verified content, while writing `<mediaDir>/blocked.txt/child.txt` where blocked.txt is an existing regular file returned false because mkdir failed with ENOTDIR — an observable rejection signal for an invalid attachment destination."
++    },
++    {
++      "path": "server/handlers/files.js",
++      "symbol": "isGeneratedFilePathAllowed",
++      "start_line": 39,
++      "end_line": 45,
++      "observation": "The allowed-name gate placed immediately after the escape check in the generated-file route. It lowercases every '/' segment and rejects the path if any segment is a denied segment ('.git', '.openclaw'), or if the final name is '.env' or starts with '.env.', or is one of the denied agent instruction/state names (agents.md, soul.md, user.md, identity.md, tools.md, bootstrap.md, memory.md, workspace-state.json, openclaw-workspace-state.json). The fixture run rejected downloads/.env, /downloads/.git/config and AGENTS.md with 403 'File access denied' even though all three resolve inside the workspace, showing a second, independent rejection cause beyond escape."
++    },
++    {
++      "path": "server/handlers/files.js",
++      "symbol": "createFileRoutes",
++      "start_line": 72,
++      "end_line": 140,
++      "observation": "createFileRoutes is declared at line 72 and registers the GET /api/chat/generated-file handler that composes the containment contract around the resolver: line 112 calls resolveGeneratedFileCandidatePath(workspaceReal, requestedPath); lines 123-131 realpath -e the candidate inside a try/catch and return 404 'File not found' when it does not exist; lines 134-140 compute posix.relative(workspaceReal, targetReal) and reject with 403 'File access denied' when the relative path is empty/'..'/'../*'/absolute (workspace escape) or when isGeneratedFilePathAllowed fails (denied name/segment). The handler function is not exported, so the operate demo replays this same sequence with fs.realpath as the realpath -e equivalent; the fixture reproduced each of these statuses and reasons for the 16 path operations."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "resolveGeneratedFileCandidatePath returns { candidatePath, pathMode } with pathMode in {workspace-absolute, workspace-root-relative, workspace-relative}: in-workspace absolute inputs are preserved verbatim, while relative and leading-slash inputs are canonicalised under the workspace root; a host-absolute input such as /etc/hostname is re-rooted under the workspace instead of reaching the host filesystem.",
++      "evidence_paths": [
++        "server/utils/generated-file-path.js",
++        "server/handlers/files.js"
++      ]
++    },
++    {
++      "claim": "The resolver itself performs no traversal or symlink validation; unsafe '..' input is caught only when the route realpaths the candidate and rejects any posix.relative result that is empty, '..', prefixed '../', or absolute, which yields HTTP 403 'File access denied' with the realpath named as the reason.",
++      "evidence_paths": [
++        "server/utils/generated-file-path.js",
++        "server/handlers/files.js"
++      ]
++    },
++    {
++      "claim": "Attachment filenames are neutralised to a single path segment and stored as {sanitized}---{8-hex-uuid}{ext}: sanitizeFilename strips separators, collapses underscores, trims to 60 chars and returns '' for blanks, and buildRemoteFileName falls back to 'file' plus a UUID suffix, so adversarial names such as '../etc/passwd' cannot escape GATEWAY_MEDIA_DIR.",
++      "evidence_paths": [
++        "server/gateway-file-transfer.js"
++      ]
++    },
++    {
++      "claim": "Attachment I/O reports normalized outcomes without throwing: uploadToGateway confines writes to GATEWAY_MEDIA_DIR and returns the canonical remote path with size, deleteRemoteFile is idempotent (true for success and ENOENT), and writeRemoteFile returns false for an impossible destination such as a path whose parent is a regular file.",
++      "evidence_paths": [
++        "server/gateway-file-transfer.js"
++      ]
++    }
++  ],
++  "conclusion": "Operating the resolver and attachment utilities on a controlled fixture produces the canonical paths and rejection reasons required by the task. Accepted input canonicalises under the workspace root: 'downloads/report.pdf' and '/downloads/report.pdf' both yield <workspaceReal>/downloads/report.pdf (modes workspace-relative and workspace-root-relative), and an in-workspace absolute path is preserved (workspace-absolute). Unsafe input is rejected with an explicit reason: traversal inputs '../outside/secret.txt', '/../outside/secret.txt' and 'downloads/../../outside/secret.txt' all realpath to <fixture>/outside/secret.txt and are rejected 403 'File access denied: resolves outside workspace root'; a symlink inside the workspace pointing outside is rejected the same way (403); contained sensitive names downloads/.env, /downloads/.git/config and AGENTS.md are rejected 403 'denied name or segment'; a directory is rejected 400 'Only regular files can be downloaded'; missing targets are 404; a NUL byte is rejected 400 pre-resolution; and /etc/hostname is re-rooted under the workspace (404) rather than escaping. On the attachment side, sanitizeFilename('../etc/passwd') -> '.._etc_passwd' and buildRemoteFileName('../../etc/passwd') -> '.._.._etc_passwd---<8hex>' contain no path separators, uploadToGateway writes only inside GATEWAY_MEDIA_DIR and returns the canonical path, deleteRemoteFile is idempotent, and writeRemoteFile returns false for an impossible destination. The demo, scripts/operate-generated-file-path-demo.mjs, reproduces all of this with 35/35 assertions passing (exit 0) and removes its fixture afterwards.",
++  "validation": {
++    "command": "node scripts/operate-generated-file-path-demo.mjs",
++    "status": "pass",
++    "notes": "Exit code 0; stderr 'DEMO OK: 35 assertions passed; fixture removed'. The demo imports the real resolveGeneratedFileCandidatePath from server/utils/generated-file-path.js and the real sanitizeFilename, buildRemoteFileName, uploadToGateway, deleteRemoteFile and writeRemoteFile from server/gateway-file-transfer.js, building and then deleting a self-contained fixture under <workspace>/.operate-fixture-*/. LIMITATION: the repo-native optional validation `npx vitest run server/utils/generated-file-path.test.js` was NOT run because vitest is declared in package.json but node_modules/ is not installed in this environment and installing dependencies is out of scope; instead the demo independently asserts the three resolution cases that test file covers (leading-slash -> workspace-root-relative, relative -> workspace-relative, workspace-absolute preserved). Only Node.js builtins were used."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+diff --git a/scripts/operate-generated-file-path-demo.mjs b/scripts/operate-generated-file-path-demo.mjs
+new file mode 100644
+index 0000000..f9ecc54
+--- /dev/null
++++ b/scripts/operate-generated-file-path-demo.mjs
+@@ -0,0 +1,324 @@
++#!/usr/bin/env node
++/**
++ * Operate demo for generated-file path resolution + attachment utilities.
++ *
++ * Runs the pure resolver from `server/utils/generated-file-path.js` and the
++ * attachment helpers from `server/gateway-file-transfer.js` against a
++ * controlled, self-contained file fixture created inside the repository
++ * workspace, then reports for every request:
++ *   - the canonical (realpath) target
++ *   - the resolution mode
++ *   - the accept/reject decision and, for unsafe input, the rejection reason.
++ *
++ * The HTTP route in `server/handlers/files.js` (GET /api/chat/generated-file)
++ * is not exported, so the demo replays the exact acceptance gates that route
++ * composes around the imported resolver: realpath(-e), posix.relative escape
++ * check, denied-name/segment check, and regular-file check. The resolver and
++ * the attachment utilities themselves are imported from the repository, not
++ * re-implemented.
++ *
++ * Usage:  node scripts/operate-generated-file-path-demo.mjs
++ * Exit code 0 = all assertions passed; 1 = a fixture assertion failed.
++ */
++
++import fs from 'fs/promises'
++import path from 'path'
++import { posix } from 'path'
++import { fileURLToPath } from 'url'
++import { resolveGeneratedFileCandidatePath } from '../server/utils/generated-file-path.js'
++import {
++  sanitizeFilename,
++  buildRemoteFileName,
++  uploadToGateway,
++  deleteRemoteFile,
++  writeRemoteFile,
++} from '../server/gateway-file-transfer.js'
++
++const WORKSPACE_ROOT = fileURLToPath(new URL('..', import.meta.url))
++
++// ---- acceptance gates mirrored from server/handlers/files.js --------------
++const GENERATED_FILE_DENIED_SEGMENTS = new Set(['.git', '.openclaw'])
++const GENERATED_FILE_DENIED_NAMES = new Set([
++  'agents.md',
++  'soul.md',
++  'user.md',
++  'identity.md',
++  'tools.md',
++  'bootstrap.md',
++  'memory.md',
++  'workspace-state.json',
++  'openclaw-workspace-state.json',
++])
++const GENERATED_FILE_MAX_BYTES = 100 * 1024 * 1024
++
++function isGeneratedFilePathAllowed(relativePath) {
++  const segments = relativePath.split('/').filter(Boolean).map((segment) => segment.toLowerCase())
++  if (segments.some((segment) => GENERATED_FILE_DENIED_SEGMENTS.has(segment))) return false
++  const name = segments[segments.length - 1] || ''
++  if (name === '.env' || name.startsWith('.env.')) return false
++  return !GENERATED_FILE_DENIED_NAMES.has(name)
++}
++
++function generatedFileMimeType(filePath) {
++  const ext = posix.extname(filePath).slice(1).toLowerCase()
++  const types = {
++    pdf: 'application/pdf',
++    txt: 'text/plain',
++    md: 'text/markdown',
++    json: 'application/json',
++    png: 'image/png',
++  }
++  return types[ext] || 'application/octet-stream'
++}
++
++const pass = []
++const fail = []
++function check(label, condition, detail) {
++  if (condition) pass.push(label)
++  else fail.push(`${label}${detail ? ` -> ${detail}` : ''}`)
++}
++
++/** Replay GET /api/chat/generated-file decision flow for one requested path. */
++async function operate(workspaceReal, requestedPath) {
++  if (!requestedPath || requestedPath.includes('\0')) {
++    return { requestedPath, status: 400, decision: 'rejected', reason: 'Invalid generated file request' }
++  }
++  const { candidatePath, pathMode } = resolveGeneratedFileCandidatePath(workspaceReal, requestedPath)
++
++  let targetReal
++  try {
++    targetReal = await fs.realpath(candidatePath)
++  } catch {
++    return {
++      requestedPath,
++      pathMode,
++      candidatePath,
++      status: 404,
++      decision: 'rejected',
++      reason: 'File not found',
++      canonicalPath: null,
++    }
++  }
++
++  const relativePath = posix.relative(workspaceReal, targetReal)
++  const escapedWorkspace =
++    !relativePath || relativePath === '..' || relativePath.startsWith('../') || posix.isAbsolute(relativePath)
++
++  if (escapedWorkspace || !isGeneratedFilePathAllowed(relativePath)) {
++    return {
++      requestedPath,
++      pathMode,
++      candidatePath,
++      canonicalPath: targetReal,
++      status: 403,
++      decision: 'rejected',
++      reason: escapedWorkspace
++        ? `File access denied: resolves outside workspace root (realpath ${targetReal})`
++        : `File access denied: denied name or segment (${relativePath})`,
++      relativePath,
++    }
++  }
++
++  const stat = await fs.stat(targetReal)
++  if (!stat.isFile()) {
++    return {
++      requestedPath,
++      pathMode,
++      candidatePath,
++      canonicalPath: targetReal,
++      status: 400,
++      decision: 'rejected',
++      reason: 'Only regular files can be downloaded',
++      relativePath,
++    }
++  }
++  if (stat.size > GENERATED_FILE_MAX_BYTES) {
++    return {
++      requestedPath,
++      pathMode,
++      candidatePath,
++      canonicalPath: targetReal,
++      status: 413,
++      decision: 'rejected',
++      reason: 'File is too large to download',
++      relativePath,
++    }
++  }
++
++  return {
++    requestedPath,
++    pathMode,
++    candidatePath,
++    canonicalPath: targetReal,
++    relativePath,
++    status: 200,
++    decision: 'accepted',
++    reason: 'served',
++    size: stat.size,
++    mimeType: generatedFileMimeType(targetReal),
++  }
++}
++
++async function main() {
++  const fixtureRoot = await fs.mkdtemp(path.join(WORKSPACE_ROOT, '.operate-fixture-'))
++  const report = { fixtureRoot, pathOperations: [], attachments: {} }
++
++  try {
++    const ws = path.join(fixtureRoot, 'workspace')
++    const mediaDir = path.join(fixtureRoot, 'media', 'inbound')
++    await fs.mkdir(path.join(ws, 'downloads'), { recursive: true })
++    await fs.mkdir(path.join(ws, 'downloads', '.git'), { recursive: true })
++    await fs.mkdir(path.join(fixtureRoot, 'outside'), { recursive: true })
++
++    await fs.writeFile(path.join(ws, 'downloads', 'report.pdf'), '%PDF-1.4 fixture report\n')
++    await fs.writeFile(path.join(ws, 'downloads', 'notes.txt'), 'hello generated file\n')
++    await fs.writeFile(path.join(ws, 'downloads', '.env'), 'SECRET=1\n')
++    await fs.writeFile(path.join(ws, 'downloads', '.git', 'config'), '[core]\n')
++    await fs.writeFile(path.join(ws, 'AGENTS.md'), '# agent rules\n')
++    await fs.writeFile(path.join(fixtureRoot, 'outside', 'secret.txt'), 'outside the workspace\n')
++    await fs.symlink(path.join(fixtureRoot, 'outside', 'secret.txt'), path.join(ws, 'downloads', 'escape-link.txt'))
++
++    const workspaceReal = (await fs.realpath(ws)).replace(/\\/g, '/')
++    report.workspaceReal = workspaceReal
++
++    const cases = [
++      { input: 'downloads/report.pdf', expect: 200, note: 'relative input canonicalises under workspace root' },
++      { input: '/downloads/report.pdf', expect: 200, note: 'leading-slash input is re-rooted at workspace root' },
++      { input: './downloads/notes.txt', expect: 200, note: 'dot-relative input' },
++      { input: `${workspaceReal}/downloads/report.pdf`, expect: 200, note: 'workspace-absolute input preserved' },
++      { input: 'downloads/../downloads/report.pdf', expect: 200, note: 'interior .. that stays inside workspace' },
++      { input: '../outside/secret.txt', expect: 403, note: 'relative traversal escapes workspace' },
++      { input: '/../outside/secret.txt', expect: 403, note: 'absolute-style traversal escapes workspace' },
++      { input: 'downloads/../../outside/secret.txt', expect: 403, note: 'nested traversal escapes workspace' },
++      { input: 'downloads/escape-link.txt', expect: 403, note: 'symlink inside workspace resolves outside' },
++      { input: 'downloads/.env', expect: 403, note: 'denied dotenv name' },
++      { input: '/downloads/.git/config', expect: 403, note: 'denied .git segment' },
++      { input: 'AGENTS.md', expect: 403, note: 'denied agent instruction file (case-insensitive)' },
++      { input: '/etc/hostname', expect: 404, note: 'host absolute path re-rooted, never escapes to host fs' },
++      { input: 'downloads', expect: 400, note: 'directory is not a downloadable regular file' },
++      { input: 'downloads/missing.pdf', expect: 404, note: 'missing target' },
++      { input: `downloads/report.pdf\0.txt`, expect: 400, note: 'NUL byte rejected before resolution' },
++    ]
++
++    for (const c of cases) {
++      const result = await operate(workspaceReal, c.input)
++      report.pathOperations.push({ ...result, expectation: c.expect, note: c.note })
++      check(
++        `operate(${JSON.stringify(c.input)}) -> ${c.expect}`,
++        result.status === c.expect,
++        `got ${result.status} (${result.reason})`,
++      )
++    }
++
++    // --- canonical path assertions -----------------------------------------
++    const relative = report.pathOperations[0]
++    const rootRelative = report.pathOperations[1]
++    const absoluteIn = report.pathOperations[3]
++    check(
++      'relative input canonical path',
++      relative.canonicalPath === `${workspaceReal}/downloads/report.pdf` && relative.pathMode === 'workspace-relative',
++      JSON.stringify(relative),
++    )
++    check(
++      'root-relative input canonical path',
++      rootRelative.canonicalPath === `${workspaceReal}/downloads/report.pdf` &&
++        rootRelative.pathMode === 'workspace-root-relative',
++      JSON.stringify(rootRelative),
++    )
++    check(
++      'workspace-absolute input preserved',
++      absoluteIn.pathMode === 'workspace-absolute' && absoluteIn.candidatePath === absoluteIn.canonicalPath,
++      JSON.stringify(absoluteIn),
++    )
++    const traversal = report.pathOperations[5]
++    check(
++      'traversal rejection reason names the escape',
++      traversal.status === 403 && /outside workspace root/.test(traversal.reason),
++      traversal.reason,
++    )
++    check(
++      'symlink escape rejection reason names the escape',
++      report.pathOperations[8].status === 403 && /outside workspace root/.test(report.pathOperations[8].reason),
++      report.pathOperations[8].reason,
++    )
++    check(
++      'host absolute path stayed inside workspace',
++      report.pathOperations[12].pathMode === 'workspace-root-relative' &&
++        report.pathOperations[12].candidatePath.startsWith(workspaceReal),
++      JSON.stringify(report.pathOperations[12]),
++    )
++
++    // --- attachment utilities ---------------------------------------------
++    const sanitized = [
++      sanitizeFilename('../etc/passwd'),
++      sanitizeFilename('报表 2026?.pdf'),
++      sanitizeFilename('  '),
++      sanitizeFilename('a'.repeat(80) + '.pdf'),
++    ]
++    report.attachments.sanitizeFilename = {
++      input: ['../etc/passwd', '报表 2026?.pdf', '  ', `${'a'.repeat(80)}.pdf`],
++      output: sanitized,
++    }
++    check('sanitizeFilename strips separators', !sanitized[0].includes('/') && !sanitized[0].includes('\\'), sanitized[0])
++    check('sanitizeFilename keeps unicode + extension', sanitized[1] === '报表_2026_.pdf', sanitized[1])
++    check('sanitizeFilename blank -> empty (caller falls back to "file")', sanitized[2] === '', JSON.stringify(sanitized[2]))
++    check('sanitizeFilename caps at 60 chars', sanitized[3].length === 60, String(sanitized[3].length))
++
++    const built = buildRemoteFileName('../../etc/passwd')
++    const builtNormal = buildRemoteFileName('季度 报告 2026.pdf')
++    report.attachments.buildRemoteFileName = { traversal: built, normal: builtNormal }
++    check('buildRemoteFileName has no path separators', !built.fileName.includes('/') && !built.fileName.includes('\\'), built.fileName)
++    check('buildRemoteFileName matches name---uuid.ext', /^.*---[0-9a-f]{8}$/.test(built.fileName), built.fileName)
++    check(
++      'buildRemoteFileName keeps ext lowercased',
++      builtNormal.ext === '.pdf' && builtNormal.fileName.endsWith('.pdf'),
++      JSON.stringify(builtNormal),
++    )
++
++    const upload = await uploadToGateway(Buffer.from('fixture payload'), '季度 报告.pdf', { GATEWAY_MEDIA_DIR: mediaDir })
++    report.attachments.uploadToGateway = upload
++    check(
++      'uploadToGateway writes inside GATEWAY_MEDIA_DIR',
++      upload.path === `${mediaDir.replace(/\\/g, '/')}/${upload.fileName}` && upload.path.startsWith(mediaDir),
++      upload.path,
++    )
++    check(
++      'uploadToGateway content round-trips',
++      (await fs.readFile(upload.path, 'utf-8')) === 'fixture payload' && upload.size === 15,
++      String(upload.size),
++    )
++    check('uploadToGateway uses traversal-safe name', !upload.fileName.includes('/'), upload.fileName)
++
++    const deleted = await deleteRemoteFile(upload.path)
++    const deletedAgain = await deleteRemoteFile(upload.path)
++    report.attachments.deleteRemoteFile = { first: deleted, second: deletedAgain }
++    check('deleteRemoteFile removes file and is idempotent', deleted === true && deletedAgain === true)
++
++    await fs.mkdir(mediaDir, { recursive: true })
++    const blocker = path.join(mediaDir, 'blocked.txt')
++    await fs.writeFile(blocker, 'i am a file, not a directory')
++    const nested = path.join(mediaDir, 'nested', 'deep', 'note.txt')
++    const wrote = await writeRemoteFile(nested, 'written by demo')
++    const wroteBad = await writeRemoteFile(path.join(blocker, 'child.txt'), 'nope')
++    report.attachments.writeRemoteFile = { wrote, wroteBad, nested, blocker }
++    check('writeRemoteFile creates parents and content', wrote === true && (await fs.readFile(nested, 'utf-8')) === 'written by demo')
++    check('writeRemoteFile reports false when parent path is a file (ENOTDIR)', wroteBad === false, String(wroteBad))
++
++    report.assertions = { passed: pass.length, failed: fail.length, failures: fail }
++    console.log(JSON.stringify(report, null, 2))
++  } finally {
++    await fs.rm(fixtureRoot, { recursive: true, force: true })
++  }
++
++  if (fail.length > 0) {
++    console.error(`\nDEMO FAILED: ${fail.length} assertion(s) failed`)
++    process.exitCode = 1
++  } else {
++    console.error(`\nDEMO OK: ${pass.length} assertions passed; fixture removed`)
++  }
++}
++
++main().catch((err) => {
++  console.error(err)
++  process.exitCode = 1
++})
+snapshot .prale-eval/operate-deliverable.md - 94b4da149248d0c13a7bd611e621b667aa4318353a3719ec61c0032906423f32
+snapshot .prale-eval/result.json - e77a58f421e255a8f900f60f13b8ea64f96ab59789a4c29542ed8d098087beb9
+snapshot scripts/operate-generated-file-path-demo.mjs - 125f506e71adb7366656f1ae43f5c8ed80bfa381a0449086999c4ce862a630cc

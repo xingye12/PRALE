@@ -1,0 +1,64 @@
+{
+  "task_id": "T09",
+  "repository": "aider",
+  "mode": "operate",
+  "evidence": [
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd",
+      "start_line": 11,
+      "end_line": 23,
+      "observation": "run_cmd is the single public entry point this task operates through. It dispatches to run_cmd_pexpect only when stdin is a tty, pexpect.spawn exists and the platform is not Windows; otherwise it calls run_cmd_subprocess. Every path returns a 2-tuple (exit_status, output), and an OSError raised while launching the command is caught and converted into (1, \"Error occurred while running command '<command>': <msg>\") rather than propagating. That contract is what lets an operator treat a failing linter as data instead of an exception: the fake linter's non-zero status arrives as the first tuple element and its console text as the second."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd_subprocess",
+      "start_line": 42,
+      "end_line": 86,
+      "observation": "This is the branch actually taken when the demo runs non-interactively. The process is started with stdout=subprocess.PIPE and stderr=subprocess.STDOUT (line 65), then the loop at lines 76-81 reads the pipe one character at a time, echoing each chunk to the caller's stdout and accumulating it into the output list. Line 84 returns process.returncode together with the fully joined text. The decisive detail for normalization is stderr=subprocess.STDOUT: the linter's stderr advisory is merged into the same stream as its stdout diagnostics, so run_cmd cannot by itself separate the two streams -- the returned text carried the fake linter's 'fake-lint: error: 1 error(s), refusing to pass' line directly after its stdout summary. On any exception the function degrades to (1, str(e)), so a spawn failure is also reported as an exit status rather than raised."
+    },
+    {
+      "path": "aider/run_cmd.py",
+      "symbol": "run_cmd_pexpect",
+      "start_line": 89,
+      "end_line": 132,
+      "observation": "The interactive alternative to run_cmd_subprocess, selected only for a tty on a non-Windows host. It spawns $SHELL -i -c <command> (falling back to spawning the command directly when the shell path does not exist), hands the terminal to the child via child.interact(output_filter=output_callback) and captures everything the child prints into a BytesIO buffer. Line 128 returns child.exitstatus paired with the decoded buffer, matching the (exit_status, output) shape of the subprocess path. Notably this path merges streams for the same reason -- pexpect attaches the child to one pseudo-terminal -- and pexpect.ExceptionPexpect/TypeError/ValueError are caught and turned into (1, error_msg). Knowing this branch exists matters because it is the one route where a linter's exit status can be lost: if child.exitstatus is None (child killed by a signal) the caller sees None rather than an integer, so a normalizer must tolerate a nullable exit status."
+    }
+  ],
+  "claims": [
+    {
+      "claim": "aider.run_cmd.run_cmd returns a two-element tuple (exit_status, output) and reports launch failures as exit status 1 instead of raising, so a failing linter is normalized as data. Operating the fake linter through it yielded exit_code 2 -- the linter's own EXIT_LINT_FINDINGS value -- confirming the process return code is surfaced verbatim as the first tuple element.",
+      "evidence_paths": [
+        "aider/run_cmd.py",
+        ".prale-eval/observed.json"
+      ]
+    },
+    {
+      "claim": "run_cmd_subprocess launches the child with stderr=subprocess.STDOUT, so the linter's stderr and stdout are merged into the single string run_cmd returns. The normalized operation therefore could not take a stdout/stderr split from run_cmd directly; it re-ran the identical command with separate pipes to recover the split, and recorded aider_stdout_matches_raw_stdout=false, proving the merged stream differs from pure stdout by exactly the stderr advisory line.",
+      "evidence_paths": [
+        "aider/run_cmd.py",
+        ".prale-eval/observed.json"
+      ]
+    },
+    {
+      "claim": "run_cmd selects run_cmd_pexpect only when sys.stdin.isatty() and pexpect.spawn is available and the platform is not Windows; on this non-tty Linux run it takes the run_cmd_subprocess branch, which uses only the standard library. This is why the observed operation worked even though pexpect and psutil are absent from the environment, and why the unexercised pexpect path can be shimmed without affecting the observed behavior.",
+      "evidence_paths": [
+        "aider/run_cmd.py",
+        ".prale-eval/operate-deliverable.md"
+      ]
+    },
+    {
+      "claim": "The normalized operation result for the fake linter is deterministic: exit_code 2, status \"fail\", 2 structured diagnostics (warning FAKE-LINT0001 at sample.py:3:1, error FAKE-LINT0002 at sample.py:7:80), 3 stdout lines and 1 stderr line. The two diagnostics parse cleanly from the stdout stream, and the single stderr line is the linter's refusal notice.",
+      "evidence_paths": [
+        ".prale-eval/observed.json",
+        ".prale-eval/fake_linter.py"
+      ]
+    }
+  ],
+  "conclusion": "The fake linter was operated through aider's own command helper, not a bespoke wrapper. aider.run_cmd.run_cmd returned the tuple (2, <merged console text>), which normalizes to exit_code 2 / status \"fail\" with two parseable diagnostics and one stderr advisory. The one contract detail that shapes the normalization is that run_cmd_subprocess passes stderr=subprocess.STDOUT, so run_cmd hands back a single merged stream; the normalizer recovers the stdout/stderr split by re-running the identical command with separate pipes, which is why the observed normalization records aider_stdout_matches_raw_stdout=false. The operation is fully reproducible offline: the exercised branch is pure standard library, and the missing pexpect/psutil imports were satisfied with inert in-memory shims that are never invoked on this non-tty Linux path. The repository's own tests/basic/test_run_cmd.py could not be used as the primary validation because collection fails on the absent pexpect dependency, so the runnable demo stands in as the focused validation.",
+  "validation": {
+    "command": "python3 .prale-eval/operate_demo.py",
+    "status": "passed",
+    "notes": "Ran from the workspace root; exit status 0. The demo executed `python3 .prale-eval/fake_linter.py sample.py` through aider.run_cmd.run_cmd, which emitted its streaming trace via run_cmd_subprocess and returned (2, merged_output). Normalized output was written to .prale-eval/observed.json and is embedded in the claims above. Cross-checks recorded by the demo: aider_exit_matches_raw_exit=true, aider_stdout_matches_raw_stdout=false (the merged stream carries the extra stderr line, as expected from stderr=subprocess.STDOUT). LIMITATION: pexpect and psutil are not installed and cannot be installed offline, so the module-level `import pexpect` in aider/run_cmd.py fails on a blind import; the demo registers inert in-memory sys.modules shims (reported under normalization.shimmed_imports) purely to satisfy that import, and they are never called because the non-tty Linux run takes the run_cmd_subprocess branch. Consequently the repository's focused test `python3 -m pytest tests/basic/test_run_cmd.py -q` cannot serve as validation -- it fails at collection with ModuleNotFoundError: No module named 'pexpect' (exit status 2, 1 error during collection), a pre-existing environment gap unrelated to this task's changes. No repository files, task metadata, lockfiles or git configuration were modified; only the new .prale-eval/ artifacts were added."
+  }
+}

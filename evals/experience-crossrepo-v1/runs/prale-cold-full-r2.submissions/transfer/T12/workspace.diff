@@ -1,0 +1,1616 @@
+diff --git a/.codegraph/.gitignore b/.codegraph/.gitignore
+new file mode 100644
+index 0000000..9de0f16
+--- /dev/null
++++ b/.codegraph/.gitignore
+@@ -0,0 +1,16 @@
++# CodeGraph data files
++# These are local to each machine and should not be committed
++
++# Database
++*.db
++*.db-wal
++*.db-shm
++
++# Cache
++cache/
++
++# Logs
++*.log
++
++# Hook markers
++.dirty
+diff --git a/.prale-eval/demo-deliverable.md b/.prale-eval/demo-deliverable.md
+new file mode 100644
+index 0000000..ce5516f
+--- /dev/null
++++ b/.prale-eval/demo-deliverable.md
+@@ -0,0 +1,123 @@
++# Demo deliverable — WattClaw project lifecycle (create → activate → stop)
++
++Task: `T12` · repository `wattclaw` · mode `demo`
++
++## 1. What is delivered
++
++| Artifact | Purpose |
++| --- | --- |
++| `server/services/wattclaw-project-runtime.demo.mjs` | Executable demo harness. Creates a fresh local project fixture on disk and drives the **real** runtime helpers in `server/services/wattclaw-project-runtime.js` through create → activate → (work) → stop → activate (restore) → stop, asserting legal transitions only and the exact emitted event stream. |
++| `.prale-eval/demo-run.json` | Normalized operation result produced by the run (transitions, rejections, events, gateway call counts, retention schedule, assertion log). |
++| `.prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo/config.json` | The fresh local project fixture written by the demo (layout resolved by `wattclaw-project-events.resolveWattClawProjectDirectory`). Rebuilt from scratch on every run. |
++| `.prale-eval/result.json` | Machine-readable task result (evidence, claims, conclusion, validation). |
++
++Run it:
++
++```bash
++node server/services/wattclaw-project-runtime.demo.mjs   # exit 0 = demo passed
++```
++
++The harness only uses Node built-ins (`node:assert/strict`, `node:fs/promises`) plus repository
++modules, so it runs in this checkout without installing dependencies. Any failed assertion throws and
++exits non-zero.
++
++## 2. Local fixture
++
++The demo tenant is `tenant-demo` and the project is `p-demo`. `create` mints the project record
++(`status: creating`, two members: `p-demo-manager` (lead) and `p-demo-worker`) and persists it as
++`config.json`, exactly where `resolveWattClawProjectDirectory` looks
++(`OPENCLAW_CONTAINER_DATA_DIR/<tenant>/.wattclaw-team/projects/<projectId>`). The fixture root is
++deleted and re-created at the start of every run, so two consecutive runs must produce identical
++results — verified.
++
++The harness plays the part of the gateway with an in-process RPC surface (`wattclaw.team.project.*`,
++`agents.list`) backed by that fixture, plus a fake agent registry that can be dropped (gateway restart)
++or refused (member restore failure).
++
++## 3. Contract under test
++
++### 3.1 Legal transitions (`LEGAL_TRANSITIONS`, demo lines 46-53)
++
++| # | Action | From | To | Driven by |
++| --- | --- | --- | --- | --- |
++| 1 | `create` | `absent` | `created` | `wattclaw.team.project.create` → `extractWattClawProject` |
++| 2 | `activate` | `created` | `active` | `activateWattClawProjectRuntime` (restores missing members) + `ensureWattClawProjectRuntime` |
++| 3 | `complete` | `active` | `terminal` | project reaches `success` |
++| 4 | `stop` | `terminal` | `stopped` | `pruneWattClawProjectsForUser` after the 3-day final retention window → `wattclaw.team.project.archive` |
++| 5 | `activate` | `stopped` | `active` | `activateWattClawProjectRuntime` on an `archived` project → `restored: true` (24 h restore window starts) |
++| 6 | `stop` | `active` | `stopped` | `pruneWattClawProjectsForUser` after the 24 h restore window → `wattclaw.team.project.archive` |
++
++`isLegalTransition()` (demo lines 55-57) is evaluated for every observed transition; the run fails if
++one is not in the table.
++
++### 3.2 Guards that make illegal transitions fail closed
++
++* `activateWattClawProjectRuntime` — requires a project + RPC (`WattClaw project and gateway RPC are required`), restores only missing members via `wattclaw.team.project.member.update`, and throws `WattClaw agents were not restored: <ids>` when a member agent cannot be loaded.
++* `ensureWattClawProjectRuntime` — throws `WattClaw project has no agents` for an agent-less project; returns immediately when all project agents are loaded (no `config.get`/`config.apply` reload); otherwise it applies the gateway config and polls `agents.list` until every agent appears or it times out.
++* `pruneWattClawProjectsForUser` — the only legal producer of a stop: it archives a project only when it is terminal (`success`/`failed`/`fail`) and the 3-day `FINAL_PROJECT_RETENTION_MS` window elapsed, or when it is `archived` and the 24-hour `RESTORED_PROJECT_RETENTION_MS` window elapsed (`restoredAt` access state). Anything else lands in `kept`/`skipped`; the gateway's own archive guard additionally answers `ok:false` when a caller bypasses the policy.
++* `nextWattClawRetentionRunAt` — the sweep that decides stop eligibility runs at 18:00 Asia/Shanghai; with the fixed demo clock `2026-08-20T10:00:00.000Z` the next sweep is asserted at `2026-08-21T10:00:00.000Z`.
++
++### 3.3 Event contract (asserted stream, 16 events)
++
++```
++ 1  wattclaw.team.project.created            p-demo (creating)
++ 2  wattclaw.team.project.member.restored    p-demo-manager
++ 3  wattclaw.team.project.member.restored    p-demo-worker
++ 4  wattclaw.team.agent.tracked              p-demo-manager
++ 5  wattclaw.team.session.tracked            agent:p-demo-manager:main
++ 6  wattclaw.team.agent.tracked              p-demo-worker
++ 7  wattclaw.team.session.tracked            agent:p-demo-worker:main
++ 8  wattclaw.team.project.updated            in_progress (revision 4)
++ 9  wattclaw.team.project.activated          in_progress (revision 4)
++10  wattclaw.team.project.updated            success (revision 5)
++11  wattclaw.team.project.terminal           success (revision 5)
++12  wattclaw.team.project.archived           archived  (legal stop #1)
++13  wattclaw.team.project.runtime.reloaded   post-restart config.apply reload
++14  wattclaw.team.project.restored           restoredAt = post-restart clock
++15  wattclaw.team.project.archived           archived  (legal stop #2)
++16  wattclaw.team.project.created            p-demo-degraded (rejected activation fixture)
++```
++
++Events 1-15 are the main lifecycle; the harness compares the stream element-by-element.
++Events 2-7 come from `wattclaw.team.project.member.update` calls made by
++`activateWattClawProjectRuntime` and from `trackWattClawProjectOwnership` (2 agents, 2 session keys).
++
++## 4. Normalized operation result (actual run)
++
++```
++status: passed            exit code: 0            assertions: 69
++legal transitions: 6      rejected attempts: 8    events: 16
++gateway calls: create x3, agents.list x10, member.update x3, project.list x5, archive x3
++gateway admin calls: agents.list x3, config.get x1, config.apply x1
++archive transitions applied: 2  (both produced by legal stops)
++```
++
++Rejected attempts — each asserted to add **no** event and to leave the fixture status untouched:
++
++| # | Action | Attempted against | Proof |
++| --- | --- | --- | --- |
++| 1 | `create` | existing `p-demo` | `project already exists: p-demo` |
++| 2 | `activate` | missing project record | `WattClaw project and gateway RPC are required` |
++| 3 | `activate` | project with no members | `WattClaw project has no agents` |
++| 4 | `stop` | `in_progress` project via prune | returned in `kept`, no archive RPC emitted |
++| 5 | `stop` | `in_progress` project via a direct archive RPC | gateway answered `ok:false` (`illegal transition: project p-demo is in_progress`); RPC logged, transition not applied |
++| 6 | `stop` | terminal project, 1 ms before the 3-day window | returned in `kept`, no archive RPC emitted |
++| 7 | `stop` | restored project, 1 ms before the 24 h window | returned in `kept`, no archive RPC emitted |
++| 8 | `activate` | `p-demo-degraded`, member restore refused | `WattClaw agents were not restored: p-demo-degraded-worker`; fixture still `creating` |
++
++Both legal stops were also checked on their `{ scanned, kept, archived, skipped, failed }` result:
++`archived: ['p-demo']`, `failed: []`, and exactly one archive RPC each.
++
++## 5. Validation
++
++```bash
++node server/services/wattclaw-project-runtime.demo.mjs
++```
++
++* Status: **passed** (exit 0), run twice back-to-back to confirm the fixture is rebuilt fresh and no
++  state leaks between runs; `.prale-eval/demo-run.json` is rewritten with the same normalized result.
++* Limitation: this checkout has no `node_modules`, so the repository's vitest suite
++  (`npx vitest run server/services/wattclaw-project-runtime.test.js`) could not be executed. The
++  dependency-free demo harness was used instead; it exercises the same module surface (activation,
++  restore, retention/archive legality, ownership tracking, retention schedule) against real runtime
++  code rather than mocks of the module itself.
+diff --git a/.prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo-degraded/config.json b/.prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo-degraded/config.json
+new file mode 100644
+index 0000000..c49abd2
+--- /dev/null
++++ b/.prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo-degraded/config.json
+@@ -0,0 +1,16 @@
++{
++  "id": "p-demo-degraded",
++  "name": "Degraded demo project",
++  "tenantId": "tenant-demo",
++  "status": "creating",
++  "members": [
++    {
++      "agentId": "p-demo-degraded-worker",
++      "name": "Unavailable Worker",
++      "role": "Researcher",
++      "isLead": false
++    }
++  ],
++  "createdAt": "2026-08-24T10:00:00.002Z",
++  "updatedAt": "2026-08-24T10:00:00.002Z"
++}
+diff --git a/.prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo/config.json b/.prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo/config.json
+new file mode 100644
+index 0000000..74c6e92
+--- /dev/null
++++ b/.prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo/config.json
+@@ -0,0 +1,22 @@
++{
++  "id": "p-demo",
++  "name": "Fresh demo project",
++  "tenantId": "tenant-demo",
++  "status": "archived",
++  "members": [
++    {
++      "agentId": "p-demo-manager",
++      "name": "Demo Manager",
++      "role": "Lead",
++      "isLead": true
++    },
++    {
++      "agentId": "p-demo-worker",
++      "name": "Demo Worker",
++      "role": "Researcher",
++      "isLead": false
++    }
++  ],
++  "createdAt": "2026-08-20T10:00:00.000Z",
++  "updatedAt": "2026-08-24T10:00:00.002Z"
++}
+diff --git a/.prale-eval/demo-run.json b/.prale-eval/demo-run.json
+new file mode 100644
+index 0000000..0d05c08
+--- /dev/null
++++ b/.prale-eval/demo-run.json
+@@ -0,0 +1,374 @@
++{
++  "demo": "wattclaw-project-runtime-lifecycle",
++  "projectId": "p-demo",
++  "degradedProjectId": "p-demo-degraded",
++  "tenantId": "tenant-demo",
++  "clock": {
++    "startedAt": "2026-08-20T10:00:00.000Z",
++    "finalAt": "2026-08-24T10:00:00.002Z"
++  },
++  "fixture": {
++    "root": ".prale-eval/demo-fixture",
++    "projectDir": ".prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo",
++    "configFile": ".prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo/config.json",
++    "resolver": "wattclaw-project-events.resolveWattClawProjectDirectory"
++  },
++  "contract": {
++    "legalTransitions": [
++      "create: absent -> created",
++      "activate: created -> active",
++      "complete: active -> terminal",
++      "stop: terminal -> stopped",
++      "activate: stopped -> active",
++      "stop: active -> stopped"
++    ],
++    "stopGuard": "archive accepted only for success/failed/fail/archived projects",
++    "finalRetentionMs": 259200000,
++    "restoredRetentionMs": 86400000
++  },
++  "transitions": [
++    {
++      "seq": 1,
++      "action": "create",
++      "from": "absent",
++      "to": "created",
++      "legal": true,
++      "via": "wattclaw.team.project.create"
++    },
++    {
++      "seq": 2,
++      "action": "activate",
++      "from": "created",
++      "to": "active",
++      "legal": true,
++      "via": "activateWattClawProjectRuntime"
++    },
++    {
++      "seq": 3,
++      "action": "complete",
++      "from": "active",
++      "to": "terminal",
++      "legal": true,
++      "via": "wattclaw.team.project.status.update"
++    },
++    {
++      "seq": 4,
++      "action": "stop",
++      "from": "terminal",
++      "to": "stopped",
++      "legal": true,
++      "via": "pruneWattClawProjectsForUser -> wattclaw.team.project.archive"
++    },
++    {
++      "seq": 5,
++      "action": "activate",
++      "from": "stopped",
++      "to": "active",
++      "legal": true,
++      "via": "activateWattClawProjectRuntime(restored:true)"
++    },
++    {
++      "seq": 6,
++      "action": "stop",
++      "from": "active",
++      "to": "stopped",
++      "legal": true,
++      "via": "pruneWattClawProjectsForUser(restored expired)"
++    }
++  ],
++  "rejections": [
++    {
++      "seq": 1,
++      "action": "create",
++      "from": "created",
++      "to": "created",
++      "legal": false,
++      "reason": "project id already exists",
++      "observed": "gateway rpc threw \"project already exists: p-demo\""
++    },
++    {
++      "seq": 2,
++      "action": "activate",
++      "from": "absent",
++      "to": "active",
++      "legal": false,
++      "reason": "no project record to activate",
++      "observed": "activateWattClawProjectRuntime threw \"WattClaw project and gateway RPC are required\""
++    },
++    {
++      "seq": 3,
++      "action": "activate",
++      "from": "created",
++      "to": "active",
++      "legal": false,
++      "reason": "project has no member agents",
++      "observed": "ensureWattClawProjectRuntime threw \"WattClaw project has no agents\""
++    },
++    {
++      "seq": 4,
++      "action": "stop",
++      "from": "active",
++      "to": "stopped",
++      "legal": false,
++      "reason": "project is in_progress (not terminal, never restored)",
++      "observed": "pruneWattClawProjectsForUser kept p-demo and issued no archive rpc"
++    },
++    {
++      "seq": 5,
++      "action": "stop",
++      "from": "active",
++      "to": "stopped",
++      "legal": false,
++      "reason": "archive rpc issued while status is in_progress",
++      "observed": "gateway answered ok:false \"illegal transition: project p-demo is in_progress\" (rpc logged, transition not applied)"
++    },
++    {
++      "seq": 6,
++      "action": "stop",
++      "from": "terminal",
++      "to": "stopped",
++      "legal": false,
++      "reason": "final retention window (3d) still open by 1ms",
++      "observed": "pruneWattClawProjectsForUser kept p-demo and issued no archive rpc"
++    },
++    {
++      "seq": 7,
++      "action": "stop",
++      "from": "active",
++      "to": "stopped",
++      "legal": false,
++      "reason": "restored retention window (24h) still open by 1ms",
++      "observed": "pruneWattClawProjectsForUser kept p-demo and issued no archive rpc"
++    },
++    {
++      "seq": 8,
++      "action": "activate",
++      "from": "created",
++      "to": "active",
++      "legal": false,
++      "reason": "member agent could not be restored",
++      "observed": "activateWattClawProjectRuntime threw \"WattClaw agents were not restored: p-demo-degraded-worker\""
++    }
++  ],
++  "events": [
++    {
++      "seq": 1,
++      "event": "wattclaw.team.project.created",
++      "projectId": "p-demo",
++      "status": "creating",
++      "revision": 1
++    },
++    {
++      "seq": 2,
++      "event": "wattclaw.team.project.member.restored",
++      "projectId": "p-demo",
++      "agentId": "p-demo-manager",
++      "revision": 2
++    },
++    {
++      "seq": 3,
++      "event": "wattclaw.team.project.member.restored",
++      "projectId": "p-demo",
++      "agentId": "p-demo-worker",
++      "revision": 3
++    },
++    {
++      "seq": 4,
++      "event": "wattclaw.team.agent.tracked",
++      "projectId": "p-demo",
++      "agentId": "p-demo-manager"
++    },
++    {
++      "seq": 5,
++      "event": "wattclaw.team.session.tracked",
++      "projectId": "p-demo",
++      "sessionKey": "agent:p-demo-manager:main"
++    },
++    {
++      "seq": 6,
++      "event": "wattclaw.team.agent.tracked",
++      "projectId": "p-demo",
++      "agentId": "p-demo-worker"
++    },
++    {
++      "seq": 7,
++      "event": "wattclaw.team.session.tracked",
++      "projectId": "p-demo",
++      "sessionKey": "agent:p-demo-worker:main"
++    },
++    {
++      "seq": 8,
++      "event": "wattclaw.team.project.updated",
++      "projectId": "p-demo",
++      "status": "in_progress",
++      "revision": 4
++    },
++    {
++      "seq": 9,
++      "event": "wattclaw.team.project.activated",
++      "projectId": "p-demo",
++      "status": "in_progress",
++      "revision": 4
++    },
++    {
++      "seq": 10,
++      "event": "wattclaw.team.project.updated",
++      "projectId": "p-demo",
++      "status": "success",
++      "revision": 5
++    },
++    {
++      "seq": 11,
++      "event": "wattclaw.team.project.terminal",
++      "projectId": "p-demo",
++      "status": "success",
++      "revision": 5
++    },
++    {
++      "seq": 12,
++      "event": "wattclaw.team.project.archived",
++      "projectId": "p-demo",
++      "status": "archived",
++      "revision": 6
++    },
++    {
++      "seq": 13,
++      "event": "wattclaw.team.project.runtime.reloaded",
++      "projectId": "p-demo"
++    },
++    {
++      "seq": 14,
++      "event": "wattclaw.team.project.restored",
++      "projectId": "p-demo",
++      "status": "restored"
++    },
++    {
++      "seq": 15,
++      "event": "wattclaw.team.project.archived",
++      "projectId": "p-demo",
++      "status": "archived",
++      "revision": 7
++    },
++    {
++      "seq": 16,
++      "event": "wattclaw.team.project.created",
++      "projectId": "p-demo-degraded",
++      "status": "creating",
++      "revision": 1
++    }
++  ],
++  "gateway": {
++    "calls": [
++      {
++        "method": "wattclaw.team.project.create",
++        "count": 3
++      },
++      {
++        "method": "agents.list",
++        "count": 10
++      },
++      {
++        "method": "wattclaw.team.project.member.update",
++        "count": 3
++      },
++      {
++        "method": "wattclaw.team.project.list",
++        "count": 5
++      },
++      {
++        "method": "wattclaw.team.project.archive",
++        "count": 3
++      }
++    ],
++    "adminCalls": [
++      {
++        "method": "agents.list",
++        "count": 3
++      },
++      {
++        "method": "config.get",
++        "count": 1
++      },
++      {
++        "method": "config.apply",
++        "count": 1
++      }
++    ]
++  },
++  "retention": {
++    "nextRunAt": "2026-08-21T10:00:00.000Z",
++    "terminalAt": "2026-08-20T10:00:00.000Z"
++  },
++  "assertions": [
++    "create returns the normalized project",
++    "fresh project status",
++    "fixture directory matches the runtime resolver",
++    "fixture is persisted as config.json",
++    "legal transition create: absent -> created",
++    "duplicate create is refused",
++    "rejected create created -> created emits no events",
++    "activate without a project is refused",
++    "rejected activate absent -> active emits no events",
++    "activate without members is refused",
++    "rejected activate created -> active emits no events",
++    "fresh activation is not a restore",
++    "activation restores every member agent",
++    "member.update is only sent for missing agents",
++    "ownership tracks one session per member",
++    "ownership tracks agents and sessions",
++    "ensure returns the loaded agents",
++    "ensure skips config.apply when agents are already loaded",
++    "legal transition activate: created -> active",
++    "active project is kept by retention",
++    "active project is not archived",
++    "prune issued no archive rpc for the active project",
++    "no archive transition happened",
++    "rejected stop active -> stopped emits no events",
++    "gateway guard rejects a bypassed stop",
++    "gateway guard reports the illegal status",
++    "project status is unchanged after the rejected stop",
++    "the bypassed attempt is logged but not applied",
++    "rejected stop active -> stopped emits no events",
++    "legal transition complete: active -> terminal",
++    "1ms before the retention window closes the project is kept",
++    "1ms before the retention window closes nothing is archived",
++    "1ms before the window closes no new archive rpc is issued",
++    "rejected stop terminal -> stopped emits no events",
++    "legal stop archives exactly the expired terminal project",
++    "legal stop leaves no failures",
++    "legal stop scanned the owned project",
++    "legal stop applied exactly one archive transition",
++    "legal stop is the only archive rpc added by prune",
++    "fixture status is archived after the stop",
++    "legal transition stop: terminal -> stopped",
++    "restart path applies config and reloads every agent",
++    "restart path used config.get + config.apply",
++    "activating an archived project is reported as restored",
++    "restore needs no member.update calls",
++    "archived status stays on disk after a restore",
++    "legal transition activate: stopped -> active",
++    "restored project is kept while the 24h window is open",
++    "restored project is not archived while the window is open",
++    "still only one legal archive transition happened",
++    "the kept restored project issued no archive rpc",
++    "rejected stop active -> stopped emits no events",
++    "second legal stop archives the restored project",
++    "second legal stop leaves no failures",
++    "second legal stop added exactly one archive rpc",
++    "two archive transitions were applied in total",
++    "legal transition stop: active -> stopped",
++    "activate fails when a member agent cannot be restored",
++    "failed activation emits no lifecycle events",
++    "failed activation does not load the refused agent",
++    "failed activation leaves the fixture untouched",
++    "rejected activate created -> active emits no events",
++    "emitted lifecycle event stream",
++    "degraded fixture only emitted its create event",
++    "every observed transition is legal",
++    "stop is only observed twice, both legal",
++    "rejections cover create / activate / stop",
++    "retention scheduled for 18:00 Asia/Shanghai",
++    "retention offset matches the runtime constant"
++  ],
++  "status": "passed"
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..e0c864f
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,126 @@
++{
++  "task_id": "T12",
++  "repository": "wattclaw",
++  "mode": "demo",
++  "evidence": [
++    {
++      "path": "server/services/wattclaw-project-runtime.js",
++      "symbol": "activateWattClawProjectRuntime",
++      "start_line": 207,
++      "end_line": 256,
++      "observation": "Export used by the demo for the create -> activate step. It throws 'WattClaw project and gateway RPC are required' when the project record or RPC function is missing, diffs project.members against agents.list and re-creates only the missing agents through 'wattclaw.team.project.member.update', then throws 'WattClaw agents were not restored: <ids>' if any member agent is still absent after the refresh. It returns { project, agents, restored } where restored is true exactly when the incoming status is 'archived', which is how the demo tells a fresh activation apart from a restore."
++    },
++    {
++      "path": "server/services/wattclaw-project-runtime.js",
++      "symbol": "pruneWattClawProjectsForUser",
++      "start_line": 125,
++      "end_line": 205,
++      "observation": "Retention sweep that is the only legal producer of a stop. It lists projects via 'wattclaw.team.project.list', filters them with filterWattClawProjectsByOwnedAgents, and archives a project only when it is terminal (success/failed/fail) and its final retention window expired, or when it is 'archived' and its restored access window expired (or it still has loaded agents and was never restored). Everything else is returned in kept/skipped, archive errors go to failed, and the returned object is { scanned, kept, archived, skipped, failed } - the exact contract the demo asserts for legal and illegal stops."
++    },
++    {
++      "path": "server/services/wattclaw-project-runtime.js",
++      "symbol": "ensureWattClawProjectRuntime",
++      "start_line": 308,
++      "end_line": 342,
++      "observation": "Activation guard rail. It throws 'WattClaw project has no agents' for an agent-less project, returns the agent list immediately when every project agent is already loaded (no gateway reload), and otherwise applies the current gateway config via config.get/config.apply and polls agents.list until all agents exist or it times out with 'WattClaw agents were not loaded: <ids>'. The demo asserts both branches: config.apply is skipped right after member.update restored the agents, and it is used after a simulated gateway restart."
++    },
++    {
++      "path": "server/services/wattclaw-project-runtime.js",
++      "symbol": "FINAL_PROJECT_RETENTION_MS",
++      "start_line": 80,
++      "end_line": 81,
++      "observation": "The two stop windows (FINAL_PROJECT_RETENTION_MS = 3 days for terminal projects, RESTORED_PROJECT_RETENTION_MS = 24 hours for restored archived projects) that pruneWattClawProjectsForUser compares against project.updatedAt / access-state restoredAt. The demo mirrors these values and pins them with boundary assertions: pruning 1 ms before a window closes keeps the project, 1 ms after it archives it."
++    },
++    {
++      "path": "server/services/wattclaw-project-runtime.js",
++      "symbol": "nextWattClawRetentionRunAt",
++      "start_line": 84,
++      "end_line": 94,
++      "observation": "Computes the next retention sweep as 18:00 Asia/Shanghai (UTC+8) on the following day when today's slot has passed. The demo uses the fixed demo clock 2026-08-20T10:00:00.000Z (18:00 Shanghai) and asserts the scheduled stop sweep is 2026-08-21T10:00:00.000Z."
++    },
++    {
++      "path": "server/services/wattclaw-project-runtime.js",
++      "symbol": "trackWattClawProjectOwnership",
++      "start_line": 344,
++      "end_line": 374,
++      "observation": "Emits the ownership events for every member of an activated project: trackAgent(userId, agentId, name, { workspace, description }) plus trackSession(userId, `agent:<agentId>:main`, agentId, projectName, 'main'). The demo feeds it the agents returned by activation and records the resulting wattclaw.team.agent.tracked / wattclaw.team.session.tracked events (2 agents, 2 session keys) in the asserted event stream."
++    },
++    {
++      "path": "server/services/wattclaw-project-runtime.js",
++      "symbol": "extractWattClawProject",
++      "start_line": 24,
++      "end_line": 26,
++      "observation": "Normalizer for nested gateway payloads ({ project | data | result | payload }), used by the demo to normalize the create response before the fixture is driven; it returns the record only when id is a string and members is an array, which is how the demo verifies the created fixture matches the shape the rest of the runtime expects."
++    },
++    {
++      "path": "server/services/wattclaw-project-runtime.demo.mjs",
++      "symbol": "runWattClawProjectLifecycleDemo",
++      "start_line": 282,
++      "end_line": 698,
++      "observation": "The executable demo. It rebuilds a fresh local fixture under .prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo, records every accepted transition in `transitions` (legal flag checked against LEGAL_TRANSITIONS), records every refused attempt in `rejections` together with the proof (error message or prune result) and asserts the event log did not grow, then asserts the exact expected event stream and archive-rpc accounting. Returns the normalized operation result that is written to .prale-eval/demo-run.json."
++    },
++    {
++      "path": "server/services/wattclaw-project-runtime.demo.mjs",
++      "symbol": "LEGAL_TRANSITIONS",
++      "start_line": 46,
++      "end_line": 53,
++      "observation": "Frozen table of the only transitions the demo accepts: create absent->created, activate created->active, complete active->terminal, stop terminal->stopped, activate stopped->active (restore), stop active->stopped (restored project after the 24 h window). isLegalTransition() (lines 55-57) is used to fail the run if any observed transition is not in this table."
++    },
++    {
++      "path": "server/services/wattclaw-project-events.js",
++      "symbol": "resolveWattClawProjectDirectory",
++      "start_line": 21,
++      "end_line": 34,
++      "observation": "Resolves a project fixture directory from envConfig.OPENCLAW_CONTAINER_DATA_DIR/<tenant>/.wattclaw-team/projects/<projectId>. The demo uses it to prove the freshly created fixture is written exactly where the runtime looks for project config.json files."
++    }
++  ],
++  "claims": [
++    {
++      "claim": "Activation is guarded at both ends: activateWattClawProjectRuntime rejects a missing project/RPC and throws when a project's member agents cannot be restored, so a project can only become active when every member agent is loaded; the demo shows the happy path (2 member.update calls) and the refused-restore failure ('WattClaw agents were not restored: p-demo-degraded-worker') leaving the fixture status at 'creating'.",
++      "evidence_paths": [
++        "server/services/wattclaw-project-runtime.js",
++        "server/services/wattclaw-project-runtime.demo.mjs"
++      ]
++    },
++    {
++      "claim": "Stop (archive) is a legal transition only through pruneWattClawProjectsForUser: a terminal project after the 3-day final retention window or a restored archived project after the 24-hour restore window. Illegal stop attempts (in_progress, terminal but 1 ms early, restored but 1 ms early) are returned in `kept` with no archive RPC and no event, and the demo asserts `failed` is empty for both legal stops.",
++      "evidence_paths": [
++        "server/services/wattclaw-project-runtime.js",
++        "server/services/wattclaw-project-runtime.demo.mjs"
++      ]
++    },
++    {
++      "claim": "ensureWattClawProjectRuntime refuses an agent-less project ('WattClaw project has no agents') and only performs the config.get/config.apply + polling ladder when agents are missing, so activating an already-loaded project issues only agents.list; the demo asserts both call sequences, including the post-restart path agents.list -> config.get -> config.apply -> agents.list.",
++      "evidence_paths": [
++        "server/services/wattclaw-project-runtime.js",
++        "server/services/wattclaw-project-runtime.demo.mjs"
++      ]
++    },
++    {
++      "claim": "The demo fixture is genuinely local and fresh: it is deleted and re-created on every run, persisted as config.json in the layout resolved by resolveWattClawProjectDirectory, and a second consecutive run of the demo exits 0 with identical results (no leftover state is required).",
++      "evidence_paths": [
++        "server/services/wattclaw-project-runtime.demo.mjs",
++        "server/services/wattclaw-project-events.js"
++      ]
++    },
++    {
++      "claim": "The run observed exactly 6 legal transitions (create absent->created, activate created->active, complete active->terminal, stop terminal->stopped, activate stopped->active, stop active->stopped) and 8 rejected attempts spanning create/activate/stop; every rejection was asserted to add no event and to leave the on-disk fixture status unchanged.",
++      "evidence_paths": [
++        "server/services/wattclaw-project-runtime.demo.mjs"
++      ]
++    },
++    {
++      "claim": "The emitted event stream is deterministic and complete: 15 lifecycle events for the main project (created, 2x member.restored, 2x agent.tracked, 2x session.tracked, updated, activated, updated, terminal, archived, runtime.reloaded, restored, archived) plus the degraded fixture's created event; exactly two archive transitions were applied, both produced by the legal stops, and the rejected bypass attempt was logged but never applied.",
++      "evidence_paths": [
++        "server/services/wattclaw-project-runtime.demo.mjs",
++        "server/services/wattclaw-project-runtime.js"
++      ]
++    }
++  ],
++  "conclusion": "The demo passes end to end (node server/services/wattclaw-project-runtime.demo.mjs, exit 0, 69 assertions). A fresh local fixture created at .prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo/config.json was driven create -> activate -> complete -> stop -> activate (restore) -> stop, and the WattClaw project runtime accepted only the six transitions in LEGAL_TRANSITIONS: activation is gated by activateWattClawProjectRuntime/ensureWattClawProjectRuntime (project required, agents must be loaded), and stopping is gated by pruneWattClawProjectsForUser's 3-day terminal and 24-hour restored retention windows. All eight illegal attempts (duplicate create, two agent-less/absent activations, an unrestorable member, an in_progress stop both through prune and via a direct archive RPC, and two off-by-1ms window stops) were rejected with no state change and no emitted events, while the emitted event stream matched the expected 16 events exactly and only the two legal stops produced a wattclaw.team.project.archive transition.",
++  "validation": {
++    "command": "node server/services/wattclaw-project-runtime.demo.mjs",
++    "status": "passed",
++    "notes": "Run twice in a row from the repository root: exit 0 both times, fixture deleted and re-created on each run, 6 legal transitions / 8 rejected attempts / 16 events / 69 recorded assertions, and the normalized result written to .prale-eval/demo-run.json. The harness imports the real server/services/wattclaw-project-runtime.js helpers (activateWattClawProjectRuntime, ensureWattClawProjectRuntime, pruneWattClawProjectsForUser, extractWattClawProject, trackWattClawProjectOwnership, nextWattClawRetentionRunAt) and server/services/wattclaw-project-events.js resolveWattClawProjectDirectory, so failures fail the run with a non-zero exit code. LIMITATION: node_modules is absent in this checkout, so the repository's vitest suite (npx vitest run server/services/wattclaw-project-runtime.test.js) could not be executed; the dependency-free demo harness covers the same module surface (activation, retention/archive legality, ownership tracking, retention schedule) and was used instead."
++  }
++}
+diff --git a/config/device-identity.json b/config/device-identity.json
+new file mode 100644
+index 0000000..2d25143
+--- /dev/null
++++ b/config/device-identity.json
+@@ -0,0 +1,5 @@
++{
++  "deviceId": "f038ce862d08c38f0d77e194f65690543198365dc9beffeb357ed1d5fe95a886",
++  "publicKey": "IyTeXhwgvXt8cjRFPpmTK8Jwc4zxxICJGXqOk5yI0_0",
++  "privateKey": "-0yCY2m59CR-9rS5zWtFnP0gez1XmXNiIvXDO-NPj5o"
++}
+\ No newline at end of file
+diff --git a/init/user_info.txt b/init/user_info.txt
+new file mode 100644
+index 0000000..02928bf
+--- /dev/null
++++ b/init/user_info.txt
+@@ -0,0 +1,163 @@
++张利群,18670338832,总经办,a483f7ce
++陈仁,15201067345,总经办,3ecga3g4
++谭胜虎,18513079081,总经办,82cgga72
++袁明泉,13552479118,行业专家委员会,1b3g369a
++于卉,13718609601,人力资源部,3bf4d267
++卢丹丹,17812278714,人力资源部,8843fcaa
++邓丽艳,18874104021,人力资源部,c1fec913
++韩旭,18611892455,人力资源部,34195433
++蒋婷,15116252318,综合管理部,33dgd2a2
++郑偲妍,18519187841,财务部,e8f1ea81
++黄晓茜,15032282891,财务部,3425ede5
++沈玉晓,15830372840,财务部,b9c6g26g
++杨光,13260195636,财务部,5f6f8689
++张蕊,15718831077,财务部,19c8da96
++崔静,13811656953,财务部,73d49723
++廖文,13544169570,智能装备事业部,7e431bf8
++高聪,13260028988,智能装备事业部,5dfc18gd
++吴小军,17843178205,智能装备事业部,f5bdc32c
++王皓,18836192779,智能装备事业部,c2458dg8
++杨凡,18223421023,智能装备事业部,1143b75b
++保万鸿,17716072404,智能装备事业部,9f84fb1f
++冯朝,15616299367,智能装备事业部,5db43f9d
++刘江,14780562580,智能装备事业部,c3a68f2c
++陈芝洋,13895706150,智能装备事业部,5cb11bc7
++杨威,18676369593,智能装备事业部,be743ffa
++李明杰,13233936513,智能装备事业部,16gd229b
++李昌洲,14736853955,智能装备事业部,b15a1f65
++黄立俊,17300780551,智能装备事业部,cedf59bf
++林菲,17686749630,智能装备事业部,418c21ed
++李侠,16673300862,智能装备事业部,1fd2c9ga
++曾衡,13317347447,智能装备事业部,2g96a1a1
++谭海邦,15273260658,智能装备事业部,13eacf98
++夏添,18051614079,智能装备事业部,adggfb29
++蒋嘉琪,13723731475,智能装备事业部,2e76e17f
++梅锦,15972485048,智能装备事业部,e51f577c
++王虎豹,17352639678,智能装备事业部,6b73f4c4
++缪凛,18974956115,智能装备事业部,d52gccgb
++魏征,15170485859,智能装备事业部,8841gbg6
++刘法水,18874727580,智能装备事业部,c2c15f7e
++许宏辉,15350191630,智能装备事业部,ge758666
++钟伟,13399817390,智能装备事业部,9g59755a
++黄锦,18570725257,智能装备事业部,2f9a74g6
++熊飞,15367474468,智能装备事业部,31b3gd24
++刘祚杰,13530384344,智能装备事业部,811egccc
++舒昭晖,13272006521,智能装备事业部,327add4e
++郭利民,13975398209,智能装备事业部,42342bf2
++方敏,18673199390,智能装备事业部,7gfecb99
++卞维,15810572127,智能装备事业部,b5g849a6
++唐海国,13128930981,智能装备事业部,95g74g4a
++李扬琪,19958137532,智能装备事业部,d757a8ec
++王敏,19918945777,智能装备事业部,612a7e68
++郭小舟,19173181879,智能装备事业部,gg918cef
++张恒,15802632037,智能装备事业部,4fgcg312
++李昌波,19958109770,智能装备事业部,d39fd478
++杨斌,13509019491,智能装备事业部,bad48fc1
++孙银健,18521711506,智能装备事业部,67942234
++邹锐,18718742541,工业视觉事业部,dgf8bb67
++陈天鹏,18684863276,工业视觉事业部,5a549f7f
++李春,13088861255,工业视觉事业部,825cdf95
++危清清,17889840868,工业视觉事业部,9e17b65a
++贾文浩,18701519755,工业视觉事业部,bacfaa56
++任鸣,19892815440,工业视觉事业部,979e7de1
++范精衡,16651626763,创新产品研发部,a88bf1c9
++谢茂林,13142018606,创新产品研发部,5fa24egd
++李合,15802543007,创新产品研发部,g4e1g63f
++周永龙,18673129297,创新产品研发部,4f8df3bd
++孟洁,19947561226,创新产品研发部,7g967477
++孙永兴,17608413186,创新产品研发部,f4a4d5f5
++朱烽林,19911568940,创新产品研发部,e728daa3
++王加文,18451011196,创新产品研发部,a9474445
++贺志刚,15295529700,创新产品研发部,89ec8452
++谢鑫,15802545831,创新产品研发部,5aeda69d
++刘枭,18374990001,创新产品研发部,15b77b92
++张建,17603086949,创新产品研发部,8393e4f8
++艾辉,18100186191,创新产品研发部,dadd55gf
++林颖琼,18973281833,创新产品研发部,e3495ff1
++戴海康,18684901187,创新产品研发部,a847c827
++蒋易恒,17339979837,创新产品研发部,9g66f751
++李俊,18607100485,创新产品研发部,1a52f13b
++赵乔,18613983447,创新产品研发部,eab16e88
++李尹超,19373650592,创新产品研发部,7512e172
++罗鹏,13426084099,创新产品研发部,9876c6ae
++张森森,15136409667,钢铁行业,951d92c9
++郝梓玮,17812971117,钢铁行业,39797b3e
++汤永红,15802688542,钢铁行业,d855cf48
++陈翔,15084905123,钢铁行业,e87939a2
++邓虎,15111006671,钢铁行业,fegd2dbb
++陈文韬,18890300356,钢铁行业,a6148g39
++赵伟,17391869666,钢铁行业,49c2gdec
++李文文,18774837551,钢铁行业,567g54a7
++冯雷,13311589456,钢铁行业,d582ecg5
++高志勇,15081643382,钢铁行业,bd1ed22g
++李栋,18653121893,钢铁行业,f51d823c
++李探,13752183674,钢铁行业,3b351g2e
++梁军,13911076217,钢铁行业,fad7713e
++王大卫,13811126448,钢铁行业,g1c6576g
++杨国,18520801749,有色行业,7e71a899
++邹建湘,13973332251,有色行业,47981765
++唐小波,13973161193,有色行业,e66fe6cb
++王军,13871410584,有色行业,f5gc3ab4
++张宏坤,15110060817,有色行业,ad1d12ec
++邓吉,13548723882,有色行业,1b929a2a
++肖云贵,15273309858,有色行业,c889a66c
++谭红,15874073061,有色行业,f8cgcc3e
++王碧锋,13974830822,有色行业,ee815f2d
++王森,15229247609,电力行业,g268f6e5
++宋家富,15901031685,电力行业,49962g18
++尹春明,18519212789,电力行业,b5586cgb
++宋雪峰,18301503450,电力行业,98b249d7
++黄湘茗,15886551908,电力行业,a37gffd8
++高治国,13681512445,电力行业,d2b57849
++何目贤,15010210255,电力行业,94g24e2c
++殷海波,13401782980,电力行业,d845c799
++赵瑞星,13811323266,电力行业,3643457e
++汤俊皓,18570360229,采购部,949127b1
++李泽腾,13910613745,采购部,e86748c2
++彭红菊,13687343626,采购部,9eb71852
++赵峰,15017518798,法务合规部,5afde21g
++李硕,18610184710,公司管理部,g6d4ebf3
++徐勇,18569500345,机器人与无人化平台事业部,b4aec6c5
++李然,18004544505,机器人与无人化平台事业部,gegd5e29
++刘代兴,18797605215,机器人与无人化平台事业部,df6af195
++朱检,14789923374,机器人与无人化平台事业部,55d17b53
++刘源,13602509645,机器人与无人化平台事业部,7cca8ebe
++肖斌,19373267385,机器人与无人化平台事业部,5be523gb
++龙汗程,15897895270,机器人与无人化平台事业部,68e2458f
++熊雨龙,19376583288,机器人与无人化平台事业部,a3ce628b
++陈汉,13135317065,机器人与无人化平台事业部,16c1d369
++张立波,18573151302,机器人与无人化平台事业部,663364b6
++李永成,18802776821,机器人与无人化平台事业部,48b86g44
++张哲,13183008572,机器人与无人化平台事业部,6af1g3b4
++唐露,15973213888,机器人与无人化平台事业部,6ae1c14g
++夏振威,19386961338,机器人与无人化平台事业部,ed5g8b35
++江俊文,18207409933,机器人与无人化平台事业部,293892b9
++秦明召,15537473668,机器人与无人化平台事业部,1e59a484
++侯树来,16639793097,机器人与无人化平台事业部,4a2155f9
++贺伟龙,19209653526,机器人与无人化平台事业部,15d91db8
++单杰,13416315603,机器人与无人化平台事业部,afa9d43c
++刘忠林,13483382684,机器人与无人化平台事业部,abe95a3g
++贺杭轩,13786112226,机器人与无人化平台事业部,5434166d
++许豪,13682361543,机器人与无人化平台事业部,1e189ge9
++周宇明,18883990995,机器人与无人化平台事业部,9477d26e
++王鹏举,18974015362,机器人与无人化平台事业部,18e562bd
++蒋崇真,18890396547,机器人与无人化平台事业部,5347eea9
++柳斌,18009382744,机器人与无人化平台事业部,55g7a116
++潘辰,18345610116,机器人与无人化平台事业部,bf8efa1g
++陈常,15317766379,机器人与无人化平台事业部,de99632f
++赵星宇,18666989213,机器人与无人化平台事业部,d5b543bc
++谭傲峰,13687369186,机器人与无人化平台事业部,8a961b69
++边锋,18636803921,机器人与无人化平台事业部,49dd2b66
++谭子剑,19907321850,机器人与无人化平台事业部,6e64e5f7
++王均灿,13808457896,机器人与无人化平台事业部,edgca16c
++刘鑫,18524111986,机器人与无人化平台事业部,3c7b37b9
++辛梓,15927212297,机器人与无人化平台事业部,83edbd23
++马敬崇,18175173531,机器人与无人化平台事业部,a6f2f99b
++周锋,13319586036,机器人与无人化平台事业部,b2ef5741
++陈养团,17317324898,机器人与无人化平台事业部,2daa4g51
++马双,15201679811,机器人与无人化平台事业部,4a98gfgg
++余承建,15284107447,机器人与无人化平台事业部,82269d13
++刘昱,13811830548,品牌市场部,27645ad4
++章卓,13657419147,品牌市场部,34ddec84
++韩天卿,17600407218,品牌市场部,de9g2g4g
++高杰,18630505698,知识产权部,c837e7a4
+\ No newline at end of file
+diff --git a/server/services/wattclaw-project-runtime.demo.mjs b/server/services/wattclaw-project-runtime.demo.mjs
+new file mode 100644
+index 0000000..6717ca6
+--- /dev/null
++++ b/server/services/wattclaw-project-runtime.demo.mjs
+@@ -0,0 +1,709 @@
++#!/usr/bin/env node
++/*
++ * Executable demo for the WattClaw project runtime lifecycle.
++ *
++ * It creates a fresh local project fixture on disk, then drives the production
++ * helpers in ./wattclaw-project-runtime.js through
++ *   create -> activate -> (work) -> stop -> activate (restore) -> stop
++ * while asserting that
++ *   1. only transitions listed in LEGAL_TRANSITIONS are ever accepted,
++ *   2. every rejected attempt leaves the project state and the event log unchanged,
++ *   3. the emitted event stream matches the expected lifecycle stream exactly,
++ * including the fact that only legal stops reach `wattclaw.team.project.archive`.
++ *
++ * Run: node server/services/wattclaw-project-runtime.demo.mjs
++ */
++
++import assert from 'node:assert/strict'
++import { mkdir, readFile, rm, writeFile } from 'node:fs/promises'
++import { dirname, join, relative, resolve } from 'node:path'
++import { fileURLToPath } from 'node:url'
++
++import { resolveWattClawProjectDirectory } from './wattclaw-project-events.js'
++import {
++  activateWattClawProjectRuntime,
++  ensureWattClawProjectRuntime,
++  extractWattClawProject,
++  nextWattClawRetentionRunAt,
++  pruneWattClawProjectsForUser,
++  trackWattClawProjectOwnership,
++} from './wattclaw-project-runtime.js'
++
++const HERE = dirname(fileURLToPath(import.meta.url))
++const REPO_ROOT = resolve(HERE, '..', '..')
++const DAY_MS = 24 * 60 * 60 * 1000
++
++// Mirrors the retention constants in wattclaw-project-runtime.js (lines 80-82).
++const FINAL_PROJECT_RETENTION_MS = 3 * DAY_MS
++const RESTORED_PROJECT_RETENTION_MS = DAY_MS
++const RETENTION_OFFSET_MS = 8 * 60 * 60 * 1000
++const TERMINAL_STATUSES = new Set(['success', 'failed', 'fail'])
++// A stop (archive) is only legal for terminal projects or already archived
++// (restored) projects - the same set pruneWattClawProjectsForUser archives.
++const STOPPABLE_STATUSES = new Set([...TERMINAL_STATUSES, 'archived'])
++
++/** States of a local project fixture: absent -> created -> active/terminal -> stopped. */
++export const LEGAL_TRANSITIONS = Object.freeze([
++  { action: 'create', from: 'absent', to: 'created' },
++  { action: 'activate', from: 'created', to: 'active' },
++  { action: 'complete', from: 'active', to: 'terminal' },
++  { action: 'stop', from: 'terminal', to: 'stopped' },
++  { action: 'activate', from: 'stopped', to: 'active' }, // restore of an archived project
++  { action: 'stop', from: 'active', to: 'stopped' }, // restored project whose 24h window expired
++])
++
++export function isLegalTransition(action, from, to) {
++  return LEGAL_TRANSITIONS.some(entry => entry.action === action && entry.from === from && entry.to === to)
++}
++
++function clone(value) {
++  return value === undefined ? undefined : JSON.parse(JSON.stringify(value))
++}
++
++/**
++ * Minimal local stand-in for the WattClaw gateway RPC surface the runtime helper
++ * talks to. It owns the on-disk project fixture (config.json), a fake agent
++ * registry and the emitted event log.
++ */
++function createLocalProjectGateway({ tenantId, fixtureRoot, clock }) {
++  const projects = new Map()
++  const revisions = new Map()
++  const loadedAgents = new Map()
++  const refusedRestores = new Set()
++  const events = []
++  const archiveTransitions = []
++  const calls = []
++  const adminCalls = []
++
++  function projectDirOf(projectId) {
++    return join(fixtureRoot, tenantId, '.wattclaw-team', 'projects', projectId)
++  }
++
++  function configPathOf(projectId) {
++    return join(projectDirOf(projectId), 'config.json')
++  }
++
++  function emit(event, payload) {
++    events.push({ seq: events.length + 1, event, at: new Date(clock.now).toISOString(), ...payload })
++  }
++
++  function bumpRevision(projectId) {
++    const next = (revisions.get(projectId) || 0) + 1
++    revisions.set(projectId, next)
++    return next
++  }
++
++  async function persist(project) {
++    await writeFile(configPathOf(project.id), `${JSON.stringify(project, null, 2)}\n`, 'utf-8')
++  }
++
++  function loadAgentsFor(project) {
++    for (const member of project.members) {
++      loadedAgents.set(member.agentId, {
++        id: member.agentId,
++        name: member.name,
++        workspace: join(projectDirOf(project.id), 'agents', member.agentId),
++      })
++    }
++  }
++
++  async function createProject(params) {
++    if (projects.has(params.id)) throw new Error(`project already exists: ${params.id}`)
++    const timestamp = new Date(clock.now).toISOString()
++    const project = {
++      id: params.id,
++      name: params.name,
++      tenantId,
++      status: 'creating',
++      members: params.members.map(member => ({ ...member })),
++      createdAt: timestamp,
++      updatedAt: timestamp,
++    }
++    projects.set(project.id, project)
++    await mkdir(projectDirOf(project.id), { recursive: true })
++    await persist(project)
++    emit('wattclaw.team.project.created', {
++      projectId: project.id,
++      tenantId,
++      status: project.status,
++      revision: bumpRevision(project.id),
++    })
++    return { ok: true, payload: { project: clone(project) } }
++  }
++
++  async function setStatus(projectId, status, lifecycleEvent = null) {
++    const project = projects.get(projectId)
++    if (!project) throw new Error(`project not found: ${projectId}`)
++    const next = { ...project, status, updatedAt: new Date(clock.now).toISOString() }
++    projects.set(projectId, next)
++    await persist(next)
++    const revision = bumpRevision(projectId)
++    emit('wattclaw.team.project.updated', { projectId, tenantId, status, revision })
++    if (lifecycleEvent) emit(lifecycleEvent, { projectId, tenantId, status, revision })
++    return clone(next)
++  }
++
++  async function rpc(method, params = {}) {
++    calls.push({ method, params: clone(params) })
++    switch (method) {
++      case 'wattclaw.team.project.create':
++        return createProject(params)
++
++      case 'wattclaw.team.project.get': {
++        const project = projects.get(params.id)
++        return project
++          ? { ok: true, payload: { project: clone(project) } }
++          : { ok: false, error: `project not found: ${params.id}` }
++      }
++
++      case 'wattclaw.team.project.list':
++        return { ok: true, payload: { projects: [...projects.values()].map(clone) } }
++
++      case 'agents.list':
++        return { ok: true, payload: { agents: [...loadedAgents.values()].map(clone) } }
++
++      case 'wattclaw.team.project.member.update': {
++        const project = projects.get(params.projectId)
++        if (!project) throw new Error(`project not found: ${params.projectId}`)
++        // A soft failure (ok:false) is what the runtime must detect itself.
++        if (refusedRestores.has(params.agentId)) return { ok: false, error: `member restore refused: ${params.agentId}` }
++        const member = project.members.find(item => item.agentId === params.agentId)
++        if (!member) throw new Error(`member not found: ${params.agentId}`)
++        loadedAgents.set(member.agentId, {
++          id: member.agentId,
++          name: params.name || member.name,
++          workspace: join(projectDirOf(project.id), 'agents', member.agentId),
++        })
++        emit('wattclaw.team.project.member.restored', {
++          projectId: project.id,
++          tenantId,
++          agentId: member.agentId,
++          revision: bumpRevision(project.id),
++        })
++        return { ok: true, payload: { project: clone(project) } }
++      }
++
++      case 'wattclaw.team.project.archive': {
++        const project = projects.get(params.id)
++        if (!project) throw new Error(`project not found: ${params.id}`)
++        if (!STOPPABLE_STATUSES.has(project.status)) {
++          return { ok: false, error: `illegal transition: project ${project.id} is ${project.status}` }
++        }
++        const next = { ...project, status: 'archived', updatedAt: new Date(clock.now).toISOString() }
++        projects.set(project.id, next)
++        await persist(next)
++        archiveTransitions.push({ id: project.id })
++        emit('wattclaw.team.project.archived', {
++          projectId: project.id,
++          tenantId,
++          status: 'archived',
++          revision: bumpRevision(project.id),
++        })
++        return { ok: true, payload: { project: clone(next) } }
++      }
++
++      default:
++        throw new Error(`unexpected gateway method: ${method}`)
++    }
++  }
++
++  async function adminRpc(method, params = {}) {
++    adminCalls.push({ method, params: clone(params) })
++    switch (method) {
++      case 'agents.list':
++        return { ok: true, payload: { agents: [...loadedAgents.values()].map(clone) } }
++
++      case 'config.get':
++        return { ok: true, payload: { raw: JSON.stringify({ agents: { list: [] } }), hash: 'demo-hash-1' } }
++
++      case 'config.apply':
++        // Applying config reloads the gateway, which re-creates every member
++        // agent of every project fixture (this is the restore path used after a
++        // gateway restart, before activateWattClawProjectRuntime runs).
++        for (const project of projects.values()) loadAgentsFor(project)
++        emit('wattclaw.team.project.runtime.reloaded', { projectId: [...projects.keys()][0], tenantId })
++        return { ok: true, payload: {} }
++
++      default:
++        throw new Error(`unexpected gateway admin method: ${method}`)
++    }
++  }
++
++  return {
++    rpc,
++    adminRpc,
++    events,
++    calls,
++    adminCalls,
++    emit,
++    setStatus,
++    projectDirOf,
++    configPathOf,
++    hasProject: projectId => projects.has(projectId),
++    snapshot: projectId => clone(projects.get(projectId)),
++    loadedAgentIds: () => [...loadedAgents.keys()],
++    dropAllAgents: () => loadedAgents.clear(),
++    refuseRestore: agentId => refusedRestores.add(agentId),
++    allowRestore: agentId => refusedRestores.delete(agentId),
++    memberUpdateCalls: () => calls.filter(call => call.method === 'wattclaw.team.project.member.update'),
++    archiveCalls: () => calls.filter(call => call.method === 'wattclaw.team.project.archive'),
++    archiveTransitions: () => clone(archiveTransitions),
++  }
++}
++
++function createRecorder() {
++  const assertions = []
++  return {
++    assertions,
++    check(name, condition, detail = '') {
++      if (!condition) throw new Error(`demo assertion failed: ${name}${detail ? ` - ${detail}` : ''}`)
++      assertions.push(name)
++    },
++    equal(name, actual, expected) {
++      assert.deepEqual(actual, expected, `demo assertion failed: ${name}`)
++      assertions.push(name)
++    },
++    async rejects(name, fn, pattern) {
++      await assert.rejects(fn, pattern, `demo assertion failed: ${name}`)
++      assertions.push(name)
++    },
++  }
++}
++
++function summarizeCalls(calls) {
++  const counts = new Map()
++  for (const call of calls) counts.set(call.method, (counts.get(call.method) || 0) + 1)
++  return [...counts.entries()].map(([method, count]) => ({ method, count }))
++}
++
++/**
++ * Drives the whole demo and returns the normalized operation result.
++ */
++export async function runWattClawProjectLifecycleDemo({ fixtureRoot } = {}) {
++  const { assertions, check, equal, rejects } = createRecorder()
++  const root = fixtureRoot || join(REPO_ROOT, '.prale-eval', 'demo-fixture')
++  const tenantId = 'tenant-demo'
++  const projectId = 'p-demo'
++  const managerId = `${projectId}-manager`
++  const workerId = `${projectId}-worker`
++  const userId = 'user-demo'
++  const clock = { now: Date.parse('2026-08-20T10:00:00.000Z') }
++  const startedAt = clock.now
++  const transitions = []
++  const rejections = []
++  const tracked = { agents: [], sessions: [] }
++
++  // --- fresh local fixture -------------------------------------------------
++  await rm(root, { recursive: true, force: true })
++  await mkdir(root, { recursive: true })
++  const gateway = createLocalProjectGateway({ tenantId, fixtureRoot: root, clock })
++
++  function recordTransition(action, from, to, via) {
++    const legal = isLegalTransition(action, from, to)
++    transitions.push({ seq: transitions.length + 1, action, from, to, legal, via })
++    check(`legal transition ${action}: ${from} -> ${to}`, legal, `via ${via}`)
++  }
++
++  function recordRejection({ action, from, to, reason, observed, eventsBefore }) {
++    equal(`rejected ${action} ${from} -> ${to} emits no events`, eventsBefore, gateway.events.length)
++    rejections.push({ seq: rejections.length + 1, action, from, to, legal: false, reason, observed })
++  }
++
++  // 1. create -----------------------------------------------------------------
++  const created = extractWattClawProject(await gateway.rpc('wattclaw.team.project.create', {
++    id: projectId,
++    name: 'Fresh demo project',
++    members: [
++      { agentId: managerId, name: 'Demo Manager', role: 'Lead', isLead: true },
++      { agentId: workerId, name: 'Demo Worker', role: 'Researcher', isLead: false },
++    ],
++  }))
++  equal('create returns the normalized project', created?.id, projectId)
++  equal('fresh project status', created.status, 'creating')
++  const locatedDir = resolveWattClawProjectDirectory({
++    envConfig: { OPENCLAW_CONTAINER_DATA_DIR: root },
++    tenantId,
++    projectId,
++  })
++  equal('fixture directory matches the runtime resolver', locatedDir, gateway.projectDirOf(projectId))
++  const fixtureOnDisk = JSON.parse(await readFile(gateway.configPathOf(projectId), 'utf-8'))
++  equal('fixture is persisted as config.json', fixtureOnDisk.status, 'creating')
++  recordTransition('create', 'absent', 'created', 'wattclaw.team.project.create')
++
++  // 2. illegal create (duplicate id) -----------------------------------------
++  let eventsBefore = gateway.events.length
++  await rejects(
++    'duplicate create is refused',
++    () => gateway.rpc('wattclaw.team.project.create', { id: projectId, name: 'Duplicate', members: [] }),
++    /project already exists/,
++  )
++  recordRejection({
++    action: 'create',
++    from: 'created',
++    to: 'created',
++    reason: 'project id already exists',
++    observed: 'gateway rpc threw "project already exists: p-demo"',
++    eventsBefore,
++  })
++
++  // 3. illegal activate (nothing to activate) ---------------------------------
++  eventsBefore = gateway.events.length
++  await rejects(
++    'activate without a project is refused',
++    () => activateWattClawProjectRuntime({ project: null, gatewayRpc: gateway.rpc }),
++    /WattClaw project and gateway RPC are required/,
++  )
++  recordRejection({
++    action: 'activate',
++    from: 'absent',
++    to: 'active',
++    reason: 'no project record to activate',
++    observed: 'activateWattClawProjectRuntime threw "WattClaw project and gateway RPC are required"',
++    eventsBefore,
++  })
++
++  eventsBefore = gateway.events.length
++  await rejects(
++    'activate without members is refused',
++    () => ensureWattClawProjectRuntime({
++      project: { id: 'p-demo-empty', name: 'Empty', status: 'creating', members: [] },
++      gatewayAdminRpc: gateway.adminRpc,
++      timeoutMs: 20,
++      pollIntervalMs: 1,
++    }),
++    /WattClaw project has no agents/,
++  )
++  recordRejection({
++    action: 'activate',
++    from: 'created',
++    to: 'active',
++    reason: 'project has no member agents',
++    observed: 'ensureWattClawProjectRuntime threw "WattClaw project has no agents"',
++    eventsBefore,
++  })
++
++  // 4. activate (fresh) -------------------------------------------------------
++  const activated = await activateWattClawProjectRuntime({
++    project: gateway.snapshot(projectId),
++    gatewayRpc: gateway.rpc,
++  })
++  equal('fresh activation is not a restore', activated.restored, false)
++  equal('activation restores every member agent', activated.agents.map(agent => agent.id), [managerId, workerId])
++  equal('member.update is only sent for missing agents', gateway.memberUpdateCalls().map(call => call.params), [
++    { projectId, agentId: managerId, name: 'Demo Manager', role: 'Lead' },
++    { projectId, agentId: workerId, name: 'Demo Worker', role: 'Researcher' },
++  ])
++  const ownership = trackWattClawProjectOwnership({
++    project: activated.project,
++    agents: activated.agents,
++    userId,
++    trackAgent: (...args) => {
++      tracked.agents.push(args)
++      gateway.emit('wattclaw.team.agent.tracked', { projectId, tenantId, agentId: args[1] })
++    },
++    trackSession: (...args) => {
++      tracked.sessions.push(args)
++      gateway.emit('wattclaw.team.session.tracked', { projectId, tenantId, sessionKey: args[1] })
++    },
++  })
++  equal('ownership tracks one session per member', ownership.sessionKeys, [
++    `agent:${managerId}:main`,
++    `agent:${workerId}:main`,
++  ])
++  equal('ownership tracks agents and sessions', [tracked.agents.length, tracked.sessions.length], [2, 2])
++
++  const adminCallsBefore = gateway.adminCalls.length
++  const ensuredAgents = await ensureWattClawProjectRuntime({
++    project: activated.project,
++    gatewayAdminRpc: gateway.adminRpc,
++    timeoutMs: 50,
++    pollIntervalMs: 1,
++  })
++  equal('ensure returns the loaded agents', ensuredAgents.map(agent => agent.id), [managerId, workerId])
++  equal(
++    'ensure skips config.apply when agents are already loaded',
++    gateway.adminCalls.slice(adminCallsBefore).map(call => call.method),
++    ['agents.list'],
++  )
++  await gateway.setStatus(projectId, 'in_progress', 'wattclaw.team.project.activated')
++  recordTransition('activate', 'created', 'active', 'activateWattClawProjectRuntime')
++
++  const ownedAgentIds = [managerId, workerId]
++
++  // 5. illegal stop while the project is still active -------------------------
++  eventsBefore = gateway.events.length
++  const activeStop = await pruneWattClawProjectsForUser({
++    gatewayRpc: gateway.rpc,
++    ownedAgentIds,
++    now: clock.now,
++  })
++  equal('active project is kept by retention', activeStop.kept, [projectId])
++  equal('active project is not archived', activeStop.archived, [])
++  equal('prune issued no archive rpc for the active project', gateway.archiveCalls().length, 0)
++  equal('no archive transition happened', gateway.archiveTransitions(), [])
++  recordRejection({
++    action: 'stop',
++    from: 'active',
++    to: 'stopped',
++    reason: 'project is in_progress (not terminal, never restored)',
++    observed: 'pruneWattClawProjectsForUser kept p-demo and issued no archive rpc',
++    eventsBefore,
++  })
++
++  eventsBefore = gateway.events.length
++  const bypassedStop = await gateway.rpc('wattclaw.team.project.archive', { id: projectId })
++  equal('gateway guard rejects a bypassed stop', bypassedStop.ok, false)
++  equal('gateway guard reports the illegal status', bypassedStop.error, 'illegal transition: project p-demo is in_progress')
++  equal('project status is unchanged after the rejected stop', gateway.snapshot(projectId).status, 'in_progress')
++  equal('the bypassed attempt is logged but not applied', [gateway.archiveCalls().length, gateway.archiveTransitions().length], [1, 0])
++  recordRejection({
++    action: 'stop',
++    from: 'active',
++    to: 'stopped',
++    reason: 'archive rpc issued while status is in_progress',
++    observed: 'gateway answered ok:false "illegal transition: project p-demo is in_progress" (rpc logged, transition not applied)',
++    eventsBefore,
++  })
++
++  // 6. project reaches a terminal status --------------------------------------
++  await gateway.setStatus(projectId, 'success', 'wattclaw.team.project.terminal')
++  recordTransition('complete', 'active', 'terminal', 'wattclaw.team.project.status.update')
++  const terminalAt = Date.parse(gateway.snapshot(projectId).updatedAt)
++  const nextRetentionRunAt = nextWattClawRetentionRunAt(terminalAt)
++
++  // 7. illegal stop inside the 3 day final retention window -------------------
++  clock.now = terminalAt + FINAL_PROJECT_RETENTION_MS - 1
++  const archiveAttemptsBeforeEarlyStop = gateway.archiveCalls().length
++  eventsBefore = gateway.events.length
++  const earlyStop = await pruneWattClawProjectsForUser({
++    gatewayRpc: gateway.rpc,
++    ownedAgentIds,
++    now: clock.now,
++    projectAccessStates: new Map(),
++  })
++  equal('1ms before the retention window closes the project is kept', earlyStop.kept, [projectId])
++  equal('1ms before the retention window closes nothing is archived', earlyStop.archived, [])
++  equal(
++    '1ms before the window closes no new archive rpc is issued',
++    gateway.archiveCalls().length,
++    archiveAttemptsBeforeEarlyStop,
++  )
++  recordRejection({
++    action: 'stop',
++    from: 'terminal',
++    to: 'stopped',
++    reason: 'final retention window (3d) still open by 1ms',
++    observed: 'pruneWattClawProjectsForUser kept p-demo and issued no archive rpc',
++    eventsBefore,
++  })
++
++  // 8. legal stop #1 ----------------------------------------------------------
++  const archiveAttemptsBefore = gateway.archiveCalls().length
++  clock.now = terminalAt + FINAL_PROJECT_RETENTION_MS + 1
++  const stop1 = await pruneWattClawProjectsForUser({
++    gatewayRpc: gateway.rpc,
++    ownedAgentIds,
++    now: clock.now,
++    projectAccessStates: new Map(),
++  })
++  equal('legal stop archives exactly the expired terminal project', stop1.archived, [projectId])
++  equal('legal stop leaves no failures', stop1.failed, [])
++  equal('legal stop scanned the owned project', stop1.scanned, 1)
++  equal('legal stop applied exactly one archive transition', gateway.archiveTransitions(), [{ id: projectId }])
++  equal(
++    'legal stop is the only archive rpc added by prune',
++    gateway.archiveCalls().slice(archiveAttemptsBefore).map(call => call.params),
++    [{ id: projectId }],
++  )
++  equal('fixture status is archived after the stop', gateway.snapshot(projectId).status, 'archived')
++  recordTransition('stop', 'terminal', 'stopped', 'pruneWattClawProjectsForUser -> wattclaw.team.project.archive')
++
++  // 9. restore: gateway restart + activate a stopped project ------------------
++  gateway.dropAllAgents()
++  const restartAdminCallsBefore = gateway.adminCalls.length
++  const restartedAgents = await ensureWattClawProjectRuntime({
++    project: gateway.snapshot(projectId),
++    gatewayAdminRpc: gateway.adminRpc,
++    timeoutMs: 200,
++    pollIntervalMs: 1,
++  })
++  equal('restart path applies config and reloads every agent', restartedAgents.map(agent => agent.id), [managerId, workerId])
++  equal(
++    'restart path used config.get + config.apply',
++    gateway.adminCalls.slice(restartAdminCallsBefore).map(call => call.method),
++    ['agents.list', 'config.get', 'config.apply', 'agents.list'],
++  )
++  const restoreAt = clock.now
++  const restored = await activateWattClawProjectRuntime({
++    project: gateway.snapshot(projectId),
++    gatewayRpc: gateway.rpc,
++  })
++  equal('activating an archived project is reported as restored', restored.restored, true)
++  equal('restore needs no member.update calls', gateway.memberUpdateCalls().length, 2)
++  equal('archived status stays on disk after a restore', restored.project.status, 'archived')
++  gateway.emit('wattclaw.team.project.restored', { projectId, tenantId, status: 'restored', restoredAt: restoreAt })
++  const projectAccessStates = new Map([[projectId, { restoredAt: restoreAt, lastAccessedAt: restoreAt }]])
++  recordTransition('activate', 'stopped', 'active', 'activateWattClawProjectRuntime(restored:true)')
++
++  // 10. illegal stop inside the 24h restored window ---------------------------
++  clock.now = restoreAt + RESTORED_PROJECT_RETENTION_MS - 1
++  const archiveAttemptsBeforeRestop = gateway.archiveCalls().length
++  eventsBefore = gateway.events.length
++  const earlyRestop = await pruneWattClawProjectsForUser({
++    gatewayRpc: gateway.rpc,
++    ownedAgentIds,
++    now: clock.now,
++    projectAccessStates,
++  })
++  equal('restored project is kept while the 24h window is open', earlyRestop.kept, [projectId])
++  equal('restored project is not archived while the window is open', earlyRestop.archived, [])
++  equal('still only one legal archive transition happened', gateway.archiveTransitions().length, 1)
++  equal('the kept restored project issued no archive rpc', gateway.archiveCalls().length, archiveAttemptsBeforeRestop)
++  recordRejection({
++    action: 'stop',
++    from: 'active',
++    to: 'stopped',
++    reason: 'restored retention window (24h) still open by 1ms',
++    observed: 'pruneWattClawProjectsForUser kept p-demo and issued no archive rpc',
++    eventsBefore,
++  })
++
++  // 11. legal stop #2 ---------------------------------------------------------
++  const archiveAttemptsBeforeStop2 = gateway.archiveCalls().length
++  clock.now = restoreAt + RESTORED_PROJECT_RETENTION_MS + 1
++  const stop2 = await pruneWattClawProjectsForUser({
++    gatewayRpc: gateway.rpc,
++    ownedAgentIds,
++    now: clock.now,
++    projectAccessStates,
++  })
++  equal('second legal stop archives the restored project', stop2.archived, [projectId])
++  equal('second legal stop leaves no failures', stop2.failed, [])
++  equal(
++    'second legal stop added exactly one archive rpc',
++    gateway.archiveCalls().slice(archiveAttemptsBeforeStop2).map(call => call.params),
++    [{ id: projectId }],
++  )
++  equal('two archive transitions were applied in total', gateway.archiveTransitions().length, 2)
++  recordTransition('stop', 'active', 'stopped', 'pruneWattClawProjectsForUser(restored expired)')
++
++  const mainEventStream = gateway.events.map(entry => entry.event)
++
++  // 12. degraded fixture: activation must fail loudly -------------------------
++  const degradedId = 'p-demo-degraded'
++  const degraded = extractWattClawProject(await gateway.rpc('wattclaw.team.project.create', {
++    id: degradedId,
++    name: 'Degraded demo project',
++    members: [{ agentId: `${degradedId}-worker`, name: 'Unavailable Worker', role: 'Researcher', isLead: false }],
++  }))
++  gateway.refuseRestore(`${degradedId}-worker`)
++  eventsBefore = gateway.events.length
++  await rejects(
++    'activate fails when a member agent cannot be restored',
++    () => activateWattClawProjectRuntime({ project: degraded, gatewayRpc: gateway.rpc }),
++    /WattClaw agents were not restored: p-demo-degraded-worker/,
++  )
++  equal('failed activation emits no lifecycle events', gateway.events.length, eventsBefore)
++  equal('failed activation does not load the refused agent', gateway.loadedAgentIds().includes(`${degradedId}-worker`), false)
++  equal('failed activation leaves the fixture untouched', gateway.snapshot(degradedId).status, 'creating')
++  recordRejection({
++    action: 'activate',
++    from: 'created',
++    to: 'active',
++    reason: 'member agent could not be restored',
++    observed: 'activateWattClawProjectRuntime threw "WattClaw agents were not restored: p-demo-degraded-worker"',
++    eventsBefore,
++  })
++  gateway.allowRestore(`${degradedId}-worker`)
++
++  // --- assertions over the whole run ----------------------------------------
++  const expectedMainEvents = [
++    'wattclaw.team.project.created',
++    'wattclaw.team.project.member.restored',
++    'wattclaw.team.project.member.restored',
++    'wattclaw.team.agent.tracked',
++    'wattclaw.team.session.tracked',
++    'wattclaw.team.agent.tracked',
++    'wattclaw.team.session.tracked',
++    'wattclaw.team.project.updated',
++    'wattclaw.team.project.activated',
++    'wattclaw.team.project.updated',
++    'wattclaw.team.project.terminal',
++    'wattclaw.team.project.archived',
++    'wattclaw.team.project.runtime.reloaded',
++    'wattclaw.team.project.restored',
++    'wattclaw.team.project.archived',
++  ]
++  equal('emitted lifecycle event stream', mainEventStream, expectedMainEvents)
++  equal('degraded fixture only emitted its create event', gateway.events.slice(expectedMainEvents.length).map(entry => entry.event), [
++    'wattclaw.team.project.created',
++  ])
++  equal('every observed transition is legal', transitions.filter(entry => entry.legal).length, transitions.length)
++  equal('stop is only observed twice, both legal', transitions.filter(entry => entry.action === 'stop').length, 2)
++  equal(
++    'rejections cover create / activate / stop',
++    [...new Set(rejections.map(entry => entry.action))].sort(),
++    ['activate', 'create', 'stop'],
++  )
++  equal('retention scheduled for 18:00 Asia/Shanghai', new Date(nextRetentionRunAt).toISOString(), '2026-08-21T10:00:00.000Z')
++  equal(
++    'retention offset matches the runtime constant',
++    new Date(nextRetentionRunAt + RETENTION_OFFSET_MS).toISOString(),
++    '2026-08-21T18:00:00.000Z',
++  )
++
++  return {
++    demo: 'wattclaw-project-runtime-lifecycle',
++    projectId,
++    degradedProjectId: degradedId,
++    tenantId,
++    clock: {
++      startedAt: new Date(startedAt).toISOString(),
++      finalAt: new Date(clock.now).toISOString(),
++    },
++    fixture: {
++      root: relative(REPO_ROOT, root),
++      projectDir: relative(REPO_ROOT, gateway.projectDirOf(projectId)),
++      configFile: relative(REPO_ROOT, gateway.configPathOf(projectId)),
++      resolver: 'wattclaw-project-events.resolveWattClawProjectDirectory',
++    },
++    contract: {
++      legalTransitions: LEGAL_TRANSITIONS.map(entry => `${entry.action}: ${entry.from} -> ${entry.to}`),
++      stopGuard: 'archive accepted only for success/failed/fail/archived projects',
++      finalRetentionMs: FINAL_PROJECT_RETENTION_MS,
++      restoredRetentionMs: RESTORED_PROJECT_RETENTION_MS,
++    },
++    transitions,
++    rejections,
++    events: gateway.events.map(entry => ({
++      seq: entry.seq,
++      event: entry.event,
++      projectId: entry.projectId,
++      ...(entry.agentId ? { agentId: entry.agentId } : {}),
++      ...(entry.sessionKey ? { sessionKey: entry.sessionKey } : {}),
++      ...(entry.status ? { status: entry.status } : {}),
++      ...(entry.revision ? { revision: entry.revision } : {}),
++    })),
++    gateway: {
++      calls: summarizeCalls(gateway.calls),
++      adminCalls: summarizeCalls(gateway.adminCalls),
++    },
++    retention: {
++      nextRunAt: new Date(nextRetentionRunAt).toISOString(),
++      terminalAt: new Date(terminalAt).toISOString(),
++    },
++    assertions,
++    status: 'passed',
++  }
++}
++
++const isDirectRun = process.argv[1] ? resolve(process.argv[1]) === fileURLToPath(import.meta.url) : false
++
++if (isDirectRun) {
++  const resultPath = join(REPO_ROOT, '.prale-eval', 'demo-run.json')
++  const summary = await runWattClawProjectLifecycleDemo()
++  await writeFile(resultPath, `${JSON.stringify(summary, null, 2)}\n`, 'utf-8')
++  console.log(JSON.stringify(summary, null, 2))
++  console.log(`\ndemo ${summary.status}: ${summary.transitions.length} legal transitions, ${summary.rejections.length} rejected attempts, ${summary.events.length} events`)
++  console.log(`normalized result written to ${relative(REPO_ROOT, resultPath)}`)
++}
+snapshot .prale-eval/demo-deliverable.md - 52e990f529927d5ef3c12bc41fc1f5d5c7a6a7452ca7a7b90157ea271f8adf0d
+snapshot .prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo-degraded/config.json - 599030ce6e4d847fee441c62b00ec5e9ab322b5fdece88d54c1efa1491c28e7a
+snapshot .prale-eval/demo-fixture/tenant-demo/.wattclaw-team/projects/p-demo/config.json - 40ad9112bf35701c1c061e02deda23a82c53e0040302a8a5b59d570210244b25
+snapshot .prale-eval/demo-run.json - 2185bf9f661e4a78066bf2053a0a269711311ea0f61ec2b5d89c7368a16e7b5c
+snapshot .prale-eval/result.json - 61fedf10afbbb451352e2ee94fbc7514dfb74e42c8d1e34078100a7e3b2444ee
+snapshot server/services/wattclaw-project-runtime.demo.mjs - 02ef8da5b6ffc0853d4686a371342ecf0607c986053c47dbfb9857e8289c16e9
