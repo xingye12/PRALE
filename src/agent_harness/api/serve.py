@@ -55,6 +55,7 @@ from agent_harness.integrations.repository_explorer import (
 from agent_harness.integrations.skill_reviewer import CodingSkillReviewer
 from agent_harness.integrations.skill_tools import create_skill_tools
 from agent_harness.integrations.subagent_definitions import load_subagent_definitions
+from agent_harness.integrations.workspaces import GitWorkspaceManager, LocalWorkspaceToolFactory
 from agent_harness.runtime.generation import GenerationRequest
 from agent_harness.runtime.subagents import (
     MappingProviderResolver,
@@ -239,6 +240,8 @@ def build_application(settings: Settings) -> Deployment:
         context_management=settings.context_management,
         definitions=definitions,
         subagent_config=settings.subagent_config,
+        workspace_manager=GitWorkspaceManager(settings.project_root),
+        workspace_tool_factory=LocalWorkspaceToolFactory(),
         provider_resolver=resolver,
     )
     return Deployment(web, tuple(stores))

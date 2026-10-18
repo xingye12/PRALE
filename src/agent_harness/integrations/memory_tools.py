@@ -40,6 +40,7 @@ def _items(bundle: RecallBundle) -> list[JsonValue]:
 
 @dataclass(frozen=True, slots=True)
 class MemorySearchTool:
+    workspace_reusable = True
     store: MemoryStore
     scope: MemoryScope
     name: str = "memory_search"
@@ -79,6 +80,7 @@ class MemorySearchTool:
 
 @dataclass(frozen=True, slots=True)
 class ConversationSearchTool:
+    workspace_reusable = True
     store: MemoryStore
     scope: MemoryScope
     name: str = "conversation_search"
@@ -106,6 +108,7 @@ class ConversationSearchTool:
 
 @dataclass(frozen=True, slots=True)
 class MemoryReadSceneTool:
+    workspace_reusable = True
     store: MemoryStore
     scope: MemoryScope
     name: str = "memory_read_scene"

@@ -16,6 +16,7 @@ from agent_harness.domain.subagents import (
     SubagentStopResult,
     SubagentWaitResult,
 )
+from agent_harness.domain.workspaces import WorkspaceManager
 from agent_harness.memory.runtime import MemoryRuntime
 from agent_harness.runtime.events import EventBus, EventListener
 from agent_harness.runtime.hooks import HookHandler, HookRegistry
@@ -24,6 +25,7 @@ from agent_harness.runtime.retry import RetryPolicy
 from agent_harness.runtime.subagents import ProviderResolver, SubagentRuntime
 from agent_harness.runtime.telemetry import TelemetrySink
 from agent_harness.runtime.tools import AgentTool, RuntimeControlTool
+from agent_harness.runtime.workspaces import WorkspaceToolFactory
 from agent_harness.skill.runtime import SkillEvolutionRuntime
 from agent_harness.storage.protocol import Storage
 
@@ -47,6 +49,8 @@ class Harness:
         definitions: tuple[SubagentDefinition, ...] = (),
         subagent_config: SubagentConfig = SubagentConfig(),
         provider_resolver: ProviderResolver | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        workspace_tool_factory: WorkspaceToolFactory | None = None,
         id_factory: Callable[[], str] | None = None,
         now_ms: Callable[[], int] | None = None,
     ) -> None:
@@ -66,7 +70,14 @@ class Harness:
         self._telemetry = telemetry
         self._context_management = context_management
         self._subagents = SubagentRuntime(
-            session, subagent_config, definitions, provider_resolver, tools, self._make_lane
+            session,
+            subagent_config,
+            definitions,
+            provider_resolver,
+            tools,
+            self._make_lane,
+            workspace_manager,
+            workspace_tool_factory,
         )
         if (memory_scope is None) != (memory_runtime is None):
             raise ValueError("memory_scope and memory_runtime must be configured together")
@@ -99,6 +110,8 @@ class Harness:
         definitions: tuple[SubagentDefinition, ...] = (),
         subagent_config: SubagentConfig = SubagentConfig(),
         provider_resolver: ProviderResolver | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        workspace_tool_factory: WorkspaceToolFactory | None = None,
         id_factory: Callable[[], str] | None = None,
         now_ms: Callable[[], int] | None = None,
     ) -> "Harness":
@@ -119,6 +132,8 @@ class Harness:
             definitions=definitions,
             subagent_config=subagent_config,
             provider_resolver=provider_resolver,
+            workspace_manager=workspace_manager,
+            workspace_tool_factory=workspace_tool_factory,
             id_factory=id_factory,
             now_ms=now_ms,
         )

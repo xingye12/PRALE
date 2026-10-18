@@ -382,3 +382,16 @@ recover_subagents 重建 queued/running 调度并完成 pending 通知投递，�
 - 真实进程退出恢复：`tests/crash_recovery/test_subagent_recovery.py`。覆盖 queued、父控制 intent、子 LLM intent、tool planned/effect、子 terminal、父 result、通知 delivered/consumed 和 cancel_requested；safe/never 分别断言重放次数，撤销工具后拒绝恢复效果。损坏 run 的通知不能阻止其他合法 run 交付。
 
 公开 Python 用法与部署配置见 [README](../README.md)。首版没有添加审批系统或进程沙箱；只读角色和子工具交集是本方案规定的能力边界。
+
+
+## 7. 可选 workspace 隔离（ADR-033）
+
+默认共享父工作区；请求 `isolation="worktree"` 优先于角色 frontmatter 默认值，模式固定到 agent。快照、终态结果与后台通知暴露 workspace 模式、路径、分支、基准 SHA、生命周期和错误。续跑不能改变模式，且必须等待收尾结算。
+
+新增 version 1 workspace value 记录（旧 Session 无该值即普通模式），使用 pending → planned → creating → ready → checking → checked/retained → removing → removed；失败保留阶段与错误。Git effect 发生在事务外，intent/span 与结果分别原子落盘。恢复校验 common directory、注册路径、分支、HEAD 和任务归属，拒绝冲突，不降级共享模式。创建前固定父 HEAD；取消先停止执行器再收尾；关闭保留可恢复资源。
+
+read/write/edit/bash/repository_explore 在独立 workspace 重新构造，索引目录独立；memory/conversation/skill 保持逻辑作用域。自定义工具必须显式声明可复用或重绑定。无 Git/HEAD/adapter 时隔离请求明确失败。
+
+验收：真实临时 Git 仓库验证并行副本、脏父目录、所有本地工具定位、无改动删除、改动及 ignored 产物保留、续跑、取消、前后台交付；memory/SQLite 共用事务测试；创建/删除 effect 后未结算恢复不重复、不误删，收尾失败保留答案和错误。
+
+实现入口：`domain/workspaces.py` 定义管理协议；`runtime/workspaces.py` 编排独立状态与 effect spans；`integrations/workspaces.py` 使用参数数组执行 Git，并以 common directory 下的 owner marker 确认资源归属。planned 冻结基准，checked 持久化无产物检查结论；删除前仍再次检查。恢复将上次 pending span 收束为 unknown，并创建新 attempt 做幂等检查，避免伪造跨进程 effect 耗时。新记录复用 Session 的 versioned value 存储，不变更 SQLite schema。

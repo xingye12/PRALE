@@ -70,6 +70,10 @@ await harness.close()  # 停止本地执行器；保留持久恢复状态
 
 部署默认启用 runtime，未设置 `PRALE_TOOLS` 时默认提供 `subagent`、`subagent_continue`、`subagent_output`、`subagent_list`、`subagent_stop`。显式 `PRALE_TOOLS` 列表完全替代默认集合，空字符串禁用全部模型工具；`PRALE_SUBAGENTS_ENABLED=false` 关闭 runtime。Python library 默认启用 facade 与恢复，模型工具仍通过 `tools=create_subagent_tools()` 注册。后台结果进入父 inbox，空闲时不主动调用模型。重开已启用的 Harness 会恢复已接纳运行；缺失 provider 和不完整状态通过恢复报告显式列出。
 
+默认共享工作区；请求或角色 Markdown frontmatter 可设置 `isolation="worktree"`。部署入口已配置本地 Git 适配器；library 用法需向 `Harness.open` 传入 `workspace_manager=GitWorkspaceManager(project_root)` 和 `workspace_tool_factory=LocalWorkspaceToolFactory()`（均位于 `agent_harness.integrations.workspaces`）。worktree 固定从父 HEAD 创建，不复制未提交或未跟踪文件，不 fetch、自动提交或合并。无产物时自动清理；有改动、ignored 文件或提交时保留，路径、分支、基准和错误见 `snapshot.workspace` / `result.workspace`。续跑固定沿用模式；保留副本复用，已清理副本从原基准重建。
+
+自定义工具需提供 `for_workspace(workspace)` 返回独立绑定工具，或显式设置 `workspace_reusable = True`；否则隔离请求会报出具体工具名。内置文件、Bash 和仓库索引工具自动重绑定；memory/conversation/skill 维持逻辑作用域。worktree 是代码副本隔离，绝对路径和任意 Bash 命令仍可访问外部目录。
+
 Python DTO 无额外依赖；显式配置 `PRALE_SUBAGENT_DIRS='["agents"]'` 加载 Markdown 时需安装 `.[subagents]`。文件不会自动发现、热加载或执行。完整持久化与恢复契约见 [Subagent 实现方案](specs/subagent-system-implementation-plan.md)。
 
 ## 追踪与评测

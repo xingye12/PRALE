@@ -34,6 +34,7 @@ from agent_harness.domain.subagents import (
     SubagentSnapshot,
     SubagentStopResult,
     SubagentWaitResult,
+    SubagentWorkspace,
     UnknownSubagentRun,
     UnknownSubagentType,
     built_in_definitions,
@@ -42,9 +43,11 @@ from agent_harness.domain.subagents import (
     value,
 )
 from agent_harness.domain.values import lane_inbox, lane_state, operation_meta, operation_result, operation_state
+from agent_harness.domain.workspaces import WorkspaceManager
 from agent_harness.runtime.generation import ChatProvider
 from agent_harness.runtime.lane import Lane
 from agent_harness.runtime.tools import AgentTool, RuntimeControlTool
+from agent_harness.runtime.workspaces import WorkspaceRuntime, WorkspaceToolFactory
 from agent_harness.storage.protocol import AppendList, SetValue, Write
 
 
@@ -93,6 +96,14 @@ def create_subagent_tools(names: tuple[str, ...] = CONTROL_NAMES) -> tuple[Runti
             "context": {"type": "string"},
             "model": {"type": "string"},
             "max_turns": {"type": "integer", "minimum": 1},
+            "isolation": {
+                "type": "string",
+                "enum": ["worktree"],
+                "description": (
+                    "Optional Git worktree from parent HEAD; excludes uncommitted and untracked parent files. "
+                    "Code copy isolation, not a security sandbox."
+                ),
+            },
             "run_in_background": {"type": "boolean"},
         },
         "subagent_continue": {
@@ -194,10 +205,13 @@ class SubagentRuntime:
         resolver: ProviderResolver | None,
         tools: tuple[AgentTool | RuntimeControlTool, ...],
         lane_factory: Callable[[str, tuple[AgentTool | RuntimeControlTool, ...]], Lane],
+        workspace_manager: WorkspaceManager | None = None,
+        workspace_tool_factory: WorkspaceToolFactory | None = None,
     ) -> None:
         self.session, self.config, self.resolver = session, config, resolver
         self._tools = {tool.name: tool for tool in tools}
         self._factory = lane_factory
+        self.workspaces = WorkspaceRuntime(self, workspace_manager, workspace_tool_factory)
         self.definitions = validate_subagent_definitions(definitions, resolver, tools)
         if any(name in self._tools for name in CONTROL_NAMES) and not config.enabled:
             raise SubagentsDisabled("control tools require enabled subagents")
@@ -262,7 +276,12 @@ class SubagentRuntime:
         prior = await mutator.get_value(address)
         if prior is not None:
             prior = record(prior)
-            if prior["request_hash"] != request_hash:
+            legacy_request = asdict(request)
+            legacy_request.pop("isolation", None)
+            legacy_hash = digest({"request": legacy_request, "agent_id": agent_id})
+            if prior["request_hash"] != request_hash and not (
+                request.isolation is None and prior["request_hash"] == legacy_hash
+            ):
                 raise SubagentIdempotencyConflict(key)
             await self.validate_run(prior["admission"]["run_id"], mutator)
             return SubagentAdmission(**prior["admission"]), []
@@ -299,7 +318,29 @@ class SubagentRuntime:
                 definition_hash=digest(definition.to_json()),
                 tools=list(tools),
                 provider_id=provider_id,
+                isolation=request.isolation or definition.isolation,
             )
+            if agent_meta["isolation"] == "worktree":
+                if self.workspaces.manager is None or self.workspaces.factory is None:
+                    raise SubagentCapabilityUnavailable(
+                        "worktree isolation requires workspace manager and tool factory"
+                    )
+                self.workspaces.factory.validate(tuple(self._tools[t] for t in tools))
+                writes.append(
+                    SetValue(
+                        value(f"subagent/{agent_id}/workspace"),
+                        versioned(
+                            mode="worktree",
+                            path="",
+                            branch="",
+                            base_commit="",
+                            common_dir="",
+                            owner="",
+                            state="pending",
+                            error=None,
+                        ),
+                    )
+                )
             writes.append(SetValue(value(f"subagent/{agent_id}/meta"), agent_meta))
         else:
             agent_meta = await self._read(f"subagent/{agent_id}/meta", mutator)
@@ -308,6 +349,17 @@ class SubagentRuntime:
             agent_state = await self._read(f"subagent/{agent_id}/state", mutator)
             if agent_state["current_run_id"] is not None:
                 raise SubagentBusy(agent_id)
+            workspace_raw = await mutator.get_value(value(f"subagent/{agent_id}/workspace"))
+            if workspace_raw is not None:
+                previous = await self._read(f"subagent-run/{agent_state['last_run_id']}/result", mutator)
+                if previous.get("workspace") is None:
+                    raise SubagentBusy("workspace finalization is incomplete")
+                if record(workspace_raw).get("error"):
+                    raise SubagentCapabilityUnavailable(
+                        "workspace requires recovery: " + record(workspace_raw)["error"]
+                    )
+            if request.isolation is not None and request.isolation != agent_meta.get("isolation"):
+                raise ValueError("cannot change agent workspace isolation")
             definition = SubagentDefinition.from_json(agent_meta["definition"])
             tools = tuple(t for t in agent_meta["tools"] if t in self.capabilities(parent, definition))
             provider_id = agent_meta["provider_id"]
@@ -432,13 +484,38 @@ class SubagentRuntime:
         agent = await self._read(f"subagent/{meta['agent_id']}/meta", mutator)
         parent = await mutator.get_value(operation_meta(meta["parent_operation_id"]))
         agent_state = await self._read(f"subagent/{meta['agent_id']}/state", mutator)
-        definition = SubagentDefinition.from_json(agent["definition"])
+        SubagentDefinition.from_json(agent["definition"])
+        workspace_raw = await getter(value(f"subagent/{meta['agent_id']}/workspace"))
+        if agent.get("isolation") == "worktree":
+            workspace_data = record(workspace_raw)
+            if (
+                workspace_data.get("mode") != "worktree"
+                or workspace_data.get("state")
+                not in {
+                    "pending",
+                    "planned",
+                    "creating",
+                    "ready",
+                    "checking",
+                    "checked",
+                    "retained",
+                    "removing",
+                    "removed",
+                }
+                or any(
+                    not isinstance(workspace_data.get(k), str)
+                    for k in ("path", "branch", "base_commit", "common_dir", "owner")
+                )
+            ):
+                raise IncompleteSubagentState("invalid workspace record")
+        elif workspace_raw is not None or agent.get("isolation") is not None:
+            raise IncompleteSubagentState("inconsistent workspace isolation binding")
         if (
             not isinstance(parent, OperationMeta)
             or parent.lane != meta["parent_lane"]
             or agent["owner_parent_lane"] != meta["parent_lane"]
             or agent["lane"] != INTERNAL_PREFIX + meta["agent_id"]
-            or agent["definition_hash"] != digest(definition.to_json())
+            or agent["definition_hash"] != digest(agent["definition"])
             or not isinstance(meta["tools"], list)
             or set(meta["tools"]) - set(agent["tools"])
             or any(name in CONTROL_NAMES for name in meta["tools"])
@@ -486,7 +563,15 @@ class SubagentRuntime:
         async def snapshot(mutator: SessionMutator) -> SubagentSnapshot:
             meta, state = await self.validate_run(run_id, mutator)
             raw = await mutator.get_value(value(f"subagent-run/{run_id}/result"))
-            result = SubagentResult(**{k: v for k, v in record(raw).items() if k != "format_version"}) if raw else None
+            workspace_raw = await mutator.get_value(value(f"subagent/{meta['agent_id']}/workspace"))
+            workspace = self.workspaces.dto(record(workspace_raw)) if workspace_raw else None
+            result_data = {k: v for k, v in record(raw).items() if k != "format_version"} if raw else None
+            result = None
+            if result_data is not None and (workspace is None or result_data.get("workspace") is not None):
+                if isinstance(result_data.get("workspace"), dict):
+                    result_data["workspace"] = SubagentWorkspace(**result_data["workspace"])
+                result = SubagentResult(**result_data)
+                workspace = result.workspace
             return SubagentSnapshot(
                 meta["agent_id"],
                 run_id,
@@ -499,6 +584,7 @@ class SubagentRuntime:
                 meta["started_at"],
                 state.get("ended_at"),
                 result,
+                workspace,
             )
 
         return await self.session.mutate(snapshot)
@@ -513,8 +599,10 @@ class SubagentRuntime:
         deadline = asyncio.get_running_loop().time() + timeout_ms / 1000
         while True:
             snapshot = await self.get(run_id)
-            if snapshot.state == "terminal":
+            if snapshot.result is not None:
                 return SubagentWaitResult("ready", snapshot)
+            if run_id in self.failures:
+                raise SubagentCapabilityUnavailable(self.failures[run_id])
             if asyncio.get_running_loop().time() >= deadline:
                 return SubagentWaitResult("timeout", snapshot)
             await asyncio.sleep(min(0.01, max(0, deadline - asyncio.get_running_loop().time())))
@@ -526,9 +614,21 @@ class SubagentRuntime:
             parent = self._factory(meta["parent_lane"], tuple(self._tools.values()))
             definition = SubagentDefinition.from_json(agent["definition"])
             names = set(meta["tools"]) & set(self.capabilities(parent, definition))
-            lane = self._factory(agent["lane"], tuple(self._tools[n] for n in sorted(names)))
+            tools = tuple(self._tools[n] for n in sorted(names))
+            workspace = await self.workspaces.ready(meta)
+            if workspace is not None:
+                if self.workspaces.factory is None:
+                    raise SubagentCapabilityUnavailable("workspace tool factory unavailable")
+                tools = self.workspaces.factory.bind(workspace, tools)
+            lane = self._factory(agent["lane"], tools)
             lane.subagent_run_id = run_id
             lane.system_prompt = definition.system_prompt
+            if workspace is not None:
+                lane.system_prompt += (
+                    f"\nWorkspace: {workspace.path}; branch: {workspace.branch}; "
+                    f"base: {workspace.base_commit}. Read files again before modifying; "
+                    "the worktree excludes parent uncommitted files."
+                )
             lane.subagent_context = {
                 "agent_id": meta["agent_id"],
                 "run_id": run_id,
@@ -544,8 +644,6 @@ class SubagentRuntime:
             return
         async with self._schedule_lock:
             for run_id in await self._ids("session/subagent_runs"):
-                if self.active >= self.config.max_running:
-                    break
                 if run_id in self._tasks or run_id in self.failures:
                     continue
                 try:
@@ -555,25 +653,31 @@ class SubagentRuntime:
                     continue
                 if state["state"] == "terminal" or state["cancel_requested"]:
                     continue
-                if self.resolver is None:
+                try:
+                    await self.workspaces.freeze(meta)
+                except Exception as error:
+                    self.failures[run_id] = f"workspace: {type(error).__name__}: {error}"
+                    continue
+                if self.active >= self.config.max_running or self.resolver is None:
                     continue
                 try:
                     provider = self.resolver.resolve(meta["provider_id"])
                 except SubagentCapabilityUnavailable:
                     continue
-                lane = await self.child_lane(run_id)
                 task = asyncio.create_task(
-                    self._execute(run_id, lane, provider, state["state"] == "running"),
+                    self._execute(run_id, provider, state["state"] == "running"),
                     name=f"subagent:{self.session.id}:{run_id}",
                 )
                 self._tasks[run_id] = task
 
-    async def _execute(self, run_id: str, lane: Lane, provider: ChatProvider, recovering: bool) -> None:
+    async def _execute(self, run_id: str, provider: ChatProvider, recovering: bool) -> None:
         try:
+            lane = await self.child_lane(run_id)
             if recovering:
                 await lane.recover(provider)
             else:
                 await lane.drive(provider)
+            await self.workspaces.finish(await self._read(f"subagent-run/{run_id}/meta"))
             snapshot = await self.get(run_id)
             await lane.emit(
                 "subagent_terminal",
@@ -741,7 +845,13 @@ class SubagentRuntime:
         ids = [run_id] if run_id else await self._ids(f"operation/{parent_id}/subagent_runs")
         for child_id in ids:
             meta, state = await self.validate_run(child_id)
-            if state["state"] == "terminal" or not state["cancel_requested"]:
+            if state["state"] == "terminal":
+                task = self._tasks.get(child_id)
+                if task is not None and not task.done():
+                    await asyncio.gather(task, return_exceptions=True)
+                await self.workspaces.finish(meta)
+                continue
+            if not state["cancel_requested"]:
                 continue
             task = self._tasks.get(child_id)
             if task is not None and not task.done():
@@ -750,6 +860,7 @@ class SubagentRuntime:
             lane = await self.child_lane(child_id)
             if await lane.active_operation() is not None:
                 await lane.recover(None)
+            await self.workspaces.finish(meta)
         await self.deliver_notifications()
 
     async def stop(self, run_id: str) -> SubagentStopResult:
@@ -787,6 +898,9 @@ class SubagentRuntime:
                     ):
                         raise IncompleteSubagentState("inconsistent notification")
                     result = await self._read(f"subagent-run/{run_id}/result", mutator)
+                    workspace_raw = await mutator.get_value(value(f"subagent/{meta['agent_id']}/workspace"))
+                    if workspace_raw is not None and result.get("workspace") is None:
+                        continue
                     parent = self._factory(meta["parent_lane"], tuple(self._tools.values()))
                     entry_id = parent.new_id()
                     prompt = (
@@ -837,6 +951,7 @@ class SubagentRuntime:
             try:
                 meta, state = await self.validate_run(run_id)
                 if state["state"] == "terminal":
+                    await self.workspaces.finish(meta)
                     groups["terminal"].append(run_id)
                 elif run_id in self._tasks:
                     groups["recovered"].append(run_id)
@@ -849,7 +964,8 @@ class SubagentRuntime:
                     self.resolver.resolve(meta["provider_id"])
                     self.failures.pop(run_id, None)
                     groups["queued" if state["state"] == "queued" else "recovered"].append(run_id)
-            except SubagentCapabilityUnavailable:
+            except SubagentCapabilityUnavailable as error:
+                self.failures[run_id] = str(error)
                 groups["unavailable"].append(run_id)
             except (IncompleteSubagentState, UnknownSubagentRun, KeyError, TypeError):
                 groups["incomplete"].append(run_id)
@@ -947,10 +1063,21 @@ class SubagentRuntime:
         kind = control["kind"]
         await self.schedule()
         if kind in ("subagent", "subagent_continue"):
+            if control["run_id"] in self.failures:
+                return {
+                    "content": {
+                        "run_id": control["run_id"],
+                        "error_code": "capability_unavailable",
+                        "message": self.failures[control["run_id"]],
+                    },
+                    "is_error": True,
+                }
             if control["phase"] == "receipt_ready":
+                snapshot = await self.get(control["run_id"])
                 return {
                     "content": {
                         "status": "accepted",
+                        "workspace": asdict(snapshot.workspace) if snapshot.workspace else None,
                         **{k: control[k] for k in ("agent_id", "run_id", "operation_id", "background")},
                     },
                     "is_error": False,

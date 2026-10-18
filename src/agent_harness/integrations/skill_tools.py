@@ -58,6 +58,7 @@ def _render(loadout: SkillLoadout) -> JsonValue:
 
 @dataclass(frozen=True, slots=True)
 class SkillLoadTool:
+    workspace_reusable = True
     """Load an immutable, enabled Skill version from the deployment's scope."""
 
     store: SkillStore

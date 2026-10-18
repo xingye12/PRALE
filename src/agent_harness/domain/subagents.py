@@ -85,9 +85,12 @@ class SubagentDefinition:
     model: str | None = None
     max_turns: int = 50
     background: bool = False
+    isolation: Literal["worktree"] | None = None
 
     def __post_init__(self) -> None:
         try:
+            if self.isolation not in (None, "worktree"):
+                raise ValueError("isolation must be worktree or None")
             if not isinstance(self.name, str) or re.fullmatch(r"[A-Za-z0-9_-]+", self.name) is None:
                 raise ValueError("invalid agent name")
             if any(not isinstance(s, str) or not s.strip() for s in (self.description, self.system_prompt)):
@@ -135,8 +138,11 @@ class SubagentRequest:
     model: str | None = None
     max_turns: int | None = None
     run_in_background: bool | None = None
+    isolation: Literal["worktree"] | None = None
 
     def __post_init__(self) -> None:
+        if self.isolation not in (None, "worktree"):
+            raise ValueError("isolation must be worktree or None")
         if any(not isinstance(s, str) or not s.strip() for s in (self.prompt, self.description, self.subagent_type)):
             raise ValueError("prompt, description and subagent_type must be non-empty")
         if self.context is not None and not isinstance(self.context, str):
@@ -158,6 +164,18 @@ class SubagentAdmission:
 
 
 @dataclass(frozen=True, slots=True)
+class SubagentWorkspace:
+    mode: Literal["worktree"]
+    path: str
+    branch: str
+    base_commit: str
+    common_dir: str
+    owner: str
+    state: str = "pending"
+    error: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SubagentResult:
     status: OperationStatus
     answer: str
@@ -165,6 +183,7 @@ class SubagentResult:
     terminal_tip_id: str | None
     truncated: bool
     error_code: str | None
+    workspace: SubagentWorkspace | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -180,6 +199,7 @@ class SubagentSnapshot:
     started_at: int
     ended_at: int | None
     result: SubagentResult | None
+    workspace: SubagentWorkspace | None = None
 
 
 @dataclass(frozen=True, slots=True)

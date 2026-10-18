@@ -128,3 +128,96 @@ def test_subagents_disabled_does_not_change_empty_session(storage):
         await harness.close()
 
     asyncio.run(scenario())
+
+
+def test_workspace_admission_is_atomic_and_required(storage):
+    from agent_harness.integrations.workspaces import LocalWorkspaceToolFactory
+
+    class Manager:
+        async def plan(self, *_):
+            raise AssertionError("admission must not perform Git effects")
+
+    async def scenario():
+        harness = await Harness.open(
+            "s",
+            storage,
+            provider_resolver=MappingProviderResolver({"test": BlockingProvider()}, "test"),
+            workspace_manager=Manager(),
+            workspace_tool_factory=LocalWorkspaceToolFactory(),
+        )
+
+        async def no_schedule():
+            pass
+
+        harness._subagents.schedule = no_schedule
+        try:
+            parent = await (await harness.acquire_lane("main")).prompt("task")
+            original_commit = storage.commit
+
+            async def reject(writes):
+                if any(isinstance(w, SetValue) and w.address.key.endswith("/workspace") for w in writes):
+                    raise OSError("workspace admission failed")
+                await original_commit(writes)
+
+            storage.commit = reject
+            request = SubagentRequest("task", "task", isolation="worktree")
+            with pytest.raises(OSError):
+                await harness.start_subagent("main", parent.operation_id, request, "key")
+            storage.commit = original_commit
+            assert not await harness.list_subagent_runs("main")
+            admitted = await harness.start_subagent("main", parent.operation_id, request, "key")
+            assert await harness.start_subagent("main", parent.operation_id, request, "key") == admitted
+            snapshot = await harness.get_subagent_run(admitted.run_id)
+            assert snapshot.workspace.state == "pending"
+
+            async def corrupt(mutator):
+                await mutator.commit([SetValue(value(f"subagent/{admitted.agent_id}/workspace"), None)])
+
+            await harness._session.mutate(corrupt)
+            with pytest.raises(IncompleteSubagentState):
+                await harness.get_subagent_run(admitted.run_id)
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())
+
+
+def test_legacy_shared_request_and_definition_remain_idempotent(storage):
+    from agent_harness.runtime.subagents import digest
+
+    async def scenario():
+        harness = await Harness.open(
+            "s", storage, provider_resolver=MappingProviderResolver({"test": BlockingProvider()}, "test")
+        )
+
+        async def no_schedule():
+            pass
+
+        harness._subagents.schedule = no_schedule
+        try:
+            parent = await (await harness.acquire_lane("main")).prompt("task")
+            request = SubagentRequest("task", "task")
+            admitted = await harness.start_subagent("main", parent.operation_id, request, "key")
+            address = value("subagent/request/" + digest(["s", "main", parent.operation_id, "key"]))
+
+            async def legacy(mutator):
+                from dataclasses import asdict
+
+                prior = await mutator.get_value(address)
+                fields = asdict(request)
+                fields.pop("isolation")
+                prior["request_hash"] = digest({"request": fields, "agent_id": None})
+                meta_address = value(f"subagent/{admitted.agent_id}/meta")
+                meta = await mutator.get_value(meta_address)
+                meta.pop("isolation")
+                meta["definition"].pop("isolation")
+                meta["definition_hash"] = digest(meta["definition"])
+                await mutator.commit([SetValue(address, prior), SetValue(meta_address, meta)])
+
+            await harness._session.mutate(legacy)
+            assert await harness.start_subagent("main", parent.operation_id, request, "key") == admitted
+            assert (await harness.get_subagent_run(admitted.run_id)).workspace is None
+        finally:
+            await harness.close()
+
+    asyncio.run(scenario())

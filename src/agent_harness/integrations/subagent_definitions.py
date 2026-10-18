@@ -29,7 +29,7 @@ def load_subagent_definitions(directories: tuple[Path, ...]) -> tuple[SubagentDe
     UniqueLoader.add_constructor(yaml.resolver.BaseResolver.DEFAULT_MAPPING_TAG, mapping)
     definitions: list[SubagentDefinition] = []
     names: set[str] = set()
-    allowed = {"name", "description", "tools", "disallowed_tools", "model", "max_turns", "background"}
+    allowed = {"name", "description", "tools", "disallowed_tools", "model", "max_turns", "background", "isolation"}
     for directory in directories:
         if not directory.is_dir():
             raise InvalidSubagentDefinition(f"definition directory does not exist: {directory}")

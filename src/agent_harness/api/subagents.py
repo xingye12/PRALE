@@ -19,6 +19,7 @@ from agent_harness.domain.subagents import (
     SubagentSnapshot,
     SubagentStopResult,
     SubagentWaitResult,
+    SubagentWorkspace,
     UnknownSubagentRun,
     UnknownSubagentType,
 )
@@ -42,6 +43,7 @@ __all__ = [
     "SubagentSnapshot",
     "SubagentStopResult",
     "SubagentWaitResult",
+    "SubagentWorkspace",
     "UnknownSubagentRun",
     "UnknownSubagentType",
 ]

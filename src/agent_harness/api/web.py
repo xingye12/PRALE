@@ -54,6 +54,7 @@ from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.skill import SkillScope
 from agent_harness.domain.subagents import SubagentConfig, SubagentDefinition
+from agent_harness.domain.workspaces import WorkspaceManager
 from agent_harness.memory.protocol import MemoryStore
 from agent_harness.memory.runtime import MemoryExtractor, MemoryRuntime
 from agent_harness.runtime.events import HarnessEvent
@@ -62,6 +63,7 @@ from agent_harness.runtime.lane import ActiveOperation, Lane
 from agent_harness.runtime.subagents import ProviderResolver, validate_subagent_definitions
 from agent_harness.runtime.telemetry import TelemetrySink, close_telemetry
 from agent_harness.runtime.tools import AgentTool, RuntimeControlTool
+from agent_harness.runtime.workspaces import WorkspaceToolFactory
 from agent_harness.skill.protocol import SkillReviewer, SkillStore
 from agent_harness.skill.runtime import SkillEvolutionRuntime
 from agent_harness.storage.catalog import SQLiteCatalogStore
@@ -237,6 +239,8 @@ class SessionSupervisor:
         definitions: tuple[SubagentDefinition, ...] = (),
         subagent_config: SubagentConfig = SubagentConfig(),
         provider_resolver: ProviderResolver | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        workspace_tool_factory: WorkspaceToolFactory | None = None,
     ) -> None:
         if skill_store is not None and memory_store is None:
             raise ValueError("skill_store requires memory_store for L0 archive materialization")
@@ -252,6 +256,8 @@ class SessionSupervisor:
         self._definitions = definitions
         self._subagent_config = subagent_config
         self._provider_resolver = provider_resolver
+        self._workspace_manager = workspace_manager
+        self._workspace_tool_factory = workspace_tool_factory
         self._sessions: dict[str, _OpenSession] = {}
         self._open_lock = asyncio.Lock()
         self._drives: dict[tuple[str, str], asyncio.Task[None]] = {}
@@ -492,6 +498,8 @@ class SessionSupervisor:
             definitions=self._definitions,
             subagent_config=self._subagent_config,
             provider_resolver=self._provider_resolver,
+            workspace_manager=self._workspace_manager,
+            workspace_tool_factory=self._workspace_tool_factory,
         )
         return _OpenSession(harness, storage)
 
@@ -546,6 +554,8 @@ class WebApplication:
         definitions: tuple[SubagentDefinition, ...] = (),
         subagent_config: SubagentConfig = SubagentConfig(),
         provider_resolver: ProviderResolver | None = None,
+        workspace_manager: WorkspaceManager | None = None,
+        workspace_tool_factory: WorkspaceToolFactory | None = None,
     ) -> None:
         validate_subagent_definitions(definitions, provider_resolver, tools)
         self._config = config
@@ -586,6 +596,8 @@ class WebApplication:
             definitions=definitions,
             subagent_config=subagent_config,
             provider_resolver=provider_resolver,
+            workspace_manager=workspace_manager,
+            workspace_tool_factory=workspace_tool_factory,
         )
         self.app = self._build_app(tokens or {})
 
@@ -941,6 +953,8 @@ def create_app(
     definitions: tuple[SubagentDefinition, ...] = (),
     subagent_config: SubagentConfig = SubagentConfig(),
     provider_resolver: ProviderResolver | None = None,
+    workspace_manager: WorkspaceManager | None = None,
+    workspace_tool_factory: WorkspaceToolFactory | None = None,
 ) -> WebApplication:
     """Build the web application for one deployment.
 
@@ -965,6 +979,8 @@ def create_app(
         definitions=definitions,
         subagent_config=subagent_config,
         provider_resolver=provider_resolver,
+        workspace_manager=workspace_manager,
+        workspace_tool_factory=workspace_tool_factory,
     )
 
 

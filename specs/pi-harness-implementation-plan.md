@@ -14,7 +14,7 @@
 - 小而稳定的 Python 库 API、事件和 hook；
 - 存储一致性与崩溃恢复测试。
 
-第一版明确不包含：多主写入、分布式一致性、外部副作用的 exactly-once 保证，以及 pi 的实验性 `pico3/` 运行时。跨会话长期记忆和 Skill 自进化作为阶段 10 的可选扩展实现，其范围和不变量分别见 [长期记忆实现规范](long-term-memory-implementation-spec.md) 与 [Skill 自进化功能接入](skill-self-evolution-integration.md)。本地 Subagent 系统作为阶段 11 的可选扩展设计，定义、控制调用、父子生命周期与恢复验收见 [Subagent 系统实现方案](subagent-system-implementation-plan.md)；该阶段尚待实现，不属于当前已交付能力。
+第一版明确不包含：多主写入、分布式一致性、外部副作用的 exactly-once 保证，以及 pi 的实验性 `pico3/` 运行时。跨会话长期记忆和 Skill 自进化作为阶段 10 的可选扩展实现，其范围和不变量分别见 [长期记忆实现规范](long-term-memory-implementation-spec.md) 与 [Skill 自进化功能接入](skill-self-evolution-integration.md)。本地 Subagent 系统作为阶段 11 的可选扩展设计，定义、控制调用、父子生命周期与恢复验收见 [Subagent 系统实现方案](subagent-system-implementation-plan.md)；基础能力已交付，可选 worktree 隔离见 ADR-033。
 
 ## 2. 规范来源与优先级
 
@@ -432,3 +432,11 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 第一个编码里程碑仅实现阶段 0–3：纯领域 DTO、storage/session 协议、内存后端、entry tree/branch projection、lane operation admission、snapshot 和结果查询。此里程碑不调用 DeepSeek、不执行工具，但必须已经具备“先持久化 operation、后由 Drive 领取”的恢复基础。
 
 阶段 4 开始前需要冻结：entry/usage/value/list 的序列化格式、value 地址命名、operation state schema、公开错误码和 conformance fixture 格式。任何破坏这些格式的修改必须附带迁移和恢复测试。
+
+### ADR-033：Subagent 可选 Git worktree 与独立可恢复收尾
+
+**背景：** 默认共享工作区仍有价值，但并行修改需要独立代码副本；Git effect 不能放进 Session 事务。
+
+**决策：** 请求和角色增加可选 `isolation="worktree"`，绑定 agent 身份。runtime 仅依赖 workspace 协议，integrations 管理 Git。接纳持久化 pending 意图，创建前冻结路径、分支与 HEAD SHA；创建、检查、删除各有持久 intent 和关联 effect span，完成后原子结算。workspace 状态独立于 run，终态答案在收尾后交付；旧记录缺省共享模式，不改变 SQLite schema。自定义工具必须声明 workspace 可复用或提供重绑定。
+
+**后果：** worktree 从父 HEAD 创建，不复制脏文件、不 fetch、不自动提交合并。发现 tracked/untracked/ignored 产物、提交偏移或不确定状态均保留。仅删除已确认归属且再次确认干净的 worktree 和分支，不 force/prune。续跑复用保留副本，已删除则从原基准重建；关闭仅停止执行，恢复接管未结算 effect。隔离只是工作副本隔离，不是安全沙箱。
