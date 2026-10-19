@@ -1,6 +1,50 @@
 # PRALE Agent Harness
+对话：
+![alt text](PRALE/images/conversation.png)
+轨迹：
+![alt text](PRALE/images/trajectory.png)
+记忆：
+![alt text](PRALE/images/memory.png)
+技能：
+![alt text](PRALE/images/skill.png)
+Python 版、可持久化的Agent Harness。Session 是可恢复执行边界；entry、usage、lane state 与 operation state 都通过 Storage transaction 持久化。
 
-Python 版、可持久化的 pi-style Agent Harness。Session 是可恢复执行边界；entry、usage、lane state 与 operation state 都通过 Storage transaction 持久化。
+PRALE 面向需要持续对话、调用工具和在进程重启后恢复工作的 Agent 应用。项目以可独立嵌入的 Python library/runtime 为核心，并提供 Web UI 与服务适配层，可用于搭建本地代码助手、仓库探索和多 Agent 委派工作流。
+
+## 主要能力
+
+- **持久化执行与恢复**：以 Session、Lane 和 Operation 管理对话与执行状态，使用 SQLite 保存历史、工具调用意图和结果，明确处理中断后的未知结果。
+- **工具与仓库探索**：提供文件读写、精确编辑、Shell 执行，以及可选的源码符号与引用关系索引。
+- **上下文与长期记忆**：支持上下文压缩、历史导航、会话检索，以及从执行归档逐层提炼的仓库记忆和全局经验；记忆晋升需要配置提取器与提示词。
+- **Skill 与 Subagent**：管理可复用 Skill，支持独立历史的子 Agent、后台委派、续跑与可选 Git worktree 隔离。
+- **Web 与可观测性**：提供浏览器交互界面、传输无关的 RPC 接口，以及可选的 Langfuse 追踪和数据集评测。
+
+## 安装
+
+需要 **Python 3.12 或更高版本**，在仓库根目录执行：
+
+```bash
+python -m pip install -e .
+```
+
+按需安装可选依赖，例如 `python -m pip install -e '.[web,subagents]'`。`web` 用于 Web 服务，`subagents` 用于加载 Markdown 子 Agent 定义；`repository-explorer`、`embedding` 和 `langfuse` 分别用于源码索引、本地向量检索与追踪。
+
+Web 部署的配置示例与启动方式见 [deploy/web.env.example](deploy/web.env.example)，启动脚本为 [deploy/start-web.sh](deploy/start-web.sh)。
+
+## 项目结构
+
+| 目录 | 职责 |
+| --- | --- |
+| `src/agent_harness/domain/` | 领域模型与契约，保持纯净依赖边界 |
+| `src/agent_harness/runtime/` | 执行循环、工具调度、重试和子 Agent 运行时 |
+| `src/agent_harness/storage/` | SQLite 等存储实现 |
+| `src/agent_harness/api/` | Python API、服务接口与部署入口 |
+| `src/agent_harness/integrations/` | 模型、工具、检索、追踪等外部集成 |
+| `src/agent_harness/memory/` | 长期记忆处理与晋升运行时 |
+| `src/agent_harness/web/` | Web UI 静态资源 |
+| `specs/` | 架构约束、实现方案与设计决策 |
+| `tests/`、`evals/` | 自动化测试与评测数据集 |
+
 
 ## 最小示例
 
@@ -33,7 +77,7 @@ SQLite 是单机持久化后端，`MemoryStorage` 用于测试。工具可标记
 
 ## 本地工具
 
-`agent_harness.integrations.create_builtin_tools(working_directory)` 提供 pi 风格的 `read`、`write`、`edit`、`bash`。相对路径以工作目录解析，绝对路径也允许；这不是文件系统沙箱。`read` 支持文本分页和 JPEG/PNG/GIF/WebP/BMP 的 base64 structured details；`write` 创建父目录；`edit` 要求原始文件中每项精确匹配一次且互不重叠，并保留 BOM 与换行风格；`bash` 合并 stdout/stderr，支持 timeout、取消时进程组终止，以及 2,000 行/50 KiB 尾部截断。
+`agent_harness.integrations.create_builtin_tools(working_directory)` 提供 `read`、`write`、`edit`、`bash`。相对路径以工作目录解析，绝对路径也允许；这不是文件系统沙箱。`read` 支持文本分页和 JPEG/PNG/GIF/WebP/BMP 的 base64 structured details；`write` 创建父目录；`edit` 要求原始文件中每项精确匹配一次且互不重叠，并保留 BOM 与换行风格；`bash` 合并 stdout/stderr，支持 timeout、取消时进程组终止，以及 2,000 行/50 KiB 尾部截断。
 
 其中只有 `read` 是恢复时可自动重放的 `safe` 工具。文件写入、编辑和 shell 命令均为 `never`：若进程在 effect 后、持久化结果前中断，恢复会显式记录结果未知，而不会重新执行可能已生效的命令。
 
