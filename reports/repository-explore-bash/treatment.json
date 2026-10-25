@@ -1,0 +1,1649 @@
+{
+  "dataset": "prale/repository-explore-bash-treatment",
+  "git_sha": "c2d847c293931f1e65f58d9fdaf22c11cf8dec87",
+  "repository_git_sha": "f384fac099fe2dc5d947d4cbebe22a0fa363f1db",
+  "model": "deepseek-flash",
+  "workspace_mode": "disposable git archive; bash in network-disabled container at /workspace",
+  "bash_image": "prale-eval/repository-explore-bash:v1",
+  "bash_timeout_seconds": 60,
+  "items": [
+    {
+      "id": "treatment-bash--memory-recovery-and-consistency",
+      "output": {
+        "answer": "{\"summary\":\"PRALE 的长期记忆捕获遵循一条明确的不变量：Session 只负责把「冻结的捕获意图」原子地提交到 outbox，MemoryStore 拥有所有可重试的记忆资产与晋升状态（L0 archive、L1/L2/L3、promotion job、watermark、audit）。崩溃安全来自两处：一是 terminal settlement 与 outbox 记录在同一 Session mutation 里提交；二是 L0 写入以 capture_key 幂等去重、watermark 单调递增。重复调度安全来自三层幂等键：outbox 记录 key、capture_key（session/operation/tip/source_hash）、job 唯一键（scope/stage/input_high_watermark）以及 lease_id 的 compare-and-set。失败不会被静默丢弃：记录要么留在 outbox 待重试（session 侧 dead letter + 重放），要么进入 job dead_letter 状态（store 侧 + audit + 可重放），并且未知 outbox 事件、frozen entry 缺失、source hash 不匹配都会显式转成可观测的 dead letter，而不是用当前分支补齐。\",\"components\":[{\"name\":\"Session capture outbox\",\"owner\":\"Session (Session storage list)\",\"detail\":\"ListAddress(\\\"memory/capture_outbox\\\") 保存冻结记录：event=memory_capture_requested、key=[session_id, operation_id, tip_id, sha256(source_entry_ids)]、scope、lane、kind、base_tip_id/tip_id、source_entry_ids、source_entry_hash、trace_format_version、trace_entry_ids。它在 terminal settlement 的同一 mutator.commit 中追加。\"},{\"name\":\"Session capture dead letters\",\"owner\":\"Session\",\"detail\":\"ListAddress(\\\"memory/capture_dead_letters\\\") 保存投递失败的冻结记录；replay 时整体搬回 outbox 并清空，产生 audit capture_dead_letters_replayed。\"},{\"name\":\"MemoryRuntime dispatcher\",\"owner\":\"Process (no Session state)\",\"detail\":\"后台 worker 轮询已 bind 的 session：读取 outbox → 校验 scope → 用冻结 ID/hash materialize L0 → capture_archive → 触发/唤醒 L1 job → 结算 outbox。它自身不持有对的记忆资产状态。\"},{\"name\":\"MemoryStore L0 (trace_archives/trace_items)\",\"owner\":\"MemoryStore\",\"detail\":\"capture_archive 在 BEGIN IMMEDIATE 中按 (session_id, operation_id, tip_id, source_entry_hash) 查找，已存在则返回 stored, False 并 audit capture_deduplicated；字段上有 UNIQUE 约束，写入成功 audit capture_stored。\"},{\"name\":\"MemoryStore promotion jobs\",\"owner\":\"MemoryStore\",\"detail\":\"memory_jobs 以 (team,agent,user,stage,input_high_watermark) 唯一，带 status、not_before、attempt、lease_id/lease_until、error_class、output_hash、input_ids/input_hash、prompt_id/version/mode；memory_job_attempts 记录每次尝试。\"},{\"name\":\"MemoryStore watermarks\",\"owner\":\"MemoryStore\",\"detail\":\"memory_stage_watermarks 保存 per-scope per-stage 水位，advance_watermark 用 MAX(watermark, excluded.watermark) 保证单调，retry 不会回退消费位置。\"},{\"name\":\"MemoryStore audit\",\"owner\":\"MemoryStore\",\"detail\":\"memory_audit 只追加行（scope、created_at、event、data），记录 capture_stored/capture_deduplicated/capture_dead_letter/capture_dead_letters_replayed、job_started/job_completed/job_dead_letter/job_replayed/job_settlement_error、l1_*、l2_update、l3_update、recall_* 等。\"},{\"name\":\"Read-only query surface\",\"owner\":\"API\",\"detail\":\"MemoryQueryService 暴露 L0/L1/L2/L3 浏览、list_jobs（含 dead_letter 状态）与 list_audit；web.py 只有 GET 路由，没有重放路由。\"}],\"flow\":[\"1) terminal settlement：Drive 在同一个 SessionMutator 里生成 terminal 写入与 frozen outbox 记录并一次 commit，因此「操作终结」与「捕获意图已持久」不可分割；若 commit 前崩溃则两者都不存在。\",\"2) 冻结语义：记录只含 entry ID 与 sha256，不含正文；它把 base tip/terminal tip/trace IDs 固定下来，dispatcher 不能读取「当前分支」。\",\"3) 派发：worker 对每个已绑定的 session 读 outbox，按 scope 过滤（不匹配的记录留在 outbox），逐条 materialize。\",\"4) materialize 校验：读取冻结的 entry/trace ID，要求集合完全相等（否则抛 frozen source entry disappeared），重算 DIGEST 与 source_entry_hash 比对（否则抛 frozen source hash mismatch）；任一失败即视为不可投递。\",\"5) L0 幂等落库：capture_archive 事务内先查 capture_key，命中返回 (stored, False) 并 audit capture_deduplicated；未命中才插入 archive+items 并分配 scope-local store_seq，audit capture_stored。因此「L0 已写、outbox 未结算」的崩溃窗口重放只会重复读取，不会重复写入。\",\"6) outbox 结算：delivered 与 dead_letters 分别从 outbox 移除（dead letter 追加到 memory/capture_dead_letters），结算本身是一次 Session mutation；结算前崩溃则记录仍在 outbox，下一步靠 capture_key 去重。\",\"7) 捕获失败：异常时非吞异常的 audit(capture_dead_letter, outbox=raw) 先落审计再搬入 dead letter；若审计本身失败，异常向外抛，dispatch 整体报 capture_dispatch_error，记录留在 outbox 等下次重试（不丢）。\",\"8) 晋升调度幂等：由 _enqueue_l1 按未消费 L0 item 的 store_seq watermark 与轮次阈值计算 bounded 切片，create_or_wake_job 用 INSERT OR IGNORE + 只更新 scheduled/queued/retry_wait（MIN(not_before) 提前唤醒），不会改写 running lease 或已冻结的 input_ids。\",\"9) lease/重试：claim_job 用 UPDATE ... WHERE lease_until IS NULL OR lease_until<=now 做 compare-and-set，并把 attempt+1 写入 memory_job_attempts；过期 lease 可被恢复 worker 接管。\",\"10) 完成/失败结算：complete_job / fail_job 都带 lease_id 谓词，lease 丢失即抛 promotion lease lost；fail_job 依据 retry_at 置 retry_wait 或 dead_letter，并回填 attempt 的 error_class。\",\"11) 重试策略：通用异常按 now + 1000*2^(attempt-1) 退避，attempt>=max_job_attempts 时 retry_at=None 进入 dead_letter 并 audit job_dead_letter；ValueError（schema）与 PermissionError 属不可重试，直接 dead_letter；结算失败 audit job_settlement_error。\",\"12) 阶段间幂等：L1 的 apply_candidates 在单个 BEGIN IMMEDIATE 中写 L1、来源关系、FTS 并推进 l1 watermark，部分写入不可能；重跑时 after 已前进导致待处理切片为空，等价空操作。\",\"13) 防止污染：L1 以 (type, content_hash) 对 active 行去重（l1_no_op）；supersede 前校验目标在同一 scope 且 active；L2/L3 用 expected_version 与 merge_scene_ids 可见性校验，冲突抛 PromotionConflict；delete_scope 与 gc 按 scope 级联，不碰全局 L3。\",\"14) 审计与人工恢复：job 侧 dead_letter 可在 scope 内通过 replay_dead_letter 置回 queued 并 audit job_replayed；capture 侧通过 replay_capture_dead_letters 把 Session dead letter 搬回 outbox 并 audit capture_dead_letters_replayed；/memory/jobs 与 /memory/audit 提供只读可观测性。\",\"15) 状态归属：outbox、capture dead letters、被冻结引用的 entries/trace list 属于 Session；L0/L1/L2/L3、jobs、job attempts、watermarks、audit、prompt registry、FTS/embedding 索引属于 MemoryStore；session→scope 绑定（_sessions）与 worker task 只是进程内状态，不持久。\"],\"evidence\":[{\"path\":\"src/agent_harness/runtime/lane.py\",\"symbol\":\"Lane.memory_capture_writes\",\"claim\":\"冻结 outbox 记录在 terminal mutation 内构造并作为 Write 返回，key=[session_id, operation_id, tip_id, sha256(source_ids)]，已存在同 key 时返回空列表，从源头阻止重复入队。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._settle_terminal_at_tip\",\"claim\":\"memory_capture_writes 的写入与 _terminal_writes 在同一个 mutator.commit 中提交，因此 terminal 结果与捕获意图原子一致（崩溃时二者都不产生）。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._dispatch_session\",\"claim\":\"dispatcher 只读取冻结记录；失败时写 capture_dead_letter 审计并搬入 memory/capture_dead_letters；结算时按当前 outbox 列表重建（保留未处理的他人记录），使投递成功/不可投递成为唯一清理条件。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._materialize\",\"claim\":\"frozen source entry 缺失抛 frozen source entry disappeared、hash 不符抛 frozen source hash mismatch、字段缺失由 _required_str 抛错，全部走 dead letter 路径，绝不用当前分支补齐。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.capture_archive\",\"claim\":\"L0 写入以 BEGIN IMMEDIATE 包裹 capture_key 查询；命中返回 (stored, False) 并 audit capture_deduplicated，未命中插入并 audit capture_stored，配合 UNIQUE(session_id,operation_id,tip_id,source_entry_hash) 实现捕获幂等。\"},{\"path\":\"src/agent_harness/domain/memory.py\",\"symbol\":\"SessionTraceArchive.capture_key\",\"claim\":\"(session_id, operation_id, tip_id, source_entry_hash) 是 L0 幂等身份的唯一定义，被 capture_archive 与 schema 唯一约束共同使用。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime.replay_capture_dead_letters\",\"claim\":\"Session 侧捕获 dead letter 可由管理员显式搬回 outbox（空列表返回 0，天然幂等），并写 audit capture_dead_letters_replayed，恢复动作本身可追溯。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.claim_job\",\"claim\":\"lease 获取是事务 compare-and-set（WHERE lease_until IS NULL OR lease_until<=now），同时 attempt+1 并写 memory_job_attempts；过期 lease 可被恢复 worker 接管，崩溃不会永久占用 job。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.complete_job\",\"claim\":\"完成结算要求 lease_id 匹配，否则抛 promotion lease lost，防止被接管后的旧 worker 覆盖新 lease 的结果（重复完成被拒）。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.fail_job\",\"claim\":\"失败结算按 retry_at 决定 retry_wait 或 dead_letter，清空 lease 并把 error_class 写回对应 attempt，dead letter 保留 job 行与输入引用而非删除。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._run_job\",\"claim\":\"重试采用 now + 1000*2^(attempt-1) 指数退避，attempt>=max_job_attempts 进入 dead_letter 并 audit job_dead_letter；ValueError/PermissionError 为不可重试直接 dead_letter；一切结算异常另记 job_settlement_error。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.create_or_wake_job\",\"claim\":\"job 唯一键 (scope, stage, input_high_watermark) + INSERT OR IGNORE 使重复调度合并为同一个 job；唤醒只作用于 scheduled/queued/retry_wait，不会打断 running lease 或改写冻结的 input_ids。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.apply_candidates\",\"claim\":\"L1 候选写入、来源关系、FTS、审计与 l1 watermark 推进在同一事务内完成；重复内容按 (type, content_hash) 命中 active 行则 audit l1_no_op 跳过，既防重复污染也防部分写入。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.advance_watermark\",\"claim\":\"watermark 使用 MAX(watermark, excluded.watermark) 单调推进，重放或乱序重试不会把消费位置回退（避免重复消费历史 L0）。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.write_scene\",\"claim\":\"L2 更新要求 expected_version 与当前 version 相等、merge_scene_ids 必须在同 scope 且 current，否则抛 PromotionConflict，阻止跨 scope 与并发覆盖造成的污染。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.replay_dead_letter\",\"claim\":\"仅 status='dead_letter' 且 scope 匹配的 job 可被置回 queued，失败抛 KeyError；成功写 audit job_replayed，使人工重放可审计。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore._audit_in_transaction\",\"claim\":\"审计可加入调用方事务（write_doctrine 的 l3_update、L1 的 l1_create/l2_capacity_warning），保证状态变更与审计在同一事务内一致。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._safe_audit\",\"claim\":\"job/recall 观测类审计是 best-effort（异常被吞），失败不会阻塞 dispatch；这决定了审计的可靠性等级低于资产写入。\"},{\"path\":\"tests/integration/test_long_term_memory.py\",\"symbol\":\"test_terminal_settlement_atomically_enqueues_frozen_capture\",\"claim\":\"验证 terminal settlement 后 outbox 中恰有一条 memory_capture_requested，且携带 operation_id 与非空 source_entry_ids。\"},{\"path\":\"tests/integration/test_long_term_memory.py\",\"symbol\":\"test_missing_frozen_entry_moves_capture_to_dead_letter\",\"claim\":\"冻结 entry 缺失时 outbox 被清空且记录出现在 memory/capture_dead_letters，证明失败是显式可观测而非静默丢弃。\"},{\"path\":\"tests/crash_recovery/test_memory_recovery.py\",\"symbol\":\"test_recovery_after_archive_write_before_outbox_settlement_is_idempotent\",\"claim\":\"模拟「L0 已写、outbox 未结算」崩溃后重放，最终仍只有 1 个 archive 且 outbox 清空，证明 capture_key 去重覆盖该窗口。\"},{\"path\":\"tests/conformance/test_long_term_memory_storage.py\",\"symbol\":\"test_capture_key_is_idempotent_and_store_sequences_are_scope_local\",\"claim\":\"store 层契约确认相同 capture_key 重复 capture 只产生一条 archive，且 store_seq 按 scope 独立分配。\"},{\"path\":\"tests/conformance/test_long_term_memory_storage.py\",\"symbol\":\"test_expired_job_lease_can_be_claimed_by_a_recovery_worker\",\"claim\":\"过期 lease 的 job 可被恢复 worker 重新 claim，证明崩溃后的 promotion 不会永久卡死。\"},{\"path\":\"src/agent_harness/api/memory.py\",\"symbol\":\"MemoryQueryService.list_jobs\",\"claim\":\"job（含 dead_letter 状态）与审计可被分页读取，使失败与重试对运维可见；该服务是只读的，不提供重放动作。\"},{\"path\":\"src/agent_harness/api/web.py\",\"symbol\":\"WebApp.list_memory_jobs\",\"claim\":\"HTTP 只暴露 GET /api/memory/jobs 与 /api/memory/audit 等只读路由，本检出中未发现 dead letter 重放的 HTTP 入口。\"},{\"path\":\"specs/long-term-memory-implementation-spec.md\",\"symbol\":\"§4.1/§4.2 Capture、晋升和恢复\",\"claim\":\"设计文档明确：outbox 与 terminal outcome 同事务、dispatcher 幂等写 L0、capture key 去重、job 以 (scope,stage,input_high_watermark) 去重并使用事务 lease、有限退避后进入 dead_letter 且重放必须产生 audit。\"}],\"uncertainties\":[\"L2 晋升不是按 job 原子：write_scene 逐候选单独提交，advance_watermark 与 complete_job 在之后才发生。若在写完部分 scene 后崩溃，重试会再次抽取同一 L1，可能因 expected_version 不匹配抛 PromotionConflict（普通异常 → 退避重试 → 可能 dead_letter），且每次成功写入都会 heat+1，故 L2 的幂等性弱于 L1，代码中未见 scene 级 content_hash 去重。\",\"L1 去重仅针对 status='active' 且 (type, content_hash) 相同的行；同一内容在旧行被 supersede/reject 后可被重新创建为新行，且新行 version 恒为 1（未见基于 source_record_ids 或 source_hash 的唯一约束）。\",\"job dead letter 与 capture dead letter 的重放只以库方法存在（MemoryRuntime.replay_capture_dead_letters、SQLiteMemoryStore.replay_dead_letter），web.py 未见对应管理路由；capture 重放是「全部搬回」而非按条目选择，颗粒度较粗。\",\"捕获派发只遍历进程内已绑定会话（MemoryRuntime._sessions 由 Harness.open → bind_session 填充）。进程完全重启后，未绑定会话的 outbox 不会被扫描；本检出未见跨 session 的全局 outbox 扫描器，故「重启恢复扫描」的实现范围依赖上层如何重新打开会话。\",\"观测类审计为 best-effort（_safe_audit 吞异常），job_started/job_completed/job_dead_letter 可能缺失而 job 实际已推进；反过来 dead letter 路径使用不吞异常的 audit，审计库故障会导致记录留在 outbox（偏向不丢数据而非不丢审计）。\",\"L2/L3 的 PromotionConflict 走通用异常分支（按未知错误重试后 dead_letter），没有被归类为不可重试或自动重新规划，因此并发/重放冲突可能以 dead letter 形式暴露，需要人工 replay。\",\"claim_job 的选择条件在全库范围内跨 scope 取最早的到期 job，worker 单线程一次只处理一个 job；未发现 spec 中提到的独立 PromotionScheduler 组件（调度由 _worker 轮询与持久 not_before 重新武装），因此高负载下延迟与「一个 scope 同 stage 只有一个运行 job」的保证依赖唯一键与 lease，而非独立调度器。\",\"_dispatch_session 的 outbox 结算按 dict 相等性移除条目：若 outbox 中同时存在两条完全相同的记录，两条都会被移除。由于 L0 侧已去重，这不会造成重复污染，但会掩盖重复计数（审计中不体现被合并的重复条数）。\",\"MemoryRuntime._sessions 中的 session→scope 绑定与 worker task 是纯进程内状态，不持久化；「哪些状态属于 Session」的边界清晰，但绑定本身的丢失不会被任何审计事件记录。\"}],\"_note\":\"状态归属小结：Session 侧 = memory/capture_outbox、memory/capture_dead_letters、被冻结引用的 entries 与 operation/<op>/trace 列表；MemoryStore 侧 = trace_archives/trace_items(L0)、atomic_memories/atomic_memory_sources(L1)、work_scene_memories(L2)、operating_doctrines(L3, GLOBAL_L3_SCOPE)、memory_jobs、memory_job_attempts、memory_stage_watermarks、memory_audit、memory_prompt_registry，以及 FTS/embedding 派生索引；进程内非持久 = _sessions 绑定与 worker task。\"}",
+        "tool_calls": [
+          {
+            "name": "repository_explore",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          }
+        ],
+        "terminal_status": "completed",
+        "generation_count": 13,
+        "usage": {
+          "prompt_tokens": 356884,
+          "completion_tokens": 11017,
+          "total_tokens": 367901,
+          "prompt_cache_hit_tokens": 315392,
+          "prompt_cache_miss_tokens": 41492
+        },
+        "unknown_effects": 0,
+        "duration_ms": 76408,
+        "error_code": null
+      },
+      "evaluations": [
+        {
+          "name": "terminal_success",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_error_free",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "answer_contract",
+          "value": 0.0,
+          "comment": "answer is not JSON"
+        },
+        {
+          "name": "tool_count",
+          "value": 23.0,
+          "comment": "23 call(s)"
+        },
+        {
+          "name": "latency",
+          "value": 76408.0,
+          "comment": "76408 ms"
+        },
+        {
+          "name": "token_cost",
+          "value": 1092686.0,
+          "comment": "1.09269e+06 token(s)"
+        }
+      ]
+    },
+    {
+      "id": "treatment-bash--memory-design",
+      "output": {
+        "answer": "{\"summary\":\"PRALE 的长期记忆是一个独立于 Session 的四层（L0–L3）存储，由 MemoryRuntime 异步提升、由 Drive 在每次 LLM effect intent 之前同步召回并冻结进 intent。L0 是 terminal operation 派生的不可变会话轨迹归档（SessionTraceArchive，含 base tip→terminal tip 增量与受限祖先链），只作晋升原料与审计证据；L1 是可独立判断的原子记忆（AtomicMemory，active/superseded/rejected）；L2 是按 scenario_key 组织、带乐观锁版本的工作场景块（WorkSceneMemory，current/dormant）；L3 是全库唯一的全局 operating doctrine（OperatingDoctrine，scope 固定为 GLOBAL_L3_SCOPE）。写入路径完全不进入 terminal settlement 事务：terminal mutation 只追加 outbox 记录，后台 worker 再幂等 materialize、capture 并按 store_seq watermark 触发 L1→L2→L3 job。读取路径是 recall → RecallBundle → ContextAssembler 生成一条独立的 <long_term_memory> system message，注入点位于 transform_context 之后、before_request 之前，并随 messages 一起写入 assistant.effect_pending 的持久 intent，恢复时复用该冻结 bundle 而不重新召回。所有召回失败都收敛为空 bundle 或关键词扫描降级，永不阻塞 prompt admission。\",\"components\":[{\"name\":\"domain（纯 DTO 与校验）\",\"path\":\"src/agent_harness/domain/memory.py\",\"responsibility\":\"定义 MemoryScope(仅 repository_id)、TraceItem、SessionTraceArchive、AtomicMemory、WorkSceneMemory、OperatingDoctrine、AtomicCandidate/SceneCandidate/DoctrineCandidate、PromotionJob、RecallQuery/RecallBudget/RecallItem/RecallBundle、MemoryRetentionPolicy，以及 validate_atomic_candidate / validate_scene_content / validate_doctrine_content 与 GLOBAL_L3_SCOPE。\",\"boundary\":\"不导入 SQLite、向量库、HTTP 或 provider SDK；只含数据与纯规则。\"},{\"name\":\"协议层\",\"path\":\"src/agent_harness/memory/protocol.py\",\"responsibility\":\"MemoryStore（capture_archive/find_archive、job 生命周期与 watermark、search、read_l1_since/read_l2/read_l3/read_all_l2、write_scene/write_doctrine、audit、gc、rebuild_indexes、只读分页浏览）、MemoryExtractor（extract_l1/extract_l2/extract_l3）、EmbeddingProvider（可选旁路）。\",\"boundary\":\"只暴露不可变 DTO，不暴露 SQL 或 provider 对象；extractor 不能直接写库。\"},{\"name\":\"MemoryRuntime（编排）\",\"path\":\"src/agent_harness/memory/runtime.py\",\"responsibility\":\"持有 store + 可选 extractor；start()/aclose() 管理单个 asyncio worker；dispatch 冻结 outbox → L0；按阈值与 not_before 调度 L1/L2/L3 job；recall() 包超时与降级；flush()/gc()/replay_capture_dead_letters()/record_injection()/materialize_capture()。\",\"boundary\":\"自身不拥有任何 Session 状态（docstring：owns no Session state），只消费冻结 outbox 记录；L0 是它唯一的权威职责。\"},{\"name\":\"ContextAssembler（投影）\",\"path\":\"src/agent_harness/memory/context.py\",\"responsibility\":\"把 RecallBundle 投影成单条 role=system 的 <long_term_memory> 消息，按 l3/l2/l1/l0 命名分组、每项带 [level:id@version]，并声明只读、不得覆盖 system 指令、路径/符号/测试结果须在当前 checkout 复核。\",\"boundary\":\"纯函数式投影，无 I/O；空 bundle 返回 None。\"},{\"name\":\"Drive / Lane 接入点\",\"path\":\"src/agent_harness/runtime/lane.py\",\"responsibility\":\"Lane.memory_capture_writes 在 terminal Session mutation 里构造冻结 outbox 记录（含 base_tip_id、tip_id、source_entry_ids、source_entry_hash、trace_entry_ids、去重 key）并追加 memory/capture_outbox；Lane.recall_memory 是对 MemoryRuntime.recall 的薄封装，未配置 memory 时返回 None。\",\"boundary\":\"capture 事务内不调用 LLM、embedding 或记忆 SQLite；Drive 通过 Lane 而非直接依赖 MemoryStore。\"},{\"name\":\"Drive 注入与冻结\",\"path\":\"src/agent_harness/runtime/drive.py\",\"responsibility\":\"_persist_generation_intent 在 transform_context 之后、before_request/before_payload 之前召回并追加记忆 system message，记录 record_injection，然后把 messages + memory_bundle_hash + memory_items 写入 OperationState(at='assistant.effect_pending')；_execute_and_settle/recover 直接复用该持久 intent 的 messages。\",\"boundary\":\"记忆内容的持久副本位于 operation state（effect intent），而不是重新召回；hooks 能观察到注入结果。\"},{\"name\":\"SQLite 后端\",\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"responsibility\":\"trace_archives/trace_items（分配 scope 内单调 store_seq、parent_archive_id + 最近 50 个 ancestor_item_ids）、atomic_memories + atomic_memory_sources + memory_fts、work_scene_memories、operating_doctrines、memory_jobs/memory_job_attempts（lease + not_before CAS）、memory_stage_watermarks、memory_audit、memory_embeddings；search 的 L3→L2→L1→L0 排序与降级；gc/rebuild_indexes/delete_scope。\",\"boundary\":\"repo 归属由 memory_scopes 的第一物理列承载，全部过滤在数据库侧完成（_scope(scope)=scope.storage_key）；L3 读写固定 GLOBAL_L3_SCOPE，read_l3 忽略传入 scope，因此所有 repo 可读同一全局 doctrine。\"},{\"name\":\"In-memory 后端\",\"path\":\"src/agent_harness/storage/memory_memory.py\",\"responsibility\":\"InMemoryMemoryStore 继承 SQLiteMemoryStore，使用 ':memory:'；与 SQLite 后端共享同一 conformance 契约。\",\"boundary\":\"仅为测试/单进程嵌入的同一实现变体，不引入第二套语义。\"},{\"name\":\"抽取适配器\",\"path\":\"src/agent_harness/integrations/memory_provider.py\",\"responsibility\":\"JsonMemoryExtractor 把 JSON-only completion 函数适配成 MemoryExtractor；mode 固定 'code'，其它 mode 抛 UnsupportedPromptMode；非法内容抛 ValueError 由 runtime 归类为不可重试 schema 失败。\",\"boundary\":\"调用方拥有模型选择与传输；不泄漏 wire payload 到 domain/storage。\"},{\"name\":\"只读查询服务与 Web 路由\",\"path\":\"src/agent_harness/api/memory.py\",\"responsibility\":\"MemoryQueryService 以部署侧构造的 MemoryScope 提供 L0/L1/L2/L3/jobs/audit 的分页只读视图；get_l0 额外校验 archive.scope == self._scope。\",\"boundary\":\"scope 由服务端派生（调用方无法选择 repo）；Web 仅暴露 GET /memory/{l0,l1,l2,l3,jobs,audit}，不提供写入、晋升或 GC 端点。\"},{\"name\":\"生命周期装配\",\"path\":\"src/agent_harness/api/web.py\",\"responsibility\":\"SessionSupervisor.__init__ 由 config.repository_id 建 MemoryScope 与 MemoryRuntime（无 store 则为 None），start()/aclose() 分别启停 worker；SessionSupervisor 共享 runtime，Harness.close 故意不关闭它。Harness.__init__ 强制 memory_scope 与 memory_runtime 必须成对出现，并 bind_session。\",\"boundary\":\"未配置 memory_store 时 /memory/* 返回 ServiceUnavailable，Drive 不捕获也不召回。\"},{\"name\":\"L0 的跨模块权威性\",\"path\":\"src/agent_harness/skill/runtime.py\",\"responsibility\":\"Skill 演化通过 memory.materialized_capture(scope, session_id, raw) 读取 MemoryRuntime 已写入的 L0 archive，而不自行再捕获。\",\"boundary\":\"MemoryRuntime 是 L0 的唯一写入者，Skill 只是 L0 的消费者。\"}],\"flow\":[{\"step\":\"1. operation terminal settlement（同一 Session mutation）\",\"detail\":\"Drive 在写入 terminal result 的同一个 mutator 中调用 Lane.memory_capture_writes：base = scan_branch(result.from_tip_id)，tip = 当前 lane tip（navigate 时用显式 branch_tip_id），source_ids = terminal branch 中 seq 严格大于 base 末项 seq 的 entry（再加 terminal_entry_ids，如 assistant entry、branch summary），digest = sha256('\\\\0'.join(source_ids))；去重 key 为 [session_id, operation_id, result.tip_id, digest]；向 Session list memory/capture_outbox 追加 {event: memory_capture_requested, scope:{repository_id}, lane, kind, operation_id, base_tip_id, tip_id, source_entry_ids, source_entry_hash, trace_format_version, trace_entry_ids}，同时写 terminal_settlement trace 记录。事务内不执行 LLM/embedding/记忆 SQLite。\"},{\"step\":\"2. outbox dispatch → L0 archive\",\"detail\":\"MemoryRuntime._worker（start() 后启动的单个 asyncio task，poll_ms=100）遍历 bind_session 注册的 (session, scope)，_dispatch_session 用 session.mutate 读取 memory/capture_outbox；scope 不匹配的记录跳过（兼容旧 (team,agent,user) 编码）。对匹配记录 _materialize 按冻结的 source_entry_ids + trace_entry_ids 直读 storage entries，校验集合一致与 source_entry_hash，逐项脱敏后构造 SessionTraceArchive；store.capture_archive 以 capture_key (session_id, operation_id, tip_id, source_entry_hash) 幂等去重（重复则审计 capture_deduplicated 并返回 created=False），并给每个 item 分配 scope 内单调 store_seq、写 parent_archive_id 与最近 50 个 ancestor_item_ids、审计 capture_stored。\"},{\"step\":\"3. L1 入队判据\",\"detail\":\"created=True 时读 current_l1_watermark（= memory_stage_watermarks 的 l1），_enqueue_l1 取 unconsumed_items(scope, after)，统计其中 role=='user' 的 item 数；不足 l1_turn_threshold（默认 5）则不入队。达标后 _bounded_l1_archives 按已消费 watermark 与 l1_max_input_chars(96k)/l1_max_item_chars(12k) 截出 hash 可追溯的 excerpt 片段，返回的 watermark 为最后一个被选 item 的 store_seq，再 create_or_wake_job(scope,'l1',watermark,not_before=now,input_ids=[archive_ids])。\"},{\"step\":\"4. outbox 结算与死信\",\"detail\":\"成功记录从 outbox 移除；抛出（含未知 event、entry 消失、hash 不符）的记录移入 Session list memory/capture_dead_letters 并写 audit capture_dead_letter，绝不用当前 branch 补齐。MemoryRuntime.replay_capture_dead_letters(session_id) 把死信搬回 outbox 并审计 capture_dead_letters_replayed。\"},{\"step\":\"5. promotion worker 与三阶段\",\"detail\":\"worker 每轮 store.claim_job(now, lease_id, 30_000) 取最早到期且租约空闲的 job（claim 用 UPDATE 做 CAS，attempt+1）。_run_job 按 stage：l1 = extract_l1(archives) → apply_candidates（validate_atomic_candidate；同 type+content_hash 视为 no_op；同 scene_key+type 的 active 项被隐式 supersede/merge；cursor 写入 new + 旧置 superseded + FTS 插入 + l1_<decision> 审计 + 提升 l1 watermark）→ complete_job → 以 not_before = now + max(l2_delay_ms=90s, 15min - 距上次 L2 完成时间) 唤醒 l2 job（input_ids 为新 L1 ids）→ 再 _enqueue_l1 处理剩余；l2 = read_l2 + read_l1_since(l2 watermark) → extract_l2 → write_scene（九段 Markdown 校验、≤1500 字符、expected_version 乐观锁、merge 他场景为 dormant、heat+1、80%/100% 容量预警、超 max_scenes=20 按 heat 降级 dormant）→ advance l2 watermark → complete → 在 GLOBAL_L3_SCOPE 上唤醒 l3 job（当尚无 doctrine，或本轮有 L2 候选，或候选带 persona_update_request）；l3 = read_all_l2（全部 repo 的 current L2）+ read_l3 → extract_l3 → write_doctrine（六段 ≤1200 字符、禁止 transient/敏感/精确版本号、乐观版本）→ advance l3 watermark → complete。\"},{\"step\":\"6. job 失败分类\",\"detail\":\"ValueError → fail_job(error_class='schema', retry_at=None) 直接 dead_letter；PermissionError → 'permission' 直接 dead_letter；其它异常按 1s*2^(attempt-1) 退避，attempt >= max_job_attempts(3) 时 dead_letter；两种死信都写 job_dead_letter 审计；extractor 缺少某阶段方法引发的 AttributeError 视为旧版 L1-only 实现，直接 complete_job。extractor 为 None 时 job 直接 complete，不产生 L1/L2/L3。生产失败因此不阻塞 L0 保留，也不影响后续 Session operation。\"},{\"step\":\"7. 下一次 LLM 请求：召回\",\"detail\":\"Drive._persist_generation_intent 先取 session.context(lane tip) 并跑 hooks.transform_context，然后 Lane.recall_memory(operation.meta.request['prompt']) → MemoryRuntime.recall(scope, RecallQuery(prompt, context_summary=''), RecallBudget())。runtime 用 asyncio.wait_for 包住 store.search，超时上限 budget.timeout_ms=5000，成功后审计 recall_completed（duration_ms、item_ids、total_chars、degraded_reason）。SQLiteMemoryStore.search 的固定顺序：① L3 doctrine（include_l3 且内容 ≤ max_total_chars 时以 score 1.0 放入，source_ids=doctrine.l2_ids）→ ② L2 current 场景（按 heat 读，关键词命中率需 ≥ min_score=0.3，正文按 max_item_chars=1200 截断，受 max_total_chars=6000 约束）→ ③ L1 active（BM25-FTS 排名 + 可选 embedding 的 RRF 融合，score = max(keyword_ratio, path_ratio, fts_score, rrf)，按 min_score 过滤，最多 5 条，可按 type_quotas 限制，每条带 atomic_memory_sources 的 source_record_ids）→ ④ 若 L1 条数/总量仍未满且有检索词，用 LOWER(content) LIKE 扫 trace_items 补 L0 证据项（固定 score 0.3，id 为 archive_id:source_entry_id）。最后以 items 拼接计算 content_hash 生成不可变 RecallBundle。\"},{\"step\":\"8. 投影与冻结进 effect intent\",\"detail\":\"bundle.items 非空时 ContextAssembler.assemble 产出一条 role=system、以 <long_term_memory> 包裹、分 <global_engineering_doctrine>/<repository_working_context>/<relevant_code_memory>/<trace_evidence> 分组、每项 prefixed [level:id@version] 的消息，追加在 transform_context 输出之后；随后依次经过 before_request、before_payload（可观察并审计），再拼 skill listing/loadout。intent 写入 OperationState(at='assistant.effect_pending') 时同时记录 memory_bundle_hash = bundle.content_hash 与 memory_items=[{id,version,level,content}]；注入前后还会写 audit recall_injected（bundle_hash、items id/version、total_chars）。_loadout_metadata 会把 bundle hash 与每项 id/level/chars 发布到 telemetry metadata。\"},{\"step\":\"9. 恢复路径\",\"detail\":\"Drive.recover 只在 state == 'assistant.effect_pending' 时执行 _execute_and_settle，后者直接使用 operation.state.data['messages'] 发起 provider 请求——崩溃恢复不会再召回，已持久化 intent 的记忆 IDs/versions/hash 保持不变。若 operation 尚在 'assistant.ready' 等更早状态，则走正常 run 路径到 _persist_generation_intent，会重新召回一次。\"},{\"step\":\"10. 检索失败与降级链（详见 uncertainties 的核对说明）\",\"detail\":\"① 未配置 memory（Harness 的 memory_scope/memory_runtime 必须成对为 None）→ Lane.recall_memory 返回 None、memory_capture_writes 返回 []，Drive 完全不变。② runtime 层：search 超时或抛任何异常 → 审计 recall_degraded{reason: 异常类名} 并返回 RecallBundle((), content_hash(''), 0, degraded_reason)；即使审计也失败（_safe_audit）仍然返回空 bundle。③ 空/降级 bundle 的 items 为空 → 不生成记忆消息、不调用 record_injection，intent 里 memory_bundle_hash=content_hash('')、memory_items=[]，Drive 继续。④ store 层 FTS：memory_fts MATCH 抛 sqlite3.OperationalError → 审计 recall_fts_degraded 并回退到 status='active' 全表扫描，再用应用层关键词/路径占比打分。⑤ embedding：provider 缺失或 embed 抛错 → 审计 recall_embedding_degraded，关键词/FTS 与 RRF 仍工作；_refresh_embeddings 失败只审计 embedding_index_degraded 并保留陈旧旁路索引（search 以 e.content_hash=m.content_hash 连接，陈旧向量不参与）。⑥ L3 缺失或超过预算 → 静默跳过该层，不算失败。⑦ 写入侧失败：capture 失败进 dead letter（可 replay），promotion 失败进 retry_wait/dead_letter，均不抛回 Drive。\"}],\"evidence\":[{\"path\":\"src/agent_harness/runtime/lane.py\",\"symbol\":\"Lane.memory_capture_writes\",\"claim\":\"terminal mutation 内用 base tip 与 terminal tip 的增量构造冻结 outbox 记录（source_entry_ids、source_entry_hash=sha256('\\\\0'.join(ids))、base_tip_id、tip_id、trace_entry_ids、scope.repository_id），去重 key 为 [session_id, operation_id, result.tip_id, digest]，且该函数在未配置 memory_scope/runtime 时返回空列表。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._settle\",\"claim\":\"memory_capture_writes 与 terminal result 写在同一个 mutator.commit 中（正常完成与 navigate 分支都如此），因此 outbox 与 terminal outcome 原子提交。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._dispatch_session\",\"claim\":\"worker 从 Session list memory/capture_outbox 读取，按 scope 匹配、校验 event 名、调用 _materialize 与 store.capture_archive，成功后按 current_l1_watermark 调 _enqueue_l1；失败记录进 memory/capture_dead_letters 并审计 capture_dead_letter。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._materialize\",\"claim\":\"L0 只按冻结的 source_entry_ids/trace_entry_ids 直读 storage entries，要求集合完全一致且 sha256 与 outbox 中 source_entry_hash 相同，不合即 RuntimeError（不使用当前 branch 补齐）。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.capture_archive\",\"claim\":\"capture_key (session_id, operation_id, tip_id, source_entry_hash) 去重；每个 item 分到 scope 内单调 store_seq；写 parent_archive_id（store_seq 最大的既有 archive）与最近 50 个 ancestor_item_ids；审计 capture_deduplicated / capture_stored。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._enqueue_l1\",\"claim\":\"L1 job 的入队判据是 unconsumed_items 中 role=='user' 的条目数 >= l1_turn_threshold（默认 5），且 watermark 由 _bounded_l1_archives 以 l1_max_input_chars/l1_max_item_chars 限幅后取最后一个被选 item 的 store_seq。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.create_or_wake_job\",\"claim\":\"job 以 (scope, stage, input_high_watermark) 去重：不存在则插入（not_before<=now 为 queued，否则 scheduled），存在则只把 scheduled/queued/retry_wait 的 not_before 取 MIN 并可能提前转 queued，不干扰 running 租约或已冻结的 input_ids。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.claim_job\",\"claim\":\"领取使用 UPDATE ... WHERE job_id=? AND (lease_until IS NULL OR lease_until<=?) 的 compare-and-set，attempt+1，并写 memory_job_attempts，因此同一 stage 不会被两个 worker 同时执行。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._run_job\",\"claim\":\"L1/L2/L3 的完整升序与阈值：L1 后以 max(l2_delay_ms=90s, 15min-距上次 L2 完成) 延迟唤醒 L2 并再次 _enqueue_l1；L2 以 read_l1_since(l2 watermark) 增量抽取、write_scene、advance l2 watermark，并在无 doctrine/有候选/persona_update_request 时唤醒 GLOBAL_L3_SCOPE 的 L3；L3 用 read_all_l2 读取全部 repo 的 current L2。失败分类为 schema/permission 直接 dead_letter、其它按指数退避到 dead_letter、AttributeError 视为 L1-only extractor 直接 complete。\"},{\"path\":\"src/agent_harness/domain/memory.py\",\"symbol\":\"SessionTraceArchive\",\"claim\":\"L0 的权威对象字段：archive_id、scope、session_id、lane、operation_id、operation_kind、base_tip_id、tip_id、source_entry_ids、source_entry_hash、trace_format_version、created_at、content_hash、items、parent_archive_id、ancestor_item_ids、parent_gap、ancestor_items，capture_key 即 (session_id, operation_id, tip_id, source_entry_hash)。\"},{\"path\":\"src/agent_harness/domain/memory.py\",\"symbol\":\"validate_atomic_candidate\",\"claim\":\"L1 的四个 type 各有必需 metadata（work_task: owner/deadline/status；work_method: scope/method_type；work_artifact: artifact_type/artifact_ref；work_fact: work_object/status/activity_start_time/activity_end_time），正文 ≤2000 字符、禁敏感标记、confidence∈[0,1]、supersede/merge 必须带被替代 ID、work_method 不得含可执行步骤标记（属于 SkillStore）。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.apply_candidates\",\"claim\":\"L1 写入在一个事务内完成：no_op 只审计、同 type+content_hash 判重、同 scene_key+type 的 active 项被隐式 supersede（多条则 merge）、旧记录置 superseded 而非删除、写 atomic_memory_sources 来源链、插入 memory_fts、写 l1_<decision> 审计并用 MAX 提升 l1 watermark，最后刷新旁路 embedding。\"},{\"path\":\"src/agent_harness/domain/memory.py\",\"symbol\":\"validate_scene_content\",\"claim\":\"L2 场景块必须是含九个固定中文段落、≤1500 字符的 Markdown；validate_doctrine_content 则要求 L3 六个英文段落、≤1200 字符、禁止 password/secret/api key/TODO/待办/blocked/deadline/owner 及精确依赖版本号。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore._write_scene_in_transaction\",\"claim\":\"L2 以 scenario_key 唯一 current、expected_version 乐观锁（不符抛 PromotionConflict）、merge_scene_ids 必须都属于本 scope 且 current、更新时 heat+1、在 80%/100% 容量处写 l2_capacity_warning，满额按 heat 降级为 dormant 而非删除。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.write_doctrine\",\"claim\":\"L3 只写入 GLOBAL_L3_SCOPE，版本单增、expected_version 不符抛 PromotionConflict，并写 l3_update 审计——因此 doctrine 不归属任何单一 repo。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.read_l3\",\"claim\":\"read_l3 忽略传入 scope，固定按 GLOBAL_L3_SCOPE 查询最新版本，这使每个 repo scope 的召回都能读到同一份全局 doctrine（L3 是 L0–L2 之外唯一的跨 repo 可见层）。\"},{\"path\":\"src/agent_harness/storage/memory_sqlite.py\",\"symbol\":\"SQLiteMemoryStore.search\",\"claim\":\"召回顺序固定为 L3 → L2（heat 排序 + 关键词阈值）→ L1（FTS BM25 + 可选 embedding RRF，score=max(keyword,path,fts,rrf)，min_score 0.3，≤max_l1_items，带 source_record_ids）→ L0 trace_items 的 LIKE 补充（固定 0.3），并以 max_total_chars 为硬预算生成 RecallBundle；FTS 失败时审计 recall_fts_degraded 并回退到 active 全表扫描，embedding 失败时审计 recall_embedding_degraded 但关键词路径继续。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime.recall\",\"claim\":\"召回被 asyncio.wait_for(budget.timeout_ms) 包住；任何异常（包括审计失败）都转成 RecallBundle((), content_hash(''), 0, 异常类名)，并尽力写 recall_degraded 审计——即召回故障不会向上抛。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime._refresh_embeddings\",\"claim\":\"embedding 是纯旁路索引：刷新失败只写 embedding_index_degraded 审计并保留陈旧数据，权威正文与 L1 记录不依赖它。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime.replay_capture_dead_letters\",\"claim\":\"L0 capture 死信可在同一 Session 的 memory/capture_dead_letters 与 memory/capture_outbox 之间显式搬回并审计 capture_dead_letters_replayed，即投递失败可恢复而不丢输入。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._persist_generation_intent\",\"claim\":\"召回发生在 transform_context 之后、before_request/before_payload 之前；bundle.items 非空才追加 <long_term_memory> system 消息并记录 record_injection；intent 持久化 memory_bundle_hash 与每项 id/version/level/content。\"},{\"path\":\"src/agent_harness/memory/context.py\",\"symbol\":\"ContextAssembler.assemble\",\"claim\":\"记忆投影是单条 system 消息，分 l3/l2/l1/l0 四组、每项带 [level:id@version]，并显式声明只读、不构成授权、路径/符号/命令/测试结果为历史证据；空 items 返回 None（不注入）。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._execute_and_settle\",\"claim\":\"provider 请求的 messages 直接取自持久化的 operation.state.data['messages']，所以崩溃恢复复用冻结的召回结果，不会重新召回而改变 intent。\"},{\"path\":\"src/agent_harness/runtime/lane.py\",\"symbol\":\"Lane.recall_memory\",\"claim\":\"未配置 memory_runtime/memory_scope 时返回 None；否则以 RecallQuery(prompt, context_summary) 与默认 RecallBudget() 调用 MemoryRuntime.recall——这是 Drive 与记忆子系统之间唯一的召回入口。\"},{\"path\":\"src/agent_harness/api/memory.py\",\"symbol\":\"MemoryQueryService\",\"claim\":\"对外只读视图按部署侧构造的 scope 分页读取 L0/L1/L2/L3/jobs/audit，get_l0 额外要求 archive.scope == self._scope；该服务没有写方法。\"},{\"path\":\"src/agent_harness/api/web.py\",\"symbol\":\"SessionSupervisor.start\",\"claim\":\"Web 部署在 lifespan 中显式调用 MemoryRuntime.start()/aclose()，未配置 memory_store 时 /memory/* 由 _memory_service 抛 ServiceUnavailable，且 memory 只读路由为 /memory/{l0,l0/{archive_id},l1,l2,l3,jobs,audit}。\"},{\"path\":\"src/agent_harness/api/harness.py\",\"symbol\":\"Harness.__init__\",\"claim\":\"memory_scope 与 memory_runtime 必须同时为 None 或同时存在（否则 ValueError），存在时调用 memory_runtime.bind_session(session, scope)——库使用者通过这一处把 Session 接入记忆 dispatch。\"},{\"path\":\"src/agent_harness/skill/runtime.py\",\"symbol\":\"SkillEvolutionRuntime\",\"claim\":\"Skill 侧通过 memory.materialized_capture(scope, session.id, raw) 读取 MemoryRuntime 已写入的 L0 archive，说明 MemoryRuntime 是 L0 的唯一写入权威、其它子系统只是消费者。\"},{\"path\":\"tests/integration/test_long_term_memory.py\",\"symbol\":\"test_recall_failure_and_audit_failure_degrade_to_empty_bundle\",\"claim\":\"既有测试断言 store.search 抛 RuntimeError 且 audit 也抛错时，recall 返回空 items 且 degraded_reason=='RuntimeError'，即降级不抛异常。\"},{\"path\":\"tests/integration/test_long_term_memory.py\",\"symbol\":\"test_recall_orders_doctrine_then_scene_then_atomic_memory\",\"claim\":\"既有测试断言 RecallBundle 前三级顺序为 l3、l2、l1，印证召回的高层优先排序。\"}],\"uncertainties\":[\"关于“降级为 FTS”的实现细节：SQLiteMemoryStore.search 在 memory_fts MATCH 抛 sqlite3.OperationalErro",
+        "tool_calls": [
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "repository_explore",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          }
+        ],
+        "terminal_status": "completed",
+        "generation_count": 24,
+        "usage": {
+          "prompt_tokens": 939528,
+          "completion_tokens": 16002,
+          "total_tokens": 955530,
+          "prompt_cache_hit_tokens": 881280,
+          "prompt_cache_miss_tokens": 58248
+        },
+        "unknown_effects": 0,
+        "duration_ms": 121678,
+        "error_code": null
+      },
+      "evaluations": [
+        {
+          "name": "terminal_success",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_error_free",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "answer_contract",
+          "value": 0.0,
+          "comment": "answer is not JSON"
+        },
+        {
+          "name": "tool_count",
+          "value": 38.0,
+          "comment": "38 call(s)"
+        },
+        {
+          "name": "latency",
+          "value": 121678.0,
+          "comment": "121678 ms"
+        },
+        {
+          "name": "token_cost",
+          "value": 2850588.0,
+          "comment": "2.85059e+06 token(s)"
+        }
+      ]
+    },
+    {
+      "id": "treatment-bash--repository-explorer-design",
+      "output": {
+        "answer": "{\"summary\":\"repository_explore 解决的是「修改代码前先定位」的问题：Agent 只有一个已知符号名、概念或已知文件时，靠它一次性得到一张「带行号、带内容快照、受预算约束」的代码导航图（repository map），而不必盲猜路径或把整仓灌进上下文。它是 integrations 层的一个普通 AgentTool（只读、replay_policy=\\\"safe\\\"、永不 terminate），结果作为一条普通 tool message 进入 branch 上下文，必须再用 read 确认，不是每轮自动注入的隐式 prompt。实现分三段：发现/解析（TreeSitterRepositoryIndexer + RepositoryTagCache）、检索排序（definition/reference 图 + 个性化 PageRank）、有界渲染（增量预算打包 + wire JSON 上限 + 输出文件二次 hash）。\",\"components\":[{\"name\":\"RepositoryExplorerTool\",\"role\":\"AgentTool 适配器：name=repository_explore、input_schema（identifiers/known_paths/focus_paths/path_prefixes/query/include_tests/max_tokens）、replay_policy=safe、execute() 把参数规范化→索引→渲染→返回 ToolExecutionResult(content, details={truncated, token_estimate})；所有 RepositoryIndexError/ValueError/OSError 都折成有界错误结果而不是抛出。\"},{\"name\":\"TreeSitterRepositoryIndexer\",\"role\":\"发现 + 解析：遍历 workspace_root，按 _DEFAULT_SKIPPED_DIRS 与真实 cache_dir 排除目录，含 resolve 后的 containment 检查、文件数/单文件字节/总字节/扫描时长上限、include_tests 过滤；对每个文件先 stat(size,mtime_ns) 查缓存，未命中才读字节、判二进制（前 8192 字节含 NUL）、sha256、用 tree-sitter 解析并按 .scm 的 definition./reference. capture 生成 (path,name,role,symbol_kind,1-based 名称行) 标签；阻塞工作放在 asyncio.to_thread。\"},{\"name\":\"repository_queries/*.scm\",\"role\":\"每种语言的 capture 查询作为 wheel package data，用 importlib.resources 读取，因此安装后的 wheel 不需要源码 checkout；python.scm 给出 class/function/constant 定义与 call reference 的捕获规则。\"},{\"name\":\"RepositoryTagCache\",\"role\":\"checkout 外 SQLite 的「仅文件标签」缓存：主键 (path,content_hash,indexer_version,query_version)，用 (size,mtime_ns) 做免读预筛；失败/损坏一律视为 miss（返回 None），有 TTL 回收与条目数 LRU 淘汰；它不是恢复所需的权威数据。\"},{\"name\":\"RepositoryExplorerConfig / RepositoryScanLimits\",\"role\":\"资源边界：workspace_root 必须 resolve 成目录，cache_dir 必须 resolve 后不在 workspace_root 内；max_export_tokens 限定在 256..6000；max_files=8000、max_file_bytes=1MB、max_total_bytes=32MB、max_scan_ms=60s；max_concurrent_indexes 通过 Semaphore 限制并发索引数。\"},{\"name\":\"检索/排序：_rank_candidates + _pagerank + _edge_weight\",\"role\":\"同名 reference→definition 建文件间带权边（sqrt(重复次数)、identifier ×10、compound 名 ×10、下划线开头 ×0.1、同名定义>5 ×0.1、known_paths 引用 ×50、low_confidence ×0.1），30 轮 0.15 阻尼的个性化 PageRank；focus_paths 提高 personalization 并 +100 分，path_prefixes 只 +10 分不裁剪候选，identifiers 精确命中 +1000 分，符号种类有加权；known_paths 只作种子且被排除渲染。\"},{\"name\":\"有界渲染与 wire 预算\",\"role\":\"每个符号候选重新读文件、取 ±3 行上下文（每行截断 120 字符）、写入 snapshot `<hash[:12]>`，读后二次 stat/hash 校验（变化则整请求重试一次，否则 workspace_changed_during_render）；按 prefix-sum 增量字节/行数/估算 token 打包候选，最后对完整 json.dumps({content,is_error,details}) 校验 50 KiB / 1600 行 / max_tokens；超限则加「Truncated by output budget…Other candidates」只有效路径列表，兜底 _trim_to_wire_budget 用二分 + \\\"[truncated]\\\" 标记。\"},{\"name\":\"Runtime 接口：AgentTool / ToolExecutionResult\",\"role\":\"runtime 只看到 name/description/input_schema/replay_policy/execute；结果带 details（会被 provider 看到，所以只放 truncated 与 token_estimate）。\"},{\"name\":\"Deployment 接线\",\"role\":\"Settings.from_environment 把 repository_explore 加入 BUILTIN_TOOLS 白名单（PRALE_TOOLS 显式开启，默认关闭），启用时强制 PRALE_REPOSITORY_INDEX_DIR 且必须位于 PRALE_PROJECT_ROOT 之外；serve._repository_explorer 构造 config+indexer，缺 repository-explorer extra 时抛 ProjectConfigError 让 build_application 失败；local_tools.create_builtin_tools 把它追加到本地工具集；evaluation 的 READ_ONLY_TOOLS 含它，评测沙箱不会授予写工具。\"}],\"flow\":[\"模型发出 tool call（如 identifiers=[\\\"Foo\\\"]、可选 known_paths/focus_paths/path_prefixes/query、include_tests、max_tokens）。\",\"Drive 保存 durable tool intent（calls[].status=\\\"effect_pending\\\"）并开启 EffectSpan(pending)，参数此时已是最终值。\",\"ToolRegistry.execute_parallel → RepositoryExplorerTool.execute：_normalize_request 做 schema 严格校验（未知属性、数组≤32 项、identifier≤256B、路径≤1024B、query≤1000B、路径必须 workspace 相对且 resolve 后在根内、不存在/绝对/.. /根外 symlink 报参数错误、known_paths∩focus_paths 非空报错、至少一个焦点、max_tokens 256..max_export_tokens）。\",\"在 Semaphore 保护的 slot 中调用 indexer.index(include_tests)（asyncio.to_thread 内同步扫描）：发现文件→stat 预筛→tag cache 命中则复用→未命中读字节+hash+tree-sitter 打标签→写入缓存；任何扫描上限越界抛 repository_scan_limit_exceeded。\",\"_render 在另一个线程中跑：identifiers 精确命中 definition；无匹配则发 identifiers_not_found 并降级为有界文件级候选（最多 12）而不是伪造符号匹配；否则用引用图 + PageRank + focus/prefix 加成排序，过滤 known_paths、每文件最多 3 个符号。\",\"逐个候选生成片段块并按增量预算选择成员；超预算即置 truncated 并追加被省略候选路径；最后对整条 wire JSON 做 50 KiB/1600 行/token 校验，必要时二分裁剪。渲染每个入选文件前后各读一次并比对 sha256 与 stat，若变化则整体重试一次，仍变化则返回 workspace_changed_during_render 错误。\",\"返回 ToolExecutionResult(content=Markdown 地图, details={truncated, token_estimate:true}, terminate 恒为 false)——如果是错误则 content 是被截到 ≤min(4000, 25KiB) 的诊断文本且 is_error=true。\",\"Drive._settle_tool 在一个事务内：写 tool_outcome trace、结算 span outcome、插入 role=\\\"tool\\\" 的 message entry（含 content/is_error/terminate/details）、推进 lane tip 与 operation state；此后结果才是权威的 branch entry，并作为普通上下文投影参与下一轮 provider 请求（也受 compaction 约束）。\",\"恢复：若进程在 effect 后、settlement 前中断，Drive.recover/_run_next_tool 发现 pending call 的 tool.replay_policy==\\\"safe\\\"，在同一事务内把旧 attempt 的 span 结算为 unknown/interrupted（并发布一条 unknown telemetry，让评测看到可能执行了两次），把 call 退回 planned 并作为新 attempt 重放；因为工具只读、参数已持久化、缓存非权威，重放得到的是等价导航结果。\"] ,\"evidence\":[{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"RepositoryExplorerTool\",\"claim\":\"工具契约即该模块定义：name/repository_explore、description 明确「已知精确路径用 read、bash 能一次精确定位时优先 bash、本工具只读、永不终止、结果是需 read 验证的导航」、replay_policy=\\\"safe\\\"、input_schema 的 identifiers/known_paths/focus_paths/path_prefixes/query/include_tests/max_tokens，以及 additionalProperties=False。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"RepositoryExplorerTool.execute\",\"claim\":\"execute 只做三件事：规范化参数、在 Semaphore(2) 下索引、在线程中渲染；捕获 RepositoryIndexError/ValueError/OSError 转为有界错误结果；WorkspaceChangedDuringRender 允许最多重试一次。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"TreeSitterRepositoryIndexer._index_sync\",\"claim\":\"索引是增量且受资源上限约束：逐文件 stat → cache.lookup(size,mtime_ns) 命中即复用，未命中读字节、判二进制（前 8192 含 NUL 则 parseable=False 无标签）、sha256、tree-sitter 打标签并 cache.store；累计总字节超过 max_total_bytes 抛 scan limit 异常。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"TreeSitterRepositoryIndexer._discover\",\"claim\":\"发现阶段的路径与资源限制：每步 resolve(strict=True) 后必须仍在 workspace_root 内，跳过 _DEFAULT_SKIPPED_DIRS 与真实 cache_dir，超过 max_file_bytes 的文件被忽略，include_tests=False 时按 tests/ test_ test_* *_test.py .test. .spec. 排除，超过 max_files 或 max_scan_ms 抛 repository_scan_limit_exceeded。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"TreeSitterRepositoryIndexer._tree_sitter_tags\",\"claim\":\"符号提取是 tree-sitter 语法树 + 每种语言的 .scm capture：只接受 definition.* 与 reference.*，符号种类由 capture 名派生，行号为名称节点的 1-based 行（可直接传给 read 的 offset），结果去重并按 (line,name,role) 稳定排序。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_query_source\",\"claim\":\".scm 查询通过 importlib.resources 从 agent_harness.integrations.repository_queries 读取，属于 wheel package data，因此安装后的部署不需要源码 checkout。\"},{\"path\":\"src/agent_harness/integrations/repository_queries/python.scm\",\"claim\":\"具体查询形状：class/function/constant 定义与 call 引用（identifier 与 attribute 两种被调形式）都带 @name 捕获，供上方 role/symbol_kind/行号推导。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"RepositoryTagCache.lookup\",\"claim\":\"缓存键包含 path+size+mtime_ns+indexer_version+query_version，并用 content_hash 定位标签；任何 OSError/sqlite3.Error/JSON 反序列化失败都返回 None，即缓存失败退化为重新解析而不是工具失败。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"RepositoryTagCache.store\",\"claim\":\"缓存有上界与回收：写入后删除 accessed_at 早于 TTL 的行，并按 accessed_at 删除超出 cache_max_entries 的溢出条目（LRU 风格）。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"RepositoryExplorerConfig\",\"claim\":\"构造期强制资源/路径不变量：workspace_root 必须 resolve 成已存在目录，cache_dir resolve 后不得位于 workspace_root 之内（否则 ValueError），max_export_tokens 必须在 256..6000。\">{{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"RepositoryScanLimits\",\"claim\":\"扫描上限的默认值与正数校验：max_files=8000、max_file_bytes=1_000_000、max_total_bytes=32_000_000、max_scan_ms=60_000，任一小于 1 直接 ValueError。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_normalize_relative_path\",\"claim\":\"路径限制：必须 workspace 相对（拒绝绝对路径与包含 .. 的路径），resolve 后必须仍在根内，已知路径必须是常规文件、prefix 必须是文件或目录、不存在的路径报错，从而把越界与根外 symlink 挡在参数阶段。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_string_array\",\"claim\":\"数组类参数限制：最多 32 项、每项非空且不含 NUL、identifier ≤256 字节、路径 ≤1024 字节，重复项静默去重——输入在 intent 之前就被规范化与限长。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_rank_candidates\",\"claim\":\"检索主路径：identifier 精确命中 definition 得 +1000，focus_paths +100 且缺席时补文件级候选，path_prefixes +10（只提升不裁剪），测试路径 -1，并与 PageRank 分数相加；无候选时回落到 _fallback_candidates。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_edge_weight\",\"claim\":\"排序权重是版本化、可审计的固定倍率：sqrt(repetitions)、identifier ×10、compound 名 ×10、下划线开头 ×0.1、同名定义多于 5 ×0.1、known_paths 引用 ×50、低置信 lexical 回填 ×0.1。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_pagerank\",\"claim\":\"确定性个性化 PageRank：0.15 阻尼、30 次迭代、悬空节点按 personalization 重分配，focus_paths 提高 50 倍、known_paths 提高 10 倍 personalization；纯文件节点也参与，故 path_prefixes 不会缩小发现范围。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_fallback_candidates\",\"claim\":\"无符号匹配时的退化路径是有界的：仅按路径/query 词/根目录重要文件/.github/workflows/path_prefixes 打分，返回至多 MAX_FALLBACK_CANDIDATES=12 个文件级候选（不渲染源码），保证「未命中」不会伪装成完整地图。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_render\",\"claim\":\"输出截断逻辑集中在 _render：先写 revision 与「仅导航、请 read 确认」前缀，按 json 字符串内层字节增量逐块打包（MAX_SYMBOLS_PER_FILE=3），超预算即停并置 truncated，追加最多 12 个被省略候选路径；最终再对整条 wire payload 做一次全量校验，失败则 _trim_to_wire_budget 兜底。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_within_wire_budget\",\"claim\":\"预算的计量对象是 provider 实际收到的完整 JSON：json.dumps({content,is_error,details}) 的 UTF-8 字节 ≤ MAX_WIRE_BYTES=50 KiB、content 行数 ≤ MAX_WIRE_LINES=1600、估算 token ≤ max_tokens。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_token_estimate\",\"claim\":\"token 估算与 tokenizer 无关且保守：math.ceil(UTF-8 字节 / 3)，因此结果 details 里恒标 token_estimate=True。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_trim_to_wire_budget\",\"claim\":\"最后一层截断保护：先截到 1600 行以内，再对字节长度做二分，拼接 \\\"[truncated]\\\" 标记，保证前缀本身异常长时也不会超 wire 预算。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_candidate_block\",\"claim\":\"渲染期的新鲜度保证：对符号级候选重读文件并展示候选行前后 3 行（每行 120 字符）与 hash 前 12 位快照，随后再次 hash+stat，若变化抛 WorkspaceChangedDuringRender；文件级候选只确认路径仍存在。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_bounded_error\",\"claim\":\"错误也是受限的 tool result：诊断文本被截到 min(4000, 25KiB)，is_error=True、terminate 仍为 False，因此不会因为错误文本突破上下文或终止 operation。\"},{\"path\":\"src/agent_harness/integrations/repository_explorer.py\",\"symbol\":\"_revision\",\"claim\":\"正文 revision 只读 .git/HEAD（不 shell out、不调 git），失败退化为 worktree；真正的新鲜度凭据是每个渲染文件的 content hash。\"},{\"path\":\"src/agent_harness/runtime/tools.py\",\"symbol\":\"AgentTool\",\"claim\":\"runtime 与集成的边界就是这个 Protocol：只暴露 name/description/input_schema/replay_policy/execute；ToolExecutionResult 增加 details 字段，正是探索工具能回传 {truncated, token_estimate} 的原因。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive.recover\",\"claim\":\"恢复语义：tools 状态下若存在 effect_pending 调用且 tool.replay_policy==\\\"safe\\\"，则重新进入 run() 重放；否则把该调用结算为 unknown/interrupted 且 terminate=True，明确不重放。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"_run_next_tool\",\"claim\":\"重放是「新 attempt」：同一事务内把丢失 attempt 的 span 结算为 unknown/interrupted 并把调用退回 planned，同时发布一条 unknown telemetry，使「可能跑过两次」成为可见事实，而不是被重放结果掩盖。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"_settle_tool\",\"claim\":\"结算的原子性：一次 commit 同时写入 tool_outcome trace、span outcome、role=\\\"tool\\\" 的结果 entry（content/is_error/terminate/details）、lane tip 和 operation state；这解释了为何 durable 参数 + 只读执行 = 可安全重放。\"},{\"path\":\"src/agent_harness/api/serve.py\",\"symbol\":\"_repository_explorer\",\"claim\":\"部署接线：仅当 settings.tools 含 repository_explore 时构造 RepositoryExplorerConfig + TreeSitterRepositoryIndexer，缺 extra 或配置非法抛 ProjectConfigError，使 build_application 在打开任何 durable store 之前失败。\"},{\"path\":\"src/agent_harness/api/settings.py\",\"symbol\":\"Settings.from_environment\",\"claim\":\"配置面：BUILTIN_TOOLS 白名单包含 repository_explore（PRALE_TOOLS 显式开启，默认空即关闭），启用时 PRALE_REPOSITORY_INDEX_DIR 必填且 resolve 后不得在 PRALE_PROJECT_ROOT 内，扫描/缓存/并发/导出 token 都有默认值与范围校验。\"},{\"path\":\"src/agent_harness/integrations/local_tools.py\",\"symbol\":\"create_builtin_tools\",\"claim\":\"接入方式：探索工具作为一个可选 AgentTool 参数追加到 read/write/edit/bash 之后，因此与本地工具同属一个 ToolRegistry，但不改变 core 依赖。\"},{\"path\":\"src/agent_harness/integrations/evaluation.py\",\"symbol\":\"READ_ONLY_TOOLS\",\"claim\":\"评测把 repository_explore 归为只读工具，允许在只允许读的 case 中使用；而 _confine 只对声明了 path 参数的工具套 ConfinedTool，探索工具靠自身的路径规范化保证不越界。\"},{\"path\":\"tests/crash_recovery/test_span_boundaries.py\",\"symbol\":\"test_repository_explorer_safe_attempt_is_replayed_after_settlement_crash\",\"claim\":\"可重放的直接证据：settlement 前进程死亡后 recover(provider) 仍以 completed 结束，且该 operation 的两条 tool span 依次为 unknown/interrupted 与 completed。\"},{\"path\":\"tests/unit/test_repository_explorer_unit.py\",\"symbol\":\"test_wire_budget_counts_full_json_bytes_lines_and_tokens\",\"claim\":\"输出截断的计量口径被单元测试锁定：预算按完整 JSON（含 details）的字节、行数与三字节一 token 的估算一起判定。\"},{\"path\":\"tests/unit/test_repository_explorer_unit.py\",\"symbol\":\"test_cache_reuses_stat_manifest_across_indexer_instances\",\"claim\":\"缓存跨索引器实例、跨进程复用：同 size/mtime_ns 的 stat manifest 命中后不再重新解析，证明缓存键与预筛行为符合「stat 预筛 + content hash 权威」的设计。\"},{\"path\":\"specs/repository-exploration-tool-design.md\",\"symbol\":\"ADR-REPO-001\",\"claim\":\"设计理由的权威表述：地图是「按需工具结果」而非每轮隐式上下文，因为自动注入既烧 token 又会破坏 provider 的 prompt cache 前缀。\"},{\"path\":\"specs/repository-exploration-tool-design.md\",\"symbol\":\"§7 Harness 执行、持久化与恢复\",\"claim\":\"为何可重放被明确写进规格：工具只读配置根与受控缓存，相同 durable arguments 可重新执行；它仍走 intent→effect→settlement 四阶段，tag cache 不是恢复所需的权威数据，中断时不得用未结算的内存结果拼造 tool result。\"},{\"path\":\"CONTEXT.md\",\"symbol\":\"Repository index / Repository map\",\"claim\":\"术语层划清了边界：索引是可从当前 checkout 重建的符号与引用视图，地图是一次请求导出的 tool result，二者都不是 Session 状态、长期记忆或工作树真相的持久副本。\"}],\"uncertainties\":[\"我主要通过读代码与规格判断单文件预算公平性：实现只用 MAX_SYMBOLS_PER_FILE=3 限制每文件符号数，规格里「单文件不能独占全部预算」的说法没有独立的显式配额检查，是否能完全防住超长片段占满预算需要构造 fixture 实测。\",\"_fallback_candidates 只在「有 identifiers 但一个都没命中」或排序后无候选时触发；我只看到 max_export_tokens 上限与 MAX_FALLBACK_CANDIDATES=12 的代码路径，没有逐条跑测试确认「query 只有概念提示、无任何术语命中」时正文措辞的全部变体。\",\"tree-sitter 版本约束（>=0.23,<0.26 且 0.26 在部分 bindings 上会使解释器崩溃）来自 pyproject 与 specs 的文字说明；我没有在本环境验证该崩溃，也没有验证所有 14 种语法模块在缺 binding 时只会静默跳过而不影响 Python 索引。\",\"settings.py 在 __all__ 之后重复声明了一段 DEFAULT_* 与 BUILTIN_TOOLS 常量，功能上等价于前面的定义（后者覆盖），但看起来是冗余/可疑的重复，我未确认是刻意保留还是复制残留。\",\"缓存损坏退化为 miss、JSON 反序列化失败返回 None 有代码与单测支持；但 SQLite 并发写保护仅靠线程本地连接（threading.local），跨进程同时索引同一 cache_dir 的行为我未验证，可能只是「各自解析、互相覆盖」而非严格串行。\",\"我只验证了 repository_explore 在评测沙箱中按 READ_ONLY_TOOLS 允许出现；parse_case_tools 是否在所有 case 配置路径下都会把 ConfinedTool 之外的自校验视为充分，我没有穷举 tests/unit/test_evaluation_unit.py 的全部断言。\"]}",
+        "tool_calls": [
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "repository_explore",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          }
+        ],
+        "terminal_status": "completed",
+        "generation_count": 18,
+        "usage": {
+          "prompt_tokens": 567851,
+          "completion_tokens": 9990,
+          "total_tokens": 577841,
+          "prompt_cache_hit_tokens": 523520,
+          "prompt_cache_miss_tokens": 44331
+        },
+        "unknown_effects": 0,
+        "duration_ms": 142465,
+        "error_code": null
+      },
+      "evaluations": [
+        {
+          "name": "terminal_success",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_error_free",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "answer_contract",
+          "value": 0.0,
+          "comment": "answer is not JSON"
+        },
+        {
+          "name": "tool_count",
+          "value": 23.0,
+          "comment": "23 call(s)"
+        },
+        {
+          "name": "latency",
+          "value": 142465.0,
+          "comment": "142465 ms"
+        },
+        {
+          "name": "token_cost",
+          "value": 1723533.0,
+          "comment": "1.72353e+06 token(s)"
+        }
+      ]
+    },
+    {
+      "id": "treatment-bash--tool-effect-recovery",
+      "output": {
+        "answer": "{\"summary\":\"PRALE 把一次 assistant tool call 当作外部副作用，固定按 durable intent → effect → atomic settlement 三段执行；每次尝试（attempt）在 effect ledger（`effect_spans` 表）里对应一行，并与授权它的 intent、以及它与 outcome 的结算分别放在同一事务里。恢复只读持久状态：对 `effect_pending` 的工具调用，`safe` 工具把丢失的那次 attempt 记为 `unknown`/`interrupted` 后作为新 attempt 重放，`never` 工具（以及注册表里已不存在的工具）不重放，而是写入一条“outcome 未知”的工具结果 entry 后收束。`unknown` 表示“已发出但无法证明远程做了什么”，既不当作成功成功，也不当作失败，且不臆造耗时。\",\"components\":[{\"name\":\"Drive\",\"path\":\"src/agent_harness/runtime/drive.py\",\"role\":\"状态机执行器：开 span、写 intent、执行 effect、原子 settlement、发布 telemetry、实现 recover()。每次 attempt 的 span 由 `_open_span`/`_settle_span` 生成。\"},{\"name\":\"EffectSpan / EffectOutcome / ErrorClass\",\"path\":\"src/agent_harness/domain/effects.py\",\"role\":\"effect ledger 的不可变记录：span_id、operation_id、call_id（工具用 tool_call_id）、kind、lane、attempt、started_at、outcome、ended_at、error_class；`pending` 与 `unknown` 语义及 `duration_ms` 的“不得臆造”规则定义在此。\"},{\"name\":\"effect_spans 表与 SettleSpan\",\"path\":\"src/agent_harness/storage/sqlite.py\",\"role\":\"持久化与不变量：`UNIQUE(operation_id, call_id, attempt)` 保证一次 attempt 只有一行，`CHECK ((outcome='pending')=(ended_at IS NULL))` 让“未结算”只能是 pending，SettleSpan 只更新 `outcome='pending'` 的行且 rowcount 必须为 1（重复结算即事务失败）。\"},{\"name\":\"ToolRegistry / AgentTool.replay_policy\",\"path\":\"src/agent_harness/runtime/tools.py\",\"role\":\"协议层暴露 `replay_policy`，Drive 只通过它决定恢复时是否允许自动重放；runtime 看不到具体工具实现。\"},{\"name\":\"builtin tools 的 replay policy\",\"path\":\"src/agent_harness/integrations/local_tools.py\",\"role\":\"`ReadTool.replay_policy=\\\"safe\\\"`；`WriteTool`、`EditTool`、`BashTool` 均为 `\\\"never\\\"`（`RepositoryExplorerTool` 亦为 safe），因此“写/编辑/shell 绝不自动重放”由工具声明而非 Drive 特判。\"},{\"name\":\"ToolTelemetry\",\"path\":\"src/agent_harness/runtime/telemetry.py\",\"role\":\"settlement 提交之后才发布的执行事实（一次 attempt 一个 observation），`EffectStatus` 中 `unknown` 被明确定义为“不是错误，只是无法证明远端做了什么”。\"},{\"name\":\"规范约束\",\"path\":\"specs/pi-harness-implementation-plan.md\",\"role\":\"四阶段协议、intent/settlement 与 span 必须同事务、safe/never 恢复规则、`pending`/`unknown` 词表与耗时规则、tool-result entry 源顺序要求的权威定义。\"}],\"flow\":[{\"stage\":\"1. 生成 intent（provider effect）\",\"detail\":\"`assistant.ready` 时 Drive 预留 `assistant_entry_id`、`usage_id`，用 `_open_span(kind=\\\"llm\\\", attempt=1)` 建 span，并在同一事务里把 `assistant.effect_pending` state（`span_id`、`span_started_at`、messages、attempt）与该 span 一起提交，因此不会出现“effect 已发但 attempt 未记录”。\"},{\"stage\":\"2. assistant settlement 预留工具调用\",\"detail\":\"`_settle_assistant` 在一个事务里写：assistant entry（payload 中 `tool_calls=[{id,name,arguments}]` 保持 provider 源顺序）、usage、`SettleSpan(completed)`、lane tip，并把 operation state 置为 `tools`，`calls` 列表中每项为 `{tool_call_id, tool_name, arguments, result_entry_id(已预留新 id), status:\\\"planned\\\", parallel}`。也就是说：工具结果 entry 的 id 与源顺序在 effect 发生之前就已 durable。\"},{\"stage\":\"3. 持久化 tool effect intent（+ span-start）\",\"detail\":\"`_run_next_tool` 取第一个 `planned` 调用（保持源顺序；若 `parallel` 为真则取一整段连续的并行批）。先跑 `before_tool` hook（可改参数、可 block），然后 `attempt = 上次 attempt+1`、`_open_span(kind=\\\"tool\\\", call_id=tool_call_id, attempt)`，并通过 `_transition_tool(s)` 把该调用置为 `effect_pending` 且附带 `span_id`、`span_started_at`、`attempt` —— intent 与 span 同行同事务提交。\"},{\"stage\":\"4. 执行 effect\",\"detail\":\"blocked → `_settle_tool(outcome=\\\"aborted\\\", error_class=\\\"hook_blocked\\\")`；工具不在 registry → `aborted`/`unknown_tool`（二者都不谎称 completed）；否则 emit `tool_start`、`await tool.execute(arguments)`，异常被转成 `is_error=True` 的结果，再经 `after_tool` hook，最后 `_tool_outcome` 映射：`is_error` → `failed`/`tool_error`，否则 `completed`。并行批次用 `asyncio.gather` 并发执行，完成顺序不可控。\"},{\"stage\":\"5. 原子 settlement（+ span-end 与工具结果 entry）\",\"detail\":\"`_settle_tool` 的单一事务按序提交：trace `tool_outcome` → `SettleSpan(span_id, ended_at, outcome, error_class)` → `InsertEntry(result_entry_id, parent=当前 tip, type=message, {role:\\\"tool\\\", tool_call_id, content, is_error, terminate[, details]})` → `SetValue(lane_tip=result_entry_id)` → operation state 中该 call 置 `completed` 并记录 `terminate`。`_settle_tool_batch` 把整批放进同一事务，并按 assistant 源顺序为每个调用写 tool-result entry（父指针逐个串成一条链），因此“事件乱序、entry 有序”。telemetry（每个调用一条 ToolTelemetry）在 commit 之后才发布。\"},{\"stage\":\"6. 循环或收束\",\"detail\":\"无 `terminate` 时 `tools → checkpoint`，下一轮 generation 的上下文中 tool 结果按源顺序出现在 assistant entry 之后；任一调用 `terminate=True` 则 `tools → terminal`（`_settle_terminal_at_tip(completed)`）。\"},{\"stage\":\"7. 崩溃恢复（`Lane.recover()` → `Drive.recover()`）\",\"detail\":\"只读 durable state。若 state 停在 `assistant.effect_pending`：`_settle_interrupted` 用已 checkpoint 的 `content_checkpoint` 写 assistant entry（`stop_reason=\\\"aborted\\\"`）、operation status `unknown`、span `unknown`/`interrupted`，绝不续接旧 HTTP 流；重试预算耗尽时 span 记 `failed`/`provider_error` 但 operation 仍是 `unknown`。\"},{\"stage\":\"8. 工具的崩溃恢复：safe 重放\",\"detail\":\"state 为 `tools` 且存在 `status=\\\"effect_pending\\\"` 的调用、且 `self._lane.tools.get(tool_name).replay_policy == \\\"safe\\\"` 时：先把该调用 `effect_pending → planned`，并在**授权重试的同一事务**里 `SettleSpan(unknown, interrupted)`（不留永久 pending），再为丢失的那次 attempt 单独发布一条 `unknown` 的 tool fact（评测方必须能看到“这个工具可能跑过两次”），然后 Drive 重新进入循环，为该调用开 `attempt+1` 的新 span 并真正重放。`read` / `repository_explore` 属于此类。\"},{\"stage\":\"9. 工具的崩溃恢复：never 不重放\",\"detail\":\"`replay_policy == \\\"never\\\"`（或工具已不在 registry）时调用 `_settle_tool(..., {\\\"content\\\": \\\"tool execution interrupted; outcome is unknown\\\", \\\"is_error\\\": True, \\\"terminate\\\": True}, outcome=\\\"unknown\\\", error_class=\\\"interrupted\\\")`：写入一条 error 工具结果 entry、结算 span 为 `unknown`/`interrupted`，随后 operation 在 tip 上收束（通常 status 仍为 `completed`，但模型/UI 看到的是显式“结果未知”的错误结果）。effect 不会被重新执行（`write`/`edit`/`bash` 即走此路）。多个残留 `effect_pending` 调用由 `run()` 的循环逐个按同一规则处理。\"},{\"stage\":\"10. unknown outcome 的语义\",\"detail\":\"`pending` = 已发出、从未结算（崩溃后未恢复前的显式编码，`ended_at` 必须为 NULL）；`unknown` = 已结算但无可证明结果（恢复关闭记录时刻写入 `ended_at`，因此 `duration_ms` 仍为 `None`，调用方也不得用 operation 的时长顶替）。`unknown` 既不是成功也不是失败：它是唯一诚实的第三种答案，避免把“可能已生效”的写操作重放，也避免把它当作“未执行”。\"}],\"evidence\":[{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._open_span\",\"claim\":\"span 与 intent 同事务提交：调用者“in the same transaction as the intent that authorizes the effect”，因此崩溃不会留下未记录的 attempt。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._settle_assistant\",\"claim\":\"assistant settlement 一次事务写 assistant entry（tool_calls 保持源顺序）、usage、SettleSpan(completed)、tip，并把 state 置 `tools`，每个 call 预置 `tool_call_id`/`arguments`/`result_entry_id`/`status=\\\"planned\\\"`/`parallel`，即工具结果 entry id 与源顺序在 effect 前已 durable。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._run_next_tool\",\"claim\":\"工具 effect 分三段：before_tool hook → `_open_span(kind=\\\"tool\\\", attempt=n)` 并 transition 到 `effect_pending`（intent+span 同事务）→ 执行 → `_settle_tool`；pending 且 policy 为 safe 时把丢失 attempt 与“调用回到 planned”写进同一事务。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._settle_tool\",\"claim\":\"工具 settlement 是单一事务：trace_writes(tool_outcome) + SettleSpan + InsertEntry(role=\\\"tool\\\") + lane tip + call 状态 completed；随后才发布 ToolTelemetry。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._settle_tool_batch\",\"claim\":\"并行批次的 tool-result entry 在同一事务内按 assistant 源顺序串链写入（parent_id 逐个前移），与 completion 顺序无关。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive.recover\",\"claim\":\"恢复只依赖 durable state：`summary.effect_pending` 走中断收束；`assistant.effect_pending` 走 `_settle_interrupted`；`tools` 下只有 `replay_policy == \\\"safe\\\"` 才 `return await self.run()` 重放，否则以 `outcome=\\\"unknown\\\", error_class=\\\"interrupted\\\"` 结算该调用。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"_tool_outcome\",\"claim\":\"工具 outcome 由结果而非异常推断：`is_error` → `failed`/`tool_error`，否则 `completed`；blocked/unknown tool 则显式记 `aborted` 并附带 `hook_blocked`/`unknown_tool`。\"},{\"path\":\"src/agent_harness/domain/effects.py\",\"symbol\":\"EffectSpan.duration_ms\",\"claim\":\"`pending` 无结束；`unknown` 的 ended_at 是记录被关闭的时刻，故两者 `duration_ms` 均为 None，且不得用 enclosing turn 的时长替代。\"},{\"path\":\"src/agent_harness/domain/effects.py\",\"symbol\":\"EffectOutcome\",\"claim\":\"`pending` = effect 已发出但未结算；`unknown` = 已结算但无可证明结果（结果随崩溃丢失）——即 unknown outcome 的权威语义。\"},{\"path\":\"src/agent_harness/storage/sqlite.py\",\"symbol\":\"_migrate_effect_spans\",\"claim\":\"持久不变量：`UNIQUE(operation_id, call_id, attempt)` 一次尝试一行，`CHECK ((outcome='pending')=(ended_at IS NULL))` 使“未结算”只能是 pending。\"},{\"path\":\"src/agent_harness/storage/sqlite.py\",\"symbol\":\"SQLiteStorage.commit\",\"claim\":\"`SettleSpan` 仅更新 `outcome='pending'` 的行且要求 rowcount==1，重复结算或不存在的 span 会让整个事务失败——span 只能结算一次。\"},{\"path\":\"src/agent_harness/runtime/tools.py\",\"symbol\":\"AgentTool.replay_policy\",\"claim\":\"恢复是否重放由工具协议字段驱动，而非 Drive 硬编码具体工具名。\"},{\"path\":\"src/agent_harness/integrations/local_tools.py\",\"symbol\":\"ReadTool.replay_policy\",\"claim\":\"`read` 声明为 `\\\"safe\\\"`，可被恢复重放。\"},{\"path\":\"src/agent_harness/integrations/local_tools.py\",\"symbol\":\"BashTool.replay_policy\",\"claim\":\"`write`/`edit`/`bash`（以及 `WriteTool`、`EditTool`）均声明 `\\\"never\\\"`，因此进程在 effect 后崩溃时不会被重新执行。\"},{\"path\":\"specs/pi-harness-implementation-plan.md\",\"symbol\":\"四阶段副作用协议（第 5 节）\",\"claim\":\"固定顺序：准备不可变输入 → 持久化 effect intent（+span-start）→ 调用外部系统 → 原子持久化 outcome 与下一状态（+span-end）；intent 与 span 同事务、settlement 与 SettleSpan/usage/entry/state 同事务，不得拆成第二次提交。\"},{\"path\":\"specs/pi-harness-implementation-plan.md\",\"symbol\":\"safe/never 恢复规则（第 5 节要点）\",\"claim\":\"`safe` 重试是新 attempt，丢失的前一次必须在授权重试的同一事务内结算为 `unknown`/`interrupted`，不允许永久 pending；`never` 必须写“执行中断、结果未知”的 tool result 且不得盲目重放。\"},{\"path\":\"specs/AGENTS.md\",\"symbol\":\"持久化与状态机规则\",\"claim\":\"“调用外部 LLM 或工具前必须写 effect intent；成功或失败 outcome 与下一状态必须原子落盘”“safe 可恢复重试、never 不得自动重放、未知结果必须明确收束”“并行工具写入的 tool-result entry 必须按 assistant 原始 tool-call 顺序”。\"},{\"path\":\"tests/crash_recovery/test_span_boundaries.py\",\"symbol\":\"test_a_replayed_tool_call_keeps_both_attempts_on_the_record\",\"claim\":\"safe 工具崩溃后：第一次 attempt 记 `(1, \\\"unknown\\\", \\\"interrupted\\\")` 且 duration 为 None，第二次 `(2, \\\"completed\\\", None)`，同 call_id——重放被如实记为第二次尝试。\"},{\"path\":\"tests/crash_recovery/test_span_boundaries.py\",\"symbol\":\"test_a_tool_call_that_is_never_replayed_is_closed_as_unknown\",\"claim\":\"`never` 工具在两种崩溃点（intent 已提交 / effect 带走进程）后 durable 状态相同：span 停在 pending；恢复只结算为 `unknown`+`interrupted`，`tool.calls == 1`（未重放），tip 是 `is_error=True` 的工具结果 entry。\"},{\"path\":\"tests/integration/test_generation_recovery.py\",\"symbol\":\"test_parallel_tool_batch_settles_entries_in_assistant_source_order\",\"claim\":\"并行批次虽可乱序完成，写入的 tool-result entries 与下一轮 provider 上下文都按 `call-first, call-second` 源顺序。\"},{\"path\":\"src/agent_harness/runtime/telemetry.py\",\"symbol\":\"EffectStatus\",\"claim\":\"`unknown` 在事实流中的定义是“process cannot prove what the remote side did”，明确不是错误类别，恢复正是用它记录被中断的 effect。\"}],\"uncertainties\":[\"intent 未把 replay policy 持久化：`_settle_assistant` 的 call 状态只含 tool_call_id/tool_name/arguments/result_entry_id/status/parallel，恢复时 `self._lane.tools.get(...)` 从当前 registry 读取 `replay_policy`。这与 specs 中“工具 intent 至少保存…replay policy”的要求存在偏差；若恢复时工具未注册或声明改变，重放决定会随之改变（未注册即按 never 处理）。此项仅为代码阅读结论，未见测试覆盖。\",\"`Drive.recover()` 的 safe 分支直接 `return await self.run()`，而 run() 在 `assistant.effect_pending` 需要 provider。README 称不带 provider 的 `recover()` 只能收束未知 LLM outcome；若“safe 工具待重放 + provider 为 None”组合（例如 `api/web.py:454` 之外的手工调用）会抛 `ProviderNotConfigured`，我没有运行用例验证其最终对外语义。\",\"并行批次的崩溃恢复没有专门 crash-recovery 测试（`tests/crash_recovery` 无 parallel 用例）；多残留 `effect_pending` 调用是逐个经 `recover()` 与 `run()` 循环处理的，我对该多调用路径的最终顺序/状态结论来自代码阅读而非测试观察。\",\"工具没有幂等键，specs 也明确只“降低重复风险”，因此 safe 重放不构成 exactly-once：外部世界可能已发生两次，`unknown` 只保证记录诚实，不保证效果唯一。\",\"未核实 `integrations/evaluation.py` 与 langfuse 侧如何消费“同一 call_id 的 unknown + completed 两次 attempt”；本回答只基于 `ToolTelemetry`/`EffectSpan` 的发布与持久语义，投影层细节未逐行确认。\"]}",
+        "tool_calls": [
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "repository_explore",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          }
+        ],
+        "terminal_status": "completed",
+        "generation_count": 18,
+        "usage": {
+          "prompt_tokens": 662448,
+          "completion_tokens": 10289,
+          "total_tokens": 672737,
+          "prompt_cache_hit_tokens": 610688,
+          "prompt_cache_miss_tokens": 51760
+        },
+        "unknown_effects": 0,
+        "duration_ms": 142022,
+        "error_code": null
+      },
+      "evaluations": [
+        {
+          "name": "terminal_success",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_error_free",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "answer_contract",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_count",
+          "value": 31.0,
+          "comment": "31 call(s)"
+        },
+        {
+          "name": "latency",
+          "value": 142022.0,
+          "comment": "142022 ms"
+        },
+        {
+          "name": "token_cost",
+          "value": 2007922.0,
+          "comment": "2.00792e+06 token(s)"
+        }
+      ]
+    },
+    {
+      "id": "treatment-bash--evaluation-and-langfuse",
+      "output": {
+        "answer": "{\n  \"summary\": \"PRALE 的 Langfuse 与评测机制由四层组成，且各层只读取自己有权读取的事实：(1) telemetry 事实层（runtime/telemetry.py）——Drive 在一次 Session 事务 commit 之后才发布 operation started/terminal、每次 provider attempt、每次 tool attempt 三种不可变事实；事实不是权威状态，全部丢失也不改变 Session。(2) Langfuse adapter（integrations/langfuse.py）——唯一导入 SDK 的模块，是一个同步 record、异步 worker 映射的 best-effort sink；默认关闭，默认 capture=metadata，只上传长度/计数/哈希，不上传任何正文。(3) dataset experiment（scripts/eval_harness.py）——把数据集 item 映射为 EvalCase，在临时 workspace + 独立 SQLite session 里跑真实 Harness/Drive/工具/settlement，再由 Langfuse SDK 的 run_experiment 驱动一遍（每 item 一个 asyncio.run），把 trace、item 分数和 run 级指标回传。(4) deterministic evaluator（integrations/evaluation.py）——纯函数，只读 Drive 已提交的事实汇总成的 RunOutput（answer、tool_calls、terminal_status、generation_count、usage、unknown_effects、duration_ms），不读模型散文；run-level metric（run_metrics）再把每 item 分数聚合成 rate/mean/p95/total，供 --gate 与 Langfuse run_evaluators 使用。评测 harness 对“真实仓库探索”的限制是结构性的：每个 case 只有自己的临时 workspace 加 fixtures，真实 checkout 从不复制；带 path 参数的工具被 ConfinedTool 限制在 workspace 内；repository_explore 虽在只读白名单里，但 eval_harness.py 从不构造 RepositoryExplorerTool，导致该 case 在 run_case 内报 unknown tools 而非按文档以退出码 2 提前拒绝；bash 无 path 参数因此不被 ConfinedTool 约束，一旦 --allow-writing 就能在无 OS 沙箱的情况下访问真实机器。\",\n  \"components\": [\n    {\n      \"name\": \"Telemetry facts (runtime/telemetry.py + runtime/drive.py)\",\n      \"reads\": \"只读已持久化的 durable 状态：OperationTelemetry 携带 operation meta 的 prompt/target 与 OperationResult 的 status/error/timestamps；GenerationTelemetry 携带该 attempt 的 model/input/output/usage/finish_reason/outcome；ToolTelemetry 携带 tool_call_id/name/attempt/input/output/is_error/outcome。三者都是“值本身是原始正文（prompt、messages、工具参数与结果）”，由 sink 决定多少可离开进程。\",\n      \"publishes_after_settlement\": \"drive.py 注释与实现都保证每个 publisher 都在 settlement 事务之后调用，且只读 durable state（_publish 只是 publish(self._lane.telemetry, event)）；publish() 吞掉 sink 异常并记 warning，因此观测者不能改变一轮的结果。\",\n      \"default_privacy\": \"无隐私策略——事实层刻意保留原文，隐私是 sink 的责任。默认没有 sink（telemetry=None），此时零上传、行为不变。\",\n      \"authority\": \"非权威：整条事实流丢失不影响 Session；未知 outcome（unknown）是恢复语义的一部分，而非错误。\"\n    },\n    {\n      \"name\": \"Langfuse adapter (integrations/langfuse.py)\",\n      \"reads\": \"只读 telemetry 事实（TelemetrySink.record），不读 Session、不读写 storage、不同步调用 Langfuse API。\",\n      \"mapping\": \"每个 operation 一个根 observation，名为稳定常量 prale.run、as_type=agent；每次 provider attempt 一个 prale.generate（generation，带 model/usage_details/attempt/finish_reason）；每次 tool attempt 一个 prale.tool.<name>（tool，带 tool_call_id/attempt/is_error）。operation_id、lane、kind、capture 只放 metadata（operation_id 绝不当 Langfuse trace id）；durable started_at 会回填 span 起始时间，使延迟不被 exporter 时间污染；status/outcome 映射为 DEFAULT/WARNING/ERROR level。\",\n      \"default_privacy\": \"三层默认：①默认关闭——只有 LANGFUSE_TRACING_ENABLED 为真才读凭据，否则 LangfuseConfig.from_environment 返回 None，未配置的机器行为与之前完全一致；开了开关却没有 public/secret key 会在启动时 ProjectConfigError。②默认档 capture=metadata（CapturePolicy.uploads_text=False）——字符串一律降级为 {chars, sha256}，数字/布尔保留（is_error、token 计数）；键名命中 secret marker（authorization/cookie/password/token/api_key/…）直接写 [REDACTED]。③无论哪档，部署自身凭据（PRALE_API_KEY、服务 token、LANGFUSE_SECRET_KEY）按字面量删除，另有 PEM/Bearer/credential 正则、绝对路径归一化（relativize 到 project_root，否则 [abs]/<basename>）、按档位的截断/深度/条目上限；非 ASCII 或超 200 字符的 session_id 被替换为 sha256:<hash>。redacted 上传去秘密后的文本，full 原样上传（仍需限长与脱敏）。\",\n      \"robustness\": \"record 只做 sanitize+enqueue 就返回；队列满时丢最旧、但 operation terminal 事件优先（否则 trace 不可评分）；worker 每个 loop 一个（experiment runner 每 item 一个 loop），drain() 供 loop 关闭前把事实落成 observation；aclose() 先 drain、关闭未闭合 turn、再在线程里 flush。丢弃/失败只计数并 warning，永不抛回调用方。\"\n    },\n    {\n      \"name\": \"Dataset experiment (scripts/eval_harness.py)\",\n      \"reads\": \"两条来源互斥：--dataset 从 Langfuse 读 item（客户端 get_dataset(name).items），--from-json 读本地 JSON 文件；--upload-to 反向把 case 写成 dataset item（id 即 case id，重复上传是更新而非翻倍），写完即停、不打分、不建 provider。item 的 input/expected_output/metadata 由 parse_case 解析成 EvalCase（prompt、files、tools、expectations、risk）。\",\n      \"what_it_runs\": \"_run_experiment 调 dataset.run_experiment(name/run_name/description/task/evaluators/run_evaluators/max_concurrency/metadata)，由 SDK 驱动循环：每个 item 的 task 在 tempfile 里调 run_case 跑真实 Agent，然后 await telemetry.drain()（SDK 每个 item 建/关一个 loop，事实必须在 loop 消失前落成 observation），最后 client.flush()；结果从 result.item_results 回读 output/evaluations/trace_id。run metadata 记录 git_sha、harness_version、provider、model、capture、evaluators、writing_allowed，用于两次运行可比。\",\n      \"default_privacy\": \"实验本身把分数与 trace 上传，故必须显式开启 tracing 才允许 --dataset/--upload-to（否则 ProjectConfigError，退出码 2）；capture 档位即出口策略，metadata 里记录本次 capture 值（未开启 tracing 时为 \\\"off\\\"）。--from-json 不写 dataset、不上传分数，但只要 LANGFUSE_TRACING_ENABLED 开着，_telemetry 仍会建 LangfuseTelemetry 把 trace 导出——“不上传”仅指数据集与分数。\",\n      \"exit_codes\": \"0 已打分；1 有 gate 未达标；2 在任何模型调用之前被拒绝（数据集歧义、重复 id、空数据集、未知 scorer、不可读 gate、case 索要未授予的写工具、缺凭据/缺 tracing 配置）。\"\n    },\n    {\n      \"name\": \"Deterministic evaluator (src/agent_harness/integrations/evaluation.py)\",\n      \"reads\": \"只读已提交事实的投影：run_case 建 _Collecting sink（转发下游 Langfuse 的同时自己留一份），_summarize 从 terminal OperationTelemetry.output 取 answer（截断 20k）、从 ToolTelemetry 取 (name,is_error,outcome)、从 GenerationTelemetry 汇总 generation_count 与 usage、把 outcome==\\\"unknown\\\" 的 generation 与 tool 计为 unknown_effects、duration_ms 取自 OperationResult，terminal_status 取自 OperationResult.status。sink 是同一份事实流，所以“上传的事实”和“被打分的事实”按构造一致。\",\n      \"scorers\": \"terminal_success（status 匹配且 unknown_effects==0）、required_tools（被调用过即算，成败另计）、forbidden_tools（调用过即违规）、tool_error_free（is_error 且不在 expected_tool_errors）、answer_contract（exact/contains/json+schema，容忍 ``` 围栏）；预算类 tool_count/latency/token_cost 返回实测值加预算注释而非 0/1 判定。空规则返回 None（没写规则就没有意见），因此 item 不能靠写 expectations 扩大自己的工具权限——工具由 parse_case_tools 与 --allow-writing 决定。\",\n      \"default_privacy\": \"不导入 Langfuse、不发网络请求：score 只在本地值与 JSON 形状上计算，因此可离线、可单测、无需 langfuse extra；写工具默认关闭（read/edit 之外需 --allow-writing）。\"\n    },\n    {\n      \"name\": \"Run-level metric (run_metrics)\",\n      \"reads\": \"聚合已完成实验里每个 item 的 evaluation 值：terminal_success_rate/forbidden_tools_rate/tool_error_free_rate/answer_contract_rate 为通过率（comment 记 item 数）、tool_count_mean（comment 记 max）、latency_p95、token_cost_total。设计上刻意是 run 级——工具数/延迟只有作为分布才有意义，gate 比的是与基线运行的分布而非每 item 常数。\",\n      \"consumers\": \"① 本地/harness 侧：--gate metric=value 与这些名字比较，gate 指向本次没有产出的指标会被拒绝而不是默认通过（退出码 2）；--report 在 gate 判定之前写出，gate 不可用不会丢掉已产生的分数。② Langfuse 侧：同一函数被包成 run_evaluators=[lambda *, item_results, **_: [m.as_dict() for m in run_metrics(item_results)]]，因此平台上的 run 级分数与本地 gate 用同一套定义。\",\n      \"default_privacy\": \"只上传聚合数值与注释，不含正文；实验模式的 item 分数由平台按 evaluator 契约（output/expected_output 关键字）计算后再回读。\"\n    }\n  ],\n  \"flow\": [\n    \"1. Drive 运行一轮：provider attempt 前持久化 effect intent，settlement 事务 commit 后 drive.py 的 _publish 才发布 OperationTelemetry(started/terminal)、GenerationTelemetry、ToolTelemetry；publish() 把 sink 异常吞成 warning。\",\n    \"2. sink 选择：无 sink（默认）则事实到此为止；LangfuseTelemetry 时 record() 先用 TelemetrySanitizer 按 capture 档位脱敏/降级，再入 deque，由绑定当前 loop 的 worker 映射成 prale.run / prale.generate / prale.tool.* observation；队列满或关闭后只丢事实并计数。\",\n    \"3. 评测入口解析：eval_harness.main 先 Settings.from_environment（同一套 PRALE_*/LANGFUSE_* 变量，评测与部署不会对“测的是什么”有分歧），加载 item（Langfuse dataset 或 JSON），_load_cases 全部解析、查重、拒绝空集，再预检 scorer、gate 语法和 parse_case_tools（未授予的写工具在此拒绝），--dry-run 只打印计划。\",\n    \"4. 单 item 执行：run_case 建 workdir/workspace，写入 case.files 固件，sandbox_tools 用 create_builtin_tools(root, repository_explorer=…) 取工具并给带 path 参数的工具套 ConfinedTool；SQLite session 放在 workspace 之外；Harness.open(session_id=\\\"eval:<id>\\\", tools, telemetry=_Collecting) → lane.prompt(operation_id=\\\"<id>-1\\\") → lane.drive(provider)。\",\n    \"5. 打分：_summarize 把 collector 里的事实折成 RunOutput；每个 evaluator 以 output=/expected_output= 关键字调用，返回 Evaluation 或 None；experiment 模式则由 _wrapped 包装成 SDK evaluator，并在每个 item 后 await telemetry.drain()，run 结束后 client.flush()。\",\n    \"6. 聚合与出口：run_metrics 产出 run 级指标（本地模式在本地算，实验模式也作为 run_evaluators 上传）；--report 写 JSON（含每 item output/trace_id/evaluations 与 metrics），--gate 与指标比对得到 0/1/2 退出码。\"\n  ],\n  \"evidence\": [\n    {\n      \"path\": \"src/agent_harness/runtime/telemetry.py\",\n      \"symbol\": \"OperationTelemetry\",\n      \"claim\": \"operation 的 input/output 被显式定义为评分契约（离线 evaluator 读 prompt 与最终答案），并且原样发布、由 sink 决定上传多少；事实层本身不做隐私裁剪。\"\n    },\n    {\n      \"path\": \"src/agent_harness/runtime/telemetry.py\",\n      \"symbol\": \"GenerationTelemetry\",\n      \"claim\": \"每个 provider attempt 是一条事实，attempt 只计同一 intent 的重试，因此重试会表现为 outcome 非 completed 的额外事实，而不是更大的 attempt 号——评测里 generation_count 也正是这样累加的。\"\n    },\n    {\n      \"path\": \"src/agent_harness/runtime/telemetry.py\",\n      \"symbol\": \"publish\",\n      \"claim\": \"sink 抛出的异常被吞掉并记 warning，观测者不能改变已提交的一轮；这正是“trace 丢失不改变 Session”的实现点。\"\n    },\n    {\n      \"path\": \"src/agent_harness/runtime/drive.py\",\n      \"symbol\": \"Drive._publish\",\n      \"claim\": \"每个 published 事实都在 settlement 事务之后产生且只读 durable 状态，因此 evaluator 读到的是“Session 能证明的”而非意图或模型散文。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/langfuse.py\",\n      \"symbol\": \"LangfuseConfig.from_environment\",\n      \"claim\": \"tracing 默认关闭（开关不是 truthy 就返回 None，不读凭据）；开关打开但缺 key、环境名不在 allowlist、capture 非法都会在启动时 ProjectConfigError，capture 默认 \\\"metadata\\\"。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/langfuse.py\",\n      \"symbol\": \"CapturePolicy.for_profile\",\n      \"claim\": \"三档默认值：metadata 的 max_string=0 且 uploads_text=False（完全不上传正文），redacted 与 full 才逐级放开长度/条目/深度上限。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/langfuse.py\",\n      \"symbol\": \"TelemetrySanitizer._describe\",\n      \"claim\": \"metadata 档把字符串替换为 {chars, sha256}、保留数字与布尔、按键名把 secret marker 字段写成 [REDACTED]，这就是“只上传长度、计数与哈希”的具体实现。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/langfuse.py\",\n      \"symbol\": \"TelemetrySanitizer._scrub_text\",\n      \"claim\": \"redacted/full 档也要先按字面量删除部署自身凭据，再做 PEM/Bearer/credential 正则与路径归一化，再做按档截断；即 full 也不是“原样不设防”。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/langfuse.py\",\n      \"symbol\": \"LangfuseTelemetry.record\",\n      \"claim\": \"record 只做 sanitize + enqueue（同步契约），队列满时按 _overflow 优先保住 operation terminal 事件，其余丢弃并计数；adapter 永远不把错误抛进 Drive。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/langfuse.py\",\n      \"symbol\": \"LangfuseTelemetry._handle_operation\",\n      \"claim\": \"根 observation 的 input/output 就是 Langfuse v4 的 trace io，因此 platform 侧 evaluator 读的正是 OperationTelemetry 的输入与结算输出，operation_id 只作 metadata 回溯 Session。\"\n    },\n    {\n      \"path\": \"scripts/eval_harness.py\",\n      \"symbol\": \"_run_experiment\",\n      \"claim\": \"dataset experiment 由 SDK 驱动：task 对每个 item 调 run_case，并在每个 item 后 await telemetry.drain()（因为 runner 每个 item 关一个 loop），evaluators 与 run_evaluators 分别承担 item 级与 run 级分数，最后 client.flush()。\"\n    },\n    {\n      \"path\": \"scripts/eval_harness.py\",\n      \"symbol\": \"_metadata\",\n      \"claim\": \"一次运行为了可比而携带的事实只有 git_sha、harness_version、provider、model、capture、evaluators、writing_allowed——评测对真实仓库的唯一读取是 git rev-parse --short HEAD（_git_sha），不是仓库内容。\"\n    },\n    {\n      \"path\": \"scripts/eval_harness.py\",\n      \"symbol\": \"_telemetry\",\n      \"claim\": \"本地 --from-json 模式在 tracing 开启时同样会构造 LangfuseTelemetry 导出 trace（只是不写 dataset、不上传分数）；并复用 experiment 已有 client，避免第二个 OpenTelemetry global tracer provider。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/evaluation.py\",\n      \"symbol\": \"run_case\",\n      \"claim\": \"每个 case 的世界就是 tempfile 下的 workdir：fixtures 写入 workdir/workspace，SQLite session 放在 workspace 之外，工具由 sandbox_tools 生根于该目录——真实 checkout 从不复制进来，这是评测无法在真实仓库上探索的第一条限制。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/evaluation.py\",\n      \"symbol\": \"ConfinedTool\",\n      \"claim\": \"任何声明 path 参数的工具在执行前把相对路径解析到 sandbox root 并拒绝逃出 root 的路径，返回 is_error 结果；因此 read/write/edit 在评测里读不到真实仓库（如 test_a_read_that_leaves_the_workspace_is_refused_and_the_turn_still_ends 所示）。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/evaluation.py\",\n      \"symbol\": \"sandbox_tools\",\n      \"claim\": \"工具集来自 create_builtin_tools(root, repository_explorer=…)，而 scripts/eval_harness.py 从不传 repository_explorer，故 repository_explore（虽在 READ_ONLY_TOOLS 白名单里、能通过 parse_case_tools 预检）会在 run_case 内因 missing 名字抛 CaseError \\\"unknown tools\\\"——拒绝点从“任何模型调用之前/退出码 2”退化为运行中异常。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/localtools 等价路径 src/agent_harness/integrations/local_tools.py\",\n      \"symbol\": \"BashTool.input_schema\",\n      \"claim\": \"bash 的 schema 只有 command/timeout、没有 path，因此 _confine 原样返回它：一旦 --allow-writing 授予 bash，命令就在无 OS 沙箱、继承 os.environ 的情况下运行，可越过 workspace 触及真实机器/仓库；反之不授予时评测完全无法用 shell 做仓库检索。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/evaluation.py\",\n      \"symbol\": \"_summarize\",\n      \"claim\": \"RunOutput 的每个字段都来自已发布事实（terminal operation 的 output、ToolTelemetry、GenerationTelemetry 汇总）或 OperationResult 的 status/时间，证明 deterministic evaluator 读事实而非模型散文；唯一读文本的是 answer（也因此 answer_contract 会看答案原文）。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/evaluation.py\",\n      \"symbol\": \"run_metrics\",\n      \"claim\": \"run-level 指标是 *_rate、tool_count_mean、latency_p95、token_cost_total，且注释声明其有意为 run 级——gate 与基线比较的是分布；缺失某个 per-item 分数时该 metric 不产出（对应 --gate 被拒绝而不是默认通过）。\"\n    },\n    {\n      \"path\": \"scripts/eval_harness.py\",\n      \"symbol\": \"main\",\n      \"claim\": \"退出码即接口：预检阶段（数据集、scorer、gate、工具授予、凭据）失败统一返回 2 且不调用模型；--report 在 gate 判定前写出；run_case 内抛出的 CaseError 不在这层 except 覆盖范围内（只被 finally: close_telemetry 包住），说明运行期拒绝不会转成文档承诺的退出码。\"\n    },\n    {\n      \"path\": \"src/agent_harness/api/serve.py\",\n      \"symbol\": \"_repository_explorer\",\n      \"claim\": \"真实部署只有在 PRALE_TOOLS 含 repository_explore 时才构造 RepositoryExplorerTool（需要 index 目录与 repository-explorer extra），说明评测里缺的正是这段部署侧装配，评测与部署的工具面并不相同。\"\n    },\n    {\n      \"path\": \"src/agent_harness/api/settings.py\",\n      \"symbol\": \"Settings.secrets\",\n      \"claim\": \"部署把 PRALE_API_KEY、服务 token 与 Langfuse secret key 一并交给 sanitizer，因此即便 full 档，本次部署自己的凭据也不会进入 trace。\"\n    },\n    {\n      \"path\": \"tests/unit/test_langfuse_sanitizer.py\",\n      \"symbol\": \"test_the_default_profile_uploads_no_payload_text\",\n      \"claim\": \"测试钉住默认隐私行为：只设开关与两个 key 时 config.capture == \\\"metadata\\\" 且 policy.uploads_text 为 False。\"\n    },\n    {\n      \"path\": \"tests/integration/test_eval_harness_cli.py\",\n      \"symbol\": \"ExperimentClient.run\",\n      \"claim\": \"测试用假 SDK 复刻真实驱动方式（每 item 一个 asyncio.run、evaluator 以 output/expected_output 关键字调用、run_evaluators 收 item_results），证明 dataset experiment 的契约与本地打分是同一套 scorer。\"\n    }\n  ],\n  \"uncertainties\": [\n    \"repository_explore 在评测中的确切结局我只做了静态推断（READ_ONLY_TOOLS 允许 + sandbox_tools 从 create_builtin_tools 取名字 → CaseError），未执行脚本验证；且未找到覆盖“评测 case 声明 repository_explore”的集成测试（test_evaluation_unit.py 只测 parse_case_tools），真实行为可能随 create_builtin_tools 未来签名变化。\",\n    \"CaseError 在 run_case 内抛出是否会冒泡为 traceback、在 experiment 模式是否被 SDK 吞成失败 item，取决于 SDK 的 task 异常处理，我没有读 Langfuse SDK 源码，只据本仓库代码推断 main 不将其转为退出码 2。\",\n    \"run_metrics 的 latency_p95 用 round(fraction*(n-1)) 取序位，不是插值百分位；小样本下与常见 p95 定义有差异，仓库内未见书面口径说明。\",\n    \"answer_contract 是唯一读文本的确定性 scorer，其“从提交输出取 answer”的口径依赖 _summarize 用 terminal OperationTelemetry.output；对 tool-terminated 轮次 terminal output 是 {tip_id: …} 这类结构，此时 answer 会是 JSON 串（_answer_text 的 json.dumps 分支），对契约判定可能产生偏差——未在测试中覆盖。\",\n    \"experiment 模式下 run_metrics(scored) 读的是 SDK 回读的 item.evaluations（平台计算），本地模式读本地计算值；两者定义相同但因平台版本差异（例如丢弃 None 分数与否）可能不等价，仓库没有对此的对比测试。\",\n    \"run_case 未配置 memory_scope/memory_runtime/skill_runtime/trace_recorder（Harness.open 只传 tools 与 telemetry），因此评测不覆盖长期记忆、Skill 召回与 L0 trace archive；这一限制 README 未明说，属于从代码推断。\",\n    \"PRALE_LANGFUSE_CAPTURE=full 下 sanitizer 仍会做密码学无关的正则脱敏与路径归一化，因此“full 原样上传”是近似说法；具体保留字段以 _scrub_text/_normalize_paths 实现为准，且 _normalize_paths 只作用于整串路径、不看内嵌于散文的路径。\",\n    \"评测的并发（--max-concurrency 默认 4）与 provider 侧的限流/共享状态如何交互没有文档；test_eval_harness_cli.py 的 ScriptedProvider 按 session 计数暗示 item 并发执行，真实 provider 下的可复现性未验证。\"\n  ]\n}",
+        "tool_calls": [
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "repository_explore",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          }
+        ],
+        "terminal_status": "completed",
+        "generation_count": 22,
+        "usage": {
+          "prompt_tokens": 799331,
+          "completion_tokens": 12411,
+          "total_tokens": 811742,
+          "prompt_cache_hit_tokens": 745216,
+          "prompt_cache_miss_tokens": 54115
+        },
+        "unknown_effects": 0,
+        "duration_ms": 178101,
+        "error_code": null
+      },
+      "evaluations": [
+        {
+          "name": "terminal_success",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_error_free",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "answer_contract",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_count",
+          "value": 33.0,
+          "comment": "33 call(s)"
+        },
+        {
+          "name": "latency",
+          "value": 178101.0,
+          "comment": "178101 ms"
+        },
+        {
+          "name": "token_cost",
+          "value": 2422815.0,
+          "comment": "2.42282e+06 token(s)"
+        }
+      ]
+    },
+    {
+      "id": "treatment-bash--project-architecture",
+      "output": {
+        "answer": "{\"summary\":\"PRALE（打包名 prale-agent-harness，包名 agent_harness）是一个以 Session 为可恢复执行边界的持久化 Agent 运行时。骨架按「内层纯净、外层适配」划分：domain 只有纯模型/纯计算；storage 用 Write 集合封装事务、sequence、编码与迁移；runtime 编排状态机（Lane admission / Drive 状态循环 / 结构化生成与工具 effect / 恢复），只通过 Storage、ChatProvider、AgentTool、TelemetrySink 等协议协作；integrations 隔离 DeepSeek wire、文件系统/Shell 工具、仓库索引、Langfuse telemetry、评测与 skill/memory 抽取等外部系统；api 暴露稳定 DTO、facade（Harness/HarnessRpc/AuthenticatedHarnessService）与领域错误，并承载后置的 RPC/HTTP-SSE/TUI 适配器与部署组合根（api/serve.py）。源码实例化依赖方向基本符合 specs 的「api → runtime → domain、storage → domain、integrations → api/domain」，但存在两处值得记录的偏差：runtime 反向依赖 api.errors/api.models（叶子错误与 DTO 模块，api/__init__ 又导入 runtime，形成包级但非模块级环），以及 storage/codec.py 依赖 api.models.OperationResult。一次 prompt 的主路径是：API 接纳（原子写入 user entry + operation meta/state + lane 索引）→ Drive 状态机 → 先写 generation effect intent 与 EffectSpan → provider 流式生成并落 checkpoint → 一次原子 settlement（assistant entry + usage + SettleSpan + lane tip）→ 有 tool_calls 则同样先写 tool span 再执行并原子结算 tool entry → 回到 checkpoint 或原子写入 terminal result + memory capture outbox → 提交之后才发布 telemetry 事实，memory/skill runtime 再异步消费冻结的 outbox/archive。\",\"components\":[{\"name\":\"domain\",\"paths\":[\"src/agent_harness/domain/entries.py\",\"src/agent_harness/domain/operations.py\",\"src/agent_harness/domain/effects.py\",\"src/agent_harness/domain/values.py\",\"src/agent_harness/domain/session.py\",\"src/agent_harness/domain/memory.py\",\"src/agent_harness/domain/skill.py\",\"src/agent_harness/domain/compaction.py\",\"src/agent_harness/domain/context.py\",\"src/agent_harness/domain/types.py\"],\"responsibility\":\"纯领域模型与纯计算：Entry/NewEntry、OperationMeta/OperationState、EffectSpan/EffectOutcome/UsageRecord 归一化、ValueAddress/ListAddress 地址命名（lane_tip、operation_state、operation_result、memory/capture_outbox 等）、MemoryScope/L0-L3 值对象与校验、Skill 版本与 scope，以及 Session/SessionMutator 这条「单写者、一次 mutation 只允许一次 commit」的能力边界。\",\"depends_on\":[\"Python 标准库\",\"自身内部模块\"],\"forbidden_depends_on\":[\"runtime（Lane/Drive/事件总线）\",\"storage 具体后端（sqlite3、SQL）\",\"Web/HTTP 框架（starlette/uvicorn）\",\"HTTP client、DeepSeek 或任何 LLM SDK\",\"telemetry 厂商 SDK\"],\"observed_deviation\":\"domain/session.py 导入 agent_harness.storage.protocol 的 CommitResult/Storage/Write：仅协议与写入 DTO，但严格按 specs 属于 domain→storage 的越界。\"},{\"name\":\"storage\",\"paths\":[\"src/agent_harness/storage/protocol.py\",\"src/agent_harness/storage/memory.py\",\"src/agent_harness/storage/sqlite.py\",\"src/agent_harness/storage/codec.py\",\"src/agent_harness/storage/catalog.py\",\"src/agent_harness/storage/repository.py\",\"src/agent_harness/storage/memory_memory.py\",\"src/agent_harness/storage/memory_sqlite.py\",\"src/agent_harness/storage/skill_memory.py\",\"src/agent_harness/storage/skill_sqlite.py\"],\"responsibility\":\"封装事务语义与后端细节：Storage 协议 + Write 联合类型（InsertEntry/InsertUsage/InsertSpan/SettleSpan/SetValue/DeleteValue/AppendList/ClearList）、CommitResult 的单调 sequence、JSON codec（含 $type 标记的 OperationMeta/State/Result 编解码）、schema 迁移、session 绑定校验、catalog 与 session 文件命名、memory/skill 的独立 store 实现。MemoryStorage 是参考实现，SQLiteStorage 是生产实现，两者跑同一 conformance suite。\",\"depends_on\":[\"domain（模型与地址）\",\"自身协议与 codec\"],\"forbidden_depends_on\":[\"runtime（不得知道 Lane/Drive/状态机）\",\"integrations（不得知道 provider/工具/厂商 SDK）\",\"上层业务编排逻辑\"],\"observed_deviation\":\"storage/codec.py 导入 agent_harness.api.models.OperationResult，形成 storage→api 的反向依赖；内存型 memory store 在 TYPE_CHECKING 下引用 memory.protocol.EmbeddingProvider。\"},{\"name\":\"runtime\",\"paths\":[\"src/agent_harness/runtime/lane.py\",\"src/agent_harness/runtime/drive.py\",\"src/agent_harness/runtime/generation.py\",\"src/agent_harness/runtime/tools.py\",\"src/agent_harness/runtime/events.py\",\"src/agent_harness/runtime/hooks.py\",\"src/agent_harness/runtime/retry.py\",\"src/agent_harness/runtime/telemetry.py\"],\"responsibility\":\"编排状态机且不碰 I/O 细节：Lane 负责持久接纳（prompt/compact/navigate/steer/follow-up）、每 lane 的操作锁与 drive lease；Drive 按 durable state 分派 starting/checkpoint/assistant.ready/assistant.effect_pending/assistant.retry_wait/tools/terminal，执行「先写 effect intent → 外部 effect → 原子 settlement」，并处理 provider 重试、中断收敛、tool 并行批次；generation/tools 定义 provider 与工具的传输中立协议；events/hooks/telemetry 只做投影，不参与判定。\",\"depends_on\":[\"domain\",\"storage.protocol（只经 Storage/SessionMutator/Write 写状态）\",\"runtime.generation.ChatProvider / runtime.tools.AgentTool / runtime.telemetry.TelemetrySink 协议\",\"api.errors 与 api.models 的叶子 DTO/错误\"],\"forbidden_depends_on\":[\"storage 具体后端（SQLiteStorage/SQL/migrations）\",\"integrations（DeepSeek wire payload、本地工具实现、Langfuse SDK）\",\"starlette/uvicorn 等传输框架\",\"把 provider SDK 对象放进 entry 或 telemetry\"],\"observed_deviation\":\"lane.py 与 drive.py 直接导入 agent_harness.api.errors / api.models，而 api/__init__.py 又导入 runtime，形成包级循环（模块级无环）。\"},{\"name\":\"integrations\",\"paths\":[\"src/agent_harness/integrations/deepseek.py\",\"src/agent_harness/integrations/local_tools.py\",\"src/agent_harness/integrations/repository_explorer.py\",\"src/agent_harness/integrations/langfuse.py\",\"src/agent_harness/integrations/evaluation.py\",\"src/agent_harness/integrations/memory_provider.py\",\"src/agent_harness/integrations/skill_reviewer.py\",\"src/agent_harness/integrations/telemetry.py\"],\"responsibility\":\"隔离一切外部系统：DeepSeek 的 HTTP/SSE 与 wire→中立 DTO 映射、read/write/edit/bash 本地工具（带 safe/never 重放策略）、tree-sitter 仓库索引与探索工具、Langfuse telemetry sink、评测 harness、memory 抽取器与 skill reviewer。它们只在组合根（api/serve.py、api/settings.py、scripts/eval_harness.py、测试）被实例化后注入。\",\"depends_on\":[\"domain\",\"runtime 的协议与中立 DTO（GenerationRequest/AssistantResult/GenerationDelta、HarnessEvent、TelemetryEvent）\",\"api 的 facade（evaluation 用 Harness 运行评测）\"],\"forbidden_depends_on\":[\"domain/runtime 反向导入它（否则核心库被迫绑定 SDK 或 HTTP）\",\"把 provider wire 字段或 SDK 对象泄漏给 runtime/Session\"],\"observed_deviation\":\"无越界；但 evaluation.py 同时依赖 api.harness 与 storage.sqlite，属于「集成层自建临时 Session」的用法。\"},{\"name\":\"api\",\"paths\":[\"src/agent_harness/api/harness.py\",\"src/agent_harness/api/rpc.py\",\"src/agent_harness/api/service.py\",\"src/agent_harness/api/tui.py\",\"src/agent_harness/api/models.py\",\"src/agent_harness/api/errors.py\",\"src/agent_harness/api/catalog.py\",\"src/agent_harness/api/trace.py\",\"src/agent_harness/api/memory.py\",\"src/agent_harness/api/skill.py\",\"src/agent_harness/api/pagination.py\",\"src/agent_harness/api/project.py\",\"src/agent_harness/api/settings.py\",\"src/agent_harness/api/web.py\",\"src/agent_harness/api/serve.py\",\"src/agent_harness/api/__init__.py\"],\"responsibility\":\"稳定公开面 + 后置适配：Harness 是传输中立 facade；HarnessRpc 是 JSON-RPC 形状的命令入口；AuthenticatedHarnessService/RemoteSubscription 提供可替换鉴权与远程订阅；catalog/trace/memory/skill 是只读查询 facade（allow-list 定位 session 文件，请求只能命名 session/lane，不能给路径或 scope）；web.py 是本包唯一导入 starlette 的模块（web extra）；serve.py 是部署组合根，读环境、装配 DeepSeek/SQLite/memory/skill/Langfuse 后交给 WebApplication。\",\"depends_on\":[\"runtime（Lane/Harness 编排、事件、telemetry 协议）\",\"domain（DTO 与 scope）\",\"storage 的协议与具体实现（catalog、sqlite storage）\",\"integrations（仅组合根与配置，如 serve.py/settings.py）\"],\"forbidden_depends_on\":[\"domain/runtime 反向依赖 api.web 或任何 HTTP 框架\",\"把认证凭据、连接状态或浏览器请求里的路径/scope 写入 Session\",\"在查询 facade 里绕过 catalog 直接按请求参数打开数据库\"],\"observed_deviation\":\"api/errors.py 与 api/models.py 实际被 runtime 与 storage.codec 反向导入，充当底层共享契约模块；api/__init__.py 的导入使包级别出现 api↔runtime 环。\"},{\"name\":\"memory 与 skill 运行时（与 runtime 平级的长期资产层）\",\"paths\":[\"src/agent_harness/memory/runtime.py\",\"src/agent_harness/memory/protocol.py\",\"src/agent_harness/memory/context.py\",\"src/agent_harness/memory/trace.py\",\"src/agent_harness/skill/runtime.py\",\"src/agent_harness/skill/protocol.py\"],\"responsibility\":\"在 Session 之外管理长期资产：MemoryRuntime 自称「不拥有任何 Session 状态，只消费冻结的 session outbox 记录」，按 scope/watermark 把 L0 增量推进到 L1/L2/L3；SkillEvolutionRuntime「只消费冻结的 L0 archive，从不读可变 operation state」。Recall/injection 只作为下一次 generation 的上下文投影写进 intent。\",\"depends_on\":[\"domain（MemoryScope/SkillScope/archive 值对象）\",\"memory.protocol.MemoryStore、skill.protocol.SkillStore 协议\",\"Session 的读取与 outbox 消费（注入的 Session）\"],\"forbidden_depends_on\":[\"api.web 与传输层\",\"在 operation 进行中读取可变 operation state 来驱动晋升\",\"把长期资产当作 Session 权威状态\"]}],\"flow\":[{\"step\":1,\"layer\":\"api\",\"symbol\":\"WebApplication.submit_turn（及库入口 Harness.acquire_lane → Lane.prompt）\",\"action\":\"HTTP/SSE 适配器只接受 session_id、lane 与 prompt，经 SessionCatalog allow-list 解析出会话数据库，再调用 Lane.prompt；随后立刻启动后台 drive，断开浏览器只取消等待、不取消 operation。库用法等价于 README 的 Harness.open → acquire_lane → lane.prompt。\"},{\"step\":2,\"layer\":\"runtime\",\"symbol\":\"Lane.prompt → Lane._admit\",\"action\":\"跑 before_run hook，然后在一次 Session.mutate 中原子提交：user message 的 InsertEntry、SetValue(lane_tip)、SetValue(operation_meta)、SetValue(operation_state at=starting)、SetValue(lane_state.current_operation_id)、AppendList(lane_operations 索引)；提交后才 emit operation_admitted。此时 prompt 已可恢复，但还没有任何外部副作用。\"},{\"step\":3,\"layer\":\"runtime\",\"symbol\":\"Lane.drive\",\"action\":\"获取 per-lane operation_lock，用 operation_lease value 做持久 drive lease（保证同一 operation 只有一个 Drive，竞争者改为 _wait_for_driver 观察），然后构造 Drive(self, provider).run()；异常路径用 Drive(recover) 收束。\"},{\"step\":4,\"layer\":\"runtime\",\"symbol\":\"Drive.run\",\"action\":\"按 durable OperationState 循环分派：starting → checkpoint（消费 inbox 的 steer/follow_up 为 entry）→ assistant.ready → assistant.effect_pending → assistant.retry_wait / tools / terminal。每一步只读持久状态，从不依赖内存事件流。\"},{\"step\":5,\"layer\":\"runtime\",\"symbol\":\"Drive._persist_generation_intent\",\"action\":\"依次跑 transform_context/before_request/before_payload hook，调用 MemoryRuntime.recall 与 SkillEvolutionRuntime.listing（best-effort 上下文），预留 assistant_entry_id/usage_id，打开 llm 类型 EffectSpan，然后一次 _transition 把 OperationState 置为 assistant.effect_pending 并在同一提交里 InsertSpan —— 这就是「外部 LLM 调用之前必须存在的 durable intent」。\"},{\"step\":6,\"layer\":\"runtime → integrations\",\"symbol\":\"Drive._execute_and_settle / _stream_response → ChatProvider.stream（DeepSeekProvider）\",\"action\":\"把 intent 里的 messages/tool 定义封成 GenerationRequest 交给中立协议；DeepSeek 适配器在内部完成 HTTP/SSE 与 wire→AssistantResult/GenerationDelta 映射。流式帧先发布 message_update 事件，并把累计 content 写入 operation state 的 content_checkpoint（短期 checkpoint，重启不续接旧 HTTP 连接）。\"},{\"step\":7,\"layer\":\"runtime\",\"symbol\":\"Drive._settle_assistant\",\"action\":\"provider 结束后跑 after_response hook，然后一次原子提交：InsertEntry(assistant message)、InsertUsage(span_id/operation_id 归属)、SettleSpan(completed)、SetValue(lane_tip)，并在同一批写入里决定下一步——有 tool_calls 则 OperationState=tools（含 planned call 列表），有 follow_up 则回 checkpoint，否则写 terminal result 与 memory capture outbox。提交之后才 publish generation/operation telemetry 事实。\"},{\"step\":8,\"layer\":\"runtime → integrations\",\"symbol\":\"Drive._run_next_tool / _run_parallel_tools → AgentTool.execute\",\"action\":\"跑 before_tool hook，打开 tool EffectSpan 并 _transition_tool 到 effect_pending（含 InsertSpan），再调用工具实现（integrations/local_tools.py 的 read/write/edit/bash 或 repository_explorer）；parallel 标记的连续批次并发执行但持久写入仍按原始 tool_call 顺序。\"},{\"step\":9,\"layer\":\"runtime\",\"symbol\":\"Drive._settle_tool / _settle_tool_batch\",\"action\":\"一次原子提交：trace_writes(tool_outcome)、SettleSpan(outcome, error_class)、InsertEntry(tool result, role=tool)、SetValue(lane_tip)、OperationState.calls 标记 completed；提交后为每个 call 单独发布 tool telemetry。随后回到 checkpoint 进入下一轮 generation；发生中断时用 unknown/interrupted 显式结算遗失的 attempt，而绝不自动重放 never 类工具。\"},{\"step\":10,\"layer\":\"runtime\",\"symbol\":\"Drive._terminal_writes / _terminal_result（含 _settle_interrupted、_settle_cancelled）\",\"action\":\"终结提交写入 OperationState(terminal/settled)、SetValue(operation_result)、清空 lane_state.current_operation_id、DeleteValue(operation_lease)，并把 memory_capture_writes 生成的 memory/skill capture outbox 记录（key + base_tip_id + tip_id + source_entry_ids + trace ids）追加到同一事务；Lane.drive 把该 OperationResult 返回给调用方。\"},{\"step\":11,\"layer\":\"api\",\"symbol\":\"HarnessRpc.dispatch / WebApplication 的响应与 SSE\",\"action\":\"asdict(OperationResult) 序列化返回；事件总线（message_start/message_update/message_end/tool_start/tool_end/operation_admitted）通过 Lane.watch 或 RemoteSubscription 推给外壳；这些事件只是投影，断线补偿来自读 facade 与 durable snapshot。\"},{\"step\":12,\"layer\":\"integrations + storage\",\"symbol\":\"publish → LangfuseTelemetry.record；MemoryRuntime._worker → MemoryStore.capture_archive；SkillEvolutionRuntime._worker\",\"action\":\"telemetry 事实在 commit 之后交给 sink（失败只记录，不影响结果）；MemoryRuntime 从 memory/capture_outbox 取冻结记录，物化为 SessionTraceArchive 写入独立 memory store 并派生 L1/L2/L3 晋升 job；Skill 侧只消费冻结 L0 archive 提出 skill candidate。权威结果始终在 Session 的 operation_result/entries/spans 里，读侧由 api/trace.py 的 TraceQueryService 读回。\"}],\"evidence\":[{\"path\":\"specs/AGENTS.md\",\"symbol\":\"## 架构边界\",\"claim\":\"文件明确规定允许的依赖方向是 api → runtime → domain、storage → domain、integrations → api/domain，并逐层写出禁止项：domain 不得导入 Web 框架/数据库驱动/HTTP client/LLM SDK/runtime；runtime 只依赖 domain 与协议；storage 不得让 SQL 泄漏到上层；integrations 不得让 wire payload 穿透 adapter；api 只暴露 DTO/facade/领域错误，HTTP/RPC/TUI 是后置适配器。\"},{\"path\":\"specs/pi-harness-implementation-plan.md\",\"symbol\":\"## 3. 目标架构\",\"claim\":\"给出 agent_harness 的五个包职责（api/domain/runtime/storage/integrations）并重申「依赖方向只能向内」，出现反向依赖应先重构协议而不是用循环导入解决，这为「哪些层不能依赖什么」提供规范依据。\"},{\"path\":\"src/agent_harness/api/harness.py\",\"symbol\":\"Harness.open / Harness.acquire_lane\",\"claim\":\"公开 facade 由 api 层构造 Session(session_id, storage) 与 Lane，只接受 storage.protocol.Storage 与 runtime 的 AgentTool/TelemetrySink 协议，证明 api 依赖 runtime/domain/协议而不依赖具体后端或框架。\"},{\"path\":\"src/agent_harness/api/web.py\",\"symbol\":\"模块 docstring 与 WebApplication.submit_turn\",\"claim\":\"web.py 是包内唯一导入 starlette 的模块，且 framework 是可选 extra；submit_turn 先 durable admit 再后台 drive，因此断开的浏览器只取消等待；请求只能命名 session/lane，不能给路径或 scope。\"},{\"path\":\"src/agent_harness/api/serve.py\",\"symbol\":\"main / build_application\",\"claim\":\"serve.py 是部署组合根：读环境变量配置，装配 DeepSeekProvider、SQLite memory/skill store、本地工具与 Langfuse sink，再交给 WebApplication，说明 integrations 只由最外层注入。\"},{\"path\":\"src/agent_harness/api/service.py\",\"symbol\":\"AuthenticatedHarnessService\",\"claim\":\"鉴权与远程订阅只包在 HarnessRpc 与 Lane.watch 之外，只依赖公开 facade，认证凭据与连接状态不进入 Session，符合「传输状态不得混入 domain/runtime」。\"},{\"path\":\"src/agent_harness/runtime/lane.py\",\"symbol\":\"Lane._admit\",\"claim\":\"接纳点在一次 mutator.commit 中同时写入 user entry、lane_tip、operation_meta、operation_state(starting)、lane_state 与 lane_operations 索引，是「一次 Session transaction 内原子提交」的具体实现。\"},{\"path\":\"src/agent_harness/runtime/lane.py\",\"symbol\":\"Lane.drive\",\"claim\":\"drive 在 per-lane operation_lock 下先用 operation_lease 值做持久 lease 抢占，失败者转为 _wait_for_driver，保证同一 operation 只有一个 Drive；recover 复用同一机制。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive.run\",\"claim\":\"Drive 的循环只依据 OperationState.at 分派（starting/checkpoint/assistant.ready/assistant.effect_pending/assistant.retry_wait/tools/terminal），证明恢复与推进依赖持久状态而非事件或内存对象。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._persist_generation_intent\",\"claim\":\"hook 链、memory recall、skill listing 与 llm span 打开后，通过 _transition 把状态置为 assistant.effect_pending 并同批插入 InsertSpan，证明「调用外部 LLM 前必须写 effect intent」。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._settle_assistant\",\"claim\":\"assistant 结算在同一 commit 中写入 assistant entry、usage 行（带 operation/span 归属）、SettleSpan、lane tip 以及下一步状态或 terminal 写入与 memory capture outbox；telemetry 在该 mutate 之后才 publish。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._settle_tool / _settle_tool_batch\",\"claim\":\"工具结算原子写入 tool 结果 entry、SettleSpan(outcome/error_class)、lane tip 与 operation state；并行批次按原始 call 顺序写入并逐 call 发布 telemetry，体现「effect intent → effect → atomic settlement」与结果顺序约束。\"},{\"path\":\"src/agent_harness/runtime/drive.py\",\"symbol\":\"Drive._terminal_writes\",\"claim\":\"终结写入包含 OperationState(terminal)、operation_result、lane_state 复位与 operation_lease 删除，说明对外返回的 OperationResult 本身就是持久值。\"},{\"path\":\"src/agent_harness/runtime/generation.py\",\"symbol\":\"ChatProvider / StreamingChatProvider / AssistantResult\",\"claim\":\"provider 边界是传输中立 DTO（GenerationRequest、GenerationDelta、AssistantResult、ToolCall），runtime 只认协议，不认 DeepSeek SDK 或 wire 字段。\"},{\"path\":\"src/agent_harness/integrations/deepseek.py\",\"symbol\":\"DeepSeekProvider.generate / stream\",\"claim\":\"HTTP/SSE 与 payload 组装、finish_reason/usage/tool_calls 解析全部收敛在 adapter 内，只向 runtime 返回中立帧与 AssistantResult，佐证 provider wire payload 不穿透 adapter。\"},{\"path\":\"src/agent_harness/runtime/tools.py\",\"symbol\":\"AgentTool / ToolRegistry\",\"claim\":\"工具边界是带 name/description/input_schema/replay_policy 的协议，runtime 通过 ToolRegistry 调用，不知道 read/write/bash 的具体实现，后者位于 integrations/local_tools.py。\"},{\"path\":\"src/agent_harness/runtime/telemetry.py\",\"symbol\":\"publish / TelemetrySink\",\"claim\":\"事实流定义为 runtime 内部小协议，明确说明 domain 与 storage 保持无 telemetry 依赖，sink 实现（如 integrations/langfuse.py）写在该协议上，publish 吞掉 sink 异常以保护已提交的结果。\"},{\"path\":\"src/agent_harness/storage/protocol.py\",\"symbol\":\"Storage 协议与 Write 联合类型、CommitResult\",\"claim\":\"storage 边界暴露的是 Write 集合（InsertEntry/InsertUsage/InsertSpan/SettleSpan/SetValue/AppendList/ClearList 等）与 CommitResult，因此 runtime/domain 提交状态时看不到 SQL、表结构或后端类型。\"},{\"path\":\"src/agent_harness/storage/sqlite.py\",\"symbol\":\"SQLiteStorage._migrate / bind_session\",\"claim\":\"SQL schema、WAL、迁移与 session 归属校验都被封装在 SQLiteStorage 内（含 StorageInvariantError 的 session 不匹配拒绝），佐证「SQL 不泄漏到上层」。\"},{\"path\":\"src/agent_harness/domain/session.py\",\"symbol\":\"Session / SessionMutator\",\"claim\":\"Session 提供唯一写入线（asyncio.Lock + 回调式 mutator），mutator 只允许一次 commit 并在关闭后拒绝写入；该文件仅从 storage.protocol 导入 Write/Storage/CommitResult，是 domain 纯净度上的唯一例外。\"},{\"path\":\"src/agent_harness/runtime/lane.py\",\"symbol\":\"模块导入（api.errors / api.models）\",\"claim\":\"runtime 直接导入 agent_harness.api.errors 的 LaneBusy/NothingToCompact/OperationAlreadyExists 与 api.models 的 DTO，而 api/__init__.py 又导入 runtime，说明规范的单向箭头在实现中被一个共享的叶子契约模块（api.errors/api.models）软化。\"},{\"path\":\"src/agent_harness/storage/codec.py\",\"symbol\":\"dumps / _encode / _decode\",\"claim\":\"storage 的 JSON codec 依赖 agent_harness.api.models.OperationResult 作为持久化类型标记，构成 storage → api 的反向依赖，与 specs 的 storage → domain 不一致。\"},{\"path\":\"src/agent_harness/api/catalog.py\",\"symbol\":\"SessionCatalog\",\"claim\":\"session 只能经 catalog allow-list 定位，session 文件名由 storage/repository.session_filename 统一映射，HTTP 参数无法变成任意数据库路径。\"},{\"path\":\"src/agent_harness/memory/runtime.py\",\"symbol\":\"MemoryRuntime（类 docstring 与 bind_session/start）\",\"claim\":\"该类自述「不拥有任何 Session 状态，只消费冻结的 session outbox 记录」，依赖注入的 Session 与 MemoryStore 协议，体现长期资产在 Session 之外、且不与 Session 争写。\"},{\"path\":\"src/agent_harness/skill/runtime.py\",\"symbol\":\"SkillEvolutionRuntime\",\"claim\":\"该类自述「只消费冻结的 L0 archive，从不读可变 operation state」，并通过 memory materialized_capture 取得 archive 后写入 skill store，佐证 skill 派生在 settlement 之后进行。\"},{\"path\":\"src/agent_harness/api/trace.py\",\"symbol\":\"TraceQueryService\",\"claim\":\"读侧 facade 依赖 storage.protocol.Storage 与 SQLiteStorage、StorageInvariantError 来读 entries/effect span/usage，是 api → storage 的正向依赖，用于 UI 展示 call 级耗时等 durable 事实。\"},{\"path\":\"pyproject.toml\",\"symbol\":\"[tool.mypy] files\",\"claim\":\"类型检查只覆盖 src/agent_harness/domain、storage、api 三个目录，runtime 与 integrations 不在 mypy 范围内，说明层边界目前主要靠约定而非静态检查保障。\"},{\"path\":\"specs/web-ui-implementation-plan.md\",\"symbol\":\"ADR-WEB-005（及第 158 行关于认证与可选依赖）\",\"claim\":\"前端不引入构建工具链、Web 框架作为可选 extra（仅 api/web.py 导入 starlette），把「传输层不得成为核心依赖」固化为决策记录。\"}],\"uncertainties\":[\"runtime 反向导入 api.errors/api.models 是否有意：代码把领域错误与 OperationResult 等 DTO 放在 api，runtime/lane.py 与 runtime/drive.py 直接使用它们，而 api/__init__.py 又导入 runtime，形成包级循环。规范写的是 api → runtime 单向，未见 ADR 说明这些模块被当作底层共享契约；因此「api 是上层」这一说法在实现中只对 web/rpc/service/trace 等模块成立。\",\"domain 是否允许依赖 storage.protocol：domain/session.py 导入 Storage/Write/CommitResult（仅协议与 DTO），而 specs 说 domain 必须纯净、不能依赖数据库驱动与运行时。是「协议例外」还是遗留耦合，文档没有明确裁决，我无法从代码判定。\",\"storage/codec.py → api.models 的依赖是否是已知技术债：它让持久化 codec 依赖公开 API 层 DTO，若未来 DTO 变更会直接影响磁盘格式兼容性；我没有找到对应的 ADR 或迁移说明。\",\"memory/ 与 skill/ 两个包在 specs 的「目标架构」清单里没有对应条目，它们既不是 runtime 也不是 integrations。我把它们描述为与 runtime 平级的长期资产运行时，依据是类 docstring、依赖方向（只依赖 domain + 协议）与 api/serve.py 的装配方式，但这一定位属于我的推断而非文档明述。\",\"仓库没有 import-linter、架构测试或 CI 配置来强制依赖方向（tests 中只有 web 资源与可选 extra 的检查），因此上述偏差目前不会被自动拦住；我无法确认是否存在仓库外的检查流程。\",\"telemetry「提交之后才发布」这一顺序，我在 _settle_assistant、_settle_tool、_settle_tool_batch、_retry_or_abort 里逐一确认过，但 drive.py 有 1500 余行且包含 compaction/navigation 等分支，不能排除某个较少见路径在提交前发布事实。\",\"「PRALE」与包名 agent_harness / prale-agent-harness 的对应关系来自 pyproject 的 project.name 与 deploy 脚本（如 prale-web 入口），我按同一项目理解；若 PRALE 另指某个子集，则层职责的映射需要重新确认。\"]}",
+        "tool_calls": [
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "repository_explore",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          }
+        ],
+        "terminal_status": "completed",
+        "generation_count": 21,
+        "usage": {
+          "prompt_tokens": 816511,
+          "completion_tokens": 15639,
+          "total_tokens": 832150,
+          "prompt_cache_hit_tokens": 755584,
+          "prompt_cache_miss_tokens": 60927
+        },
+        "unknown_effects": 0,
+        "duration_ms": 226884,
+        "error_code": null
+      },
+      "evaluations": [
+        {
+          "name": "terminal_success",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_error_free",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "answer_contract",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_count",
+          "value": 38.0,
+          "comment": "38 call(s)"
+        },
+        {
+          "name": "latency",
+          "value": 226884.0,
+          "comment": "226884 ms"
+        },
+        {
+          "name": "token_cost",
+          "value": 2480811.0,
+          "comment": "2.48081e+06 token(s)"
+        }
+      ]
+    },
+    {
+      "id": "treatment-bash--repository-explorer-query-behavior",
+      "output": {
+        "answer": "{\n  \"summary\": \"在 `repository_explore` 中，五个参数分属不同层级的信号，职责区分明确：`identifiers` 是唯一的符号级精确信号，只有它与 definition 标签的名称严格相等时，才算命中；`query` 只做“低权概念/词元提示”（正则词 + 受限中英概念表），不能伪装成精确引用分析；`known_paths` 只做图排序种子并从输出中整体排除；`focus_paths` 既进入 personalization（个性化 PageRank 的个性化向量），又可被渲染展开，并为该文件中的定义加 +100 分；`path_prefixes` 只提升匹配路径的分值，绝不裁剪发现集和图构建范围。参数处理流程是：先用 `_normalize_request` 校验、规范化、去重和限长，再用 `TreeSitterRepositoryIndexer._index_sync` 做全仓发现、stat 预筛、内容 hash 和 tree-sitter 打标（写入 checkout 外的 SQLite tag 缓存），最后在 `_render` 中二选一：若 identifiers 全部未命中，走 `_fallback_candidates` 的文件级候选；否则走 `_rank_candidates`（个性化 PageRank + 固定权重 + query 加分 + 稳定 tie-break），再在 wire 预算内增量打包，并按 `(relative_path, line, name)` 稳定渲染。新鲜度按作用域分级：索引期以 content hash 为权威身份（stat 只做预筛，缓存/解析失败退化为重新解析），渲染期只对真正要输出的符号级文件做“读-算哈希-再读-再 stat”的双读校验，变化则整轮重试一次，仍变化就返回 `workspace_changed_during_render` 的 `is_error=true` 结果；未输出文件的变化不影响本次结果。\",\n  \"components\": [\n    {\n      \"name\": \"_normalize_request / _string_array / _normalize_relative_path\",\n      \"role\": \"参数入口：拒绝未知属性、逐项校验字节上限（query 1000B、数组≤32、identifier≤256B、路径≤1024B）、去重、NUL/绝对路径/`..`/根外 symlink/不存在路径一律报错；known_paths 与 focus_paths 交集报错；至少需一项焦点；max_tokens 限定 256..config.max_export_tokens（默认 4000）。path_prefixes 允许文件或目录但必须已存在。\"\n    },\n    {\n      \"name\": \"TreeSitterRepositoryIndexer._discover / _index_sync\",\n      \"role\": \"发现与打标：从 workspace root 遍历（按名字排序以保证确定性），resolve 后必须仍在根内，跳过默认缓存/构建目录与“实际 resolve 后的 cache_dir”，按 max_file_bytes 过滤，include_tests=false 时用 _is_test_path 排除测试约定路径；超出 max_files/max_total_bytes/max_scan_ms 抛 RepositoryScanLimitExceeded（不返回部分图）。path_prefixes 不参与任何裁剪。\"\n    },\n    {\n      \"name\": \"RepositoryTagCache\",\n      \"role\": \"checkout 外 SQLite 文件级 tag 缓存，键含 path+size+mtime_ns+indexer_version+query_version，值为 content_hash 与 tags；任何 OSError/sqlite3.Error/JSON 错误都退化为 miss（lookup 返回 None）、store 静默失败，绝不使工具失败；带 TTL 与容量回收。\"\n    },\n    {\n      \"name\": \"RepositoryExplorerTool.execute\",\n      \"role\": \"编排：规范化 → 在 asyncio.Semaphore(max_concurrent_indexes) 下用 to_thread 建索引 → to_thread 渲染；捕获 WorkspaceChangedDuringRender 后整轮（含重新索引）重试一次；RepositoryIndexError/ValueError/OSError 统一转 _bounded_error（is_error=true，正文截断）。\"\n    },\n    {\n      \"name\": \"RepositoryExplorerTool._render\",\n      \"role\": \"决策中心：统计 definitions、算出 matched_identifiers 与 missing；identifiers 全不命中 → _fallback_candidates，否则 _rank_candidates；剔除全部 known_paths；生成含 revision 与“仅导航，请 read 确认”的前缀及 identifiers_not_found 行；随后做增量预算打包、稳定排序、分组渲染、尾部裁剪与最终 wire 校验。\"\n    },\n    {\n      \"name\": \"_rank_candidates\",\n      \"role\": \"符号级候选：按名建 definition 索引、聚合 reference 计数，用 _edge_weight 建 referencer→definer 边；无任何边时用 definition 互连兜底，对无入边的 definition 加 0.1 自环；调用 _pagerank；应用 query 语义（仅无 identifiers 时：query_only_paths 收窄候选文件、query_definition +30、query_reference +25）；对每个 definition 计算 score = pagerank + 1000(identifier 精确命中) + 100(focus) + 10(prefix) − 1(测试) + 符号种类加成；按 (path,line,name,role) 去重并按 _symbol_priority 保留更优种类；为未渲染的 focus_paths 追加文件级候选；空则退化为 fallback；最终按 (-score, path, line, name) 排序。\"\n    },\n    {\n      \"name\": \"_fallback_candidates\",\n      \"role\": \"文件级候选（tag=None，不输出源码/行号/snapshot）：query 词元与“未命中 identifier 拆出的词”只匹配文件路径名，另加 focus +100、ROOT_IMPORTANT_FILES +5、.github/workflows/*.yml +5、匹配 path_prefixes +10、有 tag +1；按 (-score, path) 排序取前 MAX_FALLBACK_CANDIDATES=12。\"\n    },\n    {\n      \"name\": \"_pagerank / _edge_weight\",\n      \"role\": \"确定性个性化 PageRank：30 轮、damping 0.85、personal 向量 focus_paths +50、known_paths +10；边权 = sqrt(重复次数) ×10(identifier 精确) ×10(复合名≥8) ×0.1(下划线开头) ×0.1(同名定义>5) ×50(来自 known_paths) ×0.1(low_confidence)。注意 path_prefixes 不在 personal 向量内，只在候选打分时 +10。\"\n    },\n    {\n      \"name\": \"_candidate_block / _group_rendered_candidates / _render_order\",\n      \"role\": \"渲染与稳定性：符号块含 1-based 名称行 ±3 行片段（每行≤120 字符）与 12 位 content hash 快照；文件级块只写“(file candidate; not expanded)”；最终按 (path, line, name) 排序，文件级块 line=0 排在该文件符号前，相邻同文件符号合并为一个 `## path` + 多个 `### symbol` 段。\"\n    },\n    {\n      \"name\": \"_within_incremental_wire_budget / _within_wire_budget / _trim_to_wire_budget / _token_estimate\",\n      \"role\": \"预算：整条 tool message（content+is_error+details）≤50 KiB、content ≤1600 行、token 估算 ceil(UTF-8 字节/3) ≤ max_tokens；打包阶段用 prefix-sum 式增量字节比较，只在最终结果做完整 json.dumps 校验，仍超限则按行/字节二分裁剪并标记 truncated。\"\n    }\n  ],\n  \"flow\": [\n    \"1. 校验参数：未知属性 → 报错；identifiers/known_paths/focus_paths/path_prefixes 逐项规范化（相对路径、resolve 后必须在根内、必须存在、prefix 可为目录）、去重、限长；known∩focus 报错；query 非空且 ≤1000 字节；至少一项焦点；max_tokens∈[256, 配置上限]。\",\n    \"2. 发现：全仓遍历并 stat（path_prefixes 不裁剪），跳过配置的忽略目录与实际 cache_dir、超大文件；include_tests=false 时排除 test/tests/__tests__ 目录与 test_*/_test.*/*.test.*/*.spec.* 文件名；触及文件数/总字节/扫描时长上限即失败。\",\n    \"3. 打标：先按 (path,size,mtime_ns,版本) 查 tag 缓存，命中复用 content_hash+tags；未命中才读文件、算 sha256、检测前 8192 字节 NUL 判二进制，非二进制用随 wheel 分发的 .scm 查询提取 definition/reference 标签（1-based 名称行），再写缓存。\",\n    \"4. 判定 identifier 命中：只有 name 与 definition 标签严格相等才计入 matched_identifiers；全部未命中（含只匹配到 reference 的情况）→ 文件级 fallback 模式并声明 identifiers_not_found；部分未命中 → 正常符号级排序并逐项列出未命中名。\",\n    \"5. 排序：符号级模式建引用图（权重见组件说明），跑个性化 PageRank；无 identifiers 时 query 词元/概念提示收窄候选文件并给 +30/+25 加分；focus_paths 既进 personal（+50）又给文件内定义 +100；path_prefixes 仅 +10；测试文件 −1；identifier 精确命中定义 +1000；随后去重、补 focus 文件级候选、稳定排序。\",\n    \"6. 排除与打包：剔除全部 known_paths（符号级与文件级都排除）；前缀（revision + 导航提示 + 缺失标识声明）先计入预算；按排序依次渲染候选，每文件最多 3 个符号，逐块用增量字节/行/估算 token 检查，首次超限即停止并置 truncated=true。\",\n    \"7. 渲染与收尾：入选项按 (relative_path, line, name) 重排、按文件分组；若有未入选候选，追加“Other candidates: …”（≤12 条），若加不下则从尾部弹出已选块；最后做一次完整 wire 校验，必要时裁剪正文并标记 truncated；details 仅返回 {truncated, token_estimate:true}。\",\n    \"8. 变化处理：索引期以 content hash 为权威身份，未选文件变化只影响下次排序；渲染期符号级文件“读+hash+stat → 再读+hash+stat”，任一不一致抛 WorkspaceChangedDuringRender → 整轮重试一次 → 仍不一致则返回 is_error=true 的 workspace_changed_during_render；文件级候选只确认路径仍存在（不存在同样触发重试/拒绝）。\"\n  ],\n  \"evidence\": [\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_normalize_request\",\n      \"claim\": \"五个参数在此校验：未知属性拒绝、known/focus 交集拒绝、至少一项焦点、query ≤1000 字节、max_tokens 限定在 [256, config.max_export_tokens]。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_normalize_relative_path\",\n      \"claim\": \"所有路径必须根目录相对、无 `..`、resolve 后仍在根内且必须存在；非 prefix 必须是普通文件，prefix 允许文件或目录（因此“不存在的 prefix”是参数错误）。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_string_array\",\n      \"claim\": \"数组≤32 项、identifier≤256 字节、路径≤1024 字节，空串与 NUL 拒绝，并做去重，顺序保留。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"RepositoryExplorerTool._render\",\n      \"claim\": \"identifier 命中判定只看 definition 标签名严格相等；全不命中转 _fallback_candidates 并输出 identifiers_not_found 与“仅作为文件名提示”声明；候选随后统一剔除 known_paths。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_rank_candidates\",\n      \"claim\": \"identifier 精确命中的 definition +1000、focus_paths 文件内定义 +100、path_prefixes 匹配 +10、测试文件 −1，并叠加 PageRank 分数与符号种类加成后按 (-score, path, line, name) 排序。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_pagerank\",\n      \"claim\": \"personal 向量只对 focus_paths 加 50、known_paths 加 10；path_prefixes 不参与 personalization，因此其作用是候选加分而非图排序种子。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_edge_weight\",\n      \"claim\": \"边权 = sqrt(重复次数) ×10(identifier 精确) ×10(长复合名) ×0.1(下划线开头) ×0.1(同名定义>5) ×50(known_paths 引用) ×0.1(low_confidence)，使 known_paths 成为强引用种子。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_fallback_candidates\",\n      \"claim\": \"identifier 全未命中时仅产生文件级候选：未命中 identifier 用 _QUERY_WORD 拆词后只与 relative_path 匹配（score += 100），并叠加 focus +100、根重要文件 +5、prefix +10，结果上限 MAX_FALLBACK_CANDIDATES=12，不渲染符号或源码。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_query_terms\",\n      \"claim\": \"query 只被降维为长度≥3 的 ASCII 词元加上 _QUERY_CONCEPT_HINTS 中有限的中文概念映射（如“记忆模块”→“memory”），是低权提示而非语义检索。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_rank_candidates\",\n      \"claim\": \"query-only 关联发现：先把候选文件收窄到 query_only_paths，再对名称匹配的 definition 给 +30、对指向这些 seed 定义的 reference 给 +25，形成“定义 + 其引用者”的关联渲染；有 identifiers 时 query 不产生这些候选。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_render_order\",\n      \"claim\": \"排名只决定谁进入预算，最终渲染顺序固定按 (relative_path, line, name)，文件级候选 line=0 排在同文件符号之前，保证相同状态与请求产出稳定文本。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_group_rendered_candidates\",\n      \"claim\": \"相邻同文件符号被合并为单个 `## path` 段加多个 `### symbol` 段，文件级候选单独成块并重置分组。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"_within_incremental_wire_budget\",\n      \"claim\": \"打包期使用增量字节+行+ceil(bytes/3) 估算检查 50 KiB/1600 行/max_tokens，避免对每个候选重复序列化完整 JSON；超限即截断并标记 truncated。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"RepositoryExplorerTool._render\",\n      \"claim\": \"未入选候选以 ≤12 条路径的“Other candidates”后缀附加；若加不下则从已选尾部弹块，最终再经 _within_wire_budget 校验，必要时 _trim_to_wire_budget。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"RepositoryExplorerTool._candidate_block\",\n      \"claim\": \"符号级渲染执行双读 TOCTOU 校验（两次 read_bytes 的 sha256、size、mtime_ns 必须一致），不一致抛 WorkspaceChangedDuringRender；文件级候选只校验路径仍存在且是文件。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"RepositoryExplorerTool.execute\",\n      \"claim\": \"WorkspaceChangedDuringRender 触发整轮（重新索引+重新渲染）重试一次，仍失败则由 RepositoryIndexError 分支转成 is_error=true 的 workspace_changed_during_render；索引在 semaphore 与非阻塞 to_thread 中执行。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"TreeSitterRepositoryIndexer._index_sync\",\n      \"claim\": \"索引期用 (size, mtime_ns) 做廉价预筛复用缓存，未命中才读内容并以 sha256 为权威身份、写回缓存；二进制（前 8192 字节含 NUL）只记 parseable=False 无标签。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"TreeSitterRepositoryIndexer._discover\",\n      \"claim\": \"发现阶段对所有目录做排序遍历、resolve+containment 校验、跳过默认忽略目录与实际 cache_dir、按大小/数量/时间上限失败；path_prefixes 完全未参与，因此不会裁剪全图。\"\n    },\n    {\n      \"path\": \"src/agent_harness/integrations/repository_explorer.py\",\n      \"symbol\": \"RepositoryTagCache.lookup\",\n      \"claim\": \"缓存损坏或 IO/SQLite 错误一律返回 None（miss）并退化为重新解析，缓存失败不会导致工具失败。\"\n    },\n    {\n      \"path\": \"tests/integration/test_repository_explorer.py\",\n      \"symbol\": \"test_path_prefix_personalizes_but_never_cuts_global_identifier_discovery\",\n      \"claim\": \"回归测试固定“path_prefixes 只提升分数、绝不在发现/候选阶段裁剪”，identifier 命中定义仍在全局文件中被渲染。\"\n    },\n    {\n      \"path\": \"tests/integration/test_repository_explorer.py\",\n      \"symbol\": \"test_unmatched_identifiers_rank_a_small_set_of_filename_hints\",\n      \"claim\": \"未命中 identifier 时正文含“Using unmatched identifiers only as filename hints”，只输出文件级候选（无 `line `、无 `snapshot `），并按文件名提示排序。\"\n    },\n    {\n      \"path\": \"tests/integration/test_repository_explorer.py\",\n      \"symbol\": \"test_query_only_includes_references_to_query_seed_definitions\",\n      \"claim\": \"query-only 关联发现会同时渲染匹配定义所在文件与引用该定义的消费者文件（`### reference ...`）。\"\n    },\n    {\n      \"path\": \"tests/integration/test_repository_explorer.py\",\n      \"symbol\": \"test_rank_selects_before_rendering_in_stable_path_line_name_order\",\n      \"claim\": \"尽管 beta 排名更高（identifier 命中），渲染仍按路径/行/名稳定排序，验证“排名只决定入选、渲染顺序固定”。\"\n    },\n    {\n      \"path\": \"tests/integration/test_repository_explorer.py\",\n      \"symbol\": \"test_repository_explorer_known_path_is_not_rendered\",\n      \"claim\": \"known_paths 只作排序种子，其路径绝不出现在输出正文中。\"\n    },\n    {\n      \"path\": \"tests/unit/test_repository_explorer_unit.py\",\n      \"symbol\": \"test_render_retries_once_then_rejects_concurrently_changing_output\",\n      \"claim\": \"渲染期间输出文件持续变化时，一次重试后返回 is_error=true 且正文恰为 workspace_changed_during_render。\"\n    },\n    {\n      \"path\": \"tests/unit/test_repository_explorer_unit.py\",\n      \"symbol\": \"test_graph_edge_modifiers_have_the_specified_values\",\n      \"claim\": \"固定验证边权倍率数值（identifier ×10、复合名 ×10、known 引用 ×50、sqrt(count)、下划线与多定义 ×0.1），说明排序输入可审计且确定。\"\n    },\n    {\n      \"path\": \"tests/unit/test_repository_explorer_unit.py\",\n      \"symbol\": \"test_path_validation_rejects_dotdot_symlink_and_missing_prefix\",\n      \"claim\": \"`sub/../safe.py`、指向根外的 symlink 与不存在的 path_prefixes 都作为参数错误拒绝（is_error=true）。\"\n    },\n    {\n      \"path\": \"specs/repository-exploration-tool-design.md\",\n      \"symbol\": \"5.2 图与排序\",\n      \"claim\": \"规格声明 focus_paths 与 path_prefixes 都“只提升 personalization”，实现中 prefix 实际只体现为候选 +10 分——这是实现与规格的差异点。\"\n    },\n    {\n      \"path\": \"specs/repository-exploration-tool-design.md\",\n      \"symbol\": \"5.3 预算渲染\",\n      \"claim\": \"规格要求排名只决定入选、入选集合按 (relative_path, line, name) 渲染、单文件不独占预算、脚本化二次校验只覆盖输出文件，与实现一致。\"\n    }\n  ],\n  \"uncertainties\": [\n    \"path_prefixes 在 `_rank_candidates`/`_fallback_candidates` 中只做 +10 候选加分，未进入 `_pagerank` 的 personal 向量；规格 §5.2 写的是“focus_paths 与 path_prefixes 都只提升 personalization”，两者措辞不一致，影响大小难以从代码断言（无针对性测试比对分数差）。\",\n    \"identifier 只匹配到 reference（无同名 definition）时会被判为“未命中”，整体退化为文件级 fallback，即使引用确实存在也不渲染该符号；这是实现选择而非规格明示，实际使用中可能造成困惑。\",\n    \"PageRank 的浮点累加顺序部分依赖 `nodes` 集合迭代顺序（Python 字符串哈希随机化），理论上跨进程可能有极小数值差异；最终顺序由 (-score, path, line, name) 兜底，但极端并列分数的选择未被测试覆盖。\",\n    \"query 的召回完全依赖 `_QUERY_WORD`（≥3 字符 ASCII 词）与 `_QUERY_CONCEPT_HINTS` 小表，未收录概念或 2 字符词元不会产生匹配，可能静默落入文件级 fallback（含 ROOT_IMPORTANT_FILES），与“未命中”提示不总能区分。\",\n    \"tag 缓存以 (size, mtime_ns) 预筛、content hash 为值：若文件内容变化但大小与 mtime_ns 完全相同（受文件系统时间精度限制），会命中旧标签而产生过期符号行号；此风险在本次阅读的代码路径中未做额外校验。\",\n    \"execute 的第二轮会重新建索引再渲染，极端高频写入场景下最多两次机会；重试成本与“索引期间未输出文件变化不触发重扫”的边界只有 §6.2 的规格描述和有限单测，缺少大规模并发压力证据。\",\n    \"workspace_changed_during_render 的判定对文件级候选仅检查存在性，不做内容 hash；因此文件级候选被删除会触发重试/拒绝，而被改写不会，这与规格“文件级候选不需要二次内容 hash”一致但可能被使用者误读为内容已验证。\",\n    \"证据均来自当前工作区快照与测试用例；若后续调整 INDEXER_VERSION/权重常量或 _QUERY_CONCEPT_HINTS，上述数值与倍率结论需要重新核对。\"\n  ]\n}",
+        "tool_calls": [
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": true,
+            "outcome": "failed"
+          },
+          {
+            "name": "read",
+            "is_error": true,
+            "outcome": "failed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": false,
+            "outcome": "completed"
+          }
+        ],
+        "terminal_status": "completed",
+        "generation_count": 10,
+        "usage": {
+          "prompt_tokens": 141566,
+          "completion_tokens": 11024,
+          "total_tokens": 152590,
+          "prompt_cache_hit_tokens": 114176,
+          "prompt_cache_miss_tokens": 27390
+        },
+        "unknown_effects": 0,
+        "duration_ms": 64141,
+        "error_code": null
+      },
+      "evaluations": [
+        {
+          "name": "terminal_success",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_error_free",
+          "value": 0.0,
+          "comment": "failed: read"
+        },
+        {
+          "name": "answer_contract",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_count",
+          "value": 14.0,
+          "comment": "14 call(s)"
+        },
+        {
+          "name": "latency",
+          "value": 64141.0,
+          "comment": "64141 ms"
+        },
+        {
+          "name": "token_cost",
+          "value": 446746.0,
+          "comment": "446746 token(s)"
+        }
+      ]
+    },
+    {
+      "id": "treatment-bash--web-composition-and-config",
+      "output": {
+        "answer": "## 一句话先定边界\n\n`prale-web` 不是“带 Web 能力的核心 runtime”。它只是**最外层的部署适配器**：把环境变量解析成一份 `Settings`，再组装出一个**单项目、单 repository scope、单 provider、可选 memory/skill/tool/observer** 的部署对象，最后交给 Starlette + uvicorn。\n\n核心运行时的语义完全在 `domain/`、`runtime/`、`storage/` 和 `api/` 的应用服务里；Web 层只负责 HTTP/SSE 编解码、session catalog 查找、后台 drive 生命周期和进程关闭。`api/web.py` 是唯一导入 Web 框架的模块，`domain/`、`runtime/`、`storage/` 都不依赖它。\n\n---\n\n## 1. 从环境配置到 Web deployment\n\n### 1.1 `Settings.from_environment`：只读一次环境，先拒绝错误配置\n\n入口是 `agent_harness.api.serve:main`，也可以由 `deploy/start-web.sh` 调起。`Settings` 在绑定端口、打开任何 store 之前完成校验：\n\n| 配置组 | 关键变量 | 决定什么 |\n|---|---|---|\n| 项目身份 | `PRALE_PROJECT_ROOT`、`PRALE_REPOSITORY_ID`、`PRALE_PROJECT_ID` | 工具的工作根目录、memory/skill 的归属 scope |\n| provider | `PRALE_API_KEY`、`PRALE_MODEL`、`PRALE_BASE_URL`、`PRALE_TIMEOUT_SECONDS` | Agent、memory extractor、skill reviewer 共用的模型配置 |\n| 数据布局 | `PRALE_DATA_DIR`、`*_DB`、`PRALE_MEMORY=off`、`PRALE_SKILLS=off` | session/catalog/memory/skill 的落点，以及哪些能力存在 |\n| 工具 | `PRALE_TOOLS`、`PRALE_REPOSITORY_INDEX_DIR` | 暴露给所有 session 的工具集合 |\n| 可观测性 | `PRALE_TRACES`、`LANGFUSE_*`、`PRALE_LANGFUSE_CAPTURE` | 本地 trace archive、外部 Langfuse 出口 |\n| 访问与运行 | `PRALE_TOKENS`、`PRALE_MAX_DRIVES`、`PRALE_MAX_CONNECTIONS`、`PRALE_GRACEFUL_SHUTDOWN_SECONDS`、`PRALE_HOST/PORT/LOG_LEVEL` | 认证、并发、优雅关闭、监听地址 |\n\n几个强约束：\n\n- `PRALE_REPOSITORY_ID` **没有默认值**，也**不会从 project_root 推导**。它是 memory/skill 的稳定归属标识；`start-web.sh` 在未设置时直接退出 2，最多把当前 checkout 的 git remote 作为建议打印出来。\n- `PRALE_API_KEY` 没有默认值，缺失即启动失败，不会等到第一次 turn 才报错。\n- `ProjectRuntimeConfig` 会拒绝空值、NUL 和**绝对路径形态**的 `repository_id`（ADR-018）；它不是授权维度，只是稳定的仓库身份。\n- `PRALE_SKILLS` 依赖 memory store：skill 提取要从 memory 的 L0 archive 读证据，所以“有 skill、无 memory”在配置阶段就被拒绝。\n- `repository_explore` 需要独立的索引缓存目录，且缓存目录必须**在 project_root 之外**；索引目录本身不属于项目源码，也不会写进 checkout。\n- Langfuse 默认关闭；一旦 `LANGFUSE_TRACING_ENABLED` 打开，public/secret key 缺一即启动失败，避免“看起来在监控、实际什么都没发”。\n- 配置错误统一以退出码 2 和一行说明结束，不打印 traceback，不回声凭据。`--print-config` 只解析、不建目录、不绑端口；真正部署时才由 `prepare_directories` 创建 sqlite 所需的父目录。\n\n### 1.2 `build_application`：按“先可失败、后持久化”的顺序组装\n\n顺序是有意的：\n\n1. `prepare_directories`：创建 sessions、catalog、memory、skill 的父目录。sqlite 不会替你创建父目录，首次运行必须这里做。\n2. 构造 Agent 使用的 `DeepSeekProvider`。\n3. 构造可选的 `LangfuseTelemetry`。它可能因缺少可选 SDK 或配置非法而失败，所以放在打开任何持久 store 之前；失败就什么也不留下。\n4. 构造可选的 `RepositoryExplorerTool`。这里也可能因 tree-sitter 不可用、索引目录非法而失败，同样发生在打开 store 之前。\n5. `create_builtin_tools(project_root, repository_explorer=...)`，再按 `settings.tools` 过滤。注意：所有 session 共享同一套工具和同一个 project_root，工具集合是部署级配置，不是请求级、也不是 session 级。\n6. 打开 `SQLiteMemoryStore`、`SQLiteSkillStore`。它们是部署拥有的对象，不在 Session DB 里。\n7. 调用 `create_app(...)`，把 provider、tools、stores、extractor、reviewer、telemetry、tokens、并发上限一起交给 `WebApplication`。\n\n这里要区分两个“拥有关系”：\n\n- `Deployment` 拥有 memory/skill store 的关闭责任；\n- `WebApplication` 拥有 catalog、supervisor、共享 runtime 和 telemetry 的关闭责任；\n- `SessionSupervisor` 拥有每个 session 的 SQLite 连接和后台 drive task；\n- 每一条 `Harness/Lane` 只是使用 supervisor 共享的 memory/skill runtime 和 scope，不拥有它们。\n\n所以 `SessionSupervisor.aclose()` **故意不调用 `Harness.close()`**：`Harness.close()` 会关闭跨 session 共享的 memory/skill runtime，那样第一个 session 关闭后，其余 session 的晋升和技能沉淀就失效了。\n\n### 1.3 `create_app`：在 Web 边界内绑定 scope 和 runtime\n\n`WebApplication` 做的是：\n\n- 用 `ProjectRuntimeConfig.catalog_db` 建 `SQLiteCatalogStore` 和 `SessionCatalog`；\n- 用 `MemoryScope(config.repository_id)` 建 memory 查询 facade；\n- 用 `SkillScope.from_memory_scope(...)` 建 skill 查询 facade；\n- 用同一个 `repository_id` 建 `SessionSupervisor`；\n- 在 supervisor 里**每个部署只建一次** `MemoryRuntime(memory_store, extractor)` 和 `SkillEvolutionRuntime(skill_store, reviewer)`；\n- 可选地安装 Bearer 中间件。\n\n也就是说，Web 层只是把**服务端配置里的 scope 值**绑定到 runtime 对象上。它不接收请求里的 `repository_id`，也不从 session 路径推导 scope。\n\n启动和关闭由 Starlette lifespan 承担：\n\n- `start()` 启动 memory/skill 的 worker；\n- `aclose()` 先停 supervisor，再 flush/close telemetry，最后关闭 catalog；\n- uvicorn 用 `log_config=None`，确保访问日志也经过 root handler 的脱敏过滤器；\n- `graceful_shutdown_seconds` 保证持久 SSE 订阅不会让退出永久卡住。\n\n---\n\n## 2. Session、memory、skill、repository_explore、Langfuse 的关系\n\n可以用一条“派生链”理解，而不是把它们当成五个平级存储：\n\n```text\nLane/Drive 的终态 settlement\n  └─ 同一个 Session mutation 写入 memory/capture_outbox 和 skill/capture_outbox\n        │\n        ├─ MemoryRuntime 消费 frozen outbox\n        │     ├─ 生成 L0 archive（immutable，memory DB，repository scope）\n        │     ├─ L0 → L1（extractor，需 PRALE_MEMORY_PROMPT）\n        │     ├─ L1 → L2（repository scope）\n        │     └─ 所有 repository 的 L2 → L3（GLOBAL_L3_SCOPE）\n        │\n        └─ SkillEvolutionRuntime 读取同一份 L0 archive\n              └─ reviewer 提出 proposal → 校验 → 版本化 SkillAsset（skill DB，repository scope）\n\nDrive 运行时：\n  memory recall  ─┐\n  skill listing  ─┼─ 作为只读系统上下文注入 generation intent\n  skill loadout  ─┘\n  repository_explore ── 只是一个 AgentTool，不直接读写 memory/skill\n\nDrive settlement 之后：\n  TelemetrySink（可选 Langfuse）只观察事实，不参与 turn 判定\n```\n\n### 2.1 Session 是唯一的内容权威\n\n一个 session 对应一个 SQLite 数据库，由 catalog 把 `session_id` 映射到允许访问的文件。只有 `POST /api/sessions` 会创建数据库；其他路径如果发现 catalog 有行但文件缺失，返回 404，避免“文件被删后静默变成空会话”。\n\nSession 的内容权威来自它的事务记录：operation intent、effect span、usage、entry tree、终态 result。L0 archive 只是从 Session 的**冻结条目**中物化出来的历史快照，不是 Session 的替代品。\n\n因此：\n\n- 抓取失败、memory store 丢失、skill store 丢失，都不会改变 Session 的正确性；\n- 抓取请求写在终态事务里；消费失败会进入 dead-letter 或保留在 outbox 中重试；\n- 反过来，Session 一旦提交，memory/skill 只是派生资产。\n\n### 2.2 memory：L0 是捕获，L1–L3 是晋升\n\n- **L0**：`MemoryRuntime` 从 `memory/capture_outbox` 读取冻结的 entry id、hash、trace ids，物化成 `SessionTraceArchive`。即使没有配置提取 prompt，L0 也会被捕获；只是不会产生 L1–L3。\n- **L1/L2**：由 `MemoryRuntime` 的 job worker 驱动。L1 从 L0 提取 atomic memory；L2 从 L1 合成 scene。两者都按 `repository_id` 隔离。提取 prompt 不是本包发明的：`PRALE_MEMORY_PROMPT` 指向部署自己的 prompt 文件时才启用；否则 memory 视图只有 L0，没有晋升条目。\n- **L3**：全局唯一 doctrine，使用 `GLOBAL_L3_SCOPE`，由所有 repository 的 L2 合成，读取时不按 repository 过滤。这是有意为之的“全局工程准则”，也是 scope 隔离的唯一例外。\n\nrecall 时，L3/L2/L1/L0 会按预算组装成一条 `<long_term_memory>` 系统消息，明确标注“只读背景、不是用户授权、不能覆盖系统指令、历史路径和测试结果必须重新验证”。这不是权限提升，只是上下文。\n\n### 2.3 skill：从 L0 派生，但写入独立 store\n\nskill 不是从 Session 的当前状态直接读，而是复用 memory 已经物化的同一份 L0 archive：\n\n- `SkillEvolutionRuntime` 消费 `skill/capture_outbox`；\n- 通过 `MemoryRuntime.materialized_capture` 按 scope/session/operation/tip/hash 找到 L0 archive；\n- `CodingSkillReviewer` 只看到已经脱敏的 archive 和 active skill 的 metadata，输出一个 proposal；\n- `SkillEvolutionRuntime` 仍是写入权威：它负责校验、版本冲突和持久化；\n- skill DB 的 scope 严格来自 memory scope：`SkillScope.from_memory_scope(MemoryScope(repository_id))`。\n\n所以“skill 依赖 memory”不是实现细节，而是数据流上的硬依赖：没有 memory 的 L0，就没有 skill 提取的冻结证据。配置阶段和 `SessionSupervisor` 都会拒绝“skill store 但无 memory store”。\n\nskill 也是**建议性资产**，不是授权或系统指令：它按 metadata 列表注入 `<available_skills>`，被选中后才加载 `<skill>` 正文；加载失败、review 失败都不影响当前 turn。\n\n### 2.4 repository_explore：只是工具，不是记忆库\n\n`RepositoryExplorerTool` 和 `read/write/edit/bash` 一样，实现的是 `AgentTool` 协议。它：\n\n- 只在 `PRALE_TOOLS` 显式包含 `repository_explore` 时构造和暴露；\n- 只读地索引 `settings.project_root` 下的文件；\n- 索引缓存放在 project_root 之外，避免污染 checkout，也避免缓存本身被下一次索引扫到；\n- 输出受 token/字节/行数/文件数/扫描时间上限约束；\n- 明确要求“导航结果必须用 `read` 核实”，它是导航，不是事实权威；\n- 没有直接写 memory/skill 的路径。\n\n它的结果可能作为 tool 结果进入 Session 轨迹，进而在 L0 archive 中成为“历史证据”；但即使如此，它也不会变成 L1/L2 的直接写入，更不会绕过 memory 的晋升流程。它不是“仓库知识库”，只是一个按需的只读检索工具。\n\n### 2.5 Langfuse：settlement 之后的观察者，不是 runtime 的一部分\n\nLangfuse 的关系最单向：\n\n- `Drive` 在每次 settlement 提交之后发布 `OperationTelemetry`、`GenerationTelemetry`、`ToolTelemetry`；\n- `LangfuseTelemetry.record()` 只做 sanitize + enqueue，立即返回；\n- 真正的 SDK 调用在单独的 worker task 里；\n- 队列满、网络不可达、SDK 异常，最多丢 trace，不会改变某个 turn 的结果；\n- 它不读 Session、不读 memory store、不读 skill store，也没有把外部数据写回本地的路径。\n\n它和另外两个“可观测性”概念要分开：\n\n| 机制 | 位置 | 用途 | 是否影响 Session |\n|---|---|---|---|\n| `trace_recorder` / `TraceRecord` | Session 内部，L0 archive 的一部分 | 本地执行审计、`execution-v1` 证据 | 写入是事务的一部分，但只是记录 |\n| `EffectSpan` / `UsageRecord` | Session DB 的 durable 查询表 | UI 的 call 级耗时、token、状态 | 与 settlement 同事务，是权威查询记录 |\n| Langfuse | 进程外 | 外部 trace 观察、评测对比 | 完全不影响 |\n\nLangfuse 的隔离核心是**出口策略**：`PRALE_LANGFUSE_CAPTURE` 默认 `metadata`，只上传长度、计数和哈希，不上传 prompt、消息、记忆或工具结果正文；`redacted` 才上传脱敏文本；`full` 只应显式用于受控环境。sanitizer 还会处理本部署的 secret、Bearer、`api_key=...`、PEM、绝对路径等。它保护的是“什么能离开进程”，不是“某个用户能看哪个 repository”。\n\n---\n\n## 3. 隔离语义：哪些是边界，哪些不是\n\n### 3.1 请求不能选择 scope 或路径\n\n浏览器只能提交：\n\n- `session_id`\n- `lane`\n- `operation_id`\n- `skill_id` / `archive_id`\n- prompt 文本\n\n它不能提交 `repository_id`、project root、session 数据库路径或 memory/skill DB 路径。session 路径由 catalog 的 allow-list 解析；scope 由服务端配置决定。`GET /api/project` 会返回规范化 project_root 和 repository_id，这是给 UI 顶栏展示的，不是让请求反向指定路径。\n\n注意：这**不是多用户 ACL**。`PRALE_TOKENS` 只用于防止本机其他进程误连，token 后面没有“用户到 repository scope”的映射。拿到 token 的客户端可以使用该部署的所有 catalog session，看到该 repository scope 的全部 memory/skill。ADR-WEB-003 明确把本期限定为本机单用户部署。\n\n### 3.2 memory/skill 的隔离单位是 repository，不是 session\n\n`MemoryScope(repository_id)` 和 `SkillScope.from_memory_scope(...)` 决定了：\n\n- 同一个部署里的多个 session 共享同一个 repository 的 L0–L2 和 skill；\n- 不同 `repository_id` 的部署即使指向同一个 memory/skill DB，也彼此看不到对方的 L0–L2 和 skill；\n- session 只是“内容容器”，不是 memory 的权限边界；选择另一个 session 不会切换 memory scope。\n\nSQLite 物理层把 scope 映射成 `(repository_id, \"\", \"\")` 的兼容列；查询始终带 scope 条件，所以这是存储层强制，不是 UI 过滤。\n\n**L3 是例外**：它是全局 doctrine，按 `GLOBAL_L3_SCOPE` 读写，recall 时所有 repository 都会带上它。设计上这是共享的工程准则，不是某个 repository 的私有记忆；如果未来需要严格隔离，必须引入独立的 owner/ACL 维度，而不是复用 `repository_id`。\n\n### 3.3 文件系统边界和 memory scope 不是一回事\n\n- `repository_explore` 自己限制在 project_root 内，拒绝绝对路径、`..` 和逃逸出 workspace 的路径；索引缓存必须在 project_root 之外。\n- 但内建 `read/write/edit/bash` **不是文件系统沙箱**：相对路径按 project_root 解析，绝对路径也允许。也就是说，“memory 只属于这个 repository”不代表“agent 只能读这个 repository”。\n- Web 层不接受任意文件路径，只是不接受“浏览器指定路径”；它不改变工具本身的文件系统能力。\n\n### 3.4 外部观测的隔离是“最小上传”\n\nLangfuse 不是按用户隔离，而是按**部署的 capture policy** 隔离：\n\n- 默认 `metadata` 不离开正文；\n- secret 和路径在 sanitizer 中统一处理；\n- `/api/health` 不返回任何 store 路径、凭据或 drive 异常文本，只返回 store 是否存在和计数；\n- 访问日志和 `--print-config` 属于运维面，可以看到路径和监听地址，但不会回声凭据；\n- 客户端面（包括 health）不包含其他 scope 的内容、未脱敏工具参数或数据库位置。\n\n---\n\n## 4. 失败与关闭语义\n\n- **配置阶段失败**：未设 scope、未设 API key、skill 依赖 memory 但 memory 关闭、Langfuse 半配置、repository_explore 缺索引目录或缺 extra，都会在任何 store 打开之前以退出码 2 结束。\n- **构建阶段失败**：telemetry 或 explorer 构造失败也不会留下 store 和端口。\n- **启动阶段**：lifespan 启动 memory/skill worker；`--print-config` 不启动任何 worker，也不创建目录。\n- **浏览器断开**：只关闭 SSE 订阅，不 abort operation；提交的 turn 已经 durable 接纳，后台 task 继续 drive。\n- **显式 abort**：只有 abort 请求才调用 `Lane.request_abort`。\n- **recover**：只在本进程没有该 lane 的 drive task 时执行；如果进程崩溃过，恢复会把无法证明的 effect 收束为 `unknown`/`interrupted`，不会伪造 completed 或耗时。\n- **关闭顺序**：uvicorn 先停止接收请求并等待在途 HTTP 请求（受 `graceful_shutdown_seconds` 限制），然后 lifespan 依次停止 drive、封存 skill 缓冲、关闭每个 session 连接、关闭共享 memory/skill runtime、flush/close Langfuse、关闭 catalog；最后 `serve.py` 关闭部署拥有的 memory/skill store。\n- **派生资产失败**：capture 失败进 dead-letter/重试；memory/skill store 丢失只影响派生视图；Langfuse 丢失只影响外部 trace。Session 的已提交事务不受影响。\n\n---\n\n## 5. 最容易误读的几点\n\n1. **“Web adapter 是 composition root”不等于“它是核心 runtime”**。它确实是 Web 部署的组装点，但所有 durable 语义仍在 Session/Lane/Drive，所有 scope 语义仍在 `MemoryScope`/`SkillScope`，它只负责把服务端配置绑定上去。\n2. **memory 不是“每个 session 的记忆”**。memory 的归属是 repository；session 只是产生 L0 的来源。\n3. **skill 不是 memory 的替代品**。skill 复用 memory 的 L0 archive，写入自己的版本化 store，二者是派生链上的上下游。\n4. **repository_explore 不是 RAG/memory 写入器**。它只是只读工具，输出需要被 `read` 核实，最多作为轨迹证据进入 L0。\n5. **L3 是全局的**。它不是当前 repository 的记忆；recall 会带上它，UI 也应标注为全局 doctrine。\n6. **token 不是用户身份**。它只保护部署入口，不建立“用户 → repository scope”的映射。\n7. **SSE 不是历史权威**。事件是 best-effort；历史来自 durable snapshot 和查询 facade，断线补偿不靠回放事件。\n8. **Langfuse 不是 turn 的一部分**。它在 settlement 之后观察，丢 trace 不会让 turn 失败，也不会把外部内容带回 Session。\n\n如果要把这段内容落成 `specs/` 或 README 的一节，建议标题就叫“部署组装与隔离语义（Web adapter 不是核心 runtime）”，并把上面的派生链图和“Session / memory / skill / tool / observer”五行表保留下来——它们最能防止后续维护者把 Web 层误当成 runtime 本体。",
+        "tool_calls": [
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "read",
+            "is_error": true,
+            "outcome": "failed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          },
+          {
+            "name": "bash",
+            "is_error": false,
+            "outcome": "completed"
+          }
+        ],
+        "terminal_status": "completed",
+        "generation_count": 29,
+        "usage": {
+          "prompt_tokens": 1469610,
+          "completion_tokens": 17360,
+          "total_tokens": 1486970,
+          "prompt_cache_hit_tokens": 1164672,
+          "prompt_cache_miss_tokens": 304938
+        },
+        "unknown_effects": 0,
+        "duration_ms": 229264,
+        "error_code": null
+      },
+      "evaluations": [
+        {
+          "name": "terminal_success",
+          "value": 1.0,
+          "comment": null
+        },
+        {
+          "name": "tool_error_free",
+          "value": 0.0,
+          "comment": "failed: read"
+        },
+        {
+          "name": "answer_contract",
+          "value": 0.0,
+          "comment": "answer is not JSON"
+        },
+        {
+          "name": "tool_count",
+          "value": 38.0,
+          "comment": "38 call(s)"
+        },
+        {
+          "name": "latency",
+          "value": 229264.0,
+          "comment": "229264 ms"
+        },
+        {
+          "name": "token_cost",
+          "value": 4443550.0,
+          "comment": "4.44355e+06 token(s)"
+        }
+      ]
+    }
+  ],
+  "metrics": [
+    {
+      "name": "terminal_success_rate",
+      "value": 1.0,
+      "comment": "8 item(s)"
+    },
+    {
+      "name": "tool_error_free_rate",
+      "value": 0.75,
+      "comment": "8 item(s)"
+    },
+    {
+      "name": "answer_contract_rate",
+      "value": 0.5,
+      "comment": "8 item(s)"
+    },
+    {
+      "name": "tool_count_mean",
+      "value": 29.75,
+      "comment": "max 38"
+    },
+    {
+      "name": "latency_p95",
+      "value": 229264.0,
+      "comment": "8 item(s)"
+    },
+    {
+      "name": "token_cost_total",
+      "value": 17468651.0,
+      "comment": "8 item(s)"
+    }
+  ]
+}

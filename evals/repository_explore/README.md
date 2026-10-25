@@ -62,3 +62,42 @@ JSON, including concrete missing or wrong facts; do not reward verbosity.
 For calibration, manually grade at least 20% of outputs and compare the human
 ranking with the judge's pairwise ranking.  Preserve the task version and git
 SHA with every Langfuse run.
+
+## Bash-enabled paired experiment
+
+The standard `repository_snapshot` runner refuses `bash`, because it can
+modify a workspace. Use the separate isolated export runner for a bash run:
+
+```sh
+docker build -t prale-eval/repository-explore-bash:v1 \
+  -f evals/repository_explore/bash.Dockerfile .
+PRALE_API_KEY=... python scripts/run_repository_explore_bash.py \
+  --output-dir reports/repository-explore-bash
+python scripts/judge_repository_explore.py \
+  --baseline reports/repository-explore-bash/baseline.json \
+  --treatment reports/repository-explore-bash/treatment.json \
+  --output reports/repository-explore-bash/judge.json
+```
+
+The runner also accepts `--api-key-file PATH`. It exports the answer key's
+pinned commit into a fresh writable directory per case, then uses the same
+Harness, Drive, provider, tool schemas and scoring functions as eval_harness.
+It does not change the standard snapshot policy. Baseline receives
+`read,bash`; treatment receives `read,bash,repository_explore`. Both receive
+the same instruction to explore only the current repository using relative
+paths. No answer key is added to the workspace or prompt.
+
+Bash executes in a separate Docker container per case, with only that case's
+workspace mounted at `/workspace`, no host project/configuration mounts, no
+network, dropped capabilities, and a 60-second maximum per command. The image
+includes common search tools, Git and Python. Read and explorer access the
+same exported files through their existing workspace confinement. Reports
+record the image name and timeout. Containers are removed after each case.
+
+Both conditions use `deepseek-flash` by default and identical provider defaults
+(180-second request timeout). Cases are interleaved with shared concurrency
+four. Reports are saved after each completed case, record runtime and source
+commit identities, and use no Langfuse uploads. This is one run per condition,
+without statistical confidence estimates. Compare the isolated paired reports
+directly; older read-only reports have different tool and execution policies.
+Any unconfined diagnostic run must be kept separate from the scored results.
