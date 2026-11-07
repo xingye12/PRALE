@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Final
 
 from agent_harness.domain.entries import JsonValue
+from agent_harness.integrations.tool_risk import LocalToolRisk
 from agent_harness.runtime.tools import AgentTool, ToolExecutionResult
 
 MAX_OUTPUT_LINES: Final = 2_000
@@ -116,7 +117,7 @@ class FileMutationQueue:
 
 
 @dataclass(frozen=True, slots=True)
-class ReadTool:
+class ReadTool(LocalToolRisk):
     cwd: Path | str
     name: str = "read"
     description: str = (
@@ -198,7 +199,7 @@ class ReadTool:
 
 
 @dataclass(frozen=True, slots=True)
-class WriteTool:
+class WriteTool(LocalToolRisk):
     cwd: Path | str
     name: str = "write"
     description: str = (
@@ -233,7 +234,7 @@ class WriteTool:
 
 
 @dataclass(frozen=True, slots=True)
-class EditTool:
+class EditTool(LocalToolRisk):
     cwd: Path | str
     name: str = "edit"
     description: str = "Make one or more exact, unique, non-overlapping replacements in an existing file."
@@ -331,7 +332,7 @@ class EditTool:
 
 
 @dataclass(frozen=True, slots=True)
-class BashTool:
+class BashTool(LocalToolRisk):
     cwd: Path | str
     command_prefix: tuple[str, ...] = ()
     environment: Mapping[str, str] | None = None
@@ -352,6 +353,9 @@ class BashTool:
         timeout = arguments.get("timeout")
         if timeout is not None and (not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0):
             return _error("timeout must be a positive number of seconds")
+        if arguments["command"] == "pwd" and not self.command_prefix:
+            # The read-only fast path must not run shell startup files or BASH_ENV.
+            return ToolExecutionResult(content=str(Path(self.cwd).resolve()) + "\n")
         shell = shutil.which("bash") or shutil.which("sh")
         if shell is None:
             return _error("no supported shell was found (looked for bash and sh)")

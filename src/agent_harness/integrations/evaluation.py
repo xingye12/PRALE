@@ -24,6 +24,7 @@ from typing import Any, Final
 
 from agent_harness.api.harness import Harness
 from agent_harness.api.models import OperationResult
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.entries import JsonValue
 from agent_harness.integrations.local_tools import create_builtin_tools
 from agent_harness.runtime.generation import ChatProvider
@@ -314,6 +315,10 @@ class ConfinedTool:
     @property
     def replay_policy(self) -> str:
         return self.tool.replay_policy
+
+    def assess_risk(self, arguments: JsonValue) -> RiskAssessment:
+        assessor = getattr(self.tool, "assess_risk", None)
+        return assessor(arguments) if callable(assessor) else RiskAssessment("ask", "unclassified wrapped tool")
 
     async def execute(self, arguments: JsonValue) -> ToolExecutionResult:
         value = arguments.get(_PATH_ARGUMENT) if isinstance(arguments, Mapping) else None

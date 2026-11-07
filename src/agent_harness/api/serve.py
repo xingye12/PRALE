@@ -238,6 +238,7 @@ def build_application(settings: Settings) -> Deployment:
         tokens=settings.tokens,
         max_concurrent_drives=settings.max_concurrent_drives,
         context_management=settings.context_management,
+        approvals=settings.approvals,
         definitions=definitions,
         subagent_config=settings.subagent_config,
         workspace_manager=GitWorkspaceManager(settings.project_root),
@@ -260,6 +261,7 @@ def _repository_explorer(settings: Settings) -> RepositoryExplorerTool | None:
             cache_max_entries=settings.repository_cache_entries,
             cache_ttl_ms=settings.repository_cache_ttl_ms,
             max_concurrent_indexes=settings.repository_max_concurrent_indexes,
+            sensitive_paths=getattr(settings.approvals.evaluator, "sensitive_paths", ()),
         )
         return RepositoryExplorerTool(config, TreeSitterRepositoryIndexer(config))
     except (RepositoryIndexError, ValueError) as error:

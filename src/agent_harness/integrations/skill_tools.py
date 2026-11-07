@@ -5,6 +5,7 @@ from dataclasses import dataclass, field
 
 from agent_harness.domain.entries import JsonValue
 from agent_harness.domain.skill import SkillConfig, SkillLoadout, SkillScope
+from agent_harness.integrations.tool_risk import ScopedReadRisk
 from agent_harness.runtime.tools import AgentTool, ToolExecutionResult
 from agent_harness.skill.protocol import SkillStore
 
@@ -57,7 +58,7 @@ def _render(loadout: SkillLoadout) -> JsonValue:
 
 
 @dataclass(frozen=True, slots=True)
-class SkillLoadTool:
+class SkillLoadTool(ScopedReadRisk):
     workspace_reusable = True
     """Load an immutable, enabled Skill version from the deployment's scope."""
 

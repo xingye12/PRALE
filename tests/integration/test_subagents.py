@@ -3,6 +3,7 @@ import asyncio
 import pytest
 
 from agent_harness.api.harness import Harness
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.subagents import (
     SubagentBusy,
     SubagentConfig,
@@ -161,6 +162,9 @@ def test_parent_abort_cascades_and_stop_is_idempotent():
 
 
 class Echo:
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     name = "echo"
     description = "echo"
     input_schema = {"type": "object"}
@@ -463,6 +467,9 @@ def test_incomplete_notification_does_not_block_another_run():
 @pytest.mark.parametrize("role", ["explore", "plan"])
 def test_readonly_role_override_cannot_add_write_capabilities(role):
     class WriteTool:
+        def assess_risk(self, arguments):
+            return RiskAssessment("allow", "authorized test fixture")
+
         name = "write"
         description = "Write"
         input_schema = {}

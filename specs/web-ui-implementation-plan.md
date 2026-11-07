@@ -270,3 +270,12 @@ SQLite migration 只前进：为 operation/call usage、span 和查询索引加�
 **决策：** 部署以 `PRALE_GRACEFUL_SHUTDOWN_SECONDS`（默认 10，必须为正数）传给 Uvicorn 的 `timeout_graceful_shutdown`。到期后由 ASGI server 取消仍未结束的请求，再运行应用的 shutdown/lifespan 清理；显式 abort 的 durable 语义不变，关机中断的 in-flight operation 仍遵循既有 recovery 规则。
 
 **后果：** 退出时间有上限，SSE 客户端会断开并在下次连接时通过 durable 查询恢复显示。超过期限的 in-flight operation 可能需要 recover，不能把服务器关机误报为远端 effect 已取消或成功。
+
+## 工具执行审批（ADR-037）
+
+聊天界面增加持久审批卡片与会话授权面板。完整风险规则、API、恢复及测试契约见
+[危险工具检测与 Web 执行审批](tool-approval-implementation-plan.md)。浏览器不决定风险，也不提交
+待执行参数；仅按服务端请求 ID 提交三种决定。提交按钮去重并禁用，跨标签页依赖审批事件重读。
+SSE snapshot 的 pending_approvals 与查询接口支持刷新恢复；整个 Session 的审批事件对主 lane
+订阅可见，用于处理 Subagent 的请求。批准重启前的请求时由服务端接管旧 lease。
+凭据和 Origin 检查均在服务端执行；无浏览器连接不撤回请求，显式 abort 才取消。

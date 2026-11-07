@@ -1,6 +1,7 @@
 from collections.abc import Callable
 
 from agent_harness.api.errors import InvalidLane
+from agent_harness.domain.approvals import ApprovalConfig
 from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.session import Session
@@ -18,6 +19,7 @@ from agent_harness.domain.subagents import (
 )
 from agent_harness.domain.workspaces import WorkspaceManager
 from agent_harness.memory.runtime import MemoryRuntime
+from agent_harness.runtime.approvals import ApprovalRuntime
 from agent_harness.runtime.events import EventBus, EventListener
 from agent_harness.runtime.hooks import HookHandler, HookRegistry
 from agent_harness.runtime.lane import Lane
@@ -46,6 +48,7 @@ class Harness:
         trace_recorder: bool = False,
         telemetry: TelemetrySink | None = None,
         context_management: ContextManagementConfig = ContextManagementConfig(),
+        approvals: ApprovalConfig = ApprovalConfig(),
         definitions: tuple[SubagentDefinition, ...] = (),
         subagent_config: SubagentConfig = SubagentConfig(),
         provider_resolver: ProviderResolver | None = None,
@@ -60,6 +63,7 @@ class Harness:
         self._tools = tools
         self._retry = retry
         self._events = EventBus()
+        self.approvals = ApprovalRuntime(session, approvals, self._events)
         self._hooks = HookRegistry()
         self._lanes: dict[str, Lane] = {}
         self._memory_scope = memory_scope
@@ -107,6 +111,7 @@ class Harness:
         trace_recorder: bool = False,
         telemetry: TelemetrySink | None = None,
         context_management: ContextManagementConfig = ContextManagementConfig(),
+        approvals: ApprovalConfig = ApprovalConfig(),
         definitions: tuple[SubagentDefinition, ...] = (),
         subagent_config: SubagentConfig = SubagentConfig(),
         provider_resolver: ProviderResolver | None = None,
@@ -129,6 +134,7 @@ class Harness:
             trace_recorder=trace_recorder,
             telemetry=telemetry,
             context_management=context_management,
+            approvals=approvals,
             definitions=definitions,
             subagent_config=subagent_config,
             provider_resolver=provider_resolver,
@@ -159,6 +165,7 @@ class Harness:
             telemetry=self._telemetry,
             context_management=self._context_management,
         )
+        lane.approvals = self.approvals
         lane.subagents = self._subagents
         return lane
 

@@ -10,6 +10,7 @@ import asyncio
 import contextlib
 
 from agent_harness.api.harness import Harness
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.effects import EffectSpan
 from agent_harness.runtime.generation import AssistantResult, GenerationRequest, ToolCall
 from agent_harness.runtime.retry import RetryPolicy
@@ -42,6 +43,9 @@ class FlakyProvider:
 
 
 class EchoTool:
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     name = "echo"
     description = "Return the supplied value."
     input_schema = {"type": "object"}

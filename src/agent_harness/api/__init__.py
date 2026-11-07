@@ -29,9 +29,13 @@ from agent_harness.api.subagents import (
     SubagentWaitResult,
 )
 from agent_harness.api.tui import TuiController
+from agent_harness.domain.approvals import ApprovalConfig, ApprovalConflict, RiskAssessment
 from agent_harness.domain.memory import MemoryScope
 
 __all__ = [
+    "ApprovalConfig",
+    "ApprovalConflict",
+    "RiskAssessment",
     "AuthenticatedHarnessService",
     "AuthenticationError",
     "Harness",

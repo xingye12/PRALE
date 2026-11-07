@@ -50,6 +50,7 @@ from agent_harness.api.service import AuthenticationError, RemoteSubscription, S
 from agent_harness.api.settings import DEFAULT_MAX_CONCURRENT_DRIVES
 from agent_harness.api.skill import SkillQueryService
 from agent_harness.api.trace import TraceQueryService
+from agent_harness.domain.approvals import ApprovalConfig, ApprovalConflict
 from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.skill import SkillScope
@@ -236,6 +237,7 @@ class SessionSupervisor:
         max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
         telemetry: TelemetrySink | None = None,
         context_management: ContextManagementConfig = ContextManagementConfig(),
+        approvals: ApprovalConfig = ApprovalConfig(channel_available=True),
         definitions: tuple[SubagentDefinition, ...] = (),
         subagent_config: SubagentConfig = SubagentConfig(),
         provider_resolver: ProviderResolver | None = None,
@@ -253,6 +255,7 @@ class SessionSupervisor:
         self._max_drives = max_concurrent_drives
         self._telemetry = telemetry
         self._context_management = context_management
+        self._approvals = approvals
         self._definitions = definitions
         self._subagent_config = subagent_config
         self._provider_resolver = provider_resolver
@@ -495,6 +498,7 @@ class SessionSupervisor:
             trace_recorder=self._trace_recorder,
             telemetry=self._telemetry,
             context_management=self._context_management,
+            approvals=self._approvals,
             definitions=self._definitions,
             subagent_config=self._subagent_config,
             provider_resolver=self._provider_resolver,
@@ -503,12 +507,12 @@ class SessionSupervisor:
         )
         return _OpenSession(harness, storage)
 
-    def _start_drive(self, session_id: str, lane: str, selected: Lane) -> None:
+    def _start_drive(self, session_id: str, lane: str, selected: Lane, *, recover: bool = False) -> None:
         key = (session_id, lane)
         previous = self._drives.get(key)
         if previous is not None and previous.done():
             previous = None
-        task = asyncio.create_task(self._drive(selected, previous), name=f"drive:{session_id}:{lane}")
+        task = asyncio.create_task(self._drive(selected, previous, recover=recover), name=f"drive:{session_id}:{lane}")
         self._drives[key] = task
         task.add_done_callback(lambda finished: self._finish_drive(key, finished))
 
@@ -523,14 +527,17 @@ class SessionSupervisor:
             # records that the driver died, for the deployment's own health view.
             self._failures[key] = f"{type(error).__name__}: {error}"
 
-    async def _drive(self, selected: Lane, previous: asyncio.Task[None] | None) -> None:
+    async def _drive(self, selected: Lane, previous: asyncio.Task[None] | None, *, recover: bool = False) -> None:
         if previous is not None:
             # A turn admitted while the previous drive is still winding down must
             # not be left undriven.  ``wait`` observes it without re-raising its
             # outcome, and without swallowing our own cancellation into a drive
             # that is still running.
             await asyncio.wait({previous})
-        await selected.drive(self._provider)
+        if recover:
+            await selected.recover(self._provider)
+        else:
+            await selected.drive(self._provider)
 
 
 class WebApplication:
@@ -551,6 +558,7 @@ class WebApplication:
         max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
         telemetry: TelemetrySink | None = None,
         context_management: ContextManagementConfig = ContextManagementConfig(),
+        approvals: ApprovalConfig = ApprovalConfig(channel_available=True),
         definitions: tuple[SubagentDefinition, ...] = (),
         subagent_config: SubagentConfig = SubagentConfig(),
         provider_resolver: ProviderResolver | None = None,
@@ -593,6 +601,7 @@ class WebApplication:
             max_concurrent_drives=max_concurrent_drives,
             telemetry=telemetry,
             context_management=context_management,
+            approvals=approvals,
             definitions=definitions,
             subagent_config=subagent_config,
             provider_resolver=provider_resolver,
@@ -637,6 +646,18 @@ class WebApplication:
         prefix = "/api"
         routes = [
             Route(f"{prefix}/health", self.health),
+            Route(f"{prefix}/sessions/{{session_id}}/approvals", self.list_approvals),
+            Route(
+                f"{prefix}/sessions/{{session_id}}/approvals/{{approval_id}}/decision",
+                self.decide_approval,
+                methods=["POST"],
+            ),
+            Route(f"{prefix}/sessions/{{session_id}}/approval-grants", self.list_approval_grants),
+            Route(
+                f"{prefix}/sessions/{{session_id}}/approval-grants/{{grant_id}}/revoke",
+                self.revoke_approval_grant,
+                methods=["POST"],
+            ),
             Route(f"{prefix}/project", self.get_project),
             Route(f"{prefix}/sessions", self.list_sessions),
             Route(f"{prefix}/sessions", self.create_session, methods=["POST"]),
@@ -678,6 +699,7 @@ class WebApplication:
                 HarnessError: _bad_request,
                 ServiceUnavailable: _service_unavailable,
                 Conflict: _conflict,
+                ApprovalConflict: _conflict,
                 ValueError: _bad_request,
             },
         )
@@ -744,6 +766,35 @@ class WebApplication:
     async def get_turn(self, request: Request) -> JSONResponse:
         detail = await self.trace.get_turn(request.path_params["session_id"], request.path_params["operation_id"])
         return JSONResponse(_jsonable(detail))
+
+    async def list_approvals(self, request: Request) -> JSONResponse:
+        harness = await self.supervisor.harness(request.path_params["session_id"])
+        records = await harness.approvals.records()
+        return JSONResponse({"items": [r for r in records if r["status"] == "pending"]})
+
+    async def list_approval_grants(self, request: Request) -> JSONResponse:
+        harness = await self.supervisor.harness(request.path_params["session_id"])
+        return JSONResponse({"items": await harness.approvals.records(grants=True)})
+
+    async def decide_approval(self, request: Request) -> JSONResponse:
+        _approval_origin(request)
+        body = await _json_body(request)
+        if set(body) != {"decision"} or body["decision"] not in ("allow_once", "allow_session", "reject"):
+            raise ValueError("only a valid decision is accepted")
+        harness = await self.supervisor.harness(request.path_params["session_id"])
+        result = await harness.approvals.decide(request.path_params["approval_id"], body["decision"])
+        # A reopened server may have no local Drive for this durable request.
+        if not result["lane"].startswith("__"):
+            selected = await self.supervisor.lane(request.path_params["session_id"], result["lane"])
+            task = self.supervisor.drive_task(request.path_params["session_id"], result["lane"])
+            if task is None or task.done():
+                self.supervisor._start_drive(request.path_params["session_id"], result["lane"], selected, recover=True)
+        return JSONResponse(result)
+
+    async def revoke_approval_grant(self, request: Request) -> JSONResponse:
+        _approval_origin(request)
+        harness = await self.supervisor.harness(request.path_params["session_id"])
+        return JSONResponse(await harness.approvals.revoke(request.path_params["grant_id"]))
 
     async def submit_turn(self, request: Request) -> JSONResponse:
         body = await _json_body(request)
@@ -901,6 +952,13 @@ async def _event_stream(
         subscription.close()
 
 
+def _approval_origin(request: Request) -> None:
+    origin = request.headers.get("origin")
+    expected = f"{request.url.scheme}://{request.url.netloc}"
+    if (origin is not None and origin != expected) or request.headers.get("sec-fetch-site") == "cross-site":
+        raise ApprovalConflict("cross-origin approval mutation is forbidden")
+
+
 async def _json_body(request: Request) -> dict[str, object]:
     try:
         body = await request.json()
@@ -950,6 +1008,7 @@ def create_app(
     max_concurrent_drives: int = DEFAULT_MAX_CONCURRENT_DRIVES,
     telemetry: TelemetrySink | None = None,
     context_management: ContextManagementConfig = ContextManagementConfig(),
+    approvals: ApprovalConfig = ApprovalConfig(channel_available=True),
     definitions: tuple[SubagentDefinition, ...] = (),
     subagent_config: SubagentConfig = SubagentConfig(),
     provider_resolver: ProviderResolver | None = None,
@@ -976,6 +1035,7 @@ def create_app(
         max_concurrent_drives=max_concurrent_drives,
         telemetry=telemetry,
         context_management=context_management,
+        approvals=approvals,
         definitions=definitions,
         subagent_config=subagent_config,
         provider_resolver=provider_resolver,

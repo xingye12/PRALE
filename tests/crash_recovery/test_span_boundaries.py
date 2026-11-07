@@ -11,6 +11,7 @@ from collections.abc import Callable, Sequence
 import pytest
 
 from agent_harness.api.harness import Harness
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.effects import EffectSpan, UsageRecord
 from agent_harness.domain.entries import Entry
 from agent_harness.domain.values import ListAddress, ValueAddress
@@ -125,6 +126,9 @@ def test_a_generation_lost_after_its_intent_stays_pending_until_recovery() -> No
 
 
 class EchoTool:
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     name = "echo"
     description = "Return the supplied value."
     input_schema = {"type": "object"}
@@ -139,6 +143,9 @@ class EchoTool:
 
 
 class UnsafeEchoTool(EchoTool):
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     replay_policy = "never"
 
 

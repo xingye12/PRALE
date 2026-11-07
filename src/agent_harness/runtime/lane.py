@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 from agent_harness.api.errors import LaneBusy, NothingToCompact, OperationAlreadyExists
 from agent_harness.api.models import AbortResult, LaneSnapshot, OperationAdmission, OperationResult
+from agent_harness.domain.approvals import ApprovalConfig
 from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.entries import NewEntry
 from agent_harness.domain.operations import ActiveOperation, OperationMeta, OperationState
@@ -25,6 +26,7 @@ from agent_harness.domain.values import (
     operation_state,
     session_lanes,
 )
+from agent_harness.runtime.approvals import ApprovalRuntime
 from agent_harness.runtime.events import EventBus, EventListener, HarnessEvent
 from agent_harness.runtime.hooks import HookRegistry
 from agent_harness.runtime.retry import RetryPolicy
@@ -101,6 +103,7 @@ class Lane:
         self._retry = retry
         self._events = events or EventBus()
         self._hooks = hooks or HookRegistry()
+        self.approvals = ApprovalRuntime(session, ApprovalConfig(), self._events)
         self._drive_task: asyncio.Task[object] | None = None
         self._memory_scope = memory_scope
         self._memory_runtime = memory_runtime
@@ -137,6 +140,7 @@ class Lane:
             tip_id=await self._session.get_value(lane_tip(self.name)),
             operation_id=state["current_operation_id"],
             last_operation_id=state["last_operation_id"],
+            pending_approvals=tuple(r for r in await self.approvals.records() if r["status"] == "pending"),
         )
 
     async def prompt(self, prompt: str, operation_id: str | None = None) -> OperationAdmission:
@@ -183,6 +187,7 @@ class Lane:
             await mutator.commit(
                 [
                     *cascade,
+                    *await self.approvals.cancellation_writes(mutator, operation_id),
                     *self.trace_writes(operation_id, "cancel_requested", {"state": current.at}),
                     SetValue(
                         operation_state(operation_id),
@@ -193,6 +198,7 @@ class Lane:
             return AbortResult(operation_id, newly_requested=True)
 
         result = await self._session.mutate(abort)
+        self.approvals.changed.set()
         task = self._drive_task
         current = asyncio.current_task()
         if result.newly_requested and task is not None and task is not current and not task.done():
@@ -247,9 +253,18 @@ class Lane:
                 return None
             lease_id = self._id_factory()
             await self._claim_drive(active.meta.operation_id, lease_id, replace=True)
+            task = asyncio.current_task()
+            self._drive_task = task
             try:
                 return await Drive(self, provider).recover()
+            except asyncio.CancelledError:
+                current = await self.active_operation()
+                if current is not None and current.state.control == "cancel_requested":
+                    return await Drive(self, None).recover()
+                raise
             finally:
+                if self._drive_task is task:
+                    self._drive_task = None
                 await self._release_drive(active.meta.operation_id, lease_id)
 
     async def resume(self, provider: "ChatProvider") -> OperationResult:
@@ -420,7 +435,7 @@ class Lane:
         snapshot = await self.snapshot()
 
         async def filtered(event: HarnessEvent) -> None:
-            if event.lane == self.name:
+            if event.lane == self.name or event.type.startswith("approval_"):
                 result = listener(event)
                 if hasattr(result, "__await__"):
                     await result

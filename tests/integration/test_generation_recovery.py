@@ -2,6 +2,7 @@ import asyncio
 import contextlib
 
 from agent_harness.api.harness import Harness
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.values import operation_context_reductions, operation_state
 from agent_harness.runtime.generation import AssistantResult, GenerationDelta, GenerationRequest, ToolCall
@@ -72,6 +73,9 @@ class FlakyProvider:
 
 
 class EchoTool:
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     name = "echo"
     description = "Return the supplied value."
     input_schema = {"type": "object"}
@@ -128,6 +132,9 @@ class ParallelToolProvider:
 
 
 class RecordingTool:
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     description = "records its invocation"
     input_schema = {"type": "object"}
     replay_policy = "safe"

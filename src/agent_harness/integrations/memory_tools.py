@@ -4,6 +4,7 @@ from dataclasses import dataclass, field
 
 from agent_harness.domain.entries import JsonValue
 from agent_harness.domain.memory import MemoryScope, RecallBudget, RecallBundle, RecallQuery
+from agent_harness.integrations.tool_risk import ScopedReadRisk
 from agent_harness.memory.protocol import MemoryStore
 from agent_harness.runtime.tools import AgentTool, ToolExecutionResult
 
@@ -39,7 +40,7 @@ def _items(bundle: RecallBundle) -> list[JsonValue]:
 
 
 @dataclass(frozen=True, slots=True)
-class MemorySearchTool:
+class MemorySearchTool(ScopedReadRisk):
     workspace_reusable = True
     store: MemoryStore
     scope: MemoryScope
@@ -79,7 +80,7 @@ class MemorySearchTool:
 
 
 @dataclass(frozen=True, slots=True)
-class ConversationSearchTool:
+class ConversationSearchTool(ScopedReadRisk):
     workspace_reusable = True
     store: MemoryStore
     scope: MemoryScope
@@ -107,7 +108,7 @@ class ConversationSearchTool:
 
 
 @dataclass(frozen=True, slots=True)
-class MemoryReadSceneTool:
+class MemoryReadSceneTool(ScopedReadRisk):
     workspace_reusable = True
     store: MemoryStore
     scope: MemoryScope

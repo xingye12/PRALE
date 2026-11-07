@@ -27,6 +27,7 @@ class LaneSnapshot:
     tip_id: str | None
     operation_id: str | None
     last_operation_id: str | None
+    pending_approvals: tuple[dict[str, object], ...] = ()
 
 
 @dataclass(frozen=True, slots=True)

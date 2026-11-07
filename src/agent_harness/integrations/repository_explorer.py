@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Any, Final, Literal, Protocol
 
 from agent_harness.domain.entries import JsonValue
+from agent_harness.integrations.tool_risk import ScopedReadRisk, assess_tool
 from agent_harness.runtime.tools import ToolExecutionResult
 
 TagRole = Literal["definition", "reference"]
@@ -127,6 +128,7 @@ class RepositoryExplorerConfig:
     cache_max_entries: int = 20_000
     cache_ttl_ms: int = 7 * 24 * 60 * 60 * 1_000
     max_concurrent_indexes: int = 2
+    sensitive_paths: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
         root = Path(self.workspace_root).resolve(strict=True)
@@ -328,6 +330,8 @@ class TreeSitterRepositoryIndexer:
             if cached is not None:
                 indexed.append(cached)
                 continue
+            if not _read_allowed(self._config, path):
+                continue
             raw = path.read_bytes()
             if b"\0" in raw[:8192]:
                 indexed_file = IndexedFile(relative, hashlib.sha256(raw).hexdigest(), (), False)
@@ -358,6 +362,8 @@ class TreeSitterRepositoryIndexer:
                         stack.append(resolved)
                     continue
                 if not resolved.is_file() or stat.st_size > self._config.limits.max_file_bytes:
+                    continue
+                if not _read_allowed(self._config, resolved):
                     continue
                 if not include_tests and _is_test_path(relative):
                     continue
@@ -481,7 +487,7 @@ class _Candidate:
 
 
 @dataclass(frozen=True, slots=True)
-class RepositoryExplorerTool:
+class RepositoryExplorerTool(ScopedReadRisk):
     """A safe AgentTool that renders a bounded, current repository map."""
 
     config: RepositoryExplorerConfig
@@ -554,6 +560,7 @@ class RepositoryExplorerTool:
         revision = _revision(self.config.workspace_root)
         prefix = [
             f"# Repository exploration ({revision})",
+            "Credential paths are excluded from internal file reads.",
             "Navigation only: use read on selected paths to confirm the current checkout before editing or concluding.",
         ]
         if missing:
@@ -631,6 +638,8 @@ class RepositoryExplorerTool:
         target = _safe_path(self.config.workspace_root, candidate.relative_path)
         if target is None:
             raise WorkspaceChangedDuringRender("workspace_changed_during_render")
+        if not _read_allowed(self.config, target):
+            return None
         first = target.read_bytes()
         first_hash = hashlib.sha256(first).hexdigest()
         first_stat = target.stat()
@@ -1064,14 +1073,29 @@ def _bounded_error(message: str) -> ToolExecutionResult:
     return ToolExecutionResult(content=content, is_error=True, details={"truncated": False, "token_estimate": True})
 
 
+def _read_allowed(config: RepositoryExplorerConfig, path: Path) -> bool:
+    if assess_tool("read", {"path": str(path)}, str(config.workspace_root)).decision != "allow":
+        return False
+    relative = path.resolve().relative_to(config.workspace_root)
+    return not any(relative.match(pattern) or path.match(pattern) for pattern in config.sensitive_paths)
+
+
 def _revision(root: Path) -> str:
     # Do not shell out: a git revision is optional human context, while hashes
     # attached to rendered source are the actual output freshness guarantee.
     head = root / ".git" / "HEAD"
     try:
+        if assess_tool("read", {"path": str(head)}, str(root)).decision != "allow":
+            return "worktree"
         value = head.read_text(encoding="utf-8").strip()
         if value.startswith("ref: "):
-            value = (root / ".git" / value[5:]).read_text(encoding="utf-8").strip()
+            reference = value[5:]
+            if not re.fullmatch(r"refs/(?:heads|remotes|tags)/[A-Za-z0-9_./-]+", reference):
+                return "worktree"
+            ref_path = root / ".git" / reference
+            if not ref_path.resolve().is_relative_to((root / ".git").resolve()):
+                return "worktree"
+            value = ref_path.read_text(encoding="utf-8").strip()
         return value[:12] if re.fullmatch(r"[0-9a-fA-F]{7,64}", value) else "worktree"
     except OSError:
         return "worktree"

@@ -19,10 +19,12 @@ from pathlib import Path
 
 from agent_harness.api.errors import ProjectConfigError
 from agent_harness.api.project import ProjectRuntimeConfig
+from agent_harness.domain.approvals import ApprovalConfig
 from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.subagents import CONTROL_NAMES, SubagentConfig
 from agent_harness.integrations.langfuse import LangfuseConfig
 from agent_harness.integrations.repository_explorer import RepositoryScanLimits
+from agent_harness.integrations.tool_risk import ConfiguredRiskEvaluator
 
 DEFAULT_HOST = "127.0.0.1"
 """Loopback by default: a deployment that should be reachable says so."""
@@ -126,6 +128,7 @@ class Settings:
     log_level: str
     subagent_config: SubagentConfig = SubagentConfig()
     subagent_dirs: tuple[Path, ...] = ()
+    approvals: ApprovalConfig = ApprovalConfig(channel_available=True)
 
     @property
     def config(self) -> ProjectRuntimeConfig:
@@ -180,6 +183,7 @@ class Settings:
                 f"traces            {'on' if self.traces else 'off'}",
                 f"memory_prompt     {prompt}",
                 f"max_drives        {self.max_concurrent_drives}",
+                f"approval_policy   {self.approvals.policy}",
                 f"subagents         {'on' if self.subagent_config.enabled else 'off'}",
                 f"subagent_limits   running={self.subagent_config.max_running} "
                 f"nonterminal={self.subagent_config.max_nonterminal}",
@@ -320,7 +324,17 @@ class Settings:
         repository_export_tokens = _int(environ, "PRALE_REPOSITORY_MAX_EXPORT_TOKENS", 6_000)
         if not 256 <= repository_export_tokens <= 6_000:
             raise ProjectConfigError("PRALE_REPOSITORY_MAX_EXPORT_TOKENS must be between 256 and 6000")
+        policy = environ.get("PRALE_APPROVAL_POLICY", "ask").strip()
+        if policy not in ("ask", "never"):
+            raise ProjectConfigError("PRALE_APPROVAL_POLICY must be ask or never")
+        evaluator = ConfiguredRiskEvaluator(
+            tuple(p.strip() for p in environ.get("PRALE_APPROVAL_SENSITIVE_PATHS", "").split(",") if p.strip()),
+            tuple(p.strip() for p in environ.get("PRALE_APPROVAL_PROTECTED_PATHS", "").split(",") if p.strip()),
+        )
         return cls(
+            approvals=ApprovalConfig(
+                policy="never" if policy == "never" else "ask", channel_available=True, evaluator=evaluator
+            ),
             subagent_config=subagent_config,
             subagent_dirs=subagent_dirs,
             project_root=root,

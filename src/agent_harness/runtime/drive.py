@@ -7,6 +7,7 @@ from dataclasses import replace
 from typing import Literal, cast
 
 from agent_harness.api.errors import ContextBudgetExceeded, ProviderNotConfigured, UnknownTarget
+from agent_harness.domain.approvals import ApprovalConflict
 from agent_harness.domain.compaction import select_compaction_window
 from agent_harness.domain.context import project_messages
 from agent_harness.domain.context_management import (
@@ -344,7 +345,10 @@ class Drive:
                 case "assistant.retry_wait":
                     await self._wait_for_retry(operation)
                 case "tools":
-                    result = await self._run_next_tool(operation)
+                    try:
+                        result = await self._run_next_tool(operation)
+                    except ApprovalConflict:
+                        continue  # Re-evaluate after a concurrent revoke or policy/path change.
                     if result is not None:
                         return result
                 case "terminal":
@@ -689,6 +693,14 @@ class Drive:
             if current != operation.state:
                 raise RuntimeError("operation state changed while Drive was running")
             writes = [*extra]
+            if next_state.at == "tools" and isinstance(next_state.data, dict):
+                previous = {c["tool_call_id"]: c for c in operation.state.data["calls"]}
+                for call in next_state.data["calls"]:
+                    if (
+                        call.get("status") == "effect_pending"
+                        and previous[call["tool_call_id"]].get("status") != "effect_pending"
+                    ):
+                        writes.extend(await self._lane.approvals.intent_writes(mutator, call, self._lane))
             if trace:
                 writes.extend(
                     self._lane.trace_writes(
@@ -1388,6 +1400,37 @@ class Drive:
             )
         return result
 
+    async def _authorize_tool(
+        self, operation: ActiveOperation, planned: dict
+    ) -> tuple[ActiveOperation, dict, dict, bool]:
+        event = planned.get("prepared_event")
+        if not isinstance(event, dict):
+            event = await self._lane.hooks.run(
+                "before_tool",
+                {
+                    "tool_call_id": planned["tool_call_id"],
+                    "tool_name": planned["tool_name"],
+                    "arguments": planned["arguments"],
+                    "lane": self._lane.name,
+                    "operation_id": operation.meta.operation_id,
+                    **self._lane.subagent_context,
+                },
+                block_on_error=True,
+            )
+            if not isinstance(event, dict):
+                raise RuntimeError("before_tool must return a tool request object")
+        request = await self._lane.approvals.prepare(self._lane, operation, planned, event)
+        latest = await self._required_operation()
+        if latest.state.control != "running":
+            raise asyncio.CancelledError
+        active = next(c for c in latest.state.data["calls"] if c["tool_call_id"] == planned["tool_call_id"])
+        return (
+            latest,
+            active,
+            {**event, "approval_outcome": request["status"], "approval_reason": request["reason"]},
+            request["status"] == "allowed",
+        )
+
     async def _run_next_tool(self, operation: ActiveOperation) -> OperationResult | None:
         data = operation.state.data
         if not isinstance(data, dict) or not isinstance(data.get("calls"), list):
@@ -1451,29 +1494,40 @@ class Drive:
         if planned is None:
             await self._transition(operation, OperationState("checkpoint", "running", {}))
             return
+        if (
+            planned.get("parallel")
+            and self._lane.approvals.assess(self._lane, planned).decision == "allow"
+            and not is_control_tool(self._lane.tools.get(planned["tool_name"]))
+        ):
+            await self._run_parallel_tools(operation, calls)
+            return
+        operation, planned, tool_event, allowed = await self._authorize_tool(operation, planned)
+        if not allowed:
+            missing = self._lane.tools.get(planned["tool_name"]) is None
+            await self._settle_tool(
+                operation,
+                planned,
+                {
+                    "content": (
+                        f"tool execution permission {tool_event['approval_outcome']}: {tool_event['approval_reason']}"
+                    ),
+                    "is_error": True,
+                    "error_code": "capability_unavailable"
+                    if missing and self._lane.subagent_run_id
+                    else "hook_blocked"
+                    if tool_event.get("block")
+                    else "approval_unavailable"
+                    if tool_event["approval_outcome"] == "unavailable"
+                    else "approval_denied",
+                    "terminate": bool(tool_event.get("block")) or bool(missing and self._lane.subagent_run_id),
+                },
+                outcome="aborted",
+            )
+            return
         control_tool = self._lane.tools.get(planned["tool_name"])
         if is_control_tool(control_tool):
             await self._start_control(operation, planned)
             return
-        if planned.get("parallel"):
-            await self._run_parallel_tools(operation, calls)
-            return
-        tool_event = await self._lane.hooks.run(
-            "before_tool",
-            {
-                "tool_call_id": planned["tool_call_id"],
-                "tool_name": planned["tool_name"],
-                "arguments": planned["arguments"],
-                "lane": self._lane.name,
-                "operation_id": operation.meta.operation_id,
-                **self._lane.subagent_context,
-            },
-            block_on_error=True,
-        )
-        if not isinstance(tool_event, dict):
-            raise RuntimeError("before_tool must return a tool request object")
-        if "arguments" in tool_event:
-            planned = {**planned, "arguments": tool_event["arguments"]}
         attempt = planned.get("attempt", 0) + 1 if isinstance(planned.get("attempt"), int) else 1
         span, span_write = self._open_span(operation, planned["tool_call_id"], "tool", attempt)
         await self._transition_tool(
@@ -1544,27 +1598,14 @@ class Drive:
         )
 
     async def _start_control(self, operation: ActiveOperation, planned: dict) -> None:
-        event = await self._lane.hooks.run(
-            "before_tool",
-            {
-                "tool_call_id": planned["tool_call_id"],
-                "tool_name": planned["tool_name"],
-                "arguments": planned["arguments"],
-                "lane": self._lane.name,
-                "operation_id": operation.meta.operation_id,
-                **self._lane.subagent_context,
-            },
-            block_on_error=True,
-        )
-        if not isinstance(event, dict):
-            raise RuntimeError("before_tool must return a tool request object")
+        event = planned["prepared_event"]
         span, span_write = self._open_span(operation, planned["tool_call_id"], "tool", 1)
         runtime = self._lane.subagents
 
         async def prepare(mutator: SessionMutator) -> dict:
             if await mutator.get_value(operation_state(operation.meta.operation_id)) != operation.state:
                 raise RuntimeError("control intent changed during preparation")
-            extra: list[Write] = []
+            extra: list[Write] = await self._lane.approvals.intent_writes(mutator, planned, self._lane)
             arguments = event.get("arguments", planned["arguments"])
             if event.get("block"):
                 control = {
@@ -1578,9 +1619,10 @@ class Drive:
                         raise RuntimeError("subagent dispatcher is not configured")
                     if not isinstance(arguments, dict):
                         raise ValueError("control arguments must be an object")
-                    control, extra = await runtime.prepare_control(
+                    control, control_writes = await runtime.prepare_control(
                         mutator, self._lane, operation, planned["tool_name"], arguments, planned["tool_call_id"]
                     )
+                    extra.extend(control_writes)
                 except (SubagentError, ValueError, TypeError) as error:
                     control = {
                         "format_version": 1,
@@ -1658,28 +1700,35 @@ class Drive:
         for call in calls:
             if not isinstance(call, dict) or call.get("status") != "planned":
                 continue
-            if not call.get("parallel") or is_control_tool(self._lane.tools.get(call["tool_name"])):
+            if (
+                not call.get("parallel")
+                or is_control_tool(self._lane.tools.get(call["tool_name"]))
+                or self._lane.approvals.assess(self._lane, call).decision != "allow"
+            ):
                 break
             batch.append(call)
         if not batch:
             return
         prepared: list[tuple[dict, dict]] = []
         for call in batch:
-            event = await self._lane.hooks.run(
-                "before_tool",
-                {
-                    "tool_call_id": call["tool_call_id"],
-                    "tool_name": call["tool_name"],
-                    "arguments": call["arguments"],
-                    "lane": self._lane.name,
-                    "operation_id": operation.meta.operation_id,
-                    **self._lane.subagent_context,
-                },
-                block_on_error=True,
-            )
-            if not isinstance(event, dict):
-                raise RuntimeError("before_tool must return a tool request object")
-            prepared.append(({**call, "arguments": event.get("arguments", call["arguments"])}, event))
+            operation, active, event, allowed = await self._authorize_tool(operation, call)
+            if not allowed:
+                if not prepared:
+                    await self._settle_tool(
+                        operation,
+                        active,
+                        {
+                            "content": "tool execution permission denied",
+                            "is_error": True,
+                            "error_code": "hook_blocked" if event.get("block") else "approval_denied",
+                            "terminate": bool(event.get("block")),
+                        },
+                        outcome="aborted",
+                    )
+                break
+            prepared.append((active, event))
+        if not prepared:
+            return
         targets: list[dict] = []
         span_writes: list[Write] = []
         for call, _ in prepared:
@@ -1962,7 +2011,7 @@ class Drive:
             if tip_id is not None and not isinstance(tip_id, str):
                 raise RuntimeError("invalid lane tip")
             branch_tip_id = tip_id
-            writes: list[Write] = []
+            writes: list[Write] = await self._lane.approvals.cancellation_writes(mutator, operation.meta.operation_id)
             terminal_ids: list[str] = []
             unknown_effect = False
             if operation.state.at == "tools" and isinstance(operation.state.data, dict):

@@ -466,3 +466,11 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 **后果：** 输出独立 visible-content-scores.json，不覆盖旧 syscall 指标，不调用 provider；不改变 runtime 或恢复协议。
 
 ADR-036 口径修订：按用户明确要求，仅 bash 与成功 read 的实际返回内容进入重算集合，repository_explore、edit、write 均不计入。不得复用包含 explorer 的 content_files 投影；read 必须从原始调用事件重新归属。历史混合口径报告以 including-explorer 后缀保留。
+
+### ADR-037：可恢复的工具风险门禁与精确会话授权
+
+**背景：** 工具 replay_policy 只说明恢复重放能力，不能表达执行权限。Web 用户需要在危险调用发生前审核实际参数，且等待状态必须跨进程保留。
+
+**决策：** 风险评估与审批通过 domain 协议连接。工具在 before_tool 后冻结参数与评估，审批请求、索引、审计和完整 tools state 同事务提交；等待不创建 effect span。单次批准绑定请求，会话批准绑定工具、完整参数、实际目录、路径目标、策略/能力版本和独立 lane 主体。执行 intent 与授权消费、撤销检查原子提交。未知工具默认 ask；无审批通道或 never 策略拒绝执行。Web 通道在无浏览器连接时保留等待。审批不改变 safe/never 重放语义；取消撤回未使用请求，服务停止保留请求。旧已存在的 effect intent 继续既有恢复路径，未执行调用须经过新门禁。JSON 记录使用 format_version=1，存于既有 values/lists，不变更 SQLite 表结构。
+
+**后果：** library 默认无应答通道，危险调用以 unavailable 工具错误结束；交互部署显式注册通道。内置文件工具在 integrations 解析实际路径，普通仓库写入放行，凭据、外部路径和执行配置修改审批；shell 仅精确 pwd 放行。审批是执行授权而非 OS 沙箱。并行调用也必须经过统一门禁，危险调用形成源序屏障。Web 查询与 SSE 是投影，不能作为恢复权威。接口和验收见 [工具审批实施方案](tool-approval-implementation-plan.md)。

@@ -22,6 +22,7 @@ pytest.importorskip("langfuse")
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter  # noqa: E402
 
 from agent_harness.api.harness import Harness  # noqa: E402
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.integrations.langfuse import LangfuseConfig, LangfuseTelemetry  # noqa: E402
 from agent_harness.runtime.generation import AssistantResult, GenerationRequest, ToolCall  # noqa: E402
 from agent_harness.runtime.tools import ToolExecutionResult  # noqa: E402
@@ -61,6 +62,9 @@ class ScriptedProvider:
 
 
 class ReadTool:
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     """A stand-in for the repository reader: the trace shape is what matters."""
 
     name = "read"

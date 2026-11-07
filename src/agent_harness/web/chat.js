@@ -12,6 +12,9 @@ const TURN_LIMIT = 20;
 export function createChatView(app) {
   const element = h("div");
   let turns = [];
+  let approvals = [];
+  let grants = [];
+  const submitting = new Set();
   let details = new Map();
   let nextCursor = null;
   let busy = false;
@@ -187,7 +190,7 @@ export function createChatView(app) {
         }
       },
     });
-    const live = [...app.live.keys()];
+    const hasActive = turns.some((turn) => turn.status === null);
     return h(
       "div",
       { class: "composer" },
@@ -202,7 +205,7 @@ export function createChatView(app) {
           class: "ghost",
           text: "中止当前 operation",
           title: "只有显式 abort 会取消工作；关闭页面只会结束事件订阅",
-          disabled: !scope || !live.length,
+          disabled: !scope || !hasActive,
           onClick: () => abort(),
         }),
         h("button", {
@@ -270,10 +273,57 @@ export function createChatView(app) {
     }
   }
 
+  async function decide(request, decision) {
+    const scope = app.scope();
+    if (!scope || submitting.has(request.approval_id)) return;
+    submitting.add(request.approval_id);
+    render();
+    try {
+      await app.api.request(`/sessions/${encodeURIComponent(scope.session)}/approvals/${encodeURIComponent(request.approval_id)}/decision`, {
+        method: "POST", body: { decision },
+      });
+      await load({ reset: true });
+    } catch (failure) {
+      app.report(failure);
+      await load({ reset: true });
+    } finally {
+      submitting.delete(request.approval_id);
+      render();
+    }
+  }
+
+  function approvalPanel() {
+    const nodes = approvals.map((request) => card([
+      badge("等待执行权限", "warn"),
+      h("p", { text: `${request.tool_name} · ${request.lane} · ${request.operation_id}` }),
+      h("p", { text: request.reason }),
+      h("p", { class: "mono", text: `工作目录：${request.cwd || "未声明"}` }),
+      h("details", {}, h("summary", { text: "完整执行参数与来源" }),
+        h("pre", { class: "block", text: JSON.stringify({ arguments: request.arguments, target: request.target, source: request.source }, null, 2) })),
+      h("p", { class: "meta", text: "会话授权仅复用相同工具、完整参数、工作目录、路径目标及策略版本；仅适用于此 lane，可随时撤销。" }),
+      ...[["allow_once", "允许本次"], ["allow_session", "允许本会话相同操作"], ["reject", "拒绝"]].map(([decision, label]) =>
+        h("button", { type: "button", text: label, disabled: submitting.has(request.approval_id), onClick: () => decide(request, decision) })),
+    ]));
+    const active = grants.filter((grant) => !grant.revoked);
+    if (active.length) nodes.push(h("details", {}, h("summary", { text: `会话授权（${active.length}）` }), ...active.map((grant) => h("div", {},
+      h("pre", { class: "block", text: JSON.stringify({ tool: grant.tool_name, arguments: grant.arguments, cwd: grant.cwd, subject: grant.subject }, null, 2) }),
+      h("button", { type: "button", text: "撤销授权", onClick: async () => {
+        try {
+          const scope = app.scope();
+          await app.api.request(`/sessions/${encodeURIComponent(scope.session)}/approval-grants/${encodeURIComponent(grant.grant_id)}/revoke`, { method: "POST" });
+          await load({ reset: true });
+        } catch (failure) { app.report(failure); }
+      } }),
+    ))));
+    return nodes;
+  }
+
   async function load({ reset = false } = {}) {
     const target = app.scope();
     if (!target) {
       turns = [];
+      approvals = [];
+      grants = [];
       details = new Map();
       error = null;
       render();
@@ -281,6 +331,12 @@ export function createChatView(app) {
     }
     const limit = reset ? TURN_LIMIT : turns.length + TURN_LIMIT;
     try {
+      const [pending, remembered] = await Promise.all([
+        app.api.request(`/sessions/${encodeURIComponent(target.session)}/approvals`),
+        app.api.request(`/sessions/${encodeURIComponent(target.session)}/approval-grants`),
+      ]);
+      approvals = pending.items;
+      grants = remembered.items;
       const page = await app.api.request(`/sessions/${encodeURIComponent(target.session)}/turns`, {
         query: { lane: target.lane, limit },
       });
@@ -330,6 +386,7 @@ export function createChatView(app) {
     if (!turns.length && !error) {
       append(element, empty("该 lane 还没有 turn", "提交第一条 prompt，它的 durable 记录会出现在这里。"));
     }
+    append(element, approvalPanel());
     const list = h("div");
     for (const turn of [...turns].reverse()) list.append(renderTurn(turn));
     append(element, list);

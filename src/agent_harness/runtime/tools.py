@@ -2,6 +2,10 @@ import asyncio
 from dataclasses import dataclass
 from typing import Protocol, cast
 
+from jsonschema import Draft202012Validator, SchemaError
+from referencing import Registry
+from referencing.exceptions import Unresolvable
+
 from agent_harness.domain.entries import JsonValue
 from agent_harness.runtime.generation import ToolDefinition
 
@@ -78,3 +82,18 @@ class ToolRegistry:
                 return ToolExecutionResult(content=f"tool failed: {error}", is_error=True)
 
         return tuple(await asyncio.gather(*(execute(name, arguments) for name, arguments in calls)))
+
+
+def invalid_tool_arguments(tool: object, arguments: JsonValue) -> str | None:
+    """Validate final hook arguments before seeking permission or committing an intent."""
+    schema = getattr(tool, "input_schema", None)
+    if not isinstance(schema, dict):
+        return "tool input schema is invalid"
+    try:
+        Draft202012Validator.check_schema(schema)
+        # Tool schemas are deployment data. Never fetch remote references while
+        # classifying a call: approval preparation must have no external effect.
+        error = next(Draft202012Validator(schema, registry=Registry()).iter_errors(arguments), None)
+    except (SchemaError, Unresolvable):
+        return "tool input schema is invalid"
+    return error.message if error is not None else None

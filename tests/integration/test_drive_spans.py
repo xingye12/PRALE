@@ -9,6 +9,7 @@ import asyncio
 import contextlib
 
 from agent_harness.api.harness import Harness
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.effects import EffectSpan
 from agent_harness.runtime.generation import AssistantResult, GenerationRequest, ToolCall
 from agent_harness.runtime.tools import ToolExecutionResult
@@ -27,6 +28,9 @@ class Provider:
 
 
 class EchoTool:
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     name = "echo"
     description = "Return the supplied value."
     input_schema = {"type": "object"}
@@ -121,8 +125,7 @@ def test_a_blocked_or_unknown_tool_never_claims_a_completed_effect() -> None:
         await lane.prompt("run it", operation_id="op-1")
         await lane.drive(provider)
 
-        [span] = [span for span in await _assert_no_pending(storage, "op-1") if span.kind == "tool"]
-        assert (span.outcome, span.error_class) == ("aborted", "hook_blocked")
+        assert not [span for span in await _assert_no_pending(storage, "op-1") if span.kind == "tool"]
 
     asyncio.run(scenario())
 
@@ -134,8 +137,7 @@ def test_a_blocked_or_unknown_tool_never_claims_a_completed_effect() -> None:
 
         await lane.drive(provider)
 
-        [span] = [span for span in await _assert_no_pending(storage, "op-2") if span.kind == "tool"]
-        assert (span.outcome, span.error_class) == ("aborted", "unknown_tool")
+        assert not [span for span in await _assert_no_pending(storage, "op-2") if span.kind == "tool"]
 
     asyncio.run(unknown_tool())
 

@@ -811,7 +811,12 @@ class SubagentRuntime:
             writes = await queued_lane.memory_capture_writes(mutator, result)
             writes.extend(await queued_lane.terminal_writes(mutator, result))
             return SubagentStopResult(run_id, "requested"), writes
+        agent = await self._read(f"subagent/{meta['agent_id']}/meta", mutator)
+        approval_writes = await self._factory(agent["lane"], ()).approvals.cancellation_writes(
+            mutator, meta["operation_id"]
+        )
         return SubagentStopResult(run_id, "requested"), [
+            *approval_writes,
             SetValue(value(f"subagent-run/{run_id}/state"), {**state, "cancel_requested": True}),
             SetValue(operation_state(meta["operation_id"]), OperationState(op.at, "cancel_requested", op.data)),
         ]

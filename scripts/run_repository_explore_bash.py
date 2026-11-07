@@ -23,6 +23,7 @@ from eval_harness import DEFAULT_EVALUATORS, ScoredItem, _score
 from repository_explore_scoring import FileAccessCollector, answer_key_hash, compare_reports, score_output
 
 from agent_harness.api.harness import Harness
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.integrations.deepseek import DeepSeekProvider
 from agent_harness.integrations.evaluation import (
     _Collecting,
@@ -45,6 +46,11 @@ class ContainerBash:
         self.trace_dir = trace_dir
         for name in ("name", "description", "input_schema", "replay_policy"):
             setattr(self, name, getattr(tool, name))
+
+    def assess_risk(self, arguments):
+        # Running this evaluation explicitly authorizes commands in its disposable,
+        # network-disabled container. This policy does not apply to deployed BashTool.
+        return RiskAssessment("allow", "explicit disposable-container evaluation", capability_version=self.container)
 
     async def execute(self, arguments):
         if not isinstance(arguments, dict) or not isinstance(arguments.get("command"), str):

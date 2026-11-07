@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from agent_harness.api.harness import Harness
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.operations import OperationState
 from agent_harness.domain.subagents import SubagentConfig, SubagentRequest
 from agent_harness.domain.values import lane_inbox
@@ -19,6 +20,9 @@ from agent_harness.storage.sqlite import SQLiteStorage
 
 
 class Tool:
+    def assess_risk(self, arguments):
+        return RiskAssessment("allow", "authorized test fixture")
+
     name = "record"
     description = "record effect"
     input_schema = {"type": "object"}
