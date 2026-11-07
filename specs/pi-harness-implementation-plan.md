@@ -440,3 +440,29 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 **决策：** 请求和角色增加可选 `isolation="worktree"`，绑定 agent 身份。runtime 仅依赖 workspace 协议，integrations 管理 Git。接纳持久化 pending 意图，创建前冻结路径、分支与 HEAD SHA；创建、检查、删除各有持久 intent 和关联 effect span，完成后原子结算。workspace 状态独立于 run，终态答案在收尾后交付；旧记录缺省共享模式，不改变 SQLite schema。自定义工具必须声明 workspace 可复用或提供重绑定。
 
 **后果：** worktree 从父 HEAD 创建，不复制脏文件、不 fetch、不自动提交合并。发现 tracked/untracked/ignored 产物、提交偏移或不确定状态均保留。仅删除已确认归属且再次确认干净的 worktree 和分支，不 force/prune。续跑复用保留副本，已删除则从原基准重建；关闭仅停止执行，恢复接管未结算 effect。隔离只是工作副本隔离，不是安全沙箱。
+
+### ADR-034：仓库探索采用本地文件访问事实与确定性评分
+
+**背景：** 最终回答评分无法直接测量文件定位能力；旧汇总报告未保存工具输入/输出，不能从引用推断实际访问。
+
+**决策：** 评测脚本订阅 settlement 后的 `ToolTelemetry`，在本地报告保存完整工具 attempt 输入/输出，并分别提取返回的定位路径和实际正文/片段路径。成功 read 与 explorer 的实际渲染片段可计入内容访问，内部扫描、参数和回答引用不计入。重复文件去重。主文件评测两组均提供 read/bash/edit/write，仅实验组额外提供 repository_explore。每题使用独立可写源码导出，bash 在无网络容器中运行，read/edit/write confined 到同一导出根，绝不修改原仓库。显式 --read-only 可复现只读工具实验。任意 shell 的文件访问标记为不可完整观测，不猜测 shell 参数或 stdout 中的路径；write/edit 成功只记为修改，不作为阅读证据，文件指标标记为 partial。离线 scorer 校验源码 SHA 与答案键版本/哈希，计算普通 recall、加权 recall、核心文件覆盖和仅相对于标注集合的 precision，列出命中、遗漏与未标注文件。无访问记录的旧报告不得计作零访问；有未观测 effect 的报告仅给 recall 下界，不给完整 precision。标签不得进入模型输入。
+
+**后果：** 无需 LLM judge、网络或 provider key 即可重新评分；原回答 judge 保留为辅助评估。runtime、Session schema 和工具 wire format 不变；新字段仅属于本地评测报告，不能用于恢复执行。完整 trace 保留于本地，不增加 Langfuse 上传。新采集、非完整观测、路径边界、去重和配对汇总由 unit/integration 测试覆盖。
+
+### ADR-035：bash/read 文件访问并集评分
+
+**背景：** 仅记录 read 和 explorer 会漏掉 bash 中的实际访问，导致两组观测不对称。
+
+**决策：** bash 在独立容器中由 strace -f -yy 跟踪成功的 O_RDONLY/O_RDWR 文件打开，包括子进程、管道、通配符及 Python 读取；过滤目录、失败打开和仓库外路径。追踪正文单独保存于本地 telemetry 投影，不加入模型的工具返回。read_bash 为 bash 与成功 read 的去重路径并集；accessed 再合并 explorer 实际代码片段路径，是主要文件访问指标。计算普通 recall、weighted recall、precision；打开文件不表示正文已交付模型，原 content 指标保留其原有语义。修改确认不算阅读；追踪缺失或中断显式不完整。旧报告没有系统调用证据，不能从命令文本伪造完整统计，需新运行。
+
+**后果：** 完整工具实验能够计算基于文件访问的 recall/precision；递归 grep 扫描的非命中文件也算实际访问，precision 可能降低。此变更仅影响评测脚本及报告，不改运行时恢复与持久化协议。
+
+### ADR-036：返回源码内容的离线重算
+
+**背景：** syscall 打开集合包含搜索内部扫描，不符合 Agent 实际获得内容的统计目标。
+
+**决策：** rescore_repository_visible_files.py 保留原报告，从工具实际返回中的源码正文和带路径匹配行核验访问；文件名列表不计入，read/explorer 内容合并去重。无法归属的输出不猜测，逐调用输出归属审计。该离线方法是保守归属，不声明穷尽访问集合。
+
+**后果：** 输出独立 visible-content-scores.json，不覆盖旧 syscall 指标，不调用 provider；不改变 runtime 或恢复协议。
+
+ADR-036 口径修订：按用户明确要求，仅 bash 与成功 read 的实际返回内容进入重算集合，repository_explore、edit、write 均不计入。不得复用包含 explorer 的 content_files 投影；read 必须从原始调用事件重新归属。历史混合口径报告以 including-explorer 后缀保留。

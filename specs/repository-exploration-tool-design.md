@@ -210,6 +210,41 @@ bindings 的 query cursor 上会使解释器崩溃，不能作为部署可接受
 - crash-recovery：intent 后、tag-cache 命中/未命中 effect 后、settlement 前终止，验证旧 span 为 `unknown` 且 safe attempt 可重放；
 - security：绝对路径、`..`、指向根外的 symlink、超大/二进制文件、恶意 query/符号文本和工作树并发改动。
 
+### 9.1 文件覆盖评测标注
+
+`evals/repository_explore/tasks.json` 的 `file_annotation_policy.version=2`
+为八道固定题目补充 `relevant_files`。标注必须依据 `pinned_git_sha` 的实际
+文件与实现，逐项保存相对路径、重要性权重（3 核心、2 直接相关、1 辅助）、
+可核验的符号或文本锚点及相关原因；不得从被测模型回答或实验组别反推标签。
+这些字段只属于答案键，不得放入模型输入或工具输出。
+版本 2 补充跨模块提取、wire serialization、具体 replay policy、telemetry 验证和
+Web 生命周期证据；配置/接线按直接相关证据计权。保持历史源码 SHA 不变，
+标注版本变化后两组必须使用同一新版答案键重新评分，不覆盖旧报告。
+
+标注是证据覆盖集合，不声明唯一最小阅读路径或穷尽所有合理相关文件。
+后续 weighted recall 按去重文件的命中权重计算；precision 在惩罚未标注访问前
+应复核替代证据，并对两组使用同一个标注版本。定位路径与实际返回正文/片段
+必须分开记录，内部全仓索引不算模型访问。逐题统计、解释和历史报告限制见评测目录 README。
+
+### 9.2 文件访问采集与评分
+
+`scripts/run_repository_explore.py` 默认两组均提供 read/bash/edit/write，
+仅实验组额外提供 repository_explore；每题使用独立的可写源码导出，bash 在
+无网络容器中执行，read/edit/write confined 到同一根目录，不修改原仓库。
+`--read-only` 保留先前只读对照模式。配对实验从 settlement 后的 `ToolTelemetry` 保存完整 attempt 输入/输出，
+分别统计定位路径和实际正文/片段路径。每题结束后写本地报告检查点；trace
+不增加上传，也不作为恢复权威数据。
+
+`scripts/score_repository_explore.py` 无需 provider，按去重路径计算普通 recall、
+加权 recall、仅相对于标注集合的 precision 和 weight=3 文件覆盖率，并输出
+逐题命中/遗漏/未标注路径、宏平均及配对差值。必须核对源码 SHA、标注版本和
+答案键哈希；无观测的旧报告不得当作零访问。write/edit 成功记录 modified_files，
+不作为源码阅读证据，并标记为 partial。任意 bash effect 或 unknown
+工具 outcome 导致观测不完整时，只输出 recall 下界，完整 recall/precision
+为空。零访问的 precision 也为空。成本使用 provider total_tokens，不能累加
+重叠 usage 字段；工具返回 token 单列为 UTF-8 JSON 字节估算。该脚本变更不
+改变 Session schema、runtime 或工具 wire format；决策见实施方案 ADR-034。
+
 ## 10. 架构决策记录
 
 ### ADR-REPO-001：仓库地图作为按需工具结果，而非隐式上下文
