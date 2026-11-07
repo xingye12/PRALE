@@ -7,6 +7,7 @@ import pytest
 from agent_harness.api.harness import Harness
 from agent_harness.domain.approvals import ApprovalConfig, ApprovalConflict, approval_audit
 from agent_harness.integrations.local_tools import WriteTool
+from agent_harness.integrations.tool_risk import ConfiguredRiskEvaluator
 from agent_harness.runtime.generation import AssistantResult, ToolCall
 from agent_harness.storage.memory import MemoryStorage
 from agent_harness.storage.sqlite import SQLiteStorage
@@ -27,7 +28,7 @@ class Provider:
 def test_requests_decisions_grants_and_audit_are_durable(tmp_path, backend):
     async def scenario():
         storage = MemoryStorage() if backend == "memory" else SQLiteStorage(tmp_path / "session.db")
-        config = ApprovalConfig(channel_available=True)
+        config = ApprovalConfig(channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",)))
         harness = await Harness.open("s", storage, tools=(WriteTool(tmp_path),), approvals=config)
         lane = await harness.acquire_lane("main")
         await lane.prompt("write")
@@ -73,7 +74,7 @@ def test_sqlite_session_grant_survives_connection_reopen(tmp_path):
     async def scenario():
         db = tmp_path / "session.db"
         storage = SQLiteStorage(db)
-        config = ApprovalConfig(channel_available=True)
+        config = ApprovalConfig(channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",)))
         harness = await Harness.open("s", storage, tools=(WriteTool(tmp_path),), approvals=config)
 
         async def answer(event):

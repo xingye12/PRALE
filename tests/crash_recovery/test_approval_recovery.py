@@ -9,6 +9,7 @@ import pytest
 
 from agent_harness.api.harness import Harness
 from agent_harness.domain.approvals import ApprovalConfig, RiskAssessment
+from agent_harness.integrations.local_tools import BashTool
 from agent_harness.runtime.generation import AssistantResult, ToolCall
 from agent_harness.runtime.tools import ToolExecutionResult
 from agent_harness.storage.protocol import SetValue
@@ -34,18 +35,31 @@ class DangerousTool:
         return ToolExecutionResult("done")
 
 
+class EscalatedBashTool(DangerousTool):
+    name = "bash"
+
+    def assess_risk(self, arguments):
+        # The test effect deliberately exits the process at the same boundaries
+        # as a host command; use the real Bash escalation assessment.
+        return BashTool(self.marker.parent, sandbox="off").assess_risk(arguments)
+
+
 class Provider:
-    def __init__(self, finished=False):
+    def __init__(self, finished=False, bash=False):
         self.finished = finished
+        self.bash = bash
 
     async def generate(self, request):
         if self.finished:
             return AssistantResult("done", {})
         self.finished = True
-        return AssistantResult("", {}, tool_calls=(ToolCall("c", "danger", {}),))
+        arguments = {"command": "test effect", "sandbox_permissions": "danger-full-access", "justification": "test"}
+        return AssistantResult(
+            "", {}, tool_calls=(ToolCall("c", "bash" if self.bash else "danger", arguments if self.bash else {}),)
+        )
 
 
-def worker(db, marker, stage):
+def worker(db, marker, stage, bash=False):
     async def scenario():
         storage = SQLiteStorage(db)
         original = storage.commit
@@ -72,7 +86,7 @@ def worker(db, marker, stage):
         harness = await Harness.open(
             "s",
             storage,
-            tools=(DangerousTool(marker, stage == "effect"),),
+            tools=((EscalatedBashTool if bash else DangerousTool)(marker, stage == "effect"),),
             approvals=ApprovalConfig(channel_available=True),
         )
 
@@ -83,15 +97,16 @@ def worker(db, marker, stage):
         harness.subscribe(answer)
         lane = await harness.acquire_lane("main")
         await lane.prompt("execute", operation_id="op")
-        await lane.drive(Provider())
+        await lane.drive(Provider(bash=bash))
 
     asyncio.run(scenario())
 
 
+@pytest.mark.parametrize("bash", [False, True])
 @pytest.mark.parametrize("stage", ["request", "decision", "intent", "effect", "settlement"])
-def test_recovery_preserves_approval_and_never_replays_unknown_effect(tmp_path, stage):
+def test_recovery_preserves_approval_and_never_replays_unknown_effect(tmp_path, stage, bash):
     db, marker = tmp_path / "session.db", tmp_path / "effect.txt"
-    process = multiprocessing.get_context("fork").Process(target=worker, args=(str(db), str(marker), stage))
+    process = multiprocessing.get_context("fork").Process(target=worker, args=(str(db), str(marker), stage, bash))
     process.start()
     process.join(5)
     if process.is_alive():
@@ -102,7 +117,10 @@ def test_recovery_preserves_approval_and_never_replays_unknown_effect(tmp_path, 
     async def scenario():
         storage = SQLiteStorage(db)
         harness = await Harness.open(
-            "s", storage, tools=(DangerousTool(marker),), approvals=ApprovalConfig(channel_available=True)
+            "s",
+            storage,
+            tools=((EscalatedBashTool if bash else DangerousTool)(marker),),
+            approvals=ApprovalConfig(channel_available=True),
         )
         records = await harness.approvals.records()
         assert len(records) == 1

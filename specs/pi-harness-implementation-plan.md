@@ -474,3 +474,19 @@ ADR-036 口径修订：按用户明确要求，仅 bash 与成功 read 的实际
 **决策：** 风险评估与审批通过 domain 协议连接。工具在 before_tool 后冻结参数与评估，审批请求、索引、审计和完整 tools state 同事务提交；等待不创建 effect span。单次批准绑定请求，会话批准绑定工具、完整参数、实际目录、路径目标、策略/能力版本和独立 lane 主体。执行 intent 与授权消费、撤销检查原子提交。未知工具默认 ask；无审批通道或 never 策略拒绝执行。Web 通道在无浏览器连接时保留等待。审批不改变 safe/never 重放语义；取消撤回未使用请求，服务停止保留请求。旧已存在的 effect intent 继续既有恢复路径，未执行调用须经过新门禁。JSON 记录使用 format_version=1，存于既有 values/lists，不变更 SQLite 表结构。
 
 **后果：** library 默认无应答通道，危险调用以 unavailable 工具错误结束；交互部署显式注册通道。内置文件工具在 integrations 解析实际路径，普通仓库写入放行，凭据、外部路径和执行配置修改审批；shell 仅精确 pwd 放行。审批是执行授权而非 OS 沙箱。并行调用也必须经过统一门禁，危险调用形成源序屏障。Web 查询与 SSE 是投影，不能作为恢复权威。接口和验收见 [工具审批实施方案](tool-approval-implementation-plan.md)。
+
+### ADR-038：以工作区写入沙箱替代内置 Bash 全审批
+
+**背景：** ADR-037 的 shell 全审批及默认凭据、配置路径保护产生过多交互，不能提供进程级文件边界。
+
+**决策：** 替代 ADR-037 中仅 pwd 放行和内置路径保护部分。Linux 使用经实际探测的 bubblewrap：根只读、规范化工作区可写、每调用私有 /tmp、PID 隔离，保留网络及外部读取。普通 Bash 在沙箱直接执行；显式 danger-full-access 必须附理由并精确审批。不可用、off、执行前缀或自定义路径规则回退为审批宿主执行。包装失败不得静默回退或重试。直接文件工具允许所有读取及工作区写入，外部写入审批；部署追加规则继续收紧。指纹包含策略版本、执行模式、执行器能力及工作区；执行前复核。Bash 仍为 never，不变更既有持久化结构和 intent/settlement 原子边界。
+
+**后果：** 不防止外部凭据读取、网络外传或工作区内破坏。沙箱失败只返回结果和显式升级指引，不重跑。macOS/Windows 回退审批。PRALE_BASH_SANDBOX=auto|off 默认 auto；library 工厂支持配置及执行器注入。Linux CI 必须实际运行隔离验收，不能静默跳过。
+
+### ADR-039：记忆死信通过显式 flush 恢复
+
+**背景：** L1 有界批次的终点水位参与任务去重。批次进入死信后，后续 capture 仍选择相同批次，普通 create-or-wake 不会重新激活死信，导致上层记忆永久停滞。现有 storage replay 没有接入 runtime 的显式 flush。
+
+**决策：** 普通 capture 不自动重试 schema 死信；管理员显式 `MemoryRuntime.flush(scope, stage)` 时，若选中的去重任务为 dead_letter，则通过 storage replay 原子重新入队并写审计。保留原 job ID、冻结输入和历史 attempts，不删除或跳过任何 L0，不伪造消费水位。replay 的状态转换和审计同一 SQLite 事务提交；重复或跨 scope replay 拒绝。提供无需 provider 凭据的本地管理脚本，由部署中的 worker 消费恢复任务。
+
+**后果：** 非法输出仍立即死信，不引入无限后台重试；修正配置/抽取问题后可显式重新计算。恢复过程可在重启后继续。验收覆盖有界 L1 阻塞、显式恢复、后续批次推进、L2/L3 flush、审计原子失败与重启领取。

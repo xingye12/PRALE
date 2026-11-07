@@ -77,7 +77,11 @@ SQLite 是单机持久化后端，`MemoryStorage` 用于测试。工具可标记
 
 ## 本地工具
 
-`agent_harness.integrations.create_builtin_tools(working_directory)` 提供 `read`、`write`、`edit`、`bash`。相对路径以工作目录解析，绝对路径也允许；这不是文件系统沙箱。`read` 支持文本分页和 JPEG/PNG/GIF/WebP/BMP 的 base64 structured details；`write` 创建父目录；`edit` 要求原始文件中每项精确匹配一次且互不重叠，并保留 BOM 与换行风格；`bash` 合并 stdout/stderr，支持 timeout、取消时进程组终止，以及 2,000 行/50 KiB 尾部截断。
+`agent_harness.integrations.create_builtin_tools(working_directory)` 提供 `read`、`write`、`edit`、`bash`。相对路径以工作目录解析；直接文件工具默认允许所有读取与工作区内写入，工作区外写入需要精确审批。`read` 支持文本分页和 JPEG/PNG/GIF/WebP/BMP 的 base64 structured details；`write` 创建父目录；`edit` 要求原始文件中每项精确匹配一次且互不重叠，并保留 BOM 与换行风格；`bash` 默认在 Linux bubblewrap 工作区可写沙箱中执行，根文件系统只读，每次调用使用私有 `/tmp`（因此看不到宿主 `/tmp` 的其他文件），保留网络和其余外部读取。它支持 timeout、取消时进程树终止，以及 2,000 行/50 KiB 尾部截断。这不防止凭据读取、网络外传或工作区内破坏。
+
+Linux 部署先安装 `sudo apt-get install bubblewrap`，然后运行 `PRALE_REQUIRE_BWRAP=1 pytest tests/unit/test_shell_sandbox.py` 验证命名空间、文件边界、网络及进程清理。仅安装可执行文件不表示内核允许使用。`PRALE_BASH_SANDBOX=auto|off` 默认 auto；无可用沙箱、执行前缀或自定义路径保护时，普通 Bash 请求审批后以宿主权限执行，卡片原因注明实际模式。Library 可用 `create_builtin_tools(..., bash_sandbox="off", shell_executor=...)` 配置或注入执行器；自定义执行器必须真实施加声明的能力边界。
+
+模型可显式传入 `sandbox_permissions="danger-full-access"` 和非空 `justification` 请求本次命令以宿主权限执行，仍需批准。默认 `workspace-write` 失败不会自动重试；工具返回结果和显式升级指引，普通非零退出不等于权限错误。`never` 只拒绝需要审批的调用，不授予宿主权限。部署可通过 `PRALE_APPROVAL_SENSITIVE_PATHS` 收紧文件读取/写入或 `PRALE_APPROVAL_PROTECTED_PATHS` 收紧写入；非空规则使一般 Bash 回退逐条审批，规则不在 shell 内强制实施。
 
 其中只有 `read` 是恢复时可自动重放的 `safe` 工具。文件写入、编辑和 shell 命令均为 `never`：若进程在 effect 后、持久化结果前中断，恢复会显式记录结果未知，而不会重新执行可能已生效的命令。
 

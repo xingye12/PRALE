@@ -1161,13 +1161,20 @@ class SQLiteMemoryStore:
         await self.audit(GLOBAL_L3_SCOPE, "l3_file_written", {"version": doctrine.version})
 
     async def replay_dead_letter(self, scope: MemoryScope, job_id: str) -> None:
-        changed = self._conn.execute(
-            "UPDATE memory_jobs SET status='queued',not_before=?,error_class=NULL WHERE job_id=? AND team_id=? AND agent_id=? AND user_id=? AND status='dead_letter'",
-            (self._now(), job_id, *_scope(scope)),
-        ).rowcount
-        if not changed:
-            raise KeyError(job_id)
-        await self.audit(scope, "job_replayed", {"job_id": job_id})
+        now = self._now()
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            changed = self._conn.execute(
+                "UPDATE memory_jobs SET status='queued',not_before=?,updated_at=?,error_class=NULL WHERE job_id=? AND team_id=? AND agent_id=? AND user_id=? AND status='dead_letter'",
+                (now, now, job_id, *_scope(scope)),
+            ).rowcount
+            if not changed:
+                raise KeyError(job_id)
+            self._audit_in_transaction(scope, "job_replayed", {"job_id": job_id}, now)
+            self._conn.execute("COMMIT")
+        except BaseException:
+            self._conn.execute("ROLLBACK")
+            raise
 
     async def delete_scope(self, scope: MemoryScope) -> None:
         """Explicit scope deletion is the only cascading destructive asset operation."""

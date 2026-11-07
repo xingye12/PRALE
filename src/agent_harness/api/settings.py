@@ -129,6 +129,7 @@ class Settings:
     subagent_config: SubagentConfig = SubagentConfig()
     subagent_dirs: tuple[Path, ...] = ()
     approvals: ApprovalConfig = ApprovalConfig(channel_available=True)
+    bash_sandbox: str = "auto"
 
     @property
     def config(self) -> ProjectRuntimeConfig:
@@ -184,6 +185,7 @@ class Settings:
                 f"memory_prompt     {prompt}",
                 f"max_drives        {self.max_concurrent_drives}",
                 f"approval_policy   {self.approvals.policy}",
+                f"bash_sandbox      {self.bash_sandbox}",
                 f"subagents         {'on' if self.subagent_config.enabled else 'off'}",
                 f"subagent_limits   running={self.subagent_config.max_running} "
                 f"nonterminal={self.subagent_config.max_nonterminal}",
@@ -324,6 +326,9 @@ class Settings:
         repository_export_tokens = _int(environ, "PRALE_REPOSITORY_MAX_EXPORT_TOKENS", 6_000)
         if not 256 <= repository_export_tokens <= 6_000:
             raise ProjectConfigError("PRALE_REPOSITORY_MAX_EXPORT_TOKENS must be between 256 and 6000")
+        bash_sandbox = environ.get("PRALE_BASH_SANDBOX", "auto").strip()
+        if bash_sandbox not in {"auto", "off"}:
+            raise ProjectConfigError("PRALE_BASH_SANDBOX must be auto or off")
         policy = environ.get("PRALE_APPROVAL_POLICY", "ask").strip()
         if policy not in ("ask", "never"):
             raise ProjectConfigError("PRALE_APPROVAL_POLICY must be ask or never")
@@ -332,6 +337,7 @@ class Settings:
             tuple(p.strip() for p in environ.get("PRALE_APPROVAL_PROTECTED_PATHS", "").split(",") if p.strip()),
         )
         return cls(
+            bash_sandbox=bash_sandbox,
             approvals=ApprovalConfig(
                 policy="never" if policy == "never" else "ask", channel_available=True, evaluator=evaluator
             ),

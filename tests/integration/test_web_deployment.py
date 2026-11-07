@@ -677,3 +677,19 @@ def test_a_served_turn_publishes_facts_for_the_session_that_ran_it(tmp_path: Pat
         assert terminal[-1].output["content"] == "ok"
 
     asyncio.run(scenario())
+
+
+def test_bash_sandbox_deployment_configuration(tmp_path):
+    from agent_harness.integrations.local_tools import BashTool
+
+    settings = Settings.from_environment(_environment(tmp_path, PRALE_TOOLS="bash"))
+    assert settings.bash_sandbox == "auto"
+    disabled = Settings.from_environment(_environment(tmp_path, PRALE_TOOLS="bash", PRALE_BASH_SANDBOX="off"))
+    deployment = build_application(disabled)
+    try:
+        shell = next(tool for tool in deployment.web.supervisor._tools if isinstance(tool, BashTool))
+        assert shell.sandbox == "off"
+    finally:
+        deployment.close()
+    with pytest.raises(ProjectConfigError, match="PRALE_BASH_SANDBOX"):
+        Settings.from_environment(_environment(tmp_path, PRALE_BASH_SANDBOX="invalid"))

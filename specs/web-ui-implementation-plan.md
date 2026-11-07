@@ -279,3 +279,7 @@ SQLite migration 只前进：为 operation/call usage、span 和查询索引加�
 SSE snapshot 的 pending_approvals 与查询接口支持刷新恢复；整个 Session 的审批事件对主 lane
 订阅可见，用于处理 Subagent 的请求。批准重启前的请求时由服务端接管旧 lease。
 凭据和 Origin 检查均在服务端执行；无浏览器连接不撤回请求，显式 abort 才取消。
+
+审批展示补充：审批卡片须紧邻对应 tool call，不能仅放在全部历史之前；Subagent 请求显示在父控制
+调用旁。待审批 turn 使用明确状态标记，并提供固定提醒与定位按钮。未加载到对应调用时，
+请求在输入区附近兜底展示。长历史、详情缺失、子调用和重复点击由实际 JS 模块交互测试覆盖。

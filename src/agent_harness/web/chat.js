@@ -15,6 +15,7 @@ export function createChatView(app) {
   let approvals = [];
   let grants = [];
   const submitting = new Set();
+  const approvalNodes = new Map();
   let details = new Map();
   let nextCursor = null;
   let busy = false;
@@ -36,6 +37,10 @@ export function createChatView(app) {
     ];
   }
 
+  function approvalsForTurn(operationId) {
+    return approvals.filter((request) => request.operation_id === operationId || request.source?.parent_operation_id === operationId);
+  }
+
   function turnHead(summary) {
     const status = operationStatus(summary.status);
     const nodes = [
@@ -44,6 +49,8 @@ export function createChatView(app) {
       tag(summary.kind),
       h("span", { class: "meta", text: clock(summary.started_at) }),
     ];
+    const waiting = approvalsForTurn(summary.operation_id);
+    if (waiting.length) nodes.push(badge(`等待执行权限（${waiting.length}）`, "warn"));
     if (app.live.has(summary.operation_id)) {
       nodes.push(badge("本次连接观察到活动", "pending", "本进程在当前事件流中看到过该 operation 的事件"));
     }
@@ -74,7 +81,7 @@ export function createChatView(app) {
     const detail = details.get(summary.operation_id);
     const body = [];
     if (detail) {
-      for (const entry of detail.entries) body.push(messageNode(entry));
+      for (const entry of detail.entries) body.push(messageNode(entry, summary.operation_id));
       if (detail.unattributed_usage.length) {
         body.push(
           h("p", {
@@ -102,10 +109,15 @@ export function createChatView(app) {
         ),
       );
     }
+    // Detail reads can lag the approval event. Keep decisions available even
+    // when the corresponding assistant/tool call has not been projected yet.
+    for (const request of approvalsForTurn(summary.operation_id)) {
+      if (!approvalNodes.has(request.approval_id)) body.push(approvalCard(request));
+    }
     return card(body, { head: turnHead(summary) });
   }
 
-  function messageNode(entry) {
+  function messageNode(entry, operationId) {
     const payload = entry.payload && typeof entry.payload === "object" ? entry.payload : {};
     const role = typeof payload.role === "string" ? payload.role : entry.type;
     const isToolResult = role === "tool";
@@ -136,6 +148,10 @@ export function createChatView(app) {
             h("pre", { class: "block", text: formatValue(call.arguments) }),
           ),
         );
+        for (const request of approvalsForTurn(operationId)) {
+          const callId = request.operation_id === operationId ? request.tool_call_id : request.source?.parent_tool_call_id;
+          if (callId === call.id && !approvalNodes.has(request.approval_id)) nodes.push(approvalCard(request));
+        }
       }
     }
     if (payload.is_error) nodes.push(badge("tool 返回错误", "bad"));
@@ -292,8 +308,8 @@ export function createChatView(app) {
     }
   }
 
-  function approvalPanel() {
-    const nodes = approvals.map((request) => card([
+  function approvalCard(request) {
+    const node = card([
       badge("等待执行权限", "warn"),
       h("p", { text: `${request.tool_name} · ${request.lane} · ${request.operation_id}` }),
       h("p", { text: request.reason }),
@@ -303,7 +319,15 @@ export function createChatView(app) {
       h("p", { class: "meta", text: "会话授权仅复用相同工具、完整参数、工作目录、路径目标及策略版本；仅适用于此 lane，可随时撤销。" }),
       ...[["allow_once", "允许本次"], ["allow_session", "允许本会话相同操作"], ["reject", "拒绝"]].map(([decision, label]) =>
         h("button", { type: "button", text: label, disabled: submitting.has(request.approval_id), onClick: () => decide(request, decision) })),
-    ]));
+    ]);
+    node.className = "card approval-card";
+    node.dataset.approvalId = request.approval_id;
+    approvalNodes.set(request.approval_id, node);
+    return node;
+  }
+
+  function grantPanel() {
+    const nodes = [];
     const active = grants.filter((grant) => !grant.revoked);
     if (active.length) nodes.push(h("details", {}, h("summary", { text: `会话授权（${active.length}）` }), ...active.map((grant) => h("div", {},
       h("pre", { class: "block", text: JSON.stringify({ tool: grant.tool_name, arguments: grant.arguments, cwd: grant.cwd, subject: grant.subject }, null, 2) }),
@@ -376,6 +400,7 @@ export function createChatView(app) {
 
   function render() {
     clear(element);
+    approvalNodes.clear();
     append(element, head());
     if (error) append(element, notice(errorText(error), error.status === 503 || error.status === 401 ? "bad" : "warn"));
     const scope = app.scope();
@@ -386,7 +411,6 @@ export function createChatView(app) {
     if (!turns.length && !error) {
       append(element, empty("该 lane 还没有 turn", "提交第一条 prompt，它的 durable 记录会出现在这里。"));
     }
-    append(element, approvalPanel());
     const list = h("div");
     for (const turn of [...turns].reverse()) list.append(renderTurn(turn));
     append(element, list);
@@ -396,7 +420,21 @@ export function createChatView(app) {
         h("div", { class: "pager" }, h("button", { type: "button", text: "加载更早的 turn", onClick: () => load() })),
       );
     }
+    // Requests outside the loaded page (or from another lane) remain actionable
+    // beside the composer, rather than preceding potentially long history.
+    for (const request of approvals) {
+      if (!approvalNodes.has(request.approval_id)) append(element, approvalCard(request));
+    }
+    append(element, grantPanel());
     append(element, composer());
+    if (approvals.length) {
+      append(element, h("div", { class: "approval-attention", role: "status", "aria-live": "polite" },
+        h("span", { text: `${approvals.length} 项工具调用等待你的执行许可；批准或拒绝后才会继续。` }),
+        h("button", { type: "button", text: "前往审批", onClick: () => {
+          approvalNodes.get(approvals[0].approval_id)?.scrollIntoView({ behavior: "smooth", block: "center" });
+        } }),
+      ));
+    }
   }
 
   return {

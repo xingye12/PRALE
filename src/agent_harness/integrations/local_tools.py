@@ -7,16 +7,21 @@ I/O, while the runtime only knows the small :class:`AgentTool` protocol.
 import asyncio
 import base64
 import difflib
+import hashlib
+import json
 import os
 import shutil
 import signal
 import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass, field
+from contextvars import ContextVar
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Final
 
+from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.entries import JsonValue
+from agent_harness.integrations.shell import BubblewrapExecutor, ShellCapability, ShellExecutor
 from agent_harness.integrations.tool_risk import LocalToolRisk
 from agent_harness.runtime.tools import AgentTool, ToolExecutionResult
 
@@ -331,21 +336,92 @@ class EditTool(LocalToolRisk):
         )
 
 
+@dataclass(frozen=True)
+class _ShellPlan:
+    sandboxed: bool
+    capability: ShellCapability
+    root: Path
+
+
+# Final assessment binds execution in the current Drive context. Child tasks inherit
+# the immutable mapping; concurrent lanes cannot overwrite each other's decision.
+_shell_plans: ContextVar[dict[str, _ShellPlan]] = ContextVar("shell_plans", default={})
+
+
 @dataclass(frozen=True, slots=True)
 class BashTool(LocalToolRisk):
     cwd: Path | str
     command_prefix: tuple[str, ...] = ()
     environment: Mapping[str, str] | None = None
     name: str = "bash"
-    description: str = "Run an arbitrary shell command in the session working directory."
+    description: str = (
+        "Run a command in a workspace-write sandbox when available, with external reads and network allowed. "
+        "To request unsandboxed host execution, set sandbox_permissions=danger-full-access and provide justification. "
+        "A failed command is never automatically retried."
+    )
     input_schema: JsonValue = field(
         default_factory=lambda: {
             "type": "object",
-            "properties": {"command": {"type": "string"}, "timeout": {"type": "number"}},
+            "properties": {
+                "command": {"type": "string"},
+                "timeout": {"type": "number", "exclusiveMinimum": 0},
+                "sandbox_permissions": {"enum": ["workspace-write", "danger-full-access"]},
+                "justification": {"type": "string"},
+            },
             "required": ["command"],
         }
     )
     replay_policy: str = "never"
+    sandbox: str = "auto"
+    executor: ShellExecutor = field(default_factory=BubblewrapExecutor)
+
+    def __post_init__(self) -> None:
+        if self.sandbox not in {"auto", "off"}:
+            raise ValueError("bash sandbox must be auto or off")
+
+    def _plan_key(self, arguments: JsonValue) -> str:
+        return f"{id(self)}:{json.dumps(arguments, sort_keys=True)}"
+
+    def assess_risk(self, arguments: JsonValue) -> RiskAssessment:
+        return self.assess_shell(arguments)
+
+    def assess_shell(self, arguments: JsonValue, *, custom_paths: bool = False) -> RiskAssessment:
+        base = super(BashTool, self).assess_risk(arguments)
+        if not isinstance(arguments, dict):
+            return base
+        permission = arguments.get("sandbox_permissions", "workspace-write")
+        if permission not in {"workspace-write", "danger-full-access"}:
+            return replace(base, decision="deny", reason="invalid sandbox_permissions")
+        if permission == "danger-full-access" and not str(arguments.get("justification") or "").strip():
+            return replace(base, decision="deny", reason="unsandboxed execution requires a nonempty justification")
+        capability = self.executor.probe(Path(self.cwd).resolve())
+        reason = ""
+        if permission == "danger-full-access":
+            reason = "explicit permission escalation"
+        elif custom_paths:
+            reason = "custom path protection requires individual Bash approval"
+        elif self.command_prefix:
+            reason = "execution prefix is not supported by workspace sandbox"
+        elif self.sandbox == "off":
+            reason = "workspace sandbox is disabled"
+        elif not capability.available:
+            reason = capability.reason or "sandbox capability unavailable"
+        sandboxed = not reason
+        plan = _ShellPlan(sandboxed, capability, Path(self.cwd).resolve())
+        plans = {**_shell_plans.get(), self._plan_key(arguments): plan}
+        _shell_plans.set(plans)
+        mode = (
+            "workspace-write sandbox; external reads and network allowed"
+            if sandboxed
+            else f"unsandboxed host execution: {reason}"
+        )
+        executor_type = f"{type(self.executor).__module__}.{type(self.executor).__qualname__}"
+        identity = hashlib.sha256(
+            f"{base.capability_version}:{executor_type}:{capability}:{mode}:{self.cwd}".encode()
+        ).hexdigest()
+        if arguments.get("command") == "pwd" and not self.command_prefix and permission != "danger-full-access":
+            return replace(base, decision="allow", reason="working directory query", capability_version=identity)
+        return replace(base, decision="allow" if sandboxed else "ask", reason=mode, capability_version=identity)
 
     async def execute(self, arguments: JsonValue) -> ToolExecutionResult:
         if not isinstance(arguments, dict) or not isinstance(arguments.get("command"), str):
@@ -353,7 +429,11 @@ class BashTool(LocalToolRisk):
         timeout = arguments.get("timeout")
         if timeout is not None and (not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0):
             return _error("timeout must be a positive number of seconds")
-        if arguments["command"] == "pwd" and not self.command_prefix:
+        if (
+            arguments["command"] == "pwd"
+            and not self.command_prefix
+            and arguments.get("sandbox_permissions", "workspace-write") == "workspace-write"
+        ):
             # The read-only fast path must not run shell startup files or BASH_ENV.
             return ToolExecutionResult(content=str(Path(self.cwd).resolve()) + "\n")
         shell = shutil.which("bash") or shutil.which("sh")
@@ -363,16 +443,20 @@ class BashTool(LocalToolRisk):
         env = os.environ.copy()
         if self.environment is not None:
             env.update(self.environment)
-        process = await asyncio.create_subprocess_exec(
-            shell,
-            "-lc",
-            command,
-            cwd=str(Path(self.cwd).resolve()),
-            env=env,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            start_new_session=os.name != "nt",
-        )
+        key = self._plan_key(arguments)
+        if key not in _shell_plans.get():
+            assessment = self.assess_risk(arguments)
+            if assessment.decision == "deny":
+                return _error(assessment.reason)
+        plan = _shell_plans.get()[key]
+        sandboxed = plan.sandboxed
+        root = Path(self.cwd).resolve()
+        if root != plan.root or self.executor.probe(root) != plan.capability:
+            return _error("shell capability changed after authorization; submit a new call for reassessment")
+        try:
+            process = await self.executor.launch((shell, "-lc", command), Path(self.cwd).resolve(), env, sandboxed)
+        except OSError as exc:
+            return _error(f"shell launch failed (no automatic retry): {exc}")
         chunks: list[str] = []
 
         async def consume(stream: asyncio.StreamReader | None) -> None:
@@ -383,7 +467,7 @@ class BashTool(LocalToolRisk):
 
         readers = [asyncio.create_task(consume(process.stdout)), asyncio.create_task(consume(process.stderr))]
         try:
-            await asyncio.wait_for(process.wait(), timeout=timeout)
+            await asyncio.wait_for(asyncio.gather(process.wait(), *readers), timeout=timeout)
         except asyncio.CancelledError:
             await self._kill_tree(process)
             await asyncio.gather(*readers, return_exceptions=True)
@@ -402,6 +486,12 @@ class BashTool(LocalToolRisk):
             with os.fdopen(fd, "w", encoding="utf-8") as log:
                 log.write("".join(chunks))
             details["full_output_path"] = log_path
+        details["execution_mode"] = "workspace-write" if sandboxed else "danger-full-access"
+        if sandboxed and process.returncode != 0:
+            output += (
+                "\n[If this failure requires writing outside the workspace, submit a new call with "
+                "sandbox_permissions=danger-full-access and a nonempty justification. No retry was performed.]"
+            )
         if process.returncode == 0:
             return ToolExecutionResult(content=output, details=details)
         return ToolExecutionResult(
@@ -409,14 +499,12 @@ class BashTool(LocalToolRisk):
         )
 
     async def _kill_tree(self, process: asyncio.subprocess.Process) -> None:
-        if process.returncode is not None:
-            return
         if os.name != "nt":
             try:
                 os.killpg(process.pid, signal.SIGKILL)
             except ProcessLookupError:
                 pass
-        else:  # pragma: no cover - exercised on Windows
+        elif process.returncode is None:  # pragma: no cover - exercised on Windows
             process.kill()
         await process.wait()
 
@@ -426,12 +514,16 @@ def create_builtin_tools(
     *,
     bash_environment: Mapping[str, str] | None = None,
     repository_explorer: AgentTool | None = None,
+    bash_sandbox: str = "auto",
+    shell_executor: ShellExecutor | None = None,
 ) -> tuple[AgentTool, ...]:
     """Return the Pi-compatible local tool set for a session working directory."""
     tools: tuple[AgentTool, ...] = (
         ReadTool(cwd),
         WriteTool(cwd),
         EditTool(cwd),
-        BashTool(cwd, environment=bash_environment),
+        BashTool(
+            cwd, environment=bash_environment, sandbox=bash_sandbox, executor=shell_executor or BubblewrapExecutor()
+        ),
     )
     return (*tools, repository_explorer) if repository_explorer is not None else tools

@@ -15,6 +15,7 @@ from agent_harness.domain.memory import (
     GLOBAL_L3_SCOPE,
     MemoryScope,
     MemoryRetentionPolicy,
+    PromotionJob,
     RecallBudget,
     RecallBundle,
     RecallItem,
@@ -129,16 +130,17 @@ class MemoryRuntime:
         return RecallBundle(tuple(items), digest, sum(len(item.content) for item in items))
 
     async def flush(self, scope: MemoryScope, stage: str = "l1") -> None:
-        """Explicitly enqueue one promotion stage without depending on an idle timer."""
+        """Enqueue one stage, explicitly replaying its batch if it is dead-lettered."""
         if stage not in {"l1", "l2", "l3"}:
             raise ValueError(f"unsupported promotion stage {stage!r}")
         if stage == "l3":
-            await self._store.create_or_wake_job(GLOBAL_L3_SCOPE, "l3", self._now(), self._now())
+            job = await self._store.create_or_wake_job(GLOBAL_L3_SCOPE, "l3", self._now(), self._now())
+            await self._recover_flushed_job(job)
             return
         if stage == "l1":
             consumed = await self._store.current_l1_watermark(scope)
             archives, watermark = await self._l1_batch(scope, consumed)
-            await self._store.create_or_wake_job(
+            job = await self._store.create_or_wake_job(
                 scope,
                 stage,
                 watermark,
@@ -148,9 +150,17 @@ class MemoryRuntime:
                 getattr(self._extractor, "mode", None),
                 tuple(archive.archive_id for archive in archives),
             )
+            await self._recover_flushed_job(job)
             return
         watermark = await self._store.stage_watermark(scope, "l1")
-        await self._store.create_or_wake_job(scope, stage, watermark, self._now())
+        job = await self._store.create_or_wake_job(scope, stage, watermark, self._now())
+        await self._recover_flushed_job(job)
+
+    async def _recover_flushed_job(self, job: PromotionJob) -> None:
+        # Only an explicit flush may retry a rejected batch. Ordinary capture
+        # must not turn schema failures into an unbounded background loop.
+        if job.status == "dead_letter":
+            await self._store.replay_dead_letter(job.scope, job.job_id)
 
     async def replay_capture_dead_letters(self, session_id: str) -> int:
         """Move explicitly selected Session capture dead letters back to the outbox."""
@@ -466,7 +476,7 @@ class MemoryRuntime:
         """
         used, watermark, selected_archives = 0, after, []
         for archive in archives:
-            selected_items = []
+            selected_items: list[TraceItem] = []
             for item in archive.items:
                 if item.store_seq <= after or (upto is not None and item.store_seq > upto):
                     continue

@@ -193,7 +193,9 @@ def build_application(settings: Settings) -> Deployment:
     telemetry = None if settings.langfuse is None else LangfuseTelemetry(settings.langfuse)
     explorer = _repository_explorer(settings)
     available_tools = (
-        create_builtin_tools(settings.project_root, repository_explorer=explorer) if settings.tools else ()
+        create_builtin_tools(settings.project_root, repository_explorer=explorer, bash_sandbox=settings.bash_sandbox)
+        if settings.tools
+        else ()
     )
     tools: tuple[AgentTool | RuntimeControlTool, ...] = tuple(
         tool for tool in available_tools if tool.name in settings.tools

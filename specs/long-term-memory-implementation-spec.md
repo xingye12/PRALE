@@ -299,3 +299,7 @@ API 仅暴露不可变 DTO 和显式领域错误。`MemoryStore` 至少提供 `c
 - GC 不回收仍被 supersedes 链或 watermark 引用的记录；回收动作可在 audit 中复现；
 - memory SQLite migration 在空库、旧库和重复执行下均安全，所有 backend 通过相同 conformance suite；
 - 每个新增 job 状态至少覆盖 claim 后、LLM effect 后、写入 L1/L2/L3 前后的中断恢复。
+
+### 死信恢复（ADR-039）
+
+有界 L1 批次进入死信后会阻塞该批次后的消费；capture 不得隐式重新执行非法输出。管理员显式 flush 会重新入队当前批次的死信任务，保持冻结输入、任务身份和 attempt 历史；L2/L3 同样支持显式恢复。replay 状态与审计必须原子提交，崩溃后仍可领取。运行 `python scripts/flush_memory.py --db <部署数据库> --assets <部署资产目录> --repository <repository_id> --stage l1`，由正在运行的部署 worker 完成抽取；该命令本身不调用 LLM。不得删除死信或直接调高消费水位来解除阻塞。若再次死信，必须检查审计中的拒绝原因并修正抽取配置后再显式恢复。

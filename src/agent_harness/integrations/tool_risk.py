@@ -9,7 +9,7 @@ from pathlib import Path
 from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.entries import JsonValue
 
-POLICY_VERSION = 1
+POLICY_VERSION = 2
 
 
 class LocalToolRisk:
@@ -34,7 +34,7 @@ class LocalToolRisk:
             if getattr(self, "command_prefix", ()):
                 result = replace(result, decision="ask", reason="shell command has an execution prefix")
         capability = hashlib.sha256(json.dumps(context, sort_keys=True).encode()).hexdigest()
-        return replace(result, cwd=cwd, target=target, capability_version=capability)
+        return replace(result, cwd=cwd, target=target, capability_version=capability, policy_version=POLICY_VERSION)
 
 
 class ScopedReadRisk:
@@ -62,56 +62,9 @@ def assess_tool(name: str, arguments: JsonValue, cwd: str) -> RiskAssessment:
         target = (root / raw).resolve()
     except (OSError, RuntimeError, ValueError):
         return RiskAssessment("deny", "file path cannot be resolved")
-    if not target.is_relative_to(root):
+    if name != "read" and not target.is_relative_to(root):
         return RiskAssessment("ask", "path is outside the working directory")
-    parts = (*target.relative_to(root).parts, *Path(raw).parts)
-    secrets = {
-        ".ssh",
-        ".aws",
-        ".azure",
-        ".kube",
-        ".gnupg",
-        "credentials",
-        "credentials.json",
-        "id_rsa",
-        "id_dsa",
-        "id_ecdsa",
-        "id_ed25519",
-        ".npmrc",
-        ".pypirc",
-        ".netrc",
-    }
-    if any(p.lower() in secrets or p.lower().startswith(".env") for p in parts) or target.suffix.lower() in {
-        ".pem",
-        ".key",
-        ".p12",
-        ".pfx",
-        ".keystore",
-    }:
-        return RiskAssessment("ask", "path may contain credentials")
-    protected = {".git", ".github", ".gitlab", "deploy", ".agents", ".claude", "skills"}
-    if name != "read" and (
-        any(p.lower() in protected for p in parts)
-        or target.name.lower()
-        in {
-            "agents.md",
-            "claude.md",
-            "skill.md",
-            ".gitlab-ci.yml",
-            "jenkinsfile",
-            ".gitmodules",
-            "package.json",
-            "pyproject.toml",
-            "setup.py",
-            "setup.cfg",
-            "makefile",
-            "justfile",
-            "dockerfile",
-        }
-        or target.name.lower().startswith(("docker-compose", "compose."))
-    ):
-        return RiskAssessment("ask", "modifies execution configuration or agent instructions")
-    return RiskAssessment("allow", "ordinary workspace file operation")
+    return RiskAssessment("allow", "file operation within configured write boundary")
 
 
 @dataclass(frozen=True, slots=True)
@@ -123,7 +76,10 @@ class ConfiguredRiskEvaluator:
 
     def __call__(self, name: str, arguments: JsonValue, tool: object) -> RiskAssessment:
         assessor = getattr(tool, "assess_risk", None)
-        if callable(assessor):
+        shell_assessor = getattr(tool, "assess_shell", None)
+        if name == "bash" and callable(shell_assessor):
+            assessment = shell_assessor(arguments, custom_paths=bool(self.sensitive_paths or self.protected_paths))
+        elif callable(assessor):
             assessment = assessor(arguments)
         elif isinstance(getattr(tool, "control_kind", None), str):
             assessment = RiskAssessment("allow", "capability-limited runtime control")

@@ -541,3 +541,118 @@ def test_code_artifact_reference_is_searchable_without_polluting_display_content
         assert [item.content for item in bundle.items if item.level == "l1"] == [candidate.content]
 
     asyncio.run(scenario())
+
+
+def test_explicit_flush_recovers_dead_bounded_batch_without_skipping_input(tmp_path) -> None:
+    class Extractor:
+        fail = True
+        seen = []
+
+        async def extract_l1(self, archives):
+            self.seen.extend(item.store_seq for archive in archives for item in archive.items)
+            if self.fail:
+                raise ValueError("invalid candidate")
+            return ()
+
+        async def extract_l2(self, l1, scenes):
+            return ()
+
+        async def extract_l3(self, scenes, current):
+            return None
+
+    async def scenario() -> None:
+        from agent_harness.domain.memory import SessionTraceArchive, TraceItem
+
+        scope = MemoryScope("recovery")
+        store = SQLiteMemoryStore(tmp_path / "memory.db", now_ms=lambda: 100)
+        extractor = Extractor()
+        runtime = MemoryRuntime(
+            store,
+            extractor,
+            now_ms=lambda: 100,
+            l1_turn_threshold=1,
+            l1_max_input_chars=1,
+            l2_delay_ms=0,
+            l2_min_interval_ms=0,
+        )
+        archive = SessionTraceArchive(
+            "archive",
+            scope,
+            "session",
+            "main",
+            "op",
+            "run",
+            None,
+            "b",
+            ("a", "b"),
+            "source",
+            "conversation-v1",
+            100,
+            "content",
+            (
+                TraceItem("a", 1, 100, "message", "user", "first", {}),
+                TraceItem("b", 2, 100, "message", "user", "second", {}),
+            ),
+        )
+        await store.capture_archive(archive)
+        await runtime.flush(scope)
+        first = await store.claim_job(100, "first", 30_000)
+        assert first is not None and first.input_high_watermark == 1
+        await runtime._run_job(first)  # noqa: SLF001
+        assert await store.current_l1_watermark(scope) == 0
+        await runtime._enqueue_l1(scope, 0)  # noqa: SLF001
+        assert await store.claim_job(100, "blocked", 30_000) is None
+
+        extractor.fail = False
+        await runtime.flush(scope)
+        store.close()
+        store = SQLiteMemoryStore(tmp_path / "memory.db", now_ms=lambda: 100)
+        runtime = MemoryRuntime(
+            store,
+            extractor,
+            now_ms=lambda: 100,
+            l1_turn_threshold=1,
+            l1_max_input_chars=1,
+            l2_delay_ms=0,
+            l2_min_interval_ms=0,
+        )
+        recovered = await store.claim_job(100, "recovered", 30_000)
+        assert recovered is not None and recovered.job_id == first.job_id
+        assert recovered.attempt == 2 and recovered.input_ids == first.input_ids
+        await runtime._run_job(recovered)  # noqa: SLF001
+        assert await store.current_l1_watermark(scope) == 1
+        for number in range(8):
+            job = await store.claim_job(100, f"next-{number}", 30_000)
+            if job is None:
+                break
+            await runtime._run_job(job)  # noqa: SLF001
+        assert await store.current_l1_watermark(scope) == 2
+        assert extractor.seen == [1, 1, 2]
+        assert await store.stage_watermark(scope, "l2") == 2
+        assert any(record.event == "job_replayed" for record in await store.list_audit(scope, None, 100))
+        store.close()
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("stage", ["l2", "l3"])
+def test_explicit_flush_replays_higher_stage_dead_letter(tmp_path, stage) -> None:
+    from agent_harness.domain.memory import GLOBAL_L3_SCOPE
+
+    async def scenario() -> None:
+        store = SQLiteMemoryStore(tmp_path / "memory.db", now_ms=lambda: 100)
+        scope = MemoryScope("repository")
+        owner = GLOBAL_L3_SCOPE if stage == "l3" else scope
+        watermark = 100 if stage == "l3" else 7
+        await store.advance_watermark(scope, "l1", 7)
+        original = await store.create_or_wake_job(owner, stage, watermark, 100)
+        claimed = await store.claim_job(100, "lease", 30_000)
+        assert claimed is not None
+        await store.fail_job(original.job_id, "lease", "schema", None)
+        await MemoryRuntime(store, now_ms=lambda: 100).flush(scope, stage)
+        replayed = await store.claim_job(100, "replay", 30_000)
+        assert replayed is not None and replayed.job_id == original.job_id
+        assert replayed.scope == owner
+        store.close()
+
+    asyncio.run(scenario())

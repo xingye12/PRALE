@@ -8,15 +8,17 @@ class Element {
   replaceChildren(...children) { this.children = children; }
   setAttribute(key, value) { this.attrs[key] = value; }
   addEventListener(name, handler) { this.handlers[name] = handler; }
+  scrollIntoView(options) { this.scrolled = options; }
 }
 globalThis.Node = Element;
 globalThis.document = {
   createElement: (tag) => new Element(tag),
+  createDocumentFragment: () => new Element("fragment"),
   createTextNode: (text) => Object.assign(new Element(), { textContent: text }),
 };
 function all(node) { return [node, ...node.children.flatMap(all)]; }
 function button(view, label) { return all(view.element).find((node) => node.tag === "button" && node.textContent === label); }
-const original = { approval_id: "approval-1", tool_name: "bash", lane: "__subagent__/child", operation_id: "op", reason: "shell execution", cwd: "/worktree", arguments: { command: "echo <script>" }, source: { run_id: "child" } };
+const original = { approval_id: "approval-1", tool_name: "bash", tool_call_id: "call-1", lane: "main", operation_id: "op", reason: "shell execution", cwd: "/worktree", arguments: { command: "echo <script>" }, source: { run_id: "child" } };
 let pending = [original], grants = [], requests = [], release;
 const app = {
   scope: () => ({ session: "s", lane: "main" }), live: new Map(), report: (error) => { throw error; }, navigate() {},
@@ -32,6 +34,16 @@ const app = {
     }
     if (path.endsWith("/approval-grants")) return { items: grants };
     if (path.endsWith("/approvals")) return { items: pending };
+    if (path.includes("/turns/")) {
+      const operation = path.split("/").at(-1);
+      return { entries: [{ seq: 1, timestamp: 0, type: "message", payload: operation === "op"
+        ? { role: "assistant", tool_calls: [{ id: "call-1", name: "bash", arguments: original.arguments }, { id: "call-2", name: "bash", arguments: { command: "git status -sb" } }] }
+        : { role: "assistant", content: "previous long history " + operation } }], unattributed_usage: [] };
+    }
+    if (path.endsWith("/turns")) return { items: [
+      { operation_id: "op", status: null, kind: "run" },
+      ...Array.from({ length: 19 }, (_, i) => ({ operation_id: "older-" + i, status: "completed", kind: "run" })),
+    ], next_cursor: null };
     return { items: [], next_cursor: null };
   } },
 };
@@ -41,6 +53,12 @@ assert.ok(all(view.element).some((node) => node.textContent.includes("/worktree"
 assert.ok(all(view.element).some((node) => node.textContent.includes("echo <script>")));
 assert.ok(button(view, "允许本次"));
 assert.ok(button(view, "拒绝"));
+const assistantWithApproval = all(view.element).find((node) => node.dataset.role === "assistant" && all(node).some((child) => child.dataset.approvalId === original.approval_id));
+assert.ok(assistantWithApproval, "the approval must be beside its tool call, not above long conversation history");
+assert.equal(all(view.element).filter((node) => node.dataset.approvalId === original.approval_id).length, 1);
+assert.ok(all(view.element).some((node) => node.textContent.includes("等待执行权限")));
+await button(view, "前往审批").handlers.click();
+assert.equal(all(view.element).find((node) => node.dataset.approvalId === original.approval_id).scrolled.block, "center");
 const approve = button(view, "允许本会话相同操作");
 const first = approve.handlers.click();
 assert.equal(button(view, "允许本次").attrs.disabled, "");
@@ -59,4 +77,10 @@ const rejected = button(refreshed, "拒绝").handlers.click();
 release();
 await rejected;
 assert.equal(requests[2].body.decision, "reject");
+pending = [{ ...original, approval_id: "child-approval", lane: "__subagent__/child", operation_id: "child-op", source: { parent_operation_id: "op", parent_tool_call_id: "call-1" } }];
+await refreshed.refresh();
+assert.ok(all(refreshed.element).find((node) => node.dataset.role === "assistant" && all(node).some((child) => child.dataset.approvalId === "child-approval")), "child approvals must appear beside the parent control call");
+pending = [{ ...original, approval_id: "unloaded", operation_id: "not-on-this-page" }];
+await refreshed.refresh();
+assert.ok(button(refreshed, "允许本次"), "off-page approvals must remain actionable");
 console.log("approval view interactions passed");

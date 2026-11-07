@@ -294,3 +294,42 @@ def test_index_rebuild_derives_fts_from_authoritative_l1_rows(tmp_path) -> None:
         assert result.items and result.items[0].content == "rebuildable keyword"
 
     asyncio.run(scenario())
+
+
+def test_dead_letter_replay_is_scoped_atomic_and_preserves_attempts(tmp_path) -> None:
+    import sqlite3
+
+    import pytest
+
+    async def scenario(store):
+        scope, other = MemoryScope("replay"), MemoryScope("other")
+        job = await store.create_or_wake_job(scope, "l1", 7, 100, input_ids=("archive",))
+        claimed = await store.claim_job(100, "lease", 30_000)
+        assert claimed is not None
+        await store.fail_job(job.job_id, "lease", "schema", None)
+        with pytest.raises(KeyError):
+            await store.replay_dead_letter(other, job.job_id)
+        store._conn.execute(  # noqa: SLF001
+            "CREATE TEMP TRIGGER reject_replay BEFORE INSERT ON memory_audit "
+            "WHEN NEW.event='job_replayed' BEGIN SELECT RAISE(ABORT,'audit unavailable'); END"
+        )
+        with pytest.raises(sqlite3.IntegrityError):
+            await store.replay_dead_letter(scope, job.job_id)
+        assert await store.claim_job(100, "not-replayed", 30_000) is None
+        store._conn.execute("DROP TRIGGER reject_replay")  # noqa: SLF001
+        await store.replay_dead_letter(scope, job.job_id)
+        with pytest.raises(KeyError):
+            await store.replay_dead_letter(scope, job.job_id)
+        replayed = await store.claim_job(100, "new-lease", 30_000)
+        assert replayed is not None
+        assert replayed.job_id == job.job_id and replayed.attempt == 2
+        assert replayed.input_ids == ("archive",)
+        records = await store.list_audit(scope, None, 100)
+        assert sum(record.event == "job_replayed" for record in records) == 1
+        store.close()
+
+    for store in (
+        InMemoryMemoryStore(now_ms=lambda: 100),
+        SQLiteMemoryStore(tmp_path / "replay.db", now_ms=lambda: 100),
+    ):
+        asyncio.run(scenario(store))

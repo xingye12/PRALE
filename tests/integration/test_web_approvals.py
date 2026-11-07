@@ -4,7 +4,9 @@ import httpx
 
 from agent_harness.api.project import ProjectRuntimeConfig
 from agent_harness.api.web import create_app
+from agent_harness.domain.approvals import ApprovalConfig
 from agent_harness.integrations.local_tools import WriteTool
+from agent_harness.integrations.tool_risk import ConfiguredRiskEvaluator
 from agent_harness.runtime.generation import AssistantResult, ToolCall
 
 
@@ -18,7 +20,15 @@ class Provider:
 def test_web_approval_auth_decision_reconnect_and_grant_revocation(tmp_path):
     async def scenario():
         config = ProjectRuntimeConfig(tmp_path, "repo", tmp_path / "sessions", tmp_path / "catalog.db")
-        web = create_app(config, Provider(), tools=(WriteTool(tmp_path),), tokens={"token": "owner"})
+        web = create_app(
+            config,
+            Provider(),
+            tools=(WriteTool(tmp_path),),
+            tokens={"token": "owner"},
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
+        )
         await web.start()
         await web.supervisor.create_session("s")
         await web.supervisor.create_session("other")
@@ -58,7 +68,15 @@ def test_web_approval_auth_decision_reconnect_and_grant_revocation(tmp_path):
             assert snapshot.pending_approvals[0]["approval_id"] == approval_id
             await web.aclose()
         # A new server must resume the abandoned lease after approving the same request.
-        reopened = create_app(config, Provider(), tools=(WriteTool(tmp_path),), tokens={"token": "owner"})
+        reopened = create_app(
+            config,
+            Provider(),
+            tools=(WriteTool(tmp_path),),
+            tokens={"token": "owner"},
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
+        )
         await reopened.start()
         try:
             async with httpx.AsyncClient(

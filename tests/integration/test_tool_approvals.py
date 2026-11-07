@@ -3,6 +3,7 @@ import asyncio
 from agent_harness.api.harness import Harness
 from agent_harness.domain.approvals import ApprovalConfig, ApprovalConflict
 from agent_harness.integrations.local_tools import WriteTool
+from agent_harness.integrations.tool_risk import ConfiguredRiskEvaluator
 from agent_harness.runtime.generation import AssistantResult, ToolCall
 from agent_harness.storage.memory import MemoryStorage
 
@@ -33,7 +34,12 @@ async def pending(harness):
 def test_web_channel_waits_for_permission(tmp_path):
     async def scenario():
         harness = await Harness.open(
-            "s", MemoryStorage(), tools=(WriteTool(tmp_path),), approvals=ApprovalConfig(channel_available=True)
+            "s",
+            MemoryStorage(),
+            tools=(WriteTool(tmp_path),),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
         lane = await harness.acquire_lane("main")
         await lane.prompt("write")
@@ -50,7 +56,12 @@ def test_web_channel_waits_for_permission(tmp_path):
 
 def test_no_channel_rejects_without_effect(tmp_path):
     async def scenario():
-        harness = await Harness.open("s", MemoryStorage(), tools=(WriteTool(tmp_path),))
+        harness = await Harness.open(
+            "s",
+            MemoryStorage(),
+            tools=(WriteTool(tmp_path),),
+            approvals=ApprovalConfig(evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))),
+        )
         lane = await harness.acquire_lane("main")
         await lane.prompt("write")
         await lane.drive(Provider())
@@ -63,7 +74,12 @@ def test_no_channel_rejects_without_effect(tmp_path):
 def test_cancel_rejects_late_decision(tmp_path):
     async def scenario():
         harness = await Harness.open(
-            "s", MemoryStorage(), tools=(WriteTool(tmp_path),), approvals=ApprovalConfig(channel_available=True)
+            "s",
+            MemoryStorage(),
+            tools=(WriteTool(tmp_path),),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
         lane = await harness.acquire_lane("main")
         await lane.prompt("write")
@@ -85,7 +101,12 @@ def test_cancel_rejects_late_decision(tmp_path):
 def test_session_grant_is_exact_and_revocable(tmp_path):
     async def scenario():
         harness = await Harness.open(
-            "s", MemoryStorage(), tools=(WriteTool(tmp_path),), approvals=ApprovalConfig(channel_available=True)
+            "s",
+            MemoryStorage(),
+            tools=(WriteTool(tmp_path),),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
         lane = await harness.acquire_lane("main")
         await lane.prompt("first")
@@ -119,7 +140,9 @@ def test_policy_never_rejects_without_prompt(tmp_path):
             "s",
             MemoryStorage(),
             tools=(WriteTool(tmp_path),),
-            approvals=ApprovalConfig(policy="never", channel_available=True),
+            approvals=ApprovalConfig(
+                policy="never", channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
         lane = await harness.acquire_lane("main")
         await lane.prompt("write")
@@ -133,7 +156,12 @@ def test_policy_never_rejects_without_prompt(tmp_path):
 def test_hook_changes_are_reviewed_and_frozen(tmp_path):
     async def scenario():
         harness = await Harness.open(
-            "s", MemoryStorage(), tools=(WriteTool(tmp_path),), approvals=ApprovalConfig(channel_available=True)
+            "s",
+            MemoryStorage(),
+            tools=(WriteTool(tmp_path),),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
         count = 0
 
@@ -167,7 +195,9 @@ def test_subagent_requests_have_independent_authorization_subjects(tmp_path):
             "s",
             MemoryStorage(),
             tools=(WriteTool(tmp_path),),
-            approvals=ApprovalConfig(channel_available=True),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
             provider_resolver=MappingProviderResolver({"test": provider}, "test"),
         )
         try:
@@ -219,7 +249,9 @@ def test_dangerous_parallel_call_is_a_source_order_barrier(tmp_path):
             "s",
             storage,
             tools=(ReadTool(tmp_path), WriteTool(tmp_path)),
-            approvals=ApprovalConfig(channel_available=True),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
         lane = await harness.acquire_lane("main")
         await lane.prompt("batch")
@@ -246,7 +278,12 @@ def test_symlink_change_requires_a_new_approval(tmp_path):
         (tmp_path / "second").write_text("second")
         (tmp_path / ".env").symlink_to("first")
         harness = await Harness.open(
-            "s", MemoryStorage(), tools=(WriteTool(tmp_path),), approvals=ApprovalConfig(channel_available=True)
+            "s",
+            MemoryStorage(),
+            tools=(WriteTool(tmp_path),),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
         lane = await harness.acquire_lane("main")
         await lane.prompt("write")
@@ -268,7 +305,12 @@ def test_symlink_change_requires_a_new_approval(tmp_path):
 def test_revoke_between_decision_and_intent_prevents_execution(tmp_path):
     async def scenario():
         harness = await Harness.open(
-            "s", MemoryStorage(), tools=(WriteTool(tmp_path),), approvals=ApprovalConfig(channel_available=True)
+            "s",
+            MemoryStorage(),
+            tools=(WriteTool(tmp_path),),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
 
         async def revoke_on_decision(event):
@@ -331,7 +373,12 @@ def test_invalid_final_parameters_are_denied_without_a_tool_span(tmp_path):
     async def scenario():
         storage = MemoryStorage()
         harness = await Harness.open(
-            "s", storage, tools=(WriteTool(tmp_path),), approvals=ApprovalConfig(channel_available=True)
+            "s",
+            storage,
+            tools=(WriteTool(tmp_path),),
+            approvals=ApprovalConfig(
+                channel_available=True, evaluator=ConfiguredRiskEvaluator(sensitive_paths=(".env",))
+            ),
         )
         harness.on_hook("before_tool", lambda event: {**event, "arguments": {"path": ".env", "content": 42}})
         lane = await harness.acquire_lane("main")
