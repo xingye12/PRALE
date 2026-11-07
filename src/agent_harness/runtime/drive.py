@@ -3,15 +3,19 @@
 import asyncio
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Literal, cast
 
-from agent_harness.api.errors import ContextBudgetExceeded, ProviderNotConfigured, UnknownTarget
+from agent_harness.api.errors import ContextBudgetExceeded, NothingToCompact, ProviderNotConfigured, UnknownTarget
 from agent_harness.domain.approvals import ApprovalConflict
 from agent_harness.domain.compaction import select_compaction_window
 from agent_harness.domain.context import project_messages
 from agent_harness.domain.context_management import (
+    ContextManagementConfig,
+    ContextReduction,
+    ContextReductionReport,
     build_compaction_prompt,
+    continuation_summary_message,
     estimate_messages,
     format_compact_summary,
     needs_summary,
@@ -22,6 +26,7 @@ from agent_harness.domain.entries import Entry, JsonValue, NewEntry
 from agent_harness.domain.operations import ActiveOperation, OperationResult, OperationState
 from agent_harness.domain.session import SessionMutator
 from agent_harness.domain.subagents import SubagentError
+from agent_harness.domain.tool_prune import ContextView, context_view, message_hash, prune_content
 from agent_harness.domain.types import OperationStatus
 from agent_harness.domain.values import (
     lane_inbox,
@@ -254,6 +259,9 @@ class Drive:
         """
 
         metadata: dict[str, JsonValue] = {}
+        reduction = intent.get("context_management")
+        if isinstance(reduction, dict):
+            metadata["context_management"] = cast(JsonValue, reduction)
         bundle_hash = intent.get("memory_bundle_hash")
         if isinstance(bundle_hash, str):
             metadata["memory_bundle_hash"] = bundle_hash
@@ -310,6 +318,8 @@ class Drive:
         self._publish(self._operation_started(initial))
         while True:
             operation = await self._required_operation()
+            if operation.state.control == "cancel_requested":
+                return await self._settle_cancelled(operation)
             if operation.meta.kind == "navigation":
                 return await self._run_navigation(operation)
             if operation.meta.kind == "compaction":
@@ -363,9 +373,19 @@ class Drive:
         operation = await self._lane.active_operation()
         if operation is None:
             return None
+        if operation.state.control == "cancel_requested":
+            return await self._settle_cancelled(operation)
         if operation.state.at == "summary.effect_pending":
             return await self._settle_interrupted_compaction(operation)
         if operation.state.at in {"context.collapse.effect_pending", "context.global_compaction.effect_pending"}:
+            if (
+                isinstance(operation.state.data, dict)
+                and operation.state.data.get("strategy") == "tool_prune_summary_v1"
+            ):
+                result = await self._retry_or_fail_context_summary(operation, interrupted=True)
+                if result is not None or self._provider is None:
+                    return result
+                return await self.run()
             await self._settle_interrupted_context_summary(operation)
             # The summary provider outcome is unknowable.  Do not silently
             # issue the original user generation from recovery: callers may
@@ -469,6 +489,8 @@ class Drive:
         return result
 
     async def _run_compaction(self, operation: ActiveOperation) -> OperationResult:
+        if operation.state.at == "starting" and self._lane._context_management.strategy == "tool_prune_summary_v1":  # noqa: SLF001
+            return await self._run_tool_compaction(operation)
         if operation.state.at == "starting":
             context = await self._lane._session.context(await self._lane._session.get_value(lane_tip(self._lane.name)))  # noqa: SLF001
             window = select_compaction_window(context, retain_recent=4)
@@ -507,22 +529,98 @@ class Drive:
             raise ProviderNotConfigured("a chat provider is required to compact a session")
         data = operation.state.data
         assert isinstance(data, dict) and isinstance(data.get("messages"), list)
-        response = await self._provider.generate(
-            GenerationRequest(
-                self._lane._session.id,  # noqa: SLF001
-                self._lane.name,
-                operation.meta.operation_id,
-                tuple(data["messages"]),
+        if self._lane.effect_closed:
+            raise asyncio.CancelledError
+        try:
+            response = await self._provider.generate(
+                GenerationRequest(
+                    self._lane._session.id,  # noqa: SLF001
+                    self._lane.name,
+                    operation.meta.operation_id,
+                    tuple(data["messages"]),
+                )
             )
-        )
+        except Exception:
+            if data.get("strategy") != "tool_prune_summary_v1":
+                raise
+            failed = await self._retry_or_fail_context_summary(operation)
+            return failed if failed is not None else await self._run_compaction(await self._required_operation())
         entry_id = data["entry_id"]
         usage_id = data["usage_id"]
         assert isinstance(entry_id, str) and isinstance(usage_id, str)
 
         summary = format_compact_summary(response.content)
+        if data.get("strategy") == "tool_prune_summary_v1":
+            prefix_tokens = data.get("prefix_tokens", 0)
+            if (
+                summary is None
+                or bool(response.tool_calls)
+                or not isinstance(prefix_tokens, int)
+                or (estimate_messages([continuation_summary_message(summary)]) >= prefix_tokens)
+            ):
+                failed = await self._retry_or_fail_context_summary(operation, usage=response.usage)
+                return failed if failed is not None else await self._run_compaction(await self._required_operation())
         if summary is None:
             raise RuntimeError("compaction provider returned an empty summary")
         return await self._settle_compaction_summary(operation, summary, response.usage)
+
+    async def _run_tool_compaction(self, operation: ActiveOperation) -> OperationResult:
+        config = self._lane._context_management  # noqa: SLF001
+        context = await self._lane._session.context(await self._lane._session.get_value(lane_tip(self._lane.name)))  # noqa: SLF001
+        view = context_view(context, config)
+        reduced, reduction_writes = self._prepare_tool_pruning(context, view, list(view.messages), config)
+        retained = set(view.retained_ids)
+        prefix = [m for i, m in enumerate(reduced.messages) if view.source_ids[i] not in retained]
+        hook = await self._lane.hooks.run(
+            "before_compaction",
+            {"messages": prefix, "retained_message_ids": view.retained_ids},
+        )
+        if not isinstance(hook, dict):
+            raise RuntimeError("before_compaction must return a messages object")
+        if hook.get("decline"):
+            return await self._settle_terminal_at_tip(operation, "completed")
+        if not prefix:
+            raise NothingToCompact("no prefix outside the original retained range")
+        selected = hook.get("messages")
+        if not isinstance(selected, list):
+            raise RuntimeError("before_compaction must return messages")
+        messages = build_compaction_prompt(selected)
+        entry_id = self._lane.new_id()
+        custom = hook.get("summary")
+        if (
+            custom is None
+            and config.hard_limit_tokens is not None
+            and estimate_messages(messages) > config.hard_limit_tokens
+        ):
+            raise ContextBudgetExceeded(estimate_messages(messages), config.hard_limit_tokens)
+        if custom is not None and not isinstance(custom, str):
+            raise RuntimeError("before_compaction summary must be a string")
+        span, write = self._open_span(operation, entry_id, "llm", attempt=1)
+        data = {
+            "entry_id": entry_id,
+            "usage_id": self._lane.new_id(),
+            "span_id": span.span_id if custom is None else None,
+            "messages": messages,
+            "retained_message_ids": view.retained_ids,
+            "source_entry_ids": [sid for sid in view.source_ids if sid not in retained],
+            "strategy": config.strategy,
+            "config": asdict(config),
+            "prefix_tokens": estimate_messages(prefix),
+        }
+        await self._transition(
+            operation,
+            OperationState("summary.effect_pending", "running", data),
+            [*reduction_writes, *([write] if custom is None else [])],
+        )
+        pending = await self._required_operation()
+        if custom is not None:
+            summary = format_compact_summary(custom)
+            if summary is None or estimate_messages([continuation_summary_message(summary)]) >= estimate_messages(
+                prefix
+            ):
+                return await self._settle_failed_context_summary(pending)
+            return await self._settle_compaction_summary(pending, summary, {})
+        return await self._run_compaction(pending)
 
     async def _settle_compaction_summary(
         self,
@@ -566,6 +664,14 @@ class Drive:
                                 "summary": summary,
                                 "retained_message_ids": cast(JsonValue, retained_ids),
                                 "prompt_version": 1,
+                                **(
+                                    {
+                                        "strategy": data["strategy"],
+                                        "covered_entry_ids": data.get("source_entry_ids", []),
+                                    }
+                                    if isinstance(data, dict) and data.get("strategy") == "tool_prune_summary_v1"
+                                    else {}
+                                ),
                             },
                         )
                     ),
@@ -601,6 +707,22 @@ class Drive:
         entry_id = data["entry_id"]
         usage_id = data["usage_id"]
         span_id = data.get("span_id")
+        if data.get("strategy") == "tool_prune_summary_v1":
+            # An unknown summary must never hide original history behind a placeholder.
+            async def interrupted(mutator: SessionMutator) -> OperationResult:
+                if await mutator.get_value(operation_state(operation.meta.operation_id)) != operation.state:
+                    raise RuntimeError("compaction intent was already settled")
+                tip = await mutator.get_value(lane_tip(self._lane.name))
+                result = self._terminal_result(operation, tip, "unknown", error_code="interrupted")
+                await mutator.commit(
+                    [
+                        *self._settle_span(span_id, "unknown", "interrupted"),
+                        *await self._terminal_writes(mutator, operation, result, "unknown"),
+                    ]
+                )
+                return result
+
+            return await self._lane._session.mutate(interrupted)  # noqa: SLF001
 
         async def settle(mutator: SessionMutator) -> OperationResult:
             if await mutator.get_value(operation_state(operation.meta.operation_id)) != operation.state:
@@ -729,15 +851,23 @@ class Drive:
 
     async def _persist_generation_intent(self, operation: ActiveOperation) -> None:
         context = await self._lane._session.context(await self._lane._session.get_value(lane_tip(self._lane.name)))  # noqa: SLF001
-        transformed = await self._lane.hooks.run("transform_context", {"messages": project_messages(context)})
+        config = self._context_config(operation)
+        new_strategy = config.strategy == "tool_prune_summary_v1"
+        view = context_view(context, config) if new_strategy else None
+        base_messages = list(view.messages) if view is not None else project_messages(context)
+        transformed = await self._lane.hooks.run("transform_context", {"messages": base_messages})
         if not isinstance(transformed, dict) or not isinstance(transformed.get("messages"), list):
             raise RuntimeError("transform_context must return a request object with messages")
         # This deliberately follows transform_context: existing hooks continue
         # to see the full base projection, while the durable request intent
         # freezes the subsequently reduced view.
-        reduced = reduce_request_messages(transformed["messages"], self._lane._context_management)  # noqa: SLF001
+        reduced = (
+            ContextReduction(tuple(transformed["messages"]), ContextReductionReport(0, 0))
+            if new_strategy
+            else reduce_request_messages(transformed["messages"], config)
+        )
         transformed = {**transformed, "messages": list(reduced.messages)}
-        if needs_summary(transformed["messages"], self._lane._context_management):  # noqa: SLF001
+        if not new_strategy and needs_summary(transformed["messages"], config):
             await self._start_context_summary(operation, context, list(reduced.messages), reduced.report)
             return
         prompt = operation.meta.request.get("prompt", "") if isinstance(operation.meta.request, dict) else ""
@@ -753,7 +883,7 @@ class Drive:
                 "messages": [*transformed["messages"], memory_message],
             }
             assert self._lane._memory_runtime is not None and self._lane._memory_scope is not None  # noqa: SLF001
-            await self._lane._memory_runtime.record_injection(self._lane._memory_scope, bundle)  # noqa: SLF001
+
         if skills:
             listing = "\n".join(
                 f"- {item.skill_id}@{item.version}: {item.name} — {item.description}; "
@@ -812,10 +942,22 @@ class Drive:
                 **payload,
                 "messages": [{"role": "system", "content": self._lane.system_prompt}, *payload["messages"]],
             }
-        final_estimate = estimate_messages(payload["messages"])
-        hard_limit = self._lane._context_management.hard_limit_tokens  # noqa: SLF001
+        reduction_writes: list[Write] = []
+        if view is not None:
+            reduced, reduction_writes = self._prepare_tool_pruning(context, view, payload["messages"], config)
+            payload = {**payload, "messages": list(reduced.messages)}
+            if self._request_pressure(payload["messages"], config):
+                await self._start_tool_summary(operation, context, view, payload["messages"], reduction_writes)
+                return
+        final_estimate = (
+            self._request_estimate(payload["messages"]) if new_strategy else estimate_messages(payload["messages"])
+        )
+        hard_limit = config.hard_limit_tokens
         if hard_limit is not None and final_estimate > hard_limit:
             raise ContextBudgetExceeded(final_estimate, hard_limit)
+        if bundle is not None and bundle.items:
+            assert self._lane._memory_runtime is not None and self._lane._memory_scope is not None  # noqa: SLF001
+            await self._lane._memory_runtime.record_injection(self._lane._memory_scope, bundle)  # noqa: SLF001
         assistant_entry_id = self._lane.new_id()
         usage_id = self._lane.new_id()
         span, span_write = self._open_span(operation, assistant_entry_id, "llm", attempt=1)
@@ -854,6 +996,12 @@ class Drive:
                 for loadout in loadouts
             ],
             "context_management": {
+                "strategy": config.strategy,
+                "estimator": "utf8_json_div3_v1",
+                "trigger_tokens": config.soft_limit_tokens,
+                "context_budget_unavailable": config.context_window_tokens is None,
+                "retained_message_ids": view.retained_ids if view is not None else [],
+                "restored_original_ids": list(view.restored_ids) if view is not None else [],
                 "estimated_tokens_before": reduced.report.estimated_tokens_before,
                 "estimated_tokens_after": final_estimate,
                 "trimmed_tool_results": reduced.report.trimmed_tool_results,
@@ -866,11 +1014,14 @@ class Drive:
             operation,
             OperationState(at="assistant.effect_pending", control="running", data=intent),
             [
+                *reduction_writes,
                 span_write,
                 AppendList(
                     operation_context_reductions(operation.meta.operation_id),
                     {
                         "kind": "request_projection",
+                        "strategy": config.strategy,
+                        "retained_message_ids": view.retained_ids if view is not None else [],
                         "trimmed_tool_results": reduced.report.trimmed_tool_results,
                         "micro_cleared_tool_results": reduced.report.micro_cleared_tool_results,
                         "snipped_messages": reduced.report.snipped_messages,
@@ -880,6 +1031,144 @@ class Drive:
                     },
                 ),
             ],
+        )
+
+    def _context_config(self, operation: ActiveOperation) -> ContextManagementConfig:
+        data = operation.state.data
+        frozen = data.get("context_config") if isinstance(data, dict) else None
+        if isinstance(frozen, dict):
+            return ContextManagementConfig(**frozen)
+        return self._lane._context_management  # noqa: SLF001
+
+    def _request_estimate(self, messages: list[JsonValue]) -> int:
+        tools: list[JsonValue] = [
+            {
+                "type": "function",
+                "function": {
+                    "name": tool.name,
+                    "description": tool.description,
+                    "parameters": tool.input_schema,
+                },
+            }
+            for tool in self._lane.tools.definitions()
+        ]
+        return estimate_messages(messages) + (estimate_messages(tools) if tools else 0)
+
+    def _request_pressure(self, messages: list[JsonValue], config: ContextManagementConfig) -> bool:
+        return bool(
+            config.enabled
+            and config.soft_limit_tokens is not None
+            and self._request_estimate(messages) >= config.soft_limit_tokens
+        )
+
+    def _prepare_tool_pruning(
+        self,
+        context: list[Entry],
+        view: ContextView,
+        messages: list[JsonValue],
+        config: ContextManagementConfig,
+    ) -> tuple[ContextReduction, list[Write]]:
+        before = self._request_estimate(messages)
+        result = list(messages)
+        writes: list[Write] = []
+        hashes: list[str] = []
+        parent = context[-1].id if context else None
+        if self._request_pressure(messages, config):
+            for index, original in enumerate(view.messages[: view.boundary]):
+                if not isinstance(original, dict) or original.get("role") != "tool":
+                    continue
+                # Unattributable hook messages are never rewritten implicitly.
+                positions = [i for i, candidate in enumerate(result) if candidate == original]
+                if len(positions) != 1:
+                    continue
+                content = original.get("content")
+                replacement = prune_content(content, config)
+                if replacement == content:
+                    continue
+                message: JsonValue = {**original, "content": replacement}
+                result[positions[0]] = message
+                digest = message_hash(view.originals[index])
+                hashes.append(digest)
+                entry_id = self._lane.new_id()
+                record: JsonValue = {
+                    "kind": "context_tool_prune",
+                    "format_version": 1,
+                    "strategy_version": config.strategy,
+                    "source_entry_id": view.source_ids[index],
+                    "source_hash": digest,
+                    "tool_call_id": original.get("tool_call_id"),
+                    "head_chars": config.tool_prune_head_chars,
+                    "tail_chars": config.tool_prune_tail_chars,
+                    "estimated_tokens_before": estimate_messages([original]),
+                    "estimated_tokens_after": estimate_messages([message]),
+                    "message": message,
+                }
+                writes.append(InsertEntry(NewEntry(entry_id, parent, "custom", record)))
+                parent = entry_id
+            if writes:
+                writes.append(SetValue(lane_tip(self._lane.name), parent))
+        report = ContextReductionReport(
+            before, self._request_estimate(result), len(hashes), source_hashes=tuple(hashes)
+        )
+        return ContextReduction(tuple(result), report), writes
+
+    async def _start_tool_summary(
+        self,
+        operation: ActiveOperation,
+        context: list[Entry],
+        view: ContextView,
+        messages: list[JsonValue],
+        reduction_writes: list[Write],
+    ) -> None:
+        config = self._context_config(operation)
+        count = operation.state.data.get("context_summary_count", 0) if isinstance(operation.state.data, dict) else 0
+        if not isinstance(count, int):
+            raise RuntimeError("invalid context summary count")
+        retained = set(view.retained_ids)
+        selected = [i for i, source_id in enumerate(view.source_ids) if source_id not in retained]
+        prefix: list[JsonValue] = []
+        # Only source-attributable conversation messages can be summarized.
+        for index in selected:
+            original = view.messages[index]
+            candidates = [m for m in messages if m == original]
+            if not candidates and isinstance(original, dict) and original.get("role") == "tool":
+                replacement = {**original, "content": prune_content(original.get("content"), config)}
+                candidates = [m for m in messages if m == replacement]
+            if len(candidates) != 1:
+                raise ContextBudgetExceeded(self._request_estimate(messages), config.hard_limit_tokens or 0)
+            prefix.append(candidates[0])
+        if not prefix or count >= 2:
+            raise ContextBudgetExceeded(self._request_estimate(messages), config.hard_limit_tokens or 0)
+        fixed = [m for m in messages if m not in prefix]
+        if config.hard_limit_tokens is not None and self._request_estimate(fixed) >= config.hard_limit_tokens:
+            raise ContextBudgetExceeded(self._request_estimate(fixed), config.hard_limit_tokens)
+        summary_messages = build_compaction_prompt(prefix)
+        if config.hard_limit_tokens is not None and estimate_messages(summary_messages) > config.hard_limit_tokens:
+            raise ContextBudgetExceeded(estimate_messages(summary_messages), config.hard_limit_tokens)
+        entry_id = self._lane.new_id()
+        span, span_write = self._open_span(operation, entry_id, "llm", attempt=1)
+        data = {
+            "format_version": 1,
+            "strategy": config.strategy,
+            "config": asdict(config),
+            "entry_id": entry_id,
+            "usage_id": self._lane.new_id(),
+            "span_id": span.span_id,
+            "messages": summary_messages,
+            "summary_kind": "global",
+            "retry": 0,
+            "source_tip_id": context[-1].id if context else None,
+            "source_entry_ids": [view.source_ids[i] for i in selected],
+            "retained_message_ids": view.retained_ids,
+            "prompt_version": 1,
+            "prefix_tokens": estimate_messages(prefix),
+            "context_summary_count": count + 1,
+            "request_tokens_before": self._request_estimate(messages),
+        }
+        await self._transition(
+            operation,
+            OperationState("context.global_compaction.effect_pending", "running", data),
+            [*reduction_writes, span_write],
         )
 
     async def _start_context_summary(
@@ -939,6 +1228,8 @@ class Drive:
         data = operation.state.data
         if not isinstance(data, dict) or not isinstance(data.get("messages"), list):
             raise RuntimeError("context summary intent is invalid")
+        if self._lane.effect_closed:
+            raise asyncio.CancelledError
         try:
             response = await self._provider.generate(
                 GenerationRequest(
@@ -951,44 +1242,100 @@ class Drive:
         except Exception:
             return await self._retry_or_fail_context_summary(operation)
         summary = format_compact_summary(response.content)
-        if summary is None:
-            return await self._retry_or_fail_context_summary(operation)
+        invalid = summary is None or bool(response.tool_calls)
+        if data.get("strategy") == "tool_prune_summary_v1" and summary is not None:
+            prefix_tokens = data.get("prefix_tokens", 0)
+            invalid = invalid or (
+                not isinstance(prefix_tokens, int)
+                or estimate_messages([continuation_summary_message(summary)]) >= prefix_tokens
+            )
+        if invalid:
+            return await self._retry_or_fail_context_summary(operation, usage=response.usage)
+        assert summary is not None
         await self._settle_context_summary(operation, summary, response.usage)
         return None
 
-    async def _retry_or_fail_context_summary(self, operation: ActiveOperation) -> OperationResult | None:
+    async def _retry_or_fail_context_summary(
+        self,
+        operation: ActiveOperation,
+        *,
+        interrupted: bool = False,
+        usage: dict[str, int | float] | None = None,
+    ) -> OperationResult | None:
         data = operation.state.data
         if not isinstance(data, dict):
             raise RuntimeError("context summary intent is invalid")
         retry = data.get("retry", 0)
         if not isinstance(retry, int):
             raise RuntimeError("context summary retry is invalid")
-        if retry >= self._lane._context_management.max_summary_retries:  # noqa: SLF001
-            return await self._settle_failed_context_summary(operation)
+        new_strategy = data.get("strategy") == "tool_prune_summary_v1"
+        frozen = data.get("config")
+        retry_limit = (
+            frozen.get("max_summary_retries", 1)
+            if new_strategy and isinstance(frozen, dict)
+            else self._lane._context_management.max_summary_retries
+        )  # noqa: SLF001
+        if not isinstance(retry_limit, int) or retry >= retry_limit:
+            return await self._settle_failed_context_summary(operation, interrupted=interrupted, usage=usage)
         entry_id = data.get("entry_id")
         if not isinstance(entry_id, str):
             raise RuntimeError("context summary intent is invalid")
         messages = data.get("messages")
         if not isinstance(messages, list):
             raise RuntimeError("context summary intent is invalid")
+        usage_writes = self._summary_usage_writes(operation, usage)
         span, span_write = self._open_span(operation, entry_id, "llm", attempt=retry + 2)
-        next_data = {
-            **data,
-            "span_id": span.span_id,
-            "retry": retry + 1,
-            "messages": [
-                *messages,
-                {"role": "user", "content": "[earlier conversation truncated for compaction retry]"},
-            ],
-        }
+        retry_messages = list(messages)
+        if new_strategy:
+            if not interrupted:
+                retry_messages[-1] = {
+                    "role": "user",
+                    "content": "Return a substantially shorter continuation summary. Preserve critical facts only.",
+                }
+        else:
+            retry_messages.append({"role": "user", "content": "[earlier conversation truncated for compaction retry]"})
+        next_data = {**data, "span_id": span.span_id, "retry": retry + 1, "messages": retry_messages}
         await self._transition(
             operation,
             OperationState(operation.state.at, "running", next_data),
-            [*self._settle_span(data.get("span_id"), "failed", "provider_error"), span_write],
+            [
+                *self._settle_span(
+                    data.get("span_id"),
+                    "unknown" if interrupted else "failed",
+                    "interrupted" if interrupted else "provider_error",
+                ),
+                span_write,
+                *usage_writes,
+            ],
         )
         return None
 
-    async def _settle_failed_context_summary(self, operation: ActiveOperation) -> OperationResult:
+    def _summary_usage_writes(
+        self,
+        operation: ActiveOperation,
+        usage: dict[str, int | float] | None,
+    ) -> list[Write]:
+        data = operation.state.data
+        if usage is None or not isinstance(data, dict) or data.get("strategy") != "tool_prune_summary_v1":
+            return []
+        return [
+            InsertUsage(
+                UsageRow(
+                    self._lane.new_id(),
+                    usage,
+                    operation_id=operation.meta.operation_id,
+                    span_id=data.get("span_id"),
+                )
+            )
+        ]
+
+    async def _settle_failed_context_summary(
+        self,
+        operation: ActiveOperation,
+        *,
+        interrupted: bool = False,
+        usage: dict[str, int | float] | None = None,
+    ) -> OperationResult:
         data = operation.state.data
         if not isinstance(data, dict):
             raise RuntimeError("context summary intent is invalid")
@@ -1008,7 +1355,10 @@ class Drive:
                 error_message="context summary could not be validated",
             )
             writes = [
-                *self._settle_span(span_id, "failed", "provider_error"),
+                *self._summary_usage_writes(operation, usage),
+                *self._settle_span(
+                    span_id, "unknown" if interrupted else "failed", "interrupted" if interrupted else "provider_error"
+                ),
                 *await self._lane.memory_capture_writes(mutator, result),
                 *await self._terminal_writes(mutator, operation, result, "unknown"),
             ]
@@ -1054,6 +1404,9 @@ class Drive:
                 "prompt_version": 1,
                 "provenance": "auto_context_collapse" if kind == "collapse" else "auto_global_compact",
             }
+            if data.get("strategy") == "tool_prune_summary_v1":
+                payload["strategy"] = "tool_prune_summary_v1"
+                payload["format_version"] = 1
             await mutator.commit(
                 [
                     InsertEntry(NewEntry(entry_id, parent, entry_type, payload)),
@@ -1069,7 +1422,17 @@ class Drive:
                     *self._settle_span(span_id, "completed"),
                     SetValue(lane_tip(self._lane.name), entry_id),
                     SetValue(
-                        operation_state(operation.meta.operation_id), OperationState("assistant.ready", "running", {})
+                        operation_state(operation.meta.operation_id),
+                        OperationState(
+                            "assistant.ready",
+                            "running",
+                            {
+                                "context_summary_count": data.get("context_summary_count", 0),
+                                "context_config": data.get("config"),
+                            }
+                            if data.get("strategy") == "tool_prune_summary_v1"
+                            else {},
+                        ),
                     ),
                 ]
             )
@@ -1091,7 +1454,17 @@ class Drive:
                 [
                     *self._settle_span(span_id, "unknown", error_class),
                     SetValue(
-                        operation_state(operation.meta.operation_id), OperationState("assistant.ready", "running", {})
+                        operation_state(operation.meta.operation_id),
+                        OperationState(
+                            "assistant.ready",
+                            "running",
+                            {
+                                "context_summary_count": data.get("context_summary_count", 0),
+                                "context_config": data.get("config"),
+                            }
+                            if data.get("strategy") == "tool_prune_summary_v1"
+                            else {},
+                        ),
                     ),
                 ]
             )
@@ -2014,6 +2387,13 @@ class Drive:
             writes: list[Write] = await self._lane.approvals.cancellation_writes(mutator, operation.meta.operation_id)
             terminal_ids: list[str] = []
             unknown_effect = False
+            if operation.state.at in {
+                "context.global_compaction.effect_pending",
+                "context.collapse.effect_pending",
+                "summary.effect_pending",
+            } and isinstance(operation.state.data, dict):
+                writes.extend(self._settle_span(operation.state.data.get("span_id"), "unknown", "interrupted"))
+                unknown_effect = True
             if operation.state.at == "tools" and isinstance(operation.state.data, dict):
                 for call in cast(list[dict[str, object]], operation.state.data.get("calls", [])):
                     if call.get("status") == "completed":

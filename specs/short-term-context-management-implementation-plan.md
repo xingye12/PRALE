@@ -1,5 +1,7 @@
 # 短期上下文管理实施计划
 
+> 双策略并存：本文继续作为 `layered_v1` 的实施规范，原方案完整保留并可显式选择。[工具裁剪优先的上下文压缩实施计划](tool-prune-summary-context-plan.md) 新增独立策略 `tool_prune_summary_v1`，已实现并作为默认选择，不删除或停用原方案。运行行为以代码为准。
+
 ## 1. 目标与非目标
 
 本计划为 PRALE 的 provider 请求建立分层、自动且可恢复的短期上下文管理（Short-Term Context Management, STCM）。其参考 Claude Code 的 query 前处理顺序：大工具结果预算、history snip、micro-compact、context-collapse、常规摘要压缩；但不复制其进程内消息数组、feature gate 或 Anthropic 专属 wire payload。PRALE 的 Session entry tree、usage 和 effect ledger 的现有不变量优先。

@@ -16,6 +16,7 @@ import json
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Literal, cast
 
 from agent_harness.api.errors import ProjectConfigError
 from agent_harness.api.project import ProjectRuntimeConfig
@@ -181,6 +182,9 @@ class Settings:
                 f"api_key           {'<set>' if self.api_key else '<unset>'}",
                 f"tokens            {tokens}",
                 f"tools             {tools}",
+                f"context_strategy  {self.context_management.strategy}",
+                f"context_window    {self.context_management.context_window_tokens}",
+                f"context_trigger   {self.context_management.soft_limit_tokens}",
                 f"traces            {'on' if self.traces else 'off'}",
                 f"memory_prompt     {prompt}",
                 f"max_drives        {self.max_concurrent_drives}",
@@ -225,9 +229,35 @@ class Settings:
             raise ProjectConfigError("PRALE_API_KEY is required: this deployment needs a provider credential")
         model = environ.get("PRALE_MODEL", "").strip() or DEFAULT_MODEL
         try:
+            strategy = environ.get("PRALE_CONTEXT_STRATEGY", "").strip() or "tool_prune_summary_v1"
+            if strategy not in {"layered_v1", "tool_prune_summary_v1"}:
+                raise ValueError("PRALE_CONTEXT_STRATEGY must be layered_v1 or tool_prune_summary_v1")
+            legacy_keys = (
+                "SOFT_MARGIN_TOKENS",
+                "PER_TOOL_RESULT_CHARS",
+                "PER_TOOL_MESSAGE_CHARS",
+                "PROTECTED_RECENT_MESSAGES",
+                "MICROCOMPACT_KEEP_RECENT",
+                "COLLAPSE",
+                "AUTO_COMPACT",
+            )
+            if strategy != "layered_v1" and any(f"PRALE_CONTEXT_{key}" in environ for key in legacy_keys):
+                raise ValueError("legacy context options require PRALE_CONTEXT_STRATEGY=layered_v1")
             context_management = ContextManagementConfig(
+                strategy=cast("Literal['layered_v1', 'tool_prune_summary_v1']", strategy),
+                threshold_ratio=_float(environ, "PRALE_CONTEXT_THRESHOLD_RATIO", 0.8),
+                headroom_tokens=_nonnegative_int(environ, "PRALE_CONTEXT_HEADROOM_TOKENS", 65_536),
+                retain_ratio=_float(environ, "PRALE_CONTEXT_RETAIN_RATIO", 0.16),
+                tool_prune_threshold_chars=_int(environ, "PRALE_CONTEXT_TOOL_PRUNE_THRESHOLD_CHARS", 8192),
+                tool_prune_head_chars=_nonnegative_int(environ, "PRALE_CONTEXT_TOOL_PRUNE_HEAD_CHARS", 4096),
+                tool_prune_tail_chars=_nonnegative_int(environ, "PRALE_CONTEXT_TOOL_PRUNE_TAIL_CHARS", 1024),
+                max_summary_retries=_nonnegative_int(
+                    environ, "PRALE_CONTEXT_MAX_SUMMARY_RETRIES", 3 if strategy == "layered_v1" else 1
+                ),
                 enabled=not _off(environ, "PRALE_CONTEXT_MANAGEMENT"),
-                context_window_tokens=_int(environ, "PRALE_CONTEXT_WINDOW_TOKENS", 128_000),
+                context_window_tokens=_int(
+                    environ, "PRALE_CONTEXT_WINDOW_TOKENS", 128_000 if strategy == "layered_v1" else 512_000
+                ),
                 reserved_output_tokens=_int(environ, "PRALE_CONTEXT_RESERVED_OUTPUT_TOKENS", 20_000),
                 soft_margin_tokens=_int(environ, "PRALE_CONTEXT_SOFT_MARGIN_TOKENS", 13_000),
                 hard_margin_tokens=_int(environ, "PRALE_CONTEXT_HARD_MARGIN_TOKENS", 3_000),
@@ -400,6 +430,19 @@ def _int(environ: Mapping[str, str], name: str, default: int) -> int:
     if parsed < 1:
         raise ProjectConfigError(f"{name} must be at least 1, not {parsed}")
     return parsed
+
+
+def _nonnegative_int(environ: Mapping[str, str], name: str, default: int) -> int:
+    raw = environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as error:
+        raise ProjectConfigError(f"{name} must be an integer") from error
+    if value < 0:
+        raise ProjectConfigError(f"{name} must be non-negative")
+    return value
 
 
 def _optional_int(environ: Mapping[str, str], name: str) -> int | None:

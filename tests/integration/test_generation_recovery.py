@@ -154,6 +154,7 @@ def test_large_context_automatically_collapses_before_the_generation_effect() ->
         storage = MemoryStorage()
         provider = SuccessfulProvider()
         config = ContextManagementConfig(
+            strategy="layered_v1",
             context_window_tokens=300,
             reserved_output_tokens=50,
             soft_margin_tokens=100,
@@ -186,6 +187,7 @@ def test_recovery_settles_an_interrupted_context_collapse_without_replaying_it()
         storage = MemoryStorage()
         provider = BlockingProvider()
         config = ContextManagementConfig(
+            strategy="layered_v1",
             context_window_tokens=300,
             reserved_output_tokens=50,
             soft_margin_tokens=100,
@@ -218,6 +220,7 @@ def test_global_auto_compact_is_used_only_when_collapse_mode_is_disabled() -> No
         storage = MemoryStorage()
         provider = SuccessfulProvider()
         config = ContextManagementConfig(
+            strategy="layered_v1",
             context_window_tokens=300,
             reserved_output_tokens=50,
             soft_margin_tokens=100,
@@ -243,6 +246,7 @@ def test_context_collapse_retries_invalid_summary_with_a_new_effect_attempt() ->
         storage = MemoryStorage()
         provider = SummaryRetryProvider()
         config = ContextManagementConfig(
+            strategy="layered_v1",
             context_window_tokens=300,
             reserved_output_tokens=50,
             soft_margin_tokens=100,
@@ -528,7 +532,9 @@ def test_compaction_uses_a_separate_summary_effect_and_commits_a_compaction_entr
     async def scenario() -> None:
         storage = MemoryStorage()
         provider = SuccessfulProvider()
-        lane = await (await Harness.open("session-1", storage)).acquire_lane("main")
+        lane = await (
+            await Harness.open("session-1", storage, context_management=ContextManagementConfig(strategy="layered_v1"))
+        ).acquire_lane("main")
         await lane.prompt("context", operation_id="op-1")
         await lane.request_abort()
         await lane.drive(None)  # type: ignore[arg-type]
@@ -548,7 +554,9 @@ def test_compaction_uses_a_separate_summary_effect_and_commits_a_compaction_entr
 def test_compaction_hook_can_decline_or_supply_a_durable_summary_without_provider_io() -> None:
     async def scenario() -> None:
         storage = MemoryStorage()
-        harness = await Harness.open("session-1", storage)
+        harness = await Harness.open(
+            "session-1", storage, context_management=ContextManagementConfig(strategy="layered_v1")
+        )
         lane = await harness.acquire_lane("main")
         await lane.prompt("context", operation_id="op-1")
         await lane.request_abort()
@@ -569,7 +577,9 @@ def test_generation_after_compaction_uses_summary_projection_instead_of_full_his
     async def scenario() -> None:
         storage = MemoryStorage()
         provider = SuccessfulProvider()
-        lane = await (await Harness.open("session-1", storage)).acquire_lane("main")
+        lane = await (
+            await Harness.open("session-1", storage, context_management=ContextManagementConfig(strategy="layered_v1"))
+        ).acquire_lane("main")
         await lane.prompt("old", operation_id="op-1")
         await lane.request_abort()
         await lane.drive(None)  # type: ignore[arg-type]

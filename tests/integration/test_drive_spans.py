@@ -10,6 +10,7 @@ import contextlib
 
 from agent_harness.api.harness import Harness
 from agent_harness.domain.approvals import RiskAssessment
+from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.effects import EffectSpan
 from agent_harness.runtime.generation import AssistantResult, GenerationRequest, ToolCall
 from agent_harness.runtime.tools import ToolExecutionResult
@@ -177,7 +178,9 @@ def test_a_compaction_records_its_own_summary_effect() -> None:
     async def scenario() -> None:
         storage = MemoryStorage()
         provider = Provider([AssistantResult(content="summary text", usage={"input_tokens": 9})])
-        lane = await (await Harness.open("session-1", storage)).acquire_lane("main")
+        lane = await (
+            await Harness.open("session-1", storage, context_management=ContextManagementConfig(strategy="layered_v1"))
+        ).acquire_lane("main")
         await lane.prompt("context", operation_id="op-1")
         await lane.request_abort()
         await lane.drive(None)  # type: ignore[arg-type]

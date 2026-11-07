@@ -153,3 +153,9 @@ pytest
 ruff check .
 ruff format --check .
 ```
+
+### 上下文压缩策略
+
+默认 `tool_prune_summary_v1` 使用 512,000-token 总窗口，在默认 409,600-token 压力阈值触发。先按原文 token 预算保护近期对话（包含完整工具调用、参数和结果），仅裁剪保护范围外的大工具结果；仍不足时对旧前缀做 LLM 摘要。原始历史保留，裁剪决策与请求 intent 原子持久化。
+
+旧方案完整保留：设置 `PRALE_CONTEXT_STRATEGY=layered_v1`，或传入 `ContextManagementConfig(strategy="layered_v1")`，即可使用原 hard trim、snip、microcompact、collapse/global 流程；未指定窗口时仍默认 128,000 tokens。新方案默认为 `tool_prune_summary_v1`，可通过 `PRALE_CONTEXT_WINDOW_TOKENS` 覆盖实际窗口。旧方案专属参数需同时选择 `layered_v1`。具体配置见 [部署示例](deploy/web.env.example) 和 [实施方案](specs/tool-prune-summary-context-plan.md)。

@@ -9,11 +9,12 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass
-from typing import cast
+from typing import Literal, cast
 
 from agent_harness.domain.entries import JsonValue
 
 OLD_TOOL_RESULT_CONTENT_CLEARED = "[Old tool result content cleared]"
+TOOL_PRUNE_MARKER = "\n\n[... tool result middle pruned ...]\n\n"
 
 
 @dataclass(frozen=True, slots=True)
@@ -21,12 +22,13 @@ class ContextManagementConfig:
     """Budgets for the automatic, pre-request context projection.
 
     ``context_window_tokens`` may be ``None`` for providers that do not
-    publish a context window.  In that case lossless hard trimming remains
-    active while automatic summary/collapse is disabled.
+    publish a context window. Automatic pressure reduction is then disabled
+    in the new strategy; layered_v1 still applies its unconditional hard trim.
+    The -1 constructor default resolves to the selected strategy's window.
     """
 
     enabled: bool = True
-    context_window_tokens: int | None = 128_000
+    context_window_tokens: int | None = -1
     reserved_output_tokens: int = 20_000
     reserved_system_tokens: int = 0
     soft_margin_tokens: int = 13_000
@@ -37,9 +39,42 @@ class ContextManagementConfig:
     microcompact_keep_recent: int = 5
     collapse_enabled: bool = True
     auto_compact_enabled: bool = True
-    max_summary_retries: int = 3
+    max_summary_retries: int = -1
+
+    strategy: Literal["layered_v1", "tool_prune_summary_v1"] = "tool_prune_summary_v1"
+    threshold_ratio: float = 0.8
+    headroom_tokens: int = 65_536
+    retain_ratio: float = 0.16
+    tool_prune_threshold_chars: int = 8_192
+    tool_prune_head_chars: int = 4_096
+    tool_prune_tail_chars: int = 1_024
 
     def __post_init__(self) -> None:
+        if self.strategy not in {"layered_v1", "tool_prune_summary_v1"}:
+            raise ValueError("unknown context-management strategy")
+        if self.context_window_tokens == -1:
+            object.__setattr__(self, "context_window_tokens", 128_000 if self.strategy == "layered_v1" else 512_000)
+        if self.max_summary_retries == -1:
+            object.__setattr__(self, "max_summary_retries", 3 if self.strategy == "layered_v1" else 1)
+        if self.strategy == "tool_prune_summary_v1" and (
+            self.soft_margin_tokens != 13_000
+            or self.per_tool_result_chars != 50_000
+            or self.per_tool_message_chars != 200_000
+            or self.protected_recent_messages != 6
+            or self.microcompact_keep_recent != 5
+            or not self.collapse_enabled
+            or not self.auto_compact_enabled
+        ):
+            raise ValueError("legacy context options require strategy=layered_v1")
+        if not 0 < self.retain_ratio < self.threshold_ratio < 1:
+            raise ValueError("require 0 < retain_ratio < threshold_ratio < 1")
+        if min(self.headroom_tokens, self.tool_prune_head_chars, self.tool_prune_tail_chars) < 0:
+            raise ValueError("context pruning budgets must be non-negative")
+        if (
+            self.tool_prune_head_chars + self.tool_prune_tail_chars + len(TOOL_PRUNE_MARKER)
+            > self.tool_prune_threshold_chars
+        ):
+            raise ValueError("tool pruning head, marker and tail must fit within threshold")
         positive = (
             self.reserved_output_tokens,
             self.soft_margin_tokens,
@@ -48,8 +83,9 @@ class ContextManagementConfig:
             self.per_tool_message_chars,
             self.protected_recent_messages,
             self.microcompact_keep_recent,
-            self.max_summary_retries,
         )
+        if self.max_summary_retries < (1 if self.strategy == "layered_v1" else 0):
+            raise ValueError("invalid max_summary_retries")
         if any(value < 1 for value in positive) or self.reserved_system_tokens < 0:
             raise ValueError("context-management limits must be positive")
         if self.context_window_tokens is not None:
@@ -62,11 +98,20 @@ class ContextManagementConfig:
                 raise ValueError("context window is smaller than its reservations")
             if soft_limit > hard_limit:
                 raise ValueError("soft limit must not exceed hard limit")
+            if self.strategy == "tool_prune_summary_v1" and self.retain_tokens >= soft_limit:
+                raise ValueError("retained token budget must be below pressure threshold")
 
     @property
     def soft_limit_tokens(self) -> int | None:
         if self.context_window_tokens is None:
             return None
+        if self.strategy == "tool_prune_summary_v1":
+            return int(
+                min(
+                    self.context_window_tokens * self.threshold_ratio,
+                    self.context_window_tokens - self.reserved_output_tokens - self.headroom_tokens,
+                )
+            )
         return (
             self.context_window_tokens
             - self.reserved_output_tokens
@@ -81,9 +126,13 @@ class ContextManagementConfig:
         return (
             self.context_window_tokens
             - self.reserved_output_tokens
-            - self.reserved_system_tokens
+            - (self.reserved_system_tokens if self.strategy == "layered_v1" else 0)
             - self.hard_margin_tokens
         )
+
+    @property
+    def retain_tokens(self) -> int:
+        return max(0, int(((self.context_window_tokens or 0) - self.reserved_output_tokens) * self.retain_ratio))
 
 
 @dataclass(frozen=True, slots=True)
@@ -245,6 +294,10 @@ def microcompact_messages(
 def reduce_request_messages(messages: list[JsonValue], config: ContextManagementConfig) -> ContextReduction:
     """Apply non-LLM reductions in the documented query-preparation order."""
 
+    if config.strategy == "tool_prune_summary_v1":
+        from agent_harness.domain.tool_prune import reduce_tools
+
+        return reduce_tools(messages, config)
     before = estimate_messages(messages)
     trimmed, trim_count, trim_hashes = hard_trim_tool_results(list(messages), config)
     snipped, snip_count = snip_compact_if_needed(trimmed, config)
@@ -268,7 +321,11 @@ def needs_summary(messages: list[JsonValue] | tuple[JsonValue, ...], config: Con
     return bool(
         config.enabled
         and config.soft_limit_tokens is not None
-        and estimate_messages(messages) > config.soft_limit_tokens
+        and (
+            estimate_messages(messages) >= config.soft_limit_tokens
+            if config.strategy == "tool_prune_summary_v1"
+            else estimate_messages(messages) > config.soft_limit_tokens
+        )
     )
 
 

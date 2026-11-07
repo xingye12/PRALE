@@ -56,3 +56,42 @@ def test_context_collapse_and_reduction_records_are_atomic_and_readable(storage:
         assert records == [{"kind": "request_projection", "source_hashes": ["abc"], "micro_cleared_tool_results": 1}]
 
     asyncio.run(scenario())
+
+
+def test_tool_prune_is_branch_local_and_original_tail_overrides_record(storage: Storage) -> None:
+    from agent_harness.domain.context_management import ContextManagementConfig
+    from agent_harness.domain.tool_prune import context_view, message_hash
+
+    async def scenario() -> None:
+        original = {"role": "tool", "tool_call_id": "call", "content": "original" * 3000}
+        await storage.commit(
+            [
+                InsertEntry(NewEntry("call", None, "message", {"role": "assistant", "tool_calls": [{"id": "call"}]})),
+                InsertEntry(NewEntry("tool", "call", "message", original)),
+                InsertEntry(NewEntry("tail", "tool", "message", {"role": "user", "content": "new" * 4000})),
+                InsertEntry(
+                    NewEntry(
+                        "prune",
+                        "tail",
+                        "custom",
+                        {
+                            "kind": "context_tool_prune",
+                            "format_version": 1,
+                            "source_entry_id": "tool",
+                            "source_hash": message_hash(original),
+                            "message": {**original, "content": "pruned"},
+                        },
+                    )
+                ),
+            ]
+        )
+        cfg = ContextManagementConfig(
+            context_window_tokens=20_000, headroom_tokens=1000, reserved_output_tokens=500, hard_margin_tokens=100
+        )
+        branch = await storage.scan_branch("prune")
+        assert context_view(branch, cfg).messages[1]["content"] == "pruned"
+        assert context_view(await storage.scan_branch("tail"), cfg).messages[1] == original
+        assert context_view(branch, ContextManagementConfig()).messages[1] == original
+        assert (await storage.get_entries(["tool"]))["tool"].payload == original
+
+    asyncio.run(scenario())

@@ -427,6 +427,18 @@ Session entry tree 是已结算对话的权威来源，但 compaction、navigati
 
 **后果：** 新部署可直接委派；现有显式工具配置继续决定全部权限。`PRALE_SUBAGENTS_ENABLED=false` 可关闭，显式关闭时配置控制工具或定义目录仍拒绝启动。重开 library Harness 默认恢复已接纳子运行，不注册新工具、不启动 idle 父模型。
 
+### ADR-040：工具裁剪优先的 512k 上下文策略
+
+**背景：** 用户要求参考 `/root/vibe/dsh/deepseek-harness`，将自动上下文管理简化为触发阈值后先裁剪大工具结果、不足再 LLM 摘要，并提高窗口容量。
+
+**决策：** 依据 [实施计划](tool-prune-summary-context-plan.md)，默认总窗口采用 512,000 tokens，默认压力阈值为 409,600 tokens；新策略不执行 history snip/micro-clear。工具裁剪采用头尾保留及 branch 内只追加决策，摘要按 token 预算保留完整工具配对的近期片段。原始 entry 不变，所有外部调用继续遵守 durable intent → effect → atomic settlement。保留旧策略显式选择及旧持久状态恢复。
+
+原文保留范围必须在工具裁剪之前按未裁剪内容确定并冻结；范围内的工具调用、参数和结果完整保留，工具裁剪只作用于范围外。保护优先于历史裁剪记录；无法满足预算时明确失败，不裁剪受保护工具结果。
+
+两套方案独立并存：完整保留 `layered_v1` 的原算法、配置、默认预算、手动压缩和恢复路径；新增 `tool_prune_summary_v1` 并设为默认。显式策略选择通过 library 配置和 `PRALE_CONTEXT_STRATEGY` 传入；未显式配置窗口时按所选策略解析缺省值（旧方案 128k、新方案 512k）。不得删除旧实现或以新算法替换旧策略名称对应行为，旧策略回归测试继续保留。
+
+**后果：** 默认行为、公开配置、投影和恢复需要相应测试；裁剪与 intent 原子提交，摘要失败保留已提交裁剪。512k 为配置默认容量，部署可以覆盖。已实现并作为默认策略；原方案通过 `layered_v1` 完整保留，配置及恢复兼容性由回归测试覆盖。
+
 ## 10. 首个可执行里程碑
 
 第一个编码里程碑仅实现阶段 0–3：纯领域 DTO、storage/session 协议、内存后端、entry tree/branch projection、lane operation admission、snapshot 和结果查询。此里程碑不调用 DeepSeek、不执行工具，但必须已经具备“先持久化 operation、后由 Drive 领取”的恢复基础。

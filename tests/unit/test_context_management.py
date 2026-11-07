@@ -10,6 +10,7 @@ from agent_harness.domain.context_management import (
 
 def _config(**values: object) -> ContextManagementConfig:
     defaults: dict[str, object] = {
+        "strategy": "layered_v1",
         "context_window_tokens": 500,
         "reserved_output_tokens": 50,
         "soft_margin_tokens": 100,
