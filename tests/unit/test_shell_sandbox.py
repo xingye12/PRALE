@@ -157,3 +157,122 @@ def test_real_sandbox_network_and_process_tree_cleanup(tmp_path):
         assert not (tmp_path / "leaked").exists()
 
     asyncio.run(scenario())
+
+
+def test_configuration_mounts_and_capability_identity(tmp_path):
+    from agent_harness.integrations.shell import READONLY_WORKSPACE_PATHS
+
+    executor = BubblewrapExecutor()
+    for name in READONLY_WORKSPACE_PATHS:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name in {".vscode", ".idea", ".git/hooks"}:
+            path.mkdir()
+        else:
+            path.write_text("original")
+    mounts = executor._readonly_mounts(tmp_path)
+    assert {target.relative_to(tmp_path).as_posix() for _, target in mounts} == set(READONLY_WORKSPACE_PATHS)
+    (tmp_path / ".git/config").unlink()
+    import shutil
+
+    shutil.rmtree(tmp_path / ".git")
+    (tmp_path / ".git").write_text("gitdir: /outside/worktrees/example")
+    assert (tmp_path / ".git", tmp_path / ".git") in executor._readonly_mounts(tmp_path)
+
+
+def test_configuration_wrapper_order(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_harness.integrations.shell.shutil.which", lambda name: "/usr/bin/bwrap")
+    config = tmp_path / ".mcp.json"
+    config.write_text("{}")
+    wrapper = BubblewrapExecutor()._wrapper(tmp_path)
+    workspace_index = wrapper.index("--bind")
+    protected_index = wrapper.index("--ro-bind", wrapper.index("--ro-bind") + 1)
+    assert protected_index > workspace_index
+    assert wrapper[protected_index + 1 : protected_index + 3] == (str(config), str(config))
+
+
+def test_real_configuration_mounts_are_readonly(tmp_path):
+    from agent_harness.integrations.shell import READONLY_WORKSPACE_PATHS
+
+    for name in READONLY_WORKSPACE_PATHS:
+        path = tmp_path / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if name in {".vscode", ".idea", ".git/hooks"}:
+            path.mkdir()
+            (path / "config").write_text("original")
+        else:
+            path.write_text("original")
+    capability = BubblewrapExecutor().probe(tmp_path)
+    if not capability.available:
+        import os
+
+        if os.environ.get("PRALE_REQUIRE_BWRAP") == "1":
+            pytest.fail(capability.reason)
+        pytest.skip(capability.reason)
+
+    async def scenario():
+        import shlex
+
+        tool = BashTool(tmp_path)
+        for name in READONLY_WORKSPACE_PATHS:
+            quoted = shlex.quote(name)
+            target = name + "/config" if (tmp_path / name).is_dir() else name
+            result = await tool.execute({"command": f"echo changed > {shlex.quote(target)}"})
+            assert result.is_error, name
+            assert (tmp_path / target).read_text() == "original"
+            for command in (f"rm -rf -- {quoted}", f"mv -- {quoted} moved"):
+                assert (await tool.execute({"command": command})).is_error, name
+        assert not (await tool.execute({"command": "echo ok > normal.txt"})).is_error
+
+    asyncio.run(scenario())
+
+
+def test_protected_path_changes_invalidate_capability(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr("agent_harness.integrations.shell.shutil.which", lambda name: "/bin/true")
+    monkeypatch.setattr(
+        "agent_harness.integrations.shell.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, b"", b""),
+    )
+    executor = BubblewrapExecutor()
+    original = executor.probe(tmp_path)
+    config = tmp_path / ".mcp.json"
+    config.write_text("{}")
+    created = executor.probe(tmp_path)
+    assert original.available and created.available
+    assert original.identity != created.identity
+    replacement = tmp_path / "replacement"
+    replacement.write_text("{}")
+    replacement.replace(config)
+    assert executor.probe(tmp_path).identity != created.identity
+
+
+def test_real_worktree_pointer_and_symlink_target_are_readonly(tmp_path):
+    pointer = tmp_path / ".git"
+    pointer.write_text("gitdir: /outside/worktrees/example")
+    target = tmp_path / "actual-config"
+    target.write_text("original")
+    (tmp_path / ".mcp.json").symlink_to(target)
+    capability = BubblewrapExecutor().probe(tmp_path)
+    if not capability.available:
+        import os
+
+        if os.environ.get("PRALE_REQUIRE_BWRAP") == "1":
+            pytest.fail(capability.reason)
+        pytest.skip(capability.reason)
+
+    async def scenario():
+        tool = BashTool(tmp_path)
+        for command in (
+            "echo bad > .git",
+            "rm .git",
+            "mv .git moved",
+            "echo bad > .mcp.json",
+            "echo bad > actual-config",
+        ):
+            assert (await tool.execute({"command": command})).is_error, command
+        assert pointer.read_text() == "gitdir: /outside/worktrees/example"
+        assert target.read_text() == "original"
+
+    asyncio.run(scenario())

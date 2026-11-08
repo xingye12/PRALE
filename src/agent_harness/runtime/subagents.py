@@ -42,6 +42,7 @@ from agent_harness.domain.subagents import (
     record,
     value,
 )
+from agent_harness.domain.tasks import TASK_NAMES
 from agent_harness.domain.values import lane_inbox, lane_state, operation_meta, operation_result, operation_state
 from agent_harness.domain.workspaces import WorkspaceManager
 from agent_harness.runtime.generation import ChatProvider
@@ -170,17 +171,21 @@ def validate_subagent_definitions(
 ) -> dict[str, SubagentDefinition]:
     registry = {definition.name: definition for definition in built_in_definitions()}
     custom: set[str] = set()
-    known = {tool.name for tool in tools} | {
-        "read",
-        "write",
-        "edit",
-        "bash",
-        "repository_explore",
-        "skill_load",
-        "memory_search",
-        "conversation_search",
-        "memory_read_scene",
-    }
+    known = (
+        {tool.name for tool in tools}
+        | set(TASK_NAMES)
+        | {
+            "read",
+            "write",
+            "edit",
+            "bash",
+            "repository_explore",
+            "skill_load",
+            "memory_search",
+            "conversation_search",
+            "memory_read_scene",
+        }
+    )
     for definition in definitions:
         if definition.name in custom:
             raise InvalidSubagentDefinition(f"duplicate definition: {definition.name}")

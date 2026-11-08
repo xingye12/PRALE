@@ -42,7 +42,7 @@ class ContextManagementConfig:
     max_summary_retries: int = -1
 
     strategy: Literal["layered_v1", "tool_prune_summary_v1"] = "tool_prune_summary_v1"
-    threshold_ratio: float = 0.8
+    threshold_ratio: float = 0.3
     headroom_tokens: int = 65_536
     retain_ratio: float = 0.16
     tool_prune_threshold_chars: int = 8_192
@@ -53,7 +53,7 @@ class ContextManagementConfig:
         if self.strategy not in {"layered_v1", "tool_prune_summary_v1"}:
             raise ValueError("unknown context-management strategy")
         if self.context_window_tokens == -1:
-            object.__setattr__(self, "context_window_tokens", 128_000 if self.strategy == "layered_v1" else 512_000)
+            object.__setattr__(self, "context_window_tokens", 128_000 if self.strategy == "layered_v1" else 1_000_000)
         if self.max_summary_retries == -1:
             object.__setattr__(self, "max_summary_retries", 3 if self.strategy == "layered_v1" else 1)
         if self.strategy == "tool_prune_summary_v1" and (

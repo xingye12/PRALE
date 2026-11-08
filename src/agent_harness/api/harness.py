@@ -25,6 +25,7 @@ from agent_harness.runtime.hooks import HookHandler, HookRegistry
 from agent_harness.runtime.lane import Lane
 from agent_harness.runtime.retry import RetryPolicy
 from agent_harness.runtime.subagents import ProviderResolver, SubagentRuntime
+from agent_harness.runtime.tasks import TaskRuntime
 from agent_harness.runtime.telemetry import TelemetrySink
 from agent_harness.runtime.tools import AgentTool, RuntimeControlTool
 from agent_harness.runtime.workspaces import WorkspaceToolFactory
@@ -57,6 +58,7 @@ class Harness:
         id_factory: Callable[[], str] | None = None,
         now_ms: Callable[[], int] | None = None,
     ) -> None:
+        self.tasks = TaskRuntime(session)
         self._session = session
         self._id_factory = id_factory
         self._now_ms = now_ms

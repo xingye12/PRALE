@@ -21,6 +21,7 @@ def config(**values):
         context_window_tokens=20_000,
         reserved_output_tokens=500,
         headroom_tokens=1000,
+        threshold_ratio=values.pop("threshold_ratio", 0.8),
         hard_margin_tokens=100,
         **values,
     )

@@ -113,3 +113,19 @@ Web 默认注册可持续等待的审批通道；无人打开页面时也保留�
 默认删除凭据文件名和项目配置修改审批清单；读取工作区外文件也直接允许。写入范围按实际解析目标判断，宿主 /tmp 不属于默认写入范围。显式 sensitive/protected glob 保留；配置非空时一般 Bash 回退审批，不能声称 glob 在 shell 内强制实施。
 
 普通 Bash 自动执行依赖 Linux bubblewrap 实际能力探测，根只读、工作区可写、私有 /tmp、PID 隔离、网络保留。sandbox_permissions 默认 workspace-write；danger-full-access 需要非空 justification 和审批。off、前缀、探测失败均说明将以宿主权限执行；失败不自动重试。精确 pwd 仍直接返回路径。执行模式、能力版本、工作区进入指纹并在执行前复核；策略版本提升，历史审计不改写。沿用精确 lane 授权、撤销、恢复和 never 语义，不新增表。
+
+### ADR：工作区执行配置只读覆盖挂载
+
+背景：工作区可写沙箱允许 shell 修改启动文件、编辑器和工具配置或 Git hooks，影响后续执行。
+
+决策：bubblewrap 在工作区可写挂载后，将工作区根目录已存在的 `.bashrc`、`.bash_profile`、
+`.zshrc`、`.zprofile`、`.profile`、`.gitconfig`、`.gitmodules`、`.ripgreprc`、`.mcp.json`、
+`.vscode`、`.idea`、`.git/hooks`、`.git/config` 只读覆盖挂载；`.git` 为 worktree 指针文件时，
+只读挂载该文件，不将普通仓库整个 `.git` 目录设为只读。符号链接目标使用规范化路径覆盖，
+避免向符号链接挂载导致 bubblewrap 失败；符号链接目录项本身不作为不可替换保证。能力版本升级，保护路径及文件身份进入探测身份，执行前重新核对。
+
+后果：只保护调用开始时已存在的路径，不创建缺失的占位文件，不递归搜索嵌套项目；
+不存在的路径仍可新建。工作区外仍整体只读。此边界只适用于 bubblewrap Bash，直接 write/edit
+和获批的宿主 Bash 不受这些挂载约束。不新增持久状态或改变恢复重放语义。
+验收覆盖挂载顺序、普通仓库/worktree、能力身份变化、实际写入/替换/删除拒绝与普通文件可写。
+原 `pi-harness-implementation-plan.md` 在当前工作树已删除，本次不恢复该用户改动。

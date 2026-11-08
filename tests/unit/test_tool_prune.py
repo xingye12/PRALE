@@ -7,6 +7,7 @@ def config(**kwargs):
         context_window_tokens=10_000,
         reserved_output_tokens=500,
         headroom_tokens=1000,
+        threshold_ratio=kwargs.pop("threshold_ratio", 0.8),
         hard_margin_tokens=100,
         **kwargs,
     )
@@ -15,10 +16,10 @@ def config(**kwargs):
 def test_strategy_specific_defaults():
     current = ContextManagementConfig()
     assert current.strategy == "tool_prune_summary_v1"
-    assert current.context_window_tokens == 512_000
-    assert current.soft_limit_tokens == 409_600
-    assert current.hard_limit_tokens == 489_000
-    assert current.retain_tokens == 78_720
+    assert current.context_window_tokens == 1_000_000
+    assert current.soft_limit_tokens == 300_000
+    assert current.hard_limit_tokens == 977_000
+    assert current.retain_tokens == 156_800
     assert ContextManagementConfig(strategy="layered_v1").context_window_tokens == 128_000
 
 

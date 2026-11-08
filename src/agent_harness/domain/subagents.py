@@ -9,7 +9,16 @@ from agent_harness.domain.values import ListAddress, ValueAddress
 
 CONTROL_NAMES = ("subagent", "subagent_continue", "subagent_output", "subagent_list", "subagent_stop")
 INTERNAL_PREFIX = "__subagent__/"
-READ_TOOLS = ("read", "repository_explore", "memory_search", "conversation_search", "memory_read_scene", "skill_load")
+READ_TOOLS = (
+    "task_get",
+    "task_list",
+    "read",
+    "repository_explore",
+    "memory_search",
+    "conversation_search",
+    "memory_read_scene",
+    "skill_load",
+)
 
 
 class SubagentError(Exception):

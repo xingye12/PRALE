@@ -79,6 +79,8 @@ SQLite 是单机持久化后端，`MemoryStorage` 用于测试。工具可标记
 
 `agent_harness.integrations.create_builtin_tools(working_directory)` 提供 `read`、`write`、`edit`、`bash`。相对路径以工作目录解析；直接文件工具默认允许所有读取与工作区内写入，工作区外写入需要精确审批。`read` 支持文本分页和 JPEG/PNG/GIF/WebP/BMP 的 base64 structured details；`write` 创建父目录；`edit` 要求原始文件中每项精确匹配一次且互不重叠，并保留 BOM 与换行风格；`bash` 默认在 Linux bubblewrap 工作区可写沙箱中执行，根文件系统只读，每次调用使用私有 `/tmp`（因此看不到宿主 `/tmp` 的其他文件），保留网络和其余外部读取。它支持 timeout、取消时进程树终止，以及 2,000 行/50 KiB 尾部截断。这不防止凭据读取、网络外传或工作区内破坏。
 
+工作区 Bash 沙箱额外将根目录下已存在的 `.bashrc`、`.bash_profile`、`.zshrc`、`.zprofile`、`.profile`、`.gitconfig`、`.gitmodules`、`.ripgreprc`、`.mcp.json`、`.vscode/`、`.idea/`、`.git/hooks/`、`.git/config` 只读覆盖挂载；worktree 的 `.git` 指针文件也只读。普通仓库其余 `.git` 内容仍可写。缺失路径不创建占位，仍可新建；不扫描嵌套项目。符号链接的实际目标也只读挂载，但不保证链接目录项不可替换。这些限制仅作用于沙箱 Bash，不限制直接文件工具或获批的宿主执行。
+
 Linux 部署先安装 `sudo apt-get install bubblewrap`，然后运行 `PRALE_REQUIRE_BWRAP=1 pytest tests/unit/test_shell_sandbox.py` 验证命名空间、文件边界、网络及进程清理。仅安装可执行文件不表示内核允许使用。`PRALE_BASH_SANDBOX=auto|off` 默认 auto；无可用沙箱、执行前缀或自定义路径保护时，普通 Bash 请求审批后以宿主权限执行，卡片原因注明实际模式。Library 可用 `create_builtin_tools(..., bash_sandbox="off", shell_executor=...)` 配置或注入执行器；自定义执行器必须真实施加声明的能力边界。
 
 模型可显式传入 `sandbox_permissions="danger-full-access"` 和非空 `justification` 请求本次命令以宿主权限执行，仍需批准。默认 `workspace-write` 失败不会自动重试；工具返回结果和显式升级指引，普通非零退出不等于权限错误。`never` 只拒绝需要审批的调用，不授予宿主权限。部署可通过 `PRALE_APPROVAL_SENSITIVE_PATHS` 收紧文件读取/写入或 `PRALE_APPROVAL_PROTECTED_PATHS` 收紧写入；非空规则使一般 Bash 回退逐条审批，规则不在 shell 内强制实施。
@@ -116,7 +118,7 @@ result = await harness.wait_subagent_run(child.run_id, timeout_ms=30_000)
 await harness.close()  # 停止本地执行器；保留持久恢复状态
 ```
 
-部署默认启用 runtime，未设置 `PRALE_TOOLS` 时默认提供 `subagent`、`subagent_continue`、`subagent_output`、`subagent_list`、`subagent_stop`。显式 `PRALE_TOOLS` 列表完全替代默认集合，空字符串禁用全部模型工具；`PRALE_SUBAGENTS_ENABLED=false` 关闭 runtime。Python library 默认启用 facade 与恢复，模型工具仍通过 `tools=create_subagent_tools()` 注册。后台结果进入父 inbox，空闲时不主动调用模型。重开已启用的 Harness 会恢复已接纳运行；缺失 provider 和不完整状态通过恢复报告显式列出。
+部署默认启用 runtime，未设置 `PRALE_TOOLS` 时默认提供四个任务工具及 `subagent`、`subagent_continue`、`subagent_output`、`subagent_list`、`subagent_stop`。显式 `PRALE_TOOLS` 列表完全替代默认集合，空字符串禁用全部模型工具；`PRALE_SUBAGENTS_ENABLED=false` 关闭 runtime。Python library 默认启用 facade 与恢复，模型工具仍通过 `tools=create_subagent_tools()` 注册。后台结果进入父 inbox，空闲时不主动调用模型。重开已启用的 Harness 会恢复已接纳运行；缺失 provider 和不完整状态通过恢复报告显式列出。
 
 默认共享工作区；请求或角色 Markdown frontmatter 可设置 `isolation="worktree"`。部署入口已配置本地 Git 适配器；library 用法需向 `Harness.open` 传入 `workspace_manager=GitWorkspaceManager(project_root)` 和 `workspace_tool_factory=LocalWorkspaceToolFactory()`（均位于 `agent_harness.integrations.workspaces`）。worktree 固定从父 HEAD 创建，不复制未提交或未跟踪文件，不 fetch、自动提交或合并。无产物时自动清理；有改动、ignored 文件或提交时保留，路径、分支、基准和错误见 `snapshot.workspace` / `result.workspace`。续跑固定沿用模式；保留副本复用，已清理副本从原基准重建。
 
@@ -156,6 +158,11 @@ ruff format --check .
 
 ### 上下文压缩策略
 
-默认 `tool_prune_summary_v1` 使用 512,000-token 总窗口，在默认 409,600-token 压力阈值触发。先按原文 token 预算保护近期对话（包含完整工具调用、参数和结果），仅裁剪保护范围外的大工具结果；仍不足时对旧前缀做 LLM 摘要。原始历史保留，裁剪决策与请求 intent 原子持久化。
+默认 `tool_prune_summary_v1` 使用 1,000,000-token 总窗口，在默认 300,000-token 压力阈值触发。先按原文 token 预算保护近期对话（包含完整工具调用、参数和结果），仅裁剪保护范围外的大工具结果；仍不足时对旧前缀做 LLM 摘要。原始历史保留，裁剪决策与请求 intent 原子持久化。
 
 旧方案完整保留：设置 `PRALE_CONTEXT_STRATEGY=layered_v1`，或传入 `ContextManagementConfig(strategy="layered_v1")`，即可使用原 hard trim、snip、microcompact、collapse/global 流程；未指定窗口时仍默认 128,000 tokens。新方案默认为 `tool_prune_summary_v1`，可通过 `PRALE_CONTEXT_WINDOW_TOKENS` 覆盖实际窗口。旧方案专属参数需同时选择 `layered_v1`。具体配置见 [部署示例](deploy/web.env.example) 和 [实施方案](specs/tool-prune-summary-context-plan.md)。
+
+
+任务规划工具 `task_create / task_get / task_update / task_list` 在同一 Session 的全部 lane 与子 agent 间共享任务；不同 Session 隔离。复杂任务可先拆分、设置依赖，再显式推进 pending → in_progress → completed；owner 仅记录负责人，不启动 agent。前置任务未完成时不能开始或完成下游任务，删除保留 tombstone 并移除关联依赖。metadata 按键合并，null 删除键。task_list 默认 50 条、最大 100，支持 status、offset、limit。
+
+Library 显式注册 `Harness.open(..., tools=create_task_tools())`，也可直接使用 `await harness.tasks.create(subject, description)`、`get(task_id)`、`update(task_id, status="completed")` 和 `list(status="pending")`。任务 DTO 不可变。模型工具遵守 tools allow-list；只读子角色仅获得 task_get/task_list，写工具需角色显式允许。启用任务工具后，每次生成自动附带有界任务概览；概览及版本冻结在 generation intent 中，不重复写入历史。详见 [任务方案](specs/task-planning-implementation-plan.md)。

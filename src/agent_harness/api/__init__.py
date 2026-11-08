@@ -31,8 +31,13 @@ from agent_harness.api.subagents import (
 from agent_harness.api.tui import TuiController
 from agent_harness.domain.approvals import ApprovalConfig, ApprovalConflict, RiskAssessment
 from agent_harness.domain.memory import MemoryScope
+from agent_harness.domain.tasks import Task, TaskError
+from agent_harness.runtime.tasks import create_task_tools
 
 __all__ = [
+    "Task",
+    "TaskError",
+    "create_task_tools",
     "ApprovalConfig",
     "ApprovalConflict",
     "RiskAssessment",

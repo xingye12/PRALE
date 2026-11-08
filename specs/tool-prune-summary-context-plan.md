@@ -4,16 +4,16 @@
 
 ## 1. 目标与双策略并存
 
-新增并默认采用 `tool_prune_summary_v1` 策略：达到压力阈值后，先裁剪大工具结果，重新计量；仍达到阈值才调用 LLM 摘要。默认总上下文窗口改为 **512,000 tokens**（十进制 512k，不是 524,288）。移除新策略路径中的 history snip、micro-clear 和 collapse/global 双层选择，不在摘要前直接丢弃旧对话。
+新增并默认采用 `tool_prune_summary_v1` 策略：达到压力阈值后，先裁剪大工具结果，重新计量；仍达到阈值才调用 LLM 摘要。默认总上下文窗口改为 **1,000,000 tokens**（十进制 1M，不是 1,048,576）。移除新策略路径中的 history snip、micro-clear 和 collapse/global 双层选择，不在摘要前直接丢弃旧对话。
 
 本计划新增独立策略，并将默认选择切换为 `tool_prune_summary_v1`；不删除、改写或停用旧方案。旧 [短期上下文管理计划](short-term-context-management-implementation-plan.md) 继续约束 `layered_v1` 的行为；原始历史不可变、依赖边界、effect 协议和恢复约束对两套方案同时有效。已有已接纳的 intent 按原格式恢复，不受默认策略变更影响。
 
 两套策略均必须完整可用：
 
 - `layered_v1`：保留现有 hard trim → snip → microcompact → collapse/global 流程、相关开关、显式压缩行为及恢复逻辑。默认窗口仍为旧方案的 128,000，已有显式配置优先。
-- `tool_prune_summary_v1`：新增工具裁剪 → LLM 摘要流程，保护原文保留范围，默认窗口为 512,000；未指定 strategy 时选择此方案。
+- `tool_prune_summary_v1`：新增工具裁剪 → LLM 摘要流程，保护原文保留范围，默认窗口为 1,000,000；未指定 strategy 时选择此方案。
 
-通过 `PRALE_CONTEXT_STRATEGY=layered_v1` 或 library 配置可显式选回旧方案。domain 算法和 runtime 调度按策略分派，只共享无策略语义差异的公共能力；不能通过删除旧实现或将旧策略名称映射到新算法完成接入。配置采用“先选择策略，再解析该策略缺省值”，未显式指定窗口时不能把新方案的 512k 默认泄漏给旧方案。
+通过 `PRALE_CONTEXT_STRATEGY=layered_v1` 或 library 配置可显式选回旧方案。domain 算法和 runtime 调度按策略分派，只共享无策略语义差异的公共能力；不能通过删除旧实现或将旧策略名称映射到新算法完成接入。配置采用“先选择策略，再解析该策略缺省值”，未显式指定窗口时不能把新方案的 1M 默认泄漏给旧方案。
 
 ## 2. 参考实现与采用范围
 
@@ -31,24 +31,24 @@
 | 参数 | 默认值 / 规则 |
 |---|---|
 | strategy | `tool_prune_summary_v1` |
-| context_window_tokens | 512,000 |
+| context_window_tokens | 1,000,000 |
 | reserved_output_tokens | 20,000 |
-| threshold_ratio | 0.8 |
+| threshold_ratio | 0.3 |
 | headroom_tokens | 65,536 |
-| trigger_tokens | `floor(min(window × ratio, window - reserved_output - headroom))` = **409,600** |
+| trigger_tokens | `floor(min(window × ratio, window - reserved_output - headroom))` = **300,000** |
 | hard_margin_tokens | 3,000 |
-| hard_limit_tokens | `window - reserved_output - hard_margin` = **489,000** |
+| hard_limit_tokens | `window - reserved_output - hard_margin` = **977,000** |
 | retain_ratio | 0.16 |
-| retain_tokens | `floor((window - reserved_output) × retain_ratio)` = **78,720** |
+| retain_tokens | `floor((window - reserved_output) × retain_ratio)` = **156,800** |
 | tool_prune_threshold_chars | 8,192 |
 | tool_prune_head_chars / tail_chars | 4,096 / 1,024 |
 | max_summary_retries | 1 次额外重试，独立于旧策略默认值 |
 
-512k 是总窗口，409,600 是默认压缩触发点；不等待窗口用满。计量达到阈值（`>=`）即触发，裁剪后严格低于阈值才跳过摘要。输出预留和固定上下文实际占用分别计量，避免重复扣除 system 预算。
+1M 是总窗口，300,000 是默认压缩触发点；不等待窗口用满。计量达到阈值（`>=`）即触发，裁剪后严格低于阈值才跳过摘要。输出预留和固定上下文实际占用分别计量，避免重复扣除 system 预算。
 
 继续以 `ceil(UTF-8 JSON bytes / 3)` 为默认确定性估算，报告 estimator ID/version；这是估算值，不声称等于 provider tokenizer。将普通请求与摘要请求的消息、工具定义纳入统一计量；adapter 额外开销通过中立预算接口预留，不引入 SDK 依赖。
 
-`ContextManagementConfig` 增加策略和上述参数；`Settings`、`Harness.open()`、子 agent 的配置传递、部署示例和配置展示同步更新。新增 `PRALE_CONTEXT_STRATEGY`、`PRALE_CONTEXT_THRESHOLD_RATIO`、`PRALE_CONTEXT_HEADROOM_TOKENS`、`PRALE_CONTEXT_RETAIN_RATIO` 和 `PRALE_CONTEXT_TOOL_PRUNE_*`。现有窗口环境变量保留，默认改为 512000；显式配置继续优先。
+`ContextManagementConfig` 增加策略和上述参数；`Settings`、`Harness.open()`、子 agent 的配置传递、部署示例和配置展示同步更新。新增 `PRALE_CONTEXT_STRATEGY`、`PRALE_CONTEXT_THRESHOLD_RATIO`、`PRALE_CONTEXT_HEADROOM_TOKENS`、`PRALE_CONTEXT_RETAIN_RATIO` 和 `PRALE_CONTEXT_TOOL_PRUNE_*`。现有窗口环境变量保留，默认改为 1000000；显式配置继续优先。
 
 旧 snip/micro/collapse 开关继续由 `layered_v1` 解析并生效；新策略不使用这些开关，显式混配时报清晰配置错误并指出 `layered_v1` 选项，不静默忽略。既有部署选回旧方案后，原配置不需要改名或删除。关闭 context management 时禁用自动裁剪和摘要，仍执行所选策略的硬预算检查。未知窗口按所选策略处理；新策略禁用压力压缩，保留明确的预算不可用诊断。校验比例、预留、保留预算及头尾加标记长度，拒绝不可能满足的配置。
 
@@ -93,12 +93,12 @@
 1. **先补测试与纯算法**：先将现有行为固定为 `layered_v1` 回归基线，再新增策略分派、配置、统一预算、头尾裁剪、来源映射、工具配对选区和摘要进展校验；保留旧实现与旧策略测试，不将旧测试改成只验证新策略。
 2. **持久投影**：实现裁剪记录及幂等、branch/navigation/fork 投影，memory/SQLite 运行同一 conformance suite。
 3. **runtime 接入**：最终请求计量、两阶段压缩、摘要原子结算、失败/取消/重试、旧状态兼容和有界循环。
-4. **配置与说明**：默认 512k、新旧策略切换、部署示例、子 agent 继承和 telemetry。报告策略、阈值、压缩前后估算、裁剪数量、摘要 attempt、来源 hash，不额外上传原始工具正文。
+4. **配置与说明**：默认 1M、新旧策略切换、部署示例、子 agent 继承和 telemetry。报告策略、阈值、压缩前后估算、裁剪数量、摘要 attempt、来源 hash，不额外上传原始工具正文。
 5. **验证交付**：受影响 pytest、ruff check、ruff format --check、项目 mypy；同步本文实施状态和主计划 ADR。
 
 验收必须覆盖：
 
-- 未指定策略时实际执行新方案且默认 512k；显式选择 `layered_v1` 时实际执行原流程且保留旧默认预算；两套策略的显式窗口覆盖、开关、library/部署/子 agent 传递分别测试。
+- 未指定策略时实际执行新方案且默认 1M；显式选择 `layered_v1` 时实际执行原流程且保留旧默认预算；两套策略的显式窗口覆盖、开关、library/部署/子 agent 传递分别测试。
 - 旧 hard trim、snip、microcompact、collapse/global、手动 compact 和恢复测试继续通过；新方案的保护规则不意外改变旧方案行为。切换默认不改变已冻结 intent，策略切换后的新请求按明确选择执行。
 - 阈值前原样；等于阈值触发；仅裁剪足够时零摘要调用；裁剪不足时摘要；无大工具时直接摘要。
 - 8,192 字符边界、CJK/emoji、多文本块和非文本块、错误/terminate 属性、完整工具配对和巨大单轮。
@@ -111,9 +111,9 @@
 
 ## 8. ADR：压力触发的工具剪枝与单层摘要
 
-**背景：** 现有自动路径在摘要之前 snip 旧消息，再 micro-clear，并将 collapse/global 分为两个入口。用户要求参考 deepseek-harness 简化流程并将总窗口提高至 512k。
+**背景：** 现有自动路径在摘要之前 snip 旧消息，再 micro-clear，并将 collapse/global 分为两个入口。用户要求参考 deepseek-harness 简化流程并将总窗口提高至 1M。
 
-**决策：** 默认采用 512,000 总窗口、80% 压力触发、head/tail 工具裁剪及单层前缀摘要。裁剪前按原文 token 预算确定并冻结近期完整 fragment，范围内工具调用及结果不得裁剪，保护优先于历史裁剪投影。保留旧策略显式选项和旧持久格式读取。裁剪决策采用 branch 内 append-only 记录，LLM 使用 durable intent → effect → atomic settlement。
+**决策：** 默认采用 1,000,000 总窗口、30% 压力触发、head/tail 工具裁剪及单层前缀摘要。裁剪前按原文 token 预算确定并冻结近期完整 fragment，范围内工具调用及结果不得裁剪，保护优先于历史裁剪投影。保留旧策略显式选项和旧持久格式读取。裁剪决策采用 branch 内 append-only 记录，LLM 使用 durable intent → effect → atomic settlement。
 
 **后果：** 阈值前保留完整上下文；达到阈值后优先节省模型调用，摘要不会遗漏被 snip 的旧对话。新增来源映射、裁剪投影和兼容测试；默认容量变更并不证明部署模型具有该容量，部署仍可显式设置实际窗口。新策略已接入运行时；实际窗口可由部署配置覆盖。
 

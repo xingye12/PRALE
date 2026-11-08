@@ -23,6 +23,7 @@ from agent_harness.api.project import ProjectRuntimeConfig
 from agent_harness.domain.approvals import ApprovalConfig
 from agent_harness.domain.context_management import ContextManagementConfig
 from agent_harness.domain.subagents import CONTROL_NAMES, SubagentConfig
+from agent_harness.domain.tasks import TASK_NAMES
 from agent_harness.integrations.langfuse import LangfuseConfig
 from agent_harness.integrations.repository_explorer import RepositoryScanLimits
 from agent_harness.integrations.tool_risk import ConfiguredRiskEvaluator
@@ -42,7 +43,17 @@ DATA_DIR_NAME = ".prale"
 """Where the stores live when ``PRALE_DATA_DIR`` does not say otherwise."""
 
 MEMORY_TOOLS = ("memory_search", "conversation_search", "memory_read_scene")
-BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore", "skill_load", *MEMORY_TOOLS, *CONTROL_NAMES)
+BUILTIN_TOOLS = (
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "repository_explore",
+    "skill_load",
+    *MEMORY_TOOLS,
+    *CONTROL_NAMES,
+    *TASK_NAMES,
+)
 """The local tool set, named individually because enabling ``bash`` is a decision."""
 
 DEFAULT_MAX_CONCURRENT_DRIVES = 8
@@ -82,7 +93,17 @@ DEFAULT_LANE = "main"
 DATA_DIR_NAME = ".prale"
 """Where the stores live when ``PRALE_DATA_DIR`` does not say otherwise."""
 MEMORY_TOOLS = ("memory_search", "conversation_search", "memory_read_scene")
-BUILTIN_TOOLS = ("read", "write", "edit", "bash", "repository_explore", "skill_load", *MEMORY_TOOLS, *CONTROL_NAMES)
+BUILTIN_TOOLS = (
+    "read",
+    "write",
+    "edit",
+    "bash",
+    "repository_explore",
+    "skill_load",
+    *MEMORY_TOOLS,
+    *CONTROL_NAMES,
+    *TASK_NAMES,
+)
 """The local tool set, named individually because enabling ``bash`` is a decision."""
 
 
@@ -245,7 +266,7 @@ class Settings:
                 raise ValueError("legacy context options require PRALE_CONTEXT_STRATEGY=layered_v1")
             context_management = ContextManagementConfig(
                 strategy=cast("Literal['layered_v1', 'tool_prune_summary_v1']", strategy),
-                threshold_ratio=_float(environ, "PRALE_CONTEXT_THRESHOLD_RATIO", 0.8),
+                threshold_ratio=_float(environ, "PRALE_CONTEXT_THRESHOLD_RATIO", 0.3),
                 headroom_tokens=_nonnegative_int(environ, "PRALE_CONTEXT_HEADROOM_TOKENS", 65_536),
                 retain_ratio=_float(environ, "PRALE_CONTEXT_RETAIN_RATIO", 0.16),
                 tool_prune_threshold_chars=_int(environ, "PRALE_CONTEXT_TOOL_PRUNE_THRESHOLD_CHARS", 8192),
@@ -256,7 +277,7 @@ class Settings:
                 ),
                 enabled=not _off(environ, "PRALE_CONTEXT_MANAGEMENT"),
                 context_window_tokens=_int(
-                    environ, "PRALE_CONTEXT_WINDOW_TOKENS", 128_000 if strategy == "layered_v1" else 512_000
+                    environ, "PRALE_CONTEXT_WINDOW_TOKENS", 128_000 if strategy == "layered_v1" else 1_000_000
                 ),
                 reserved_output_tokens=_int(environ, "PRALE_CONTEXT_RESERVED_OUTPUT_TOKENS", 20_000),
                 soft_margin_tokens=_int(environ, "PRALE_CONTEXT_SOFT_MARGIN_TOKENS", 13_000),
@@ -279,7 +300,7 @@ class Settings:
             max_nonterminal=_int(environ, "PRALE_SUBAGENT_MAX_NONTERMINAL", 64),
             max_result_tokens=_int(environ, "PRALE_SUBAGENT_MAX_RESULT_TOKENS", 4096),
         )
-        default_tools = ",".join(CONTROL_NAMES) if subagent_config.enabled else ""
+        default_tools = ",".join((*TASK_NAMES, *(CONTROL_NAMES if subagent_config.enabled else ())))
         tools = _tools(environ.get("PRALE_TOOLS", default_tools))
         unknown = sorted(set(tools) - set(BUILTIN_TOOLS))
         if unknown:

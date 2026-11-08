@@ -26,6 +26,7 @@ from agent_harness.domain.entries import Entry, JsonValue, NewEntry
 from agent_harness.domain.operations import ActiveOperation, OperationResult, OperationState
 from agent_harness.domain.session import SessionMutator
 from agent_harness.domain.subagents import SubagentError
+from agent_harness.domain.tasks import TASK_NAMES, TaskError
 from agent_harness.domain.tool_prune import ContextView, context_view, message_hash, prune_content
 from agent_harness.domain.types import OperationStatus
 from agent_harness.domain.values import (
@@ -36,6 +37,7 @@ from agent_harness.domain.values import (
 )
 from agent_harness.runtime.generation import AssistantResult, ChatProvider, GenerationDelta, GenerationRequest, ToolCall
 from agent_harness.runtime.lane import Lane
+from agent_harness.runtime.tasks import task_overview, task_writes
 from agent_harness.runtime.telemetry import (
     EffectStatus,
     GenerationTelemetry,
@@ -897,6 +899,11 @@ class Drive:
                     {"role": "system", "content": f"<available_skills>\n{listing}\n</available_skills>"},
                 ],
             }
+        task_version, overview = (None, None)
+        if any(self._lane.tools.get(name) is not None for name in TASK_NAMES):
+            task_version, overview = await task_overview(self._lane._session)
+            if overview is not None:
+                transformed = {**transformed, "messages": [*transformed["messages"], overview]}
         request = await self._lane.hooks.run(
             "before_request",
             transformed,
@@ -962,6 +969,8 @@ class Drive:
         usage_id = self._lane.new_id()
         span, span_write = self._open_span(operation, assistant_entry_id, "llm", attempt=1)
         intent = {
+            "task_snapshot_version": task_version,
+            "task_overview": overview,
             "assistant_entry_id": assistant_entry_id,
             "usage_id": usage_id,
             "span_id": span.span_id,
@@ -1988,13 +1997,17 @@ class Drive:
                 }
             else:
                 try:
-                    if runtime is None:
+                    if planned["tool_name"] in TASK_NAMES:
+                        control = {"format_version": 1, "kind": "task"}
+                        control_writes = []
+                    elif runtime is None:
                         raise RuntimeError("subagent dispatcher is not configured")
                     if not isinstance(arguments, dict):
                         raise ValueError("control arguments must be an object")
-                    control, control_writes = await runtime.prepare_control(
-                        mutator, self._lane, operation, planned["tool_name"], arguments, planned["tool_call_id"]
-                    )
+                    if planned["tool_name"] not in TASK_NAMES:
+                        control, control_writes = await runtime.prepare_control(
+                            mutator, self._lane, operation, planned["tool_name"], arguments, planned["tool_call_id"]
+                        )
                     extra.extend(control_writes)
                 except (SubagentError, ValueError, TypeError) as error:
                     control = {
@@ -2045,6 +2058,10 @@ class Drive:
         control = active["control"]
         if control.get("format_version") != 1:
             raise RuntimeError("unknown control state version")
+        if control["kind"] == "task":
+            await self._settle_tool(operation, active, {})
+            await self._lane.emit("tool_end", operation.meta.operation_id, {"tool_call_id": active["tool_call_id"]})
+            return
         if control["kind"] in ("blocked", "error"):
             result = control["receipt"]
         else:
@@ -2210,6 +2227,19 @@ class Drive:
             current = await mutator.get_value(operation_state(operation.meta.operation_id))
             if current != operation.state:
                 raise RuntimeError("tool intent was already settled or replaced")
+            nonlocal result, outcome, error_class
+            task_changes: list[Write] = []
+            if active.get("control", {}).get("kind") == "task":
+                try:
+                    content, task_changes = await task_writes(mutator, active["tool_name"], active["arguments"])
+                    result = {"content": content, "is_error": False}
+                except TaskError as error:
+                    result = {
+                        "content": {"error_code": "invalid_task_operation", "message": str(error)},
+                        "is_error": True,
+                    }
+                result = await self._lane.hooks.run("after_tool", result)
+                outcome, error_class = _tool_outcome(result)
             data = operation.state.data
             assert isinstance(data, dict) and isinstance(data.get("calls"), list)
             parent_id = await mutator.get_value(lane_tip(self._lane.name))
@@ -2227,6 +2257,7 @@ class Drive:
             ]
             await mutator.commit(
                 [
+                    *task_changes,
                     *self._lane.trace_writes(
                         operation.meta.operation_id,
                         "tool_outcome",

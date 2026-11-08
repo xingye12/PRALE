@@ -40,6 +40,7 @@ from agent_harness.api.web import WebApplication, create_app
 from agent_harness.domain.memory import MemoryScope
 from agent_harness.domain.skill import SkillScope
 from agent_harness.domain.subagents import CONTROL_NAMES
+from agent_harness.domain.tasks import TASK_NAMES
 from agent_harness.integrations.bge_m3 import LocalBgeM3EmbeddingProvider
 from agent_harness.integrations.deepseek import DeepSeekProvider
 from agent_harness.integrations.langfuse import LangfuseTelemetry
@@ -62,6 +63,7 @@ from agent_harness.runtime.subagents import (
     create_subagent_tools,
     validate_subagent_definitions,
 )
+from agent_harness.runtime.tasks import create_task_tools
 from agent_harness.runtime.tools import AgentTool, RuntimeControlTool
 from agent_harness.storage.memory_sqlite import SQLiteMemoryStore
 from agent_harness.storage.skill_sqlite import SQLiteSkillStore
@@ -200,6 +202,7 @@ def build_application(settings: Settings) -> Deployment:
     tools: tuple[AgentTool | RuntimeControlTool, ...] = tuple(
         tool for tool in available_tools if tool.name in settings.tools
     )
+    tools = (*tools, *create_task_tools(tuple(name for name in settings.tools if name in TASK_NAMES)))
     resolver = (
         MappingProviderResolver({settings.model: provider}, settings.model)
         if settings.subagent_config.enabled

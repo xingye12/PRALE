@@ -6,6 +6,7 @@ from agent_harness.api.errors import ProjectConfigError
 from agent_harness.api.serve import build_application
 from agent_harness.api.settings import Settings
 from agent_harness.domain.subagents import SubagentCapabilityUnavailable
+from agent_harness.domain.tasks import TASK_NAMES
 from agent_harness.runtime.generation import AssistantResult, ToolCall
 
 
@@ -130,12 +131,12 @@ def test_subagents_default_on_and_explicit_tool_allowlist_is_preserved(tmp_path)
     assert SubagentConfig().enabled
     settings = Settings.from_environment(environment(tmp_path))
     assert settings.subagent_config.enabled
-    assert settings.tools == CONTROL_NAMES
+    assert settings.tools == (*TASK_NAMES, *CONTROL_NAMES)
     assert Settings.from_environment(environment(tmp_path, PRALE_TOOLS="")).tools == ()
     assert Settings.from_environment(environment(tmp_path, PRALE_TOOLS="read")).tools == ("read",)
     disabled = Settings.from_environment(environment(tmp_path, PRALE_SUBAGENTS_ENABLED="false"))
     assert not disabled.subagent_config.enabled
-    assert disabled.tools == ()
+    assert disabled.tools == TASK_NAMES
 
 
 def test_default_deployment_registers_all_subagent_tools(tmp_path):
@@ -146,7 +147,7 @@ def test_default_deployment_registers_all_subagent_tools(tmp_path):
         try:
             session = await deployment.web.supervisor.create_session("s")
             lane = await deployment.web.supervisor.lane(session.session_id, "main")
-            assert {t.name for t in lane.tools.definitions()} == set(CONTROL_NAMES)
+            assert {t.name for t in lane.tools.definitions()} == set((*TASK_NAMES, *CONTROL_NAMES))
         finally:
             await deployment.web.aclose()
             for store in deployment.stores:
