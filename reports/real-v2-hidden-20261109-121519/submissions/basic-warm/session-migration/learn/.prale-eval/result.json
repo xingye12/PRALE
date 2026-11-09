@@ -1,0 +1,32 @@
+{
+  "task_id": "session-migration/learn",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claims": [
+    {
+      "claim": "Legacy oauth.json is parsed with JSON.parse on the raw file text, so a UTF-8 BOM makes parsing throw and the OAuth credentials are silently skipped while an auth.json with only apiKeys is written, permanently blocking the OAuth migration.",
+      "citation": "packages/coding-agent/src/migrations.ts:36 (pre-fix: JSON.parse(readFileSync(oauthPath, \"utf-8\"))); fixed to JSON.parse(stripBom(readFileSync(oauthPath, \"utf-8\")))"
+    },
+    {
+      "claim": "The repair only strips the BOM before parsing (reusing the existing stripBom helper already used for settings.json and keybindings.json) and rejects non-object oauth.json payloads before anything is renamed, so malformed legacy files stay on disk unchanged.",
+      "citation": "packages/coding-agent/src/migrations.ts:36-44"
+    },
+    {
+      "claim": "OAuth precedence and apiKeys fallback are preserved: migrated providers carry type \"oauth\" and settings.json apiKeys are only applied when the provider was not already migrated, then removed from settings.json.",
+      "citation": "packages/coding-agent/src/migrations.ts:41-43 (oauth precedence), 55-62 (apiKeys fallback + removal)"
+    },
+    {
+      "claim": "An existing auth.json still short-circuits the migration before any read/write/rename, so it is never modified.",
+      "citation": "packages/coding-agent/src/migrations.ts:28"
+    },
+    {
+      "claim": "The regression executes the real migrateAuthToAuthJson through .prale-eval/subject.mjs and asserts BOM migration, OAuth precedence, apiKeys fallback, malformed-input preservation and untouched existing auth.json; it fails with an assertion on the original fault and passes on the repaired code.",
+      "citation": ".prale-eval/regression.mjs"
+    }
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node 24.14.0; all 4 regression checks passed and the process exited 0. The script loads the real packages/coding-agent/src/migrations.ts via .prale-eval/subject.mjs loadMigrations(root, agentDir) with real fs/path and a caller-owned agent dir under .prale-eval/.tmp-regression (removed afterwards). Checked: (1) oauth.json written as '\\uFEFF{...}' now migrates both providers into auth.json with type \"oauth\" and byte-preserved access/refresh/expires, and the legacy file is renamed to oauth.json.migrated retaining its credentials; (2) when settings.json apiKeys collide with an OAuth provider, the OAuth credential wins, the apiKey is not written, the non-colliding apiKey migrates as type \"api_key\", apiKeys is dropped from settings.json and unrelated settings survive; (3) a truncated BOM-prefixed oauth.json stays byte-identical with no .migrated copy and no invented provider entry while apiKeys still migrate as fallback; (4) an existing auth.json (contents unchanged, including its BOM and trailing newline) makes the migration return [] and leaves oauth.json and settings.json untouched. Fault detection was verified by temporarily restoring the baseline migrations.ts (git checkout of that single file) and re-running the same command: it exited 1 with AssertionError 'BOM-prefixed oauth.json providers must be reported as migrated' (actual [], expected ['anthropic','custom-provider']), then exited 0 again after re-applying the repair. No dependencies or network were required; optional repository typecheck/vitest suites were not run because node_modules is absent in this environment, so only the Node TypeScript-strip load and the VM-based regression were used."
+  }
+}

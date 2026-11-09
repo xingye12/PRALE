@@ -1,0 +1,46 @@
+{
+  "task_id": "advanced/execution-lifecycle/correction",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node 24.14.0; 8 cross-module checks passed, exit code 0, no dependencies/network/credentials and no wall-clock or randomness used as evidence. The script loads the real submitted production modules through .prale-eval/subject.mjs (real recoverToolInvocation -> performToolInvocation -> executeToolCall -> finalizeToolCall -> createToolResultMessage, real createGate, real tool-call placement); only checkpoint storage, progress transport, hook delivery and provider/argument-validation boundaries are in-memory fakes, and asynchronous ordering is controlled with explicit promises. Asserted behavior: (a) a non-cancelled pending call persisted as replay 'safe' whose tool declares replay 'safe' clears its checkpoint and re-executes the effect, publishing the real tool result (no interruption marker, details/usage preserved) while cancelled recovery, unsafe intents, unsafe declarations and vanished tools still settle from the checkpoint with the interruption marker; (b) an after-tool patch may explicitly clear isError on a failed effect and may raise it on a successful one, while explicit content []/terminate false are applied and unspecified fields plus usage are preserved; (c) a gate closed with a terminal error while a cancellation is pending rejects every later admission (including the real after-tool hook admission inside the drive pass) with that terminal error, and a late beginAbort/signalAbort cannot override the closure. Mutation check: restoring each of the three source files alone to its faulty baseline produces a node:assert/strict failure in the matching check (drive/tools.ts line 527 -> missing clear/invoke events; execution/tools.ts line 178 -> isError stayed true; execution/effect-gate.ts line 58 -> missing expected rejection), never a crash, import error or timeout. Type-checking/lint and the package vitest suites were not run because node_modules is absent and dependencies must not be installed; module evaluation still type-strips every touched file via node:module.stripTypeScriptTypes. Only in-memory fixtures were used, so no test inputs were left on disk.",
+    "regression_script": ".prale-eval/regression.mjs",
+    "sources_repaired": [
+      "packages/agent/src/harness/runtime/drive/tools.ts",
+      "packages/agent/src/harness/execution/tools.ts",
+      "packages/agent/src/harness/execution/effect-gate.ts"
+    ]
+  },
+  "claims": [
+    {
+      "claim": "Non-cancelled safe/safe replay is allowed: a recovered effect_pending call with a safe durable intent and a safe tool declaration re-executes instead of being settled from the checkpoint.",
+      "citation": "packages/agent/src/harness/runtime/drive/tools.ts:527",
+      "change": "Removed the statically dead `false &&` prefix so the replay predicate is `!cancelled && tool !== undefined && call.replay === \"safe\" && tool.replay === \"safe\"`.",
+      "evidence": ".prale-eval/regression.mjs: 'safe/safe recovery replays persisted arguments through the real executor', plus 'a pending cancellation still wins over safe replay' and 'unsafe declarations, unsafe intents and missing tools stay interrupted'."
+    },
+    {
+      "claim": "An after-tool hook may explicitly clear isError, while unspecified result fields and usage are preserved and explicit false/empty patch values are applied.",
+      "citation": "packages/agent/src/harness/execution/tools.ts:178",
+      "change": "finalizeToolCall now uses `patch?.isError ?? executed.isError` instead of `||`, leaving the field-by-field result merge (spread of executed.result plus === undefined guards for content/details/usage/terminate) intact.",
+      "evidence": ".prale-eval/regression.mjs: 'an after-tool hook may explicitly clear isError on a failed effect', 'an after-tool hook may still raise isError on a successful effect', 'patch application preserves unspecified fields and usage while applying false/empty', 'no patch preserves the whole executed result unchanged'."
+    },
+    {
+      "claim": "If an aborting gate is closed with a terminal error, the terminal error becomes authoritative for future admissions and a pending cancellation must not override that closure.",
+      "citation": "packages/agent/src/harness/execution/effect-gate.ts:58",
+      "change": "GateControl.close now short-circuits only when the gate is already closed, so an aborting gate promotes to closed with the terminal error and aborts its signal with that error; beginAbort/signalAbort still cannot downgrade or replace the closed state.",
+      "evidence": ".prale-eval/regression.mjs: 'a terminal close of an aborting gate is authoritative for later admissions'."
+    }
+  ],
+  "deliverables": {
+    "production_repairs": [
+      "packages/agent/src/harness/runtime/drive/tools.ts",
+      "packages/agent/src/harness/execution/tools.ts",
+      "packages/agent/src/harness/execution/effect-gate.ts"
+    ],
+    "executable_regression": ".prale-eval/regression.mjs",
+    "explanation": ".prale-eval/repair.md",
+    "result": ".prale-eval/result.json"
+  }
+}

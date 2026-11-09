@@ -58,42 +58,51 @@ class _MeteredProvider:
 
     async def generate(self, request: GenerationRequest) -> AssistantResult:
         started = time.monotonic()
-        result = await self._provider.generate(request)
-        self._calls.append(
-            {
-                "lane": request.lane,
-                "duration_ms": round((time.monotonic() - started) * 1000),
-                "usage": _numeric_usage(result.usage),
-            }
-        )
-        return result
+        call: dict[str, Any] = {"lane": request.lane, "usage": {}, "status": "failed"}
+        try:
+            result = await self._provider.generate(request)
+            call.update(usage=_numeric_usage(result.usage), status="completed")
+            return result
+        except BaseException as error:
+            call["error_class"] = type(error).__name__
+            raise
+        finally:
+            call["duration_ms"] = round((time.monotonic() - started) * 1000)
+            self._calls.append(call)
 
-    def metrics(self, pricing: Mapping[str, float | None]) -> dict[str, Any]:
-        usage = _aggregate_usage([call["usage"] for call in self._calls])
+    def metrics(self, pricing: Mapping[str, float | None], *, phase: str = "all") -> dict[str, Any]:
+        if phase not in {"all", "solving", "promotion"}:
+            raise ValueError("unknown accounting phase")
+        calls = [call for call in self._calls if phase == "all" or (call["lane"] == "main") == (phase == "solving")]
+        completed = [call for call in calls if call["status"] == "completed"]
+        usage = _aggregate_usage([call["usage"] for call in completed])
         provider_costs = [
             value
-            for call in self._calls
+            for call in completed
             for key, value in call["usage"].items()
             if key in {"cost", "cost_usd", "total_cost_usd"}
         ]
+        # Partial cost is useful evidence, but never present it as a complete bill.
         cost = sum(provider_costs) if provider_costs else _estimated_cost(usage, pricing)
-        agent_turns = sum(call["lane"] == "main" for call in self._calls)
+        agent_turns = sum(call["lane"] == "main" for call in completed)
+        unknown = sum(not call["usage"] for call in calls)
         return {
-            "model_turns": len(self._calls),
+            "model_turns": len(completed),
             "agent_model_turns": agent_turns,
-            "memory_model_turns": len(self._calls) - agent_turns,
-            "model_duration_ms": sum(call["duration_ms"] for call in self._calls),
+            "memory_model_turns": len(completed) - agent_turns,
+            "model_attempts": len(calls),
+            "failed_model_attempts": len(calls) - len(completed),
+            "unknown_usage_attempts": unknown,
+            "usage_complete": unknown == 0,
+            "model_duration_ms": sum(call["duration_ms"] for call in calls),
             "usage": usage,
-            "cost_usd": cost,
+            "cost_usd": cost if unknown == 0 else None,
+            "observed_cost_usd": cost,
         }
 
 
 def _numeric_usage(value: Mapping[str, object]) -> dict[str, int | float]:
-    return {
-        key: item
-        for key, item in value.items()
-        if isinstance(item, (int, float)) and not isinstance(item, bool)
-    }
+    return {key: item for key, item in value.items() if isinstance(item, (int, float)) and not isinstance(item, bool)}
 
 
 def _aggregate_usage(rows: list[Mapping[str, int | float]]) -> dict[str, int | float]:
@@ -140,8 +149,9 @@ def _estimated_cost(usage: Mapping[str, int | float], pricing: Mapping[str, floa
     if not isinstance(cache_read, (int, float)) or not isinstance(cache_write, (int, float)):
         return None
     uncached_input = max(0, input_tokens - cache_read - cache_write)
-    cache_read_rate = pricing.get("cache_read") if pricing.get("cache_read") is not None else input_rate
-    cache_write_rate = pricing.get("cache_write") if pricing.get("cache_write") is not None else input_rate
+    read_price, write_price = pricing.get("cache_read"), pricing.get("cache_write")
+    cache_read_rate = read_price if read_price is not None else input_rate
+    cache_write_rate = write_price if write_price is not None else input_rate
     return round(
         (
             uncached_input * input_rate
@@ -195,7 +205,12 @@ async def run_prale(
     l1_turn_threshold: int,
     memory_phase: str,
     pricing: Mapping[str, float | None],
+    promotion_timeout_seconds: float = 900,
+    progress_path: Path | None = None,
 ) -> dict[str, Any]:
+    if promotion_timeout_seconds <= 0:
+        raise ValueError("promotion timeout must be positive")
+    started = time.monotonic()
     if memory_mode not in {"warm", "cold"}:
         raise ValueError("memory_mode must be warm or cold")
     if memory_phase not in {"learn", "frozen", "cold"}:
@@ -234,23 +249,70 @@ async def run_prale(
 
         harness.subscribe(observe)
         lane = await harness.acquire_lane("main")
-        await lane.prompt(_task(workspace), operation_id=f"stage-{uuid.uuid4()}")
-        result = await asyncio.wait_for(lane.drive(_NonStreamingProvider(metered_provider)), timeout=timeout_seconds)
-        if memory_phase == "learn" and runtime is not None and store is not None and scope is not None:
-            await _promote(runtime, store, scope)
-        return {
+        solve_error = None
+        try:
+            await lane.prompt(_task(workspace), operation_id=f"stage-{uuid.uuid4()}")
+            result = await asyncio.wait_for(
+                lane.drive(_NonStreamingProvider(metered_provider)), timeout=timeout_seconds
+            )
+            terminal_status = result.status
+        except Exception as error:
+            terminal_status = "timed_out" if isinstance(error, TimeoutError) else "failed"
+            solve_error = {"error_class": type(error).__name__, "message": str(error)}
+        solved_at = time.monotonic()
+        solving = metered_provider.metrics(pricing, phase="solving")
+        output = {
             "adapter": "prale",
-            "terminal_status": result.status,
+            "accounting_version": 2,
+            "terminal_status": terminal_status,
             "tool_calls": calls,
-            "memory_retrievals": ["memory_search"] if "memory_search" in calls else [],
+            "memory_retrievals": [name for name in calls if name in {"memory_search", "memory_read_scene"}],
             "memory_phase": memory_phase,
+            "duration_seconds": round(solved_at - started, 3),
+            **solving,
+            "promotion": {"status": "not_run", "duration_seconds": 0},
+        }
+        if solve_error is not None:
+            output["error"] = solve_error
+        # Persist solved evidence before any post-task memory work, including failures.
+        if progress_path is not None:
+            _save_progress(progress_path, output)
+        promotion_started = time.monotonic()
+        promotion_status = "not_run"
+        promotion_error = None
+        if memory_phase == "learn" and runtime is not None and store is not None and scope is not None:
+            try:
+                await asyncio.wait_for(_promote(runtime, store, scope), timeout=promotion_timeout_seconds)
+                promotion_status = "completed"
+            except Exception as error:
+                promotion_status = "timed_out" if isinstance(error, TimeoutError) else "failed"
+                promotion_error = {"error_class": type(error).__name__, "message": str(error)}
+        output["promotion"] = {
+            "status": promotion_status,
+            "duration_seconds": round(time.monotonic() - promotion_started, 3),
+            **metered_provider.metrics(pricing, phase="promotion"),
+        }
+        if promotion_error is not None:
+            output["promotion"]["error"] = promotion_error
+        output["total"] = {
+            "duration_seconds": round(time.monotonic() - started, 3),
             **metered_provider.metrics(pricing),
         }
+        if progress_path is not None:
+            _save_progress(progress_path, output)
+        return output
     finally:
         if runtime is not None:
             await runtime.aclose()
         if store is not None:
             store.close()
+
+
+def _save_progress(path: Path, result: Mapping[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.replace(path)
 
 
 def _claude_summary(output: str) -> dict[str, Any]:
@@ -268,12 +330,12 @@ def _claude_summary(output: str) -> dict[str, Any]:
             content = event["message"].get("content")
             if isinstance(content, list):
                 tools.extend(
-                    block.get("name")
+                    name
                     for block in content
                     if (
                         isinstance(block, Mapping)
                         and block.get("type") == "tool_use"
-                        and isinstance(block.get("name"), str)
+                        and isinstance(name := block.get("name"), str)
                     )
                 )
         if event.get("type") == "result":
@@ -392,6 +454,7 @@ def run_claude(
         str(max_budget_usd),
     ]
     if session_mode == "resume":
+        assert session_id is not None
         command.extend(["--resume", session_id])
     if model:
         command.extend(["--model", model])
@@ -420,7 +483,8 @@ def run_claude(
             preexec_fn=_claude_preexec(workspace, home, config_dir),
         )
     except subprocess.TimeoutExpired as error:
-        parsed = _claude_summary(error.stdout or "")
+        stdout = error.stdout.decode("utf-8", errors="replace") if isinstance(error.stdout, bytes) else error.stdout
+        parsed = _claude_summary(stdout or "")
         return {
             "adapter": "claude-code",
             "terminal_status": "timed_out",
@@ -465,6 +529,7 @@ def main() -> int:
     )
     prale.add_argument("--base-url", default="https://api.deepseek.com/chat/completions")
     prale.add_argument("--model", default=os.environ.get("MODEL", "deepseek-flash"))
+    prale.add_argument("--promotion-timeout", type=float, default=900)
     prale.add_argument("--l1-turn-threshold", type=int, default=5)
     prale.add_argument("--memory-phase", choices=("learn", "frozen", "cold"), default="learn")
     prale.add_argument("--input-price-usd-per-million", type=float)
@@ -493,6 +558,8 @@ def main() -> int:
                 timeout_seconds=args.timeout,
                 l1_turn_threshold=args.l1_turn_threshold,
                 memory_phase=args.memory_phase,
+                promotion_timeout_seconds=args.promotion_timeout,
+                progress_path=args.output,
                 pricing={
                     "input": args.input_price_usd_per_million,
                     "cache_read": args.cache_read_price_usd_per_million,
@@ -515,7 +582,7 @@ def main() -> int:
         )
     args.output.write_text(json.dumps(output, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     print(json.dumps(output, ensure_ascii=False, sort_keys=True))
-    return 0
+    return 0 if args.adapter != "prale" or output["terminal_status"] == "completed" else 1
 
 
 if __name__ == "__main__":

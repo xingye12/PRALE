@@ -1,0 +1,450 @@
+diff --git a/packages/agent/src/harness/execution/effect-gate.ts b/packages/agent/src/harness/execution/effect-gate.ts
+index a2b7c8c..7be5638 100644
+--- a/packages/agent/src/harness/execution/effect-gate.ts
++++ b/packages/agent/src/harness/execution/effect-gate.ts
+@@ -52,7 +52,8 @@ export function createGate(): { gate: Gate; control: GateControl } {
+ 			},
+ 			signalAbort() {
+ 				if (state.status !== "aborting" || controller.signal.aborted) return;
+-				// Regression: abort signal is never delivered.
++				// Deliver cancellation to already-admitted work once the abort is durable.
++				controller.abort(new AbortRequested(state.cancellation));
+ 			},
+ 			close(error) {
+ 				if (state.status === "closed") return;
+diff --git a/packages/agent/src/harness/execution/tools.ts b/packages/agent/src/harness/execution/tools.ts
+index e5b968a..f768781 100644
+--- a/packages/agent/src/harness/execution/tools.ts
++++ b/packages/agent/src/harness/execution/tools.ts
+@@ -149,7 +149,7 @@ export function executeToolCall<TContext extends object | undefined>(
+ 		} catch (error) {
+ 			return {
+ 				result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+-				isError: false,
++				isError: true,
+ 			};
+ 		} finally {
+ 			acceptingUpdates = false;
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 91fce39..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -385,7 +385,7 @@ async function performToolInvocation<TContext extends object | undefined>(
+ 			drive.gate,
+ 			(partial, options) => {
+ 				publishUpdate(partial);
+-				if (options?.checkpoint !== false) progress.write(partial);
++				if (options?.checkpoint === true) progress.write(partial);
+ 			},
+ 			toolContext,
+ 			capability.invocation,
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..b2195a7
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,228 @@
++/**
++ * Regression evidence for advanced/execution-lifecycle/transfer.
++ *
++ * Exercises the real recovered-tool path end to end: the private recovery entry
++ * in `runtime/drive/tools.ts`, the real executor/finalizer in
++ * `execution/tools.ts`, the real effect gate in `execution/effect-gate.ts`, and
++ * the real placement helpers in `runtime/drive/tool-placement.ts` that resolve
++ * the recovered call. Only external boundaries (checkpoint store, progress
++ * transport, hook delivery, outcome publication) are faked by the read-only
++ * subject helper. No timers, randomness, network or real time are used:
++ * asynchronous ordering is controlled exclusively with promises.
++ *
++ * Contract under test:
++ *  1. Every admitted live update reaches observers; only `checkpoint: true`
++ *     updates are persisted as durable progress.
++ *  2. A tool exception stays an error in the final published message.
++ *  3. Final publication happens only after progress has been drained.
++ *  4. `signalAbort()` delivers cancellation to the already-admitted tool's
++ *     AbortSignal.
++ *  5. No new effect may be admitted after `beginAbort`.
++ */
++import assert from "node:assert/strict";
++import { fileURLToPath } from "node:url";
++
++import { createExecutionPipeline } from "./subject.mjs";
++
++const root = fileURLToPath(new URL("..", import.meta.url));
++
++function deferred() {
++	let resolve;
++	let reject;
++	const promise = new Promise((res, rej) => {
++		resolve = res;
++		reject = rej;
++	});
++	return { promise, resolve, reject };
++}
++
++function textOf(message) {
++	return (message?.content ?? [])
++		.filter((block) => block.type === "text")
++		.map((block) => block.text)
++		.join("\n");
++}
++
++function indexOfEvent(events, name) {
++	const index = events.indexOf(name);
++	assert.notEqual(index, -1, `expected a ${name} event in ${JSON.stringify(events)}`);
++	return index;
++}
++
++const pipeline = await createExecutionPipeline(root);
++
++// ---------------------------------------------------------------------------
++// 1. Recovered tool: live progress, an explicit checkpoint, then a failure.
++// ---------------------------------------------------------------------------
++{
++	const liveOne = { content: [{ type: "text", text: "live-1" }], details: { step: 1 } };
++	const liveTwo = { content: [{ type: "text", text: "live-2" }], details: { step: 2 } };
++	const checkpoint = { content: [{ type: "text", text: "durable" }], details: { step: 3 } };
++
++	const result = await pipeline.run({
++		persisted: "safe",
++		declared: "safe",
++		effect: async ({ update }) => {
++			update(liveOne);
++			update(liveTwo);
++			update(checkpoint, { checkpoint: true });
++			throw new Error("tool failed after checkpoint");
++		},
++	});
++
++	// Every admitted live update still reaches observers, in call order.
++	assert.deepEqual(
++		result.updates.map((event) => event.partialResult),
++		[liveOne, liveTwo, checkpoint],
++		"all admitted live updates must reach observers",
++	);
++	assert.deepEqual(
++		result.checkpoints,
++		[checkpoint],
++		"only updates marked checkpoint: true may be persisted",
++	);
++	assert.equal(
++		result.events.filter((name) => name === "checkpoint").length,
++		1,
++		"exactly one durable progress write is expected",
++	);
++
++	// A tool exception remains an error in the final message.
++	assert.equal(result.outcome?.message.isError, true, "a failed tool must publish an error result");
++	assert.equal(textOf(result.outcome?.message), "tool failed after checkpoint");
++	assert.equal(result.outcome?.terminate, false);
++
++	// Sealing happens before the drain, and publication follows the drain.
++	const seal = indexOfEvent(result.events, "seal");
++	const drain = indexOfEvent(result.events, "drain");
++	const drained = indexOfEvent(result.events, "drain-complete");
++	const publish = indexOfEvent(result.events, "publish");
++	assert.ok(seal < drain, "progress must be sealed before draining");
++	assert.ok(drain < drained, "drain must complete after it starts");
++	assert.ok(drained < publish, "final publication must follow progress drain");
++	assert.ok(
++		result.events.lastIndexOf("update") < drained,
++		"all live updates must be admitted before the drain completes",
++	);
++}
++
++// ---------------------------------------------------------------------------
++// 2. Live-only progress is never persisted, and publication waits for a drain
++//    that is still pending.
++// ---------------------------------------------------------------------------
++{
++	const published = deferred();
++	const drainReached = deferred();
++	const releaseDrain = deferred();
++	let drainFinished = false;
++	let publishObservedDrain = undefined;
++
++	const running = pipeline.run({
++		effect: async ({ update }) => {
++			update({ content: [{ type: "text", text: "live-only" }], details: { step: 1 } });
++			return { content: [{ type: "text", text: "done" }], details: { ok: true } };
++		},
++		progressDrain: async () => {
++			drainReached.resolve();
++			await releaseDrain.promise;
++			drainFinished = true;
++		},
++		onPublish: () => {
++			publishObservedDrain = drainFinished;
++			published.resolve();
++		},
++	});
++
++	await drainReached.promise;
++	// Drain is still pending here: publication must not have happened yet.
++	assert.equal(drainFinished, false, "drain is expected to still be pending");
++	releaseDrain.resolve();
++	const result = await running;
++	await published.promise;
++
++	assert.equal(publishObservedDrain, true, "publication must wait for the progress drain to finish");
++	assert.deepEqual(result.checkpoints, [], "live updates without checkpoint: true must not be persisted");
++	assert.equal(result.outcome?.message.isError, false);
++	assert.equal(textOf(result.outcome?.message), "done");
++	assert.ok(
++		indexOfEvent(result.events, "drain-complete") < indexOfEvent(result.events, "publish"),
++		"publish must be the last step after drain completion",
++	);
++}
++
++// ---------------------------------------------------------------------------
++// 3. Signaling an abort reaches the already-admitted tool's AbortSignal while
++//    new effects are refused.
++// ---------------------------------------------------------------------------
++{
++	const cancellation = deferred();
++	let signal;
++	let abortedDuringEffect;
++	let listenerFired = false;
++	let refusal;
++	let refusalCancellation;
++
++	const result = await pipeline.run({
++		effect: async ({ context, control }) => {
++			signal = context.abortSignal;
++			assert.ok(signal instanceof AbortSignal, "admitted tool must receive an AbortSignal");
++			signal.addEventListener("abort", () => {
++				listenerFired = true;
++			});
++			control.beginAbort(cancellation.promise);
++			control.signalAbort();
++			abortedDuringEffect = signal.aborted;
++			return { content: [{ type: "text", text: "still returned" }], details: {} };
++		},
++	});
++
++	assert.equal(abortedDuringEffect, true, "signalAbort must abort the admitted tool's signal");
++	assert.equal(signal.aborted, true);
++	assert.equal(listenerFired, true, "an abort listener on the admitted signal must fire");
++
++	// No new effect may be admitted through the gate once beginAbort ran.
++	try {
++		result.gate.admit(() => "admitted");
++	} catch (error) {
++		refusal = error;
++	}
++	assert.ok(refusal instanceof Error, "the gate must refuse admission after beginAbort");
++	assert.equal(refusal.name, "AbortRequested");
++	assert.equal(refusal.cancellation, cancellation.promise);
++	cancellation.resolve();
++}
++
++// ---------------------------------------------------------------------------
++// 4. beginAbort before admission: the effect is never invoked and a synthetic
++//    interrupted outcome is published instead.
++// ---------------------------------------------------------------------------
++{
++	const result = await pipeline.run({ gateState: "aborting" });
++	assert.equal(result.events.includes("invoke"), false, "no new effect may be admitted after beginAbort");
++	assert.equal(result.updates.length, 0);
++	assert.equal(result.checkpoints.length, 0);
++	assert.equal(result.outcome?.message.isError, true);
++	assert.match(
++		textOf(result.outcome?.message),
++		/external outcome is unknown/,
++		"an effect refused by the aborting gate must publish the interrupted outcome",
++	);
++	assert.ok(
++		indexOfEvent(result.events, "drain-complete") < indexOfEvent(result.events, "publish"),
++		"even a cancelled outcome publishes after the drain",
++	);
++}
++
++// ---------------------------------------------------------------------------
++// 5. Cancelled recovery keeps the durable checkpoint evidence and stays error.
++// ---------------------------------------------------------------------------
++{
++	const result = await pipeline.run({ cancelled: true });
++	assert.equal(result.events.includes("invoke"), false, "a cancelled recovery must not run the tool");
++	assert.equal(result.outcome?.message.isError, true);
++	assert.match(textOf(result.outcome?.message), /checkpoint-evidence/);
++	assert.match(textOf(result.outcome?.message), /external outcome is unknown/);
++	assert.deepEqual(result.checkpoints, []);
++}
++
++console.log("execution lifecycle transfer regression: ok");
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..dc67856
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,131 @@
++# Repair: live progress, durable progress and errors diverge
++
++Task: `advanced/execution-lifecycle/transfer` — repository `earendil-works/pi`.
++
++## Incident
++
++A recovered tool (an `effect_pending` call replayed through the private recovery
++entry `recoverToolInvocation`) emitted live progress, then one explicit
++`{ checkpoint: true }` update, then threw. Three separate defects made the
++lifecycle diverge across module boundaries:
++
++1. every live update was persisted as durable progress, not just the
++   checkpoint-marked one;
++2. the tool's exception was published as a *successful* tool result;
++3. `control.signalAbort()` never reached the already-admitted tool's
++   `AbortSignal`, so an abort could not interrupt in-flight work.
++
++## Cross-module flow and the three repairs
++
++`recoverToolInvocation` (`runtime/drive/tools.ts`) re-clears the persisted
++arguments, then hands the call to `performToolInvocation`
++(`runtime/drive/tools.ts`), which
++
++* opens the progress channel via `openToolProgress` (boundary),
++* calls `executeToolCall` (`execution/tools.ts`) with `drive.gate`
++  (`execution/effect-gate.ts`) and an update callback,
++* seals the channel, awaits the last observer delivery and `progress.drain()`,
++* then publishes the finalized outcome through `publishToolOutcome`.
++
++### 1. Durable progress must be checkpoint-gated — `runtime/drive/tools.ts`
++
++`performToolInvocation`'s update callback persisted progress whenever the
++options were *not* explicitly `checkpoint: false`:
++
++```ts
++publishUpdate(partial);                                  // observers: every admitted update
++if (options?.checkpoint !== false) progress.write(partial); // durable: also every live update
++```
++
++`AgentHarnessToolUpdateOptions.checkpoint` is documented as
++"Request replacement of this invocation's durable recovery checkpoint", i.e. it
++is opt-in. Every admitted live update must still reach observers, but only an
++explicit `checkpoint: true` may overwrite the durable recovery snapshot.
++
++```ts
++publishUpdate(partial);
++if (options?.checkpoint === true) progress.write(partial);
++```
++
++The ordering guarantees around the callback were already correct and are now
++preserved: seal → drain → publish.
++
++### 2. Tool exceptions stay errors — `execution/tools.ts`
++
++`executeToolCall` converts an expected tool throw into a synthetic error result
++so the call can still be recorded, but it returned `isError: false`:
++
++```ts
++} catch (error) {
++    return {
++        result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
++        isError: false,   // wrong: finalizeToolCall propagates this into the message
++    };
++}
++```
++
++`finalizeToolCall` derives `isError` from that field (`patch?.isError ??
++executed.isError`) and `createToolResultMessage` copies it into the durable
++`ToolResultMessage`, so a throw was indistinguishable from success in the final
++message and in the `tool_end` event. Fixed by returning `isError: true`.
++
++### 3. `signalAbort` must deliver cancellation — `execution/effect-gate.ts`
++
++The owner-facing control was a no-op:
++
++```ts
++signalAbort() {
++    if (state.status !== "aborting" || controller.signal.aborted) return;
++    // Regression: abort signal is never delivered.
++},
++```
++
++`beginAbort` moves the gate to `aborting` (which already refuses *new* effect
++admission with `AbortRequested`) and defers signalling until the cancellation is
++durable; `reconcileOperation` and `Lane.requestOperationAbort` call
++`beginAbort` → `signalAbort` once that cancellation commits. Without the
++abort, admitted work kept running with a live `drive.gate.signal`, so
++`waitUntil`-style waits and abort-aware tools never observed the cancellation.
++The repair aborts the controller with the internal control-flow error so the
++existing `AbortRequested` handling (including `await error.cancellation`) keeps
++working:
++
++```ts
++signalAbort() {
++    if (state.status !== "aborting" || controller.signal.aborted) return;
++    controller.abort(new AbortRequested(state.cancellation));
++},
++```
++
++Public APIs (`Gate`, `GateControl`, `createGate`, `executeToolCall`,
++`runTools`, the recovery entry signature) are unchanged.
++
++## Regression evidence
++
++`.prale-eval/regression.mjs` loads the real production modules through the
++read-only `.prale-eval/subject.mjs` helper (only checkpoint storage, progress
++transport, hook delivery and outcome publication are faked) and exercises five
++cross-module scenarios:
++
++1. live → live → checkpoint → throw: observers see all three updates, exactly
++   one durable write (the checkpoint), the published message is an error, and
++   `drain-complete` precedes `publish`;
++2. live-only update with a drain held open on a promise: nothing is persisted
++   and publication only happens after the drain finishes;
++3. `beginAbort` + `signalAbort` while the tool is admitted: the captured
++   `AbortSignal` aborts and its listener fires, and the gate refuses any further
++   admission with the same cancellation promise;
++4. `beginAbort` before admission: the effect is never invoked and the
++   interrupted, error-flagged outcome is published after the drain;
++5. cancelled recovery: the tool does not run, the durable checkpoint evidence
++   and interruption marker are kept, and the result is an error.
++
++Verified locally: the script exits 0 on the repaired tree and fails with a
++`node:assert/strict` `AssertionError` for each faulty file restored in
++isolation (effect gate → "signalAbort must abort the admitted tool's signal";
++executor → "a failed tool must publish an error result"; drive tools → "only
++updates marked checkpoint: true may be persisted").
++
++Command: `node --experimental-vm-modules .prale-eval/regression.mjs` (Node 24,
++no dependencies, no network, no timers or randomness; ordering is driven purely
++by promises).
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..fce31de
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,27 @@
++{
++  "task_id": "advanced/execution-lifecycle/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Executed from the workspace root on Node 24 with no dependencies, network, credentials or deployment. .prale-eval/regression.mjs drives the real recovered-tool path through the read-only .prale-eval/subject.mjs helper: the private recoverToolInvocation entry in packages/agent/src/harness/runtime/drive/tools.ts, the real executeToolCall/finalizeToolCall in packages/agent/src/harness/execution/tools.ts, the real createGate in packages/agent/src/harness/execution/effect-gate.ts, and the real toolCallFor/withToolBatch helpers in packages/agent/src/harness/runtime/drive/tool-placement.ts. Only external boundaries (checkpoint store, progress transport, hook delivery, outcome publication) are faked. Five cross-module scenarios assert with node:assert/strict that (1) a recovered tool emitting live, live, checkpoint, then throwing delivers all admitted live updates to observers while persisting exactly the checkpoint-marked snapshot, publishes an error-flagged tool result, and seals/drains progress before publication; (2) a live-only update is never persisted and publication waits for a drain that is still held open on a promise; (3) beginAbort + signalAbort aborts the AbortSignal of the already-admitted tool (listener fires) while the gate refuses further admission with the same cancellation promise; (4) beginAbort before admission means the effect is never invoked and the interrupted error outcome publishes after the drain; (5) cancelled recovery keeps the durable checkpoint evidence plus interruption marker and stays an error. Asynchronous ordering is controlled only with promises (no timers, real time, randomness or services). Mutation check: restoring each repaired file alone to its git baseline makes the script fail with an AssertionError instead of crashing or hanging - effect-gate.ts -> 'signalAbort must abort the admitted tool's signal', execution/tools.ts -> 'a failed tool must publish an error result', runtime/drive/tools.ts -> 'only updates marked checkpoint: true may be persisted'; the repaired tree exits 0."
++  },
++  "fixes": [
++    {
++      "file": "packages/agent/src/harness/runtime/drive/tools.ts",
++      "symbol": "performToolInvocation",
++      "summary": "Durable progress writes are opt-in: progress.write(partial) now runs only when options?.checkpoint === true, while publishUpdate still forwards every admitted live update to observers."
++    },
++    {
++      "file": "packages/agent/src/harness/execution/tools.ts",
++      "symbol": "executeToolCall",
++      "summary": "A caught tool exception returns isError: true so finalizeToolCall/createToolResultMessage keep the failure as an error in the durable message and tool_end event."
++    },
++    {
++      "file": "packages/agent/src/harness/execution/effect-gate.ts",
++      "symbol": "createGate/control.signalAbort",
++      "summary": "signalAbort now aborts the gate controller with the internal AbortRequested(state.cancellation) once the cancellation is durable, delivering cancellation to already-admitted work; beginAbort still refuses new admissions."
++    }
++  ]
++}
+snapshot .prale-eval/regression.mjs - b6b9a7bbe00e0222caea1e7c8e227a49413033ad5f1b4163436477caa77503ef
+snapshot .prale-eval/repair.md - d034723dd634146fe7658664e85be3d01f6c6b033ae1b137c8de97a2ead20d37
+snapshot .prale-eval/result.json - ec5b938af53c69c2517c75885fbbaeda8dabe693df41adb520e7d7c19c9a24ab
+snapshot packages/agent/src/harness/execution/effect-gate.ts 3b737e1b45e93cffd6c00ab23811eaf7d49a0ee573a255b0215d1c3c1370f0f8 a50449442c2df42cab6c9189d8627ee2ec4efe95d72d27894ae0c02bc04d122b
+snapshot packages/agent/src/harness/execution/tools.ts 9872562d00722599bcce5d2820a280bbdb71f9f5779afae12a67a810a2e59ae0 446b8624b365162a8878efeadcdc97ac053dc953f25155743d6a0646cf8868d5
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 1259e79fadea8c2c61499aea735a88cb3960f372b22de921320c644b2962dcc3 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

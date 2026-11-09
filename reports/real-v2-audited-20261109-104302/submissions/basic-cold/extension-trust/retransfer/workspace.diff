@@ -1,0 +1,138 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 72decd8..c6ce1ab 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,8 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(true);
++			// Keep the resolved decision: a denied prompt must not grant project resources.
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..0883c66
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,99 @@
++/**
++ * Regression: a denied project-trust decision must survive reload.
++ *
++ * The loader performs a bootstrap pass with trust forced off, asks the caller to
++ * resolve trust, and then reloads with the resolved state. If the resolved
++ * decision is discarded (denial treated as approval), project-scoped extensions
++ * appear after a denial. Bootstrap must always exclude project resources, user and
++ * CLI resources must always be present, and project resources may appear only
++ * after an explicit `true` decision.
++ */
++import assert from "node:assert/strict";
++import { basename, dirname } from "node:path";
++import { fileURLToPath } from "node:url";
++import { createTrustSubject } from "./subject.mjs";
++
++const root = dirname(dirname(fileURLToPath(import.meta.url)));
++
++// Array.from keeps the result in this realm so deep equality compares like with like
++// (the subject runs in a vm context with its own Array prototype).
++const names = (result) =>
++	Array.from(result.extensions, (extension) => basename(extension.path, ".ts")).sort();
++
++// --- A denial keeps project resources out, in the bootstrap pass and after reload ---
++{
++	const subject = await createTrustSubject(root, { initialTrusted: true });
++	let bootstrapNames;
++	await subject.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			bootstrapNames = names(extensionsResult);
++			return false;
++		},
++	});
++
++	assert.deepEqual(
++		bootstrapNames,
++		["cli", "user"],
++		"bootstrap pass must exclude project extensions while keeping user and CLI extensions",
++	);
++	assert.deepEqual(
++		names(subject.loader.getExtensions()),
++		["cli", "user"],
++		"a denied trust decision must not load project extensions (denial treated as approval)",
++	);
++	assert.equal(subject.state.trusted, false, "denied decision must stay untrusted in settings");
++	assert.equal(subject.state.loadedTrust, false, "settings must be reloaded as untrusted after denial");
++
++	// A subsequent fresh reload must not promote the denied decision to approval.
++	await subject.loader.reload();
++	assert.deepEqual(
++		names(subject.loader.getExtensions()),
++		["cli", "user"],
++		"a fresh reload after denial must keep project extensions absent",
++	);
++}
++
++// --- Approval loads project resources, still after a project-free bootstrap ---
++{
++	const subject = await createTrustSubject(root, { initialTrusted: true });
++	let bootstrapNames;
++	await subject.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			bootstrapNames = names(extensionsResult);
++			return true;
++		},
++	});
++
++	assert.deepEqual(
++		bootstrapNames,
++		["cli", "user"],
++		"bootstrap pass must exclude project extensions even when trust is later granted",
++	);
++	assert.deepEqual(
++		names(subject.loader.getExtensions()),
++		["cli", "project", "user"],
++		"an approved trust decision must load project extensions alongside user and CLI extensions",
++	);
++	assert.equal(subject.state.trusted, true, "approved decision must be trusted in settings");
++	assert.equal(subject.state.loadedTrust, true, "settings must be reloaded as trusted after approval");
++}
++
++// --- The resolved decision is re-evaluated on each reload, not sticky ---
++{
++	const subject = await createTrustSubject(root, { initialTrusted: true });
++	await subject.loader.reload({ resolveProjectTrust: async () => false });
++	assert.deepEqual(
++		names(subject.loader.getExtensions()),
++		["cli", "user"],
++		"first reload denied trust, so project extensions must be absent",
++	);
++
++	await subject.loader.reload({ resolveProjectTrust: async () => true });
++	assert.deepEqual(
++		names(subject.loader.getExtensions()),
++		["cli", "project", "user"],
++		"second reload approved trust, so project extensions must be present",
++	);
++}
++
++console.log("extension-trust/retransfer regression: passed");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..7de274f
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "extension-trust/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired reload() in packages/coding-agent/src/core/resource-loader.ts: the boolean returned by resolveProjectTrust was discarded and setProjectTrusted(true) was called unconditionally, so a denied trust prompt still loaded project-scoped resources. It now calls setProjectTrusted(projectTrusted), preserving the resolved decision while keeping the bootstrap pass forced untrusted. .prale-eval/regression.mjs drives the real DefaultResourceLoader via .prale-eval/subject.mjs with explicit boundary fakes and asserts (1) the bootstrap extension set given to resolveProjectTrust is user+CLI only, (2) a false decision leaves project extensions absent both immediately and on a later fresh reload while user/CLI stay loaded and the settings manager remains untrusted, (3) a true decision loads project extensions after a project-free bootstrap, and (4) the decision is re-evaluated per reload (deny then approve). Validation ran from the workspace root with Node v24.14.0 and exited 0. The same script run against a temporary copy of the original HEAD source exited 1 with 'AssertionError: a denied trust decision must not load project extensions (denial treated as approval)' (actual [cli, project, user] vs expected [cli, user]), confirming it detects this stage's fault. The existing vitest suite could not be run because node_modules is absent and installing dependency trees is out of scope; the regression relies only on Node built-ins."
++  }
++}
+snapshot .prale-eval/regression.mjs - 4ea98d461aaa70687e1cdb5ae205aec61a2d5b84113ff601c0453804f8bacb87
+snapshot .prale-eval/result.json - 33261e56e96425751281e1aeb03c616d60370033925117c6b359f99e3f4aa672
+snapshot packages/coding-agent/src/core/resource-loader.ts 076fed822b4c7a151bb59becc911d376eab3ae0eecbc7ecbdf90b2adc827b22b f48f4da330c4102af71c745fbd3b94dbb136eaa8faa899e622d5038a0d5d9516

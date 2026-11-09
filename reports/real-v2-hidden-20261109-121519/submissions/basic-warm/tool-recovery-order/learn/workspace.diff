@@ -1,0 +1,193 @@
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 8e41e3a..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,7 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (!cancelled && (call.replay === "safe" || tool?.replay === "safe")) {
++	if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..156ffc5
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,125 @@
++/**
++ * Standalone regression for tool-recovery-order: replay admission of an
++ * orphaned `effect_pending` tool call.
++ *
++ * Contract under test (from packages/agent/docs/tool-durability.md):
++ * - Replay is admitted only when the persisted call policy AND the current tool
++ *   declaration are both `replay: "safe"`, and the run was not cancelled.
++ * - Otherwise recovery must publish an interrupted outcome carrying the durable
++ *   checkpoint, without clearing the checkpoint or invoking the tool.
++ *
++ * Everything at the boundaries (checkpoint IO, tool invocation, outcome
++ * publication) is replaced by observable fakes in the read-only subject helper;
++ * the real recoverToolInvocation / interruptedOutcome code paths run.
++ */
++import assert from "node:assert/strict";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createRecoverySubject } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const recover = await createRecoverySubject(root);
++
++const INTERRUPTION_MARKER =
++	"[Tool execution was interrupted. The preceding output is the latest durable progress snapshot; newer live output may be missing, and the external outcome is unknown.]";
++
++const DEFAULT_CHECKPOINT = {
++	content: [{ type: "text", text: "durable-progress" }],
++	details: { step: 2 },
++};
++
++// Values can originate in the VM realm used by the subject loader; normalize
++// them before strict structural comparison.
++const plain = (value) => JSON.parse(JSON.stringify(value));
++
++function assertReplayed(result, label) {
++	assert.deepEqual(
++		plain(result.events),
++		["clear", "invoke", "effect-complete", "publish"],
++		`${label}: both safe declarations and no cancellation must clear the checkpoint and replay the tool`,
++	);
++	assert.ok(result.outcome, `${label}: replay must publish an outcome`);
++	const message = plain(result.outcome.message);
++	assert.deepEqual(
++		message.content,
++		[{ type: "text", text: "effect-result" }],
++		`${label}: the replayed tool result must be published unchanged`,
++	);
++	assert.equal(message.isError, false, `${label}: a replayed effect result is not an interruption`);
++	assert.equal(result.outcome.terminate, false, `${label}: replay must not terminate the run`);
++}
++
++function assertInterrupted(result, label, checkpoint = DEFAULT_CHECKPOINT) {
++	assert.deepEqual(
++		plain(result.events),
++		["read", "publish"],
++		`${label}: replay is not admitted, so recovery must read the durable checkpoint and publish an interrupted outcome without clearing or invoking`,
++	);
++	assert.ok(result.outcome, `${label}: interruption must publish an outcome`);
++	const message = plain(result.outcome.message);
++	assert.equal(message.isError, true, `${label}: interrupted outcomes are delivered as errors`);
++	assert.deepEqual(
++		message.content,
++		[...checkpoint.content, { type: "text", text: INTERRUPTION_MARKER }],
++		`${label}: interrupted outcome must preserve the durable checkpoint content and append the interruption marker`,
++	);
++	assert.equal(message.toolCallId, "call-1", `${label}: interrupted outcome must keep the tool call identity`);
++	assert.equal(message.toolName, "fixture-tool", `${label}: interrupted outcome must keep the tool name`);
++	assert.equal(result.outcome.terminate, false, `${label}: interruption must not terminate the run`);
++	if (checkpoint.details === undefined) {
++		assert.equal(message.details, undefined, `${label}: absent checkpoint details must stay absent`);
++	} else {
++		assert.deepEqual(message.details, checkpoint.details, `${label}: checkpoint details must be preserved`);
++	}
++	if (checkpoint.usage !== undefined) {
++		assert.deepEqual(message.usage, checkpoint.usage, `${label}: checkpoint usage must be preserved`);
++	}
++}
++
++// --- Replay is admitted only when both declarations are safe. -----------------
++
++assertReplayed(await recover("safe", "safe", false), "stored safe + current safe, not cancelled");
++
++// The original fault admitted replay when EITHER declaration was safe. Each of
++// these cases has exactly one safe side and must not replay.
++assertInterrupted(
++	await recover("safe", undefined, false),
++	"stored safe + tool absent (original fault: replayed because the stored policy was safe)",
++);
++assertInterrupted(
++	await recover("safe", null, false),
++	"stored safe + current declaration without a policy (original fault: replayed because the stored policy was safe)",
++);
++assertInterrupted(
++	await recover("safe", "never", false),
++	"stored safe + current never (original fault: replayed because the stored policy was safe)",
++);
++assertInterrupted(
++	await recover("never", "safe", false),
++	"stored never + current safe (original fault: replayed because the current declaration was safe)",
++);
++assertInterrupted(await recover("never", null, false), "stored never + current without a policy");
++assertInterrupted(await recover("never", undefined, false), "stored never + tool absent");
++assertInterrupted(await recover("never", "never", false), "stored never + current never");
++
++// --- Cancellation always interrupts, never replays. --------------------------
++
++assertInterrupted(await recover("safe", "safe", true), "both safe but the run was cancelled");
++
++// --- The durable checkpoint is carried through interruption untouched. -------
++
++const partialCheckpoint = {
++	content: [
++		{ type: "text", text: "partial-line-1" },
++		{ type: "text", text: "partial-line-2" },
++	],
++	details: { step: 7, note: "latest durable progress" },
++	usage: { input: 11, output: 5 },
++};
++assertInterrupted(
++	await recover("never", "safe", false, { checkpoint: partialCheckpoint }),
++	"interruption preserves a multi-chunk checkpoint with details and usage",
++	partialCheckpoint,
++);
++
++console.log("tool-recovery-order regression: all replay admission assertions passed");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..f438b1a
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,40 @@
++{
++  "task_id": "tool-recovery-order/learn",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "An orphaned effect_pending tool call is replayed only when the persisted call policy and the current tool declaration are both replay-safe and the run was not cancelled.",
++      "citations": [
++        "TASK.md:3",
++        "packages/agent/src/harness/runtime/drive/tools.ts:527",
++        "packages/agent/docs/tool-durability.md:395"
++      ]
++    },
++    {
++      "claim": "When replay is not admitted, recovery publishes an interrupted outcome that carries the durable checkpoint content, details, and usage, without clearing the checkpoint or invoking the tool.",
++      "citations": [
++        "TASK.md:3",
++        "packages/agent/src/harness/runtime/drive/tools.ts:534-537",
++        "packages/agent/docs/tool-durability.md:407"
++      ]
++    },
++    {
++      "claim": "The original fault admitted replay when either declaration was safe, so recovery cleared the checkpoint and invoked a tool whose current declaration was absent, unsafe, or missing.",
++      "citations": [
++        "packages/agent/src/harness/runtime/drive/tools.ts:527",
++        ".prale-eval/regression.mjs"
++      ]
++    }
++  ],
++  "deliverables": [
++    "packages/agent/src/harness/runtime/drive/tools.ts",
++    ".prale-eval/regression.mjs",
++    ".prale-eval/result.json"
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired recoverToolInvocation in packages/agent/src/harness/runtime/drive/tools.ts: replay admission changed from `!cancelled && (call.replay === \"safe\" || tool?.replay === \"safe\")` to `!cancelled && call.replay === \"safe\" && tool?.replay === \"safe\"`, matching the durable contract that both the persisted call policy and the current tool declaration must be safe. The standalone assertion script loads the real production module through .prale-eval/subject.mjs with boundary fakes for checkpoint clear/read, tool invocation, and outcome publication. It asserts the replay path (both safe, not cancelled => clear, invoke, effect-complete, publish) and, for every single-safe or unsafe combination (stored safe with tool absent/without policy/never, stored never with current safe, both never) plus the cancelled case, asserts only checkpoint read then publish with preserved checkpoint content, details, and usage, the interruption marker appended, isError true, and no checkpoint clear or tool invocation. Failure evidence on the original fault: before the fix, the 'stored safe + tool absent' case produced events ['clear','invoke','effect-complete','publish'] and failed the deepStrictEqual assertion against ['read','publish']; after the fix the same command exits zero. The repository vitest suite could not be run because node_modules is not installed and installing dependencies is out of scope; the regression uses only Node 24 built-ins (node:assert, node:vm via subject.mjs) and needs no network."
++  }
++}
+snapshot .prale-eval/regression.mjs - 34ff9f53494208cd1e4c14e988074d7268991ce3bc642af06967e615f4062c7e
+snapshot .prale-eval/result.json - 99ed10459e0808da51809d66cfa5ca40968fe02a5a84c14f647710d701454f2a
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 9124e863ac773f90ef99595adfa658c59a75ac9020ce677d2c3fb0e9da7e4c0b 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

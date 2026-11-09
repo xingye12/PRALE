@@ -1,0 +1,45 @@
+{
+  "task_id": "extension-trust/correction",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claims": [
+    {
+      "claim": "Policy allows project resources after a true trust decision.",
+      "evidence": "packages/coding-agent/src/core/resource-loader.ts:453 awaits resolveProjectTrust and applies its boolean via setProjectTrusted, so a true decision makes the post-bootstrap packageManager.resolve() include project extensions.",
+      "verified_by": ".prale-eval/regression.mjs scenario 1 (project.ts loaded after true)"
+    },
+    {
+      "claim": "Policy denies project resources after a false trust decision.",
+      "evidence": "packages/coding-agent/src/core/resource-loader.ts:453-454 propagate the resolver's false result; the reload path then resolves only user/CLI extensions.",
+      "verified_by": ".prale-eval/regression.mjs scenario 2 (project.ts stays excluded after false)"
+    },
+    {
+      "claim": "The resolver must observe an untrusted bootstrap result.",
+      "evidence": "loadProjectTrustExtensions() forces setProjectTrusted(false) and reloads settings before loadCurrentExtensionSet(), and that bootstrap LoadExtensionsResult is the object passed to resolveProjectTrust.",
+      "verified_by": ".prale-eval/regression.mjs scenarios 1 and 2 (resolver sees cli.ts + user.ts only, settingsLoadedTrust === false)"
+    },
+    {
+      "claim": "The resolver is called exactly once and its asynchronous ordering is preserved.",
+      "evidence": "Single awaited call site in reload(); setProjectTrusted runs only after the promise settles, followed by settingsManager.reload() and the trusted resolve.",
+      "verified_by": ".prale-eval/regression.mjs scenario 1 (call count === 1; no set/resolve/settings true events before the resolver returns; set->settings->resolve ordering after it)"
+    },
+    {
+      "claim": "Reload without a resolver still honors the caller-provided trust state.",
+      "evidence": "reload() only consults a resolver when options.resolveProjectTrust is supplied; otherwise preTrustExtensions stays undefined and no trust is forced.",
+      "verified_by": ".prale-eval/regression.mjs scenario 3"
+    }
+  ],
+  "deliverables": [
+    "packages/coding-agent/src/core/resource-loader.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/result.json"
+  ],
+  "changes": [
+    "packages/coding-agent/src/core/resource-loader.ts: replaced the hardcoded `const projectTrusted = false;` with `const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });` so the trust resolver is consulted exactly once with the untrusted bootstrap extension result and its decision is applied only after the promise settles. No other source changes."
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Regression replayed against the repaired source: exits 0 with all assertions holding (resolver call count exactly 1; resolver observes bootstrap extensions cli.ts+user.ts with project.ts excluded and settingsLoadedTrust false; no set/resolve/settings-true event occurs before the delayed resolver settles, proving the decision is not applied early; set(true) -> settings(true) -> resolve(true) order after it; project.ts loaded after true, excluded after false, and control scenario without a resolver keeps caller-provided trust). The same script was replayed against a temporary copy of the original fault (`const projectTrusted = false;`) and failed with AssertionError ERR_ASSERTION \"reload() with a resolveProjectTrust callback must consult the trust resolver exactly once\" (0 !== 1) at regression.mjs:42, exit 1, confirming it detects this stage's fault without timing out or hitting a syntax/import error. The modified source also parses under Node 24 type stripping. Limitation: the repository's vitest suites (e.g. packages/coding-agent/test/resource-loader.test.ts) could not be run because no node_modules are installed and installing dependencies was out of scope, so only the standalone VM-module regression was executed."
+  }
+}

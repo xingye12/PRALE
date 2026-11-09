@@ -1,0 +1,128 @@
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index c598980..dad96ed 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -121,7 +121,9 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const fileName = file.split("/").pop() || file.split("\\").pop();
+ 			const newPath = join(correctDir, fileName!);
+ 
+-			// Existing destinations are incorrectly overwritten. // Skip if target exists
++			// Skip if target exists: the existing destination always wins. Leave the
++			// destination and the colliding legacy file untouched.
++			if (existsSync(newPath)) continue;
+ 
+ 			renameSync(file, newPath);
+ 		} catch {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..a7ca771
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,88 @@
++/**
++ * Regression for session-migration/correction.
++ *
++ * Policy: when migrating legacy sessions from the agent root into
++ * sessions/<encoded-cwd>/, an existing destination always wins. Both the
++ * destination bytes and the colliding legacy source must be left untouched,
++ * while unrelated files must still be migrated.
++ *
++ * Exercises the real migrateSessionsFromAgentRoot production code through the
++ * read-only subject helper (real fs/path, fake getAgentDir/stripBom).
++ */
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import { join } from "node:path";
++import { loadMigrations } from "./subject.mjs";
++
++const root = process.cwd();
++const scratch = mkdtempSync(join(root, ".prale-eval", "regression-tmp-"));
++const agentDir = join(scratch, "agent");
++
++const header = (cwd, id) => JSON.stringify({ type: "session", id, cwd });
++
++// Colliding pair: same file name in the legacy root and in the correct folder.
++const collisionCwd = "/work/project";
++const collisionDir = join(agentDir, "sessions", "--work-project--");
++const collisionName = "collision.jsonl";
++const legacyCollisionPath = join(agentDir, collisionName);
++const destinationPath = join(collisionDir, collisionName);
++const legacyBytes = `${header(collisionCwd, "legacy-copy")}\nlegacy-body\n`;
++const destinationBytes = `${header(collisionCwd, "existing-destination")}\nexisting-body\n`;
++
++// An unrelated legacy session that must still be migrated normally.
++const freeCwd = "/work/other";
++const freeDir = join(agentDir, "sessions", "--work-other--");
++const freeName = "unrelated.jsonl";
++const legacyFreePath = join(agentDir, freeName);
++const freeBytes = `${header(freeCwd, "unrelated")}\nfree-body\n`;
++const freeDestinationPath = join(freeDir, freeName);
++
++function snapshot(path) {
++	return existsSync(path) ? readFileSync(path, "utf8") : null;
++}
++
++try {
++	mkdirSync(collisionDir, { recursive: true });
++	writeFileSync(destinationPath, destinationBytes);
++	writeFileSync(legacyCollisionPath, legacyBytes);
++	writeFileSync(legacyFreePath, freeBytes);
++
++	const migrations = await loadMigrations(root, agentDir);
++	assert.equal(typeof migrations.migrateSessionsFromAgentRoot, "function");
++	migrations.migrateSessionsFromAgentRoot();
++
++	// 1. The existing destination wins byte-for-byte (never overwritten).
++	assert.equal(
++		snapshot(destinationPath),
++		destinationBytes,
++		"existing destination must not be overwritten by the collision policy",
++	);
++
++	// 2. The colliding legacy source is neither renamed away nor deleted.
++	assert.equal(
++		snapshot(legacyCollisionPath),
++		legacyBytes,
++		"colliding legacy source must be left untouched at its original path",
++	);
++
++	// 3. Unrelated files still migrate: moved to the correct folder, source gone.
++	assert.equal(
++		snapshot(freeDestinationPath),
++		freeBytes,
++		"unrelated legacy session must still be migrated to sessions/<encoded-cwd>/",
++	);
++	assert.equal(
++		existsSync(legacyFreePath),
++		false,
++		"unrelated legacy session should no longer remain in the agent root after migration",
++	);
++
++	// 4. A second run is idempotent: nothing changes for the collision pair.
++	migrations.migrateSessionsFromAgentRoot();
++	assert.equal(snapshot(destinationPath), destinationBytes, "destination stable across reruns");
++	assert.equal(snapshot(legacyCollisionPath), legacyBytes, "legacy collision source stable across reruns");
++
++	console.log("session-migration/correction regression: ok");
++} finally {
++	rmSync(scratch, { recursive: true, force: true });
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..f8c3e1a
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "session-migration/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired migrateSessionsFromAgentRoot in packages/coding-agent/src/migrations.ts: the unconditional renameSync(file, newPath) was replaced with an existsSync(newPath) guard that skips colliding legacy sessions, so the existing destination wins and both copies are left untouched while unrelated legacy sessions still migrate. .prale-eval/regression.mjs loads the real production module through .prale-eval/subject.mjs (real fs/path, fake getAgentDir/stripBom) against a workspace-local temp agent dir and asserts: destination bytes unchanged after a collision, colliding legacy source still present with original bytes at its original path, an unrelated legacy session moved into sessions/--work-other--/ with its legacy source removed, and idempotence across a second run. Running the command from the workspace root exits 0 on the fixed code; replaying it against the original (unfixed) source fails with AssertionError 'existing destination must not be overwritten by the collision policy' (exit 1). No external dependencies or network were needed; only Node 24 built-ins (node:test-free assertion via node:assert/strict, node:fs, node:path, node:module stripTypeScriptTypes, node:vm SourceTextModule)."
++  }
++}
+snapshot .prale-eval/regression.mjs - 527366dbeb1b0eb0234707e550e1724648bd8f9f05322d14ba6d690555f31f81
+snapshot .prale-eval/result.json - 7b00cd4ba777876dfe1ba04d04ca2f713b1e85a882add97cddffc5c7cf77ff9e
+snapshot packages/coding-agent/src/migrations.ts 7813fb4c7fa0fd2c5ff50f48ee7f16d7622ba49f26b58e2085b6d6fa8501f56d a0fcf7741d1af928329e976b97a74fa20ff6e52dac3a35fc1e02a0ee83464968

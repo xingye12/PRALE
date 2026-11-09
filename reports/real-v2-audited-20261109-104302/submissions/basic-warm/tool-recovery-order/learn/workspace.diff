@@ -1,0 +1,220 @@
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 8e41e3a..657be9b 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,8 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (!cancelled && (call.replay === "safe" || tool?.replay === "safe")) {
++	const replaySafe = call.replay === "safe" && tool?.replay === "safe";
++	if (!cancelled && replaySafe) {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..3354039
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,181 @@
++/**
++ * Standalone regression for interrupted tool recovery ordering.
++ *
++ * Invariant under test (packages/agent/src/harness/runtime/drive/tools.ts,
++ * recoverToolInvocation): a restored `effect_pending` call may only be replayed
++ * when the persisted call policy AND the current tool declaration both declare
++ * `replay: "safe"` and the batch is not cancelled. Every other combination must
++ * publish an interrupted outcome that carries the durable checkpoint, without
++ * clearing the checkpoint and without invoking the tool.
++ *
++ * The real production module is loaded through the read-only
++ * `.prale-eval/subject.mjs` helper; only checkpoint IO, tool execution and
++ * outcome publication are replaced by observable boundary fakes.
++ */
++import assert from "node:assert/strict";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createRecoverySubject } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const recover = await createRecoverySubject(root);
++
++const DURABLE_TEXT = "durable-progress";
++const DURABLE_DETAILS = { step: 2 };
++const INTERRUPTED_MARKER_FRAGMENT = "external outcome is unknown";
++const REPLAY_EVENTS = ["clear", "invoke", "effect-complete", "publish"];
++const INTERRUPTED_EVENTS = ["read", "publish"];
++
++/** Rebuild VM-realm values as host-realm plain data before strict comparison. */
++function normalize(value) {
++	if (Array.isArray(value)) return Array.from(value, normalize);
++	if (value !== null && typeof value === "object") {
++		const copy = {};
++		for (const key of Object.keys(value)) copy[key] = normalize(value[key]);
++		return copy;
++	}
++	return value;
++}
++
++function label(policy, declaration, cancelled) {
++	return `callPolicy=${String(policy)} toolDeclaration=${stringifyDeclaration(declaration)}${
++		cancelled ? " cancelled" : ""
++	}`;
++}
++
++function stringifyDeclaration(declaration) {
++	if (declaration === undefined) return "absent";
++	if (declaration === null) return "no-policy";
++	return JSON.stringify(declaration);
++}
++
++function assertInterrupted(bundle, context) {
++	const { events, outcome } = bundle;
++	const observed = Array.from(events);
++	assert.deepEqual(
++		observed,
++		INTERRUPTED_EVENTS,
++		`${context}: replay must require BOTH policies safe and no cancellation, so the checkpoint must only be read ` +
++			`and published (never cleared, never invoked); observed events ${JSON.stringify(observed)}`,
++	);
++	assert.ok(outcome !== undefined, `${context}: interrupted recovery must publish an outcome`);
++	const message = normalize(outcome.message);
++	assert.equal(message.role, "toolResult", `${context}: interrupted outcome must be a tool result message`);
++	assert.equal(message.toolCallId, "call-1", `${context}: interrupted outcome must target the restored call`);
++	assert.equal(message.toolName, "fixture-tool", `${context}: interrupted outcome must keep the tool name`);
++	assert.equal(message.isError, true, `${context}: interrupted outcome must be reported as an error`);
++	assert.equal(outcome.terminate, false, `${context}: interrupted outcome must not terminate the run`);
++	const content = normalize(message.content);
++	assert.equal(
++		content.length,
++		2,
++		`${context}: interrupted outcome must keep the durable checkpoint content and append the interruption marker`,
++	);
++	assert.deepEqual(
++		content[0],
++		{ type: "text", text: DURABLE_TEXT },
++		`${context}: the durable checkpoint content must be published, not dropped`,
++	);
++	assert.equal(content[1].type, "text", `${context}: interruption marker must be a text block`);
++	assert.ok(
++		content[1].text.includes(INTERRUPTED_MARKER_FRAGMENT),
++		`${context}: interruption marker must state that the external outcome is unknown, got ${JSON.stringify(content[1].text)}`,
++	);
++	assert.deepEqual(
++		normalize(message.details),
++		DURABLE_DETAILS,
++		`${context}: durable checkpoint details must be preserved in the interrupted outcome`,
++	);
++}
++
++function assertReplayed(bundle, context) {
++	const { events, outcome } = bundle;
++	const observed = Array.from(events);
++	assert.deepEqual(
++		observed,
++		REPLAY_EVENTS,
++		`${context}: both policies are safe and the batch is live, so the durable checkpoint must be cleared before ` +
++			`the tool is invoked; observed events ${JSON.stringify(observed)}`,
++	);
++	assert.ok(outcome !== undefined, `${context}: replay must publish the tool outcome`);
++	assert.equal(
++		events.indexOf("clear") < events.indexOf("invoke"),
++		true,
++		`${context}: the replay checkpoint must be cleared before invoking the tool`,
++	);
++	const message = normalize(outcome.message);
++	assert.equal(message.isError, false, `${context}: replayed tool outcome must not be an error`);
++	assert.equal(outcome.recovery, true, `${context}: replayed invocation must be flagged as recovery`);
++	assert.equal(outcome.terminate, false, `${context}: replayed invocation must not terminate the run`);
++	const content = normalize(message.content);
++	assert.deepEqual(
++		content,
++		[{ type: "text", text: "effect-result" }],
++		`${context}: replay must publish the tool result`,
++	);
++	assert.deepEqual(
++		normalize(outcome.args),
++		{ persisted: 42 },
++		`${context}: replay must re-run with the persisted arguments recovered from the durable checkpoint`,
++	);
++}
++
++const failures = [];
++
++async function scenario(context, body) {
++	try {
++		await body();
++	} catch (error) {
++		if (error instanceof assert.AssertionError) {
++			failures.push(error.message);
++			return;
++		}
++		throw error;
++	}
++}
++
++await scenario("both policies safe", async () => {
++	const bundle = await recover("safe", "safe", false);
++	assertReplayed(bundle, "both policies safe");
++});
++
++await scenario("persisted safe, declaration never", async () => {
++	const bundle = await recover("safe", "never", false);
++	assertInterrupted(bundle, label("safe", "never", false));
++});
++
++await scenario("persisted never, declaration safe", async () => {
++	const bundle = await recover("never", "safe", false);
++	assertInterrupted(bundle, label("never", "safe", false));
++});
++
++await scenario("persisted safe, declaration absent", async () => {
++	const bundle = await recover("safe", undefined, false);
++	assertInterrupted(bundle, label("safe", undefined, false));
++});
++
++await scenario("persisted safe, declaration without policy", async () => {
++	const bundle = await recover("safe", null, false);
++	assertInterrupted(bundle, label("safe", null, false));
++});
++
++await scenario("neither policy safe", async () => {
++	const bundle = await recover("never", "never", false);
++	assertInterrupted(bundle, label("never", "never", false));
++});
++
++await scenario("both policies safe but cancelled", async () => {
++	const bundle = await recover("safe", "safe", true);
++	assertInterrupted(bundle, label("safe", "safe", true));
++});
++
++if (failures.length > 0) {
++	assert.fail(
++		`${failures.length} interrupted-recovery scenario(s) violated the replay safety invariant ` +
++			`(replay needs persisted call policy AND current tool declaration safe, and no cancellation):\n- ${failures.join("\n- ")}`,
++	);
++}
++
++console.log(
++	"regression passed: 7 interrupted-recovery scenarios (conjunctive replay policy, cancellation, durable checkpoint publication)",
++);
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..5cf1fda
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "tool-recovery-order/learn",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired recoverToolInvocation in packages/agent/src/harness/runtime/drive/tools.ts: replayed an interrupted effect_pending call whenever EITHER the persisted call policy OR the current tool declaration said replay:\"safe\" (`call.replay === \"safe\" || tool?.replay === \"safe\"`). It now requires both (`const replaySafe = call.replay === \"safe\" && tool?.replay === \"safe\"`) and still requires !cancelled; every other case reads the durable checkpoint and publishes the interrupted outcome without clearing it or invoking the tool. .prale-eval/regression.mjs drives the real module through the read-only .prale-eval/subject.mjs createRecoverySubject helper (checkpoint IO, invocation and outcome publication are observable boundary fakes) and asserts the full matrix: both safe -> ['clear','invoke','effect-complete','publish'] with persisted args {persisted:42} replayed and recovery:true; persisted safe + declaration never, persisted never + declaration safe, persisted safe + absent tool, persisted safe + tool without policy, and neither safe -> exactly ['read','publish'] with the durable checkpoint content 'durable-progress', details {step:2}, isError true, terminate false and the 'external outcome is unknown' marker; both safe while cancelled -> interrupted as well, so cancellation never replays. VM-realm results are normalized to plain host-realm data before node:assert/strict comparison. Negative control was executed: temporarily restoring the `||` fault made the regression exit 1 with AssertionError '4 interrupted-recovery scenario(s) violated the replay safety invariant' (callPolicy=safe/toolDeclaration=never, never/safe, safe/absent, safe/no-policy all observed ['clear','invoke','effect-complete','publish']); the fix was then restored and the same command exits 0. Optional type-level validation (tsc/vitest) was unavailable because the workspace has no node_modules and dependencies must not be installed, so only the Node 24 VM regression was run."
++  }
++}
+snapshot .prale-eval/regression.mjs - e104b96a44f518014c6a96bedcea00d717cbdccca7b116e6edacedbdc97eb0cc
+snapshot .prale-eval/result.json - 4a70473565af6c0dcdcf758c471d7ab22cd7deebc678fd087c9fbb559f062dbf
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 9124e863ac773f90ef99595adfa658c59a75ac9020ce677d2c3fb0e9da7e4c0b 65563a60d8f379ab91e8ac8bbda2f87fe1d5a5b789ca1ce6db620be46be6840c

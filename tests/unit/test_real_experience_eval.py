@@ -216,3 +216,61 @@ def _git_output(root: Path, *arguments: str) -> str:
     return subprocess.run(
         ["git", "-C", str(root), *arguments], check=True, capture_output=True, text=True
     ).stdout.strip()
+
+
+@pytest.mark.parametrize("timeout", [False, True])
+def test_agent_descendants_are_stopped_before_oracle(tmp_path: Path, timeout: bool) -> None:
+    source, fixture = _source(tmp_path), _fixture(tmp_path)
+    capsule = build_capsule(repository_root=source, output=tmp_path / "capsule", container_image="node@sha256:test")
+    # The child closes inherited streams so a completed parent cannot hide behind
+    # communicate() waiting for pipe EOF. The oracle checks Linux process state.
+    (fixture / "oracle.py").write_text(
+        "import sys\nfrom pathlib import Path\n"
+        "pid = (Path(sys.argv[1]) / 'child.pid').read_text()\n"
+        "stat = Path('/proc') / pid / 'stat'\n"
+        "raise SystemExit(0 if not stat.exists() or stat.read_text().split()[2] == 'Z' else 1)\n"
+    )
+    script = (
+        "import subprocess, sys, time\nfrom pathlib import Path\n"
+        "child = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], "
+        "stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)\n"
+        "Path('child.pid').write_text(str(child.pid))\n" + ("time.sleep(30)\n" if timeout else "")
+    )
+    report = run_stage(
+        capsule=capsule,
+        fixture=fixture,
+        agent_command=[sys.executable, "-c", script],
+        allow_host_execution=True,
+        timeout_seconds=1 if timeout else 10,
+    )
+    assert report["agent_status"] == ("timed_out" if timeout else "completed")
+    assert report["oracle_output"] == ""
+    assert report["acceptance"] == "passed"
+
+
+def test_stage_uses_solving_metrics_and_keeps_promotion_separate(tmp_path):
+    source, fixture = _source(tmp_path), _fixture(tmp_path)
+    capsule = build_capsule(repository_root=source, output=tmp_path / "capsule", container_image="node@sha256:test")
+    accounting = {
+        "accounting_version": 2,
+        "duration_seconds": 2.5,
+        "usage": {"total_tokens": 11},
+        "usage_complete": True,
+        "cost_usd": 0.1,
+        "promotion": {"status": "failed", "duration_seconds": 500, "usage": {"total_tokens": 100}},
+        "total": {"duration_seconds": 502.5, "usage": {"total_tokens": 111}},
+    }
+    command = [
+        sys.executable,
+        "-c",
+        "from pathlib import Path; Path('app.txt').write_text('working\\n'); " + f"print({json.dumps(accounting)!r})",
+    ]
+    result = run_stage(
+        capsule=capsule, fixture=fixture, agent_command=command, allow_host_execution=True, timeout_seconds=10
+    )
+    assert result["acceptance"] == "passed"
+    assert result["duration_seconds"] == 2.5
+    assert result["usage"] == {"total_tokens": 11}
+    assert result["promotion"]["duration_seconds"] == 500
+    assert result["promotion"]["status"] == "failed"
+    assert "wall_duration_seconds" in result

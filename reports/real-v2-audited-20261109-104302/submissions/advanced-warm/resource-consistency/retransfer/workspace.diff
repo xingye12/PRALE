@@ -1,0 +1,492 @@
+diff --git a/packages/coding-agent/src/core/project-trust.ts b/packages/coding-agent/src/core/project-trust.ts
+index 4bc890d..e348bd6 100644
+--- a/packages/coding-agent/src/core/project-trust.ts
++++ b/packages/coding-agent/src/core/project-trust.ts
+@@ -83,8 +83,9 @@ export async function resolveProjectTrusted(options: ResolveProjectTrustedOption
+ 			break;
+ 	}
+ 
++	// No UI means the prompt cannot be answered: fail closed instead of granting trust.
+ 	if (!options.projectTrustContext.hasUI) {
+-		return true;
++		return false;
+ 	}
+ 
+ 	const selected = await selectProjectTrustOption(options.cwd, options.projectTrustContext);
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 72decd8..b972a17 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,8 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(true);
++			// Apply the resolver's decision; revocation must clear project settings and extensions.
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+index cadf028..2cad340 100644
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -521,7 +521,9 @@ export class SettingsManager {
+ 		this.modifiedProjectNestedFields.clear();
+ 
+ 		if (!trusted) {
+-			this.projectSettings = this.projectSettings;
++			// Revocation must discard cached project configuration immediately, even before
++			// the next reload reads (and skips) the project settings file.
++			this.projectSettings = {};
+ 			this.projectSettingsLoadError = null;
+ 			this.settings = deepMergeSettings(this.globalSettings, this.projectSettings);
+ 			return;
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100755
+index 0000000..639b94e
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,309 @@
++#!/usr/bin/env node
++/**
++ * Cross-module regression for project-trust revocation.
++ *
++ * Exercises the real `resolveProjectTrusted` -> `DefaultResourceLoader.reload` ->
++ * `SettingsManager` -> package resolution flow through `.prale-eval/subject.mjs`.
++ * Only external boundaries (settings storage, package manager, extension loader,
++ * trust event, UI) are faked by the harness.
++ *
++ * Each scenario is independent; assertions are uncaught so a failure exits non-zero.
++ */
++import assert from 'node:assert/strict';
++import * as fs from 'node:fs';
++import * as path from 'node:path';
++import { createResourcePipeline } from './subject.mjs';
++
++const workspaceRoot = path.resolve(import.meta.dirname, '..');
++// Scratch fixtures live under .prale-eval so manual runs never touch the repository.
++const fixtureRoot = path.join(import.meta.dirname, '.tmp-regression');
++// Values crossing the VM boundary carry the guest realm's prototypes, so normalize
++// to host-owned primitives/containers before strict comparison.
++const toHost = (value) => JSON.parse(JSON.stringify(value));
++const namesOf = (extensions) => Array.from(extensions, (extension) => path.basename(extension.path));
++const extensionNames = (pipeline) => namesOf(pipeline.loader.getExtensions().extensions);
++
++function prepareFixtures() {
++	fs.rmSync(fixtureRoot, { recursive: true, force: true });
++	fs.mkdirSync(path.join(fixtureRoot, '.fixture-resources'), { recursive: true });
++	for (const name of ['global', 'project', 'cli']) {
++		fs.writeFileSync(path.join(fixtureRoot, '.fixture-resources', `${name}.ts`), `export default ${name};\n`);
++	}
++}
++
++function cleanupFixtures() {
++	fs.rmSync(fixtureRoot, { recursive: true, force: true });
++}
++
++/** Headless reload with no stored decision under "ask" must deny, not silently consent. */
++async function headlessAskDenies() {
++	const pipeline = await createResourcePipeline(workspaceRoot);
++	pipeline.scenario.override = undefined;
++	pipeline.scenario.stored = null;
++	pipeline.scenario.hasUI = false;
++	pipeline.scenario.policy = 'ask';
++
++	const reload = await pipeline.reload();
++
++	assert.equal(
++		pipeline.settings.isProjectTrusted(),
++		false,
++		'headless reload without a stored decision and "ask" policy must not grant trust',
++	);
++	assert.deepEqual(
++		toHost(reload.names),
++		['cli.ts', 'global.ts'],
++		'denied trust must resolve only global and CLI extensions',
++	);
++	assert.deepEqual(
++		toHost(pipeline.settings.getProjectSettings()),
++		{},
++		'denied trust must not expose project settings',
++	);
++	assert.equal(pipeline.settings.getDefaultModel(), 'global-model', 'global settings must still apply');
++	assert.equal(
++		pipeline.settings.getCompactionReserveTokens(),
++		8192,
++		'global compaction settings must survive a denied project scope',
++	);
++	assert.deepEqual(pipeline.consentWrites, [], 'a missing UI must not persist any trust decision');
++}
++
++/** Approval loads project configuration; a later revocation must drop it immediately. */
++async function approvalThenRevocation() {
++	const pipeline = await createResourcePipeline(workspaceRoot);
++
++	pipeline.scenario.override = true;
++	const approved = await pipeline.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), true, 'explicit approval must grant trust');
++	assert.deepEqual(
++		toHost(approved.names),
++		['cli.ts', 'global.ts', 'project.ts'],
++		'approved trust must resolve project extensions alongside global and CLI ones',
++	);
++	assert.equal(pipeline.settings.getDefaultModel(), 'project-model', 'approved trust must merge project settings');
++	assert.equal(pipeline.settings.getCompactionReserveTokens(), 4096, 'project settings must override global ones');
++	assert.equal(approved.calls, 1, 'reload must consult the trust resolver exactly once');
++
++	pipeline.scenario.override = undefined;
++	pipeline.scenario.stored = false;
++	pipeline.scenario.hasUI = false;
++	const revoked = await pipeline.reload();
++
++	assert.equal(pipeline.settings.isProjectTrusted(), false, 'revocation must leave the project untrusted');
++	assert.deepEqual(
++		toHost(revoked.names),
++		['cli.ts', 'global.ts'],
++		'revocation must remove project extensions from the next resolved resource set',
++	);
++	assert.deepEqual(toHost(pipeline.settings.getProjectSettings()), {}, 'revocation must discard cached project settings');
++	assert.equal(pipeline.settings.getDefaultModel(), 'global-model', 'revocation must fall back to global settings');
++	assert.equal(
++		pipeline.settings.getCompactionReserveTokens(),
++		8192,
++		'revocation must preserve global resources while dropping project ones',
++	);
++	assert.equal(
++		JSON.parse(pipeline.storageData.project).defaultModel,
++		'project-model',
++		'revocation must not rewrite the stored project settings file',
++	);
++	assert.equal(revoked.calls, 1, 'revocation reload must also consult the trust resolver once');
++}
++
++/** The loader must await the resolver before applying trust, and never pre-trust the project. */
++async function resolverOrdering() {
++	const pipeline = await createResourcePipeline(workspaceRoot);
++
++	let releaseResolver;
++	let reachedResolver;
++	const resolverReached = new Promise((resolve) => {
++		reachedResolver = resolve;
++	});
++	const resolverGate = new Promise((resolve) => {
++		releaseResolver = resolve;
++	});
++
++	const reload = pipeline.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			assert.deepEqual(
++				namesOf(extensionsResult.extensions),
++				['cli.ts', 'global.ts'],
++				'the resolver must receive a pre-trust set without project extensions',
++			);
++			assert.equal(pipeline.settings.isProjectTrusted(), false, 'the pre-trust pass must run untrusted');
++			assert.deepEqual(
++				toHost(pipeline.settings.getProjectSettings()),
++				{},
++				'the pre-trust pass must not expose project settings',
++			);
++			reachedResolver();
++			await resolverGate;
++			return false;
++		},
++	});
++
++	await resolverReached;
++	assert.equal(
++		pipeline.settings.isProjectTrusted(),
++		false,
++		'trust must stay denied while the resolver is still pending',
++	);
++	assert.deepEqual(
++		toHost(pipeline.settings.getProjectSettings()),
++		{},
++		'project settings must stay discarded while the resolver is still pending',
++	);
++
++	releaseResolver();
++	await reload;
++
++	assert.equal(pipeline.settings.isProjectTrusted(), false, 'the resolver denial must be applied after it settles');
++	assert.deepEqual(
++		extensionNames(pipeline),
++		['cli.ts', 'global.ts'],
++		'a denied resolver must leave project extensions out of the final resource set',
++	);
++	assert.deepEqual(toHost(pipeline.settings.getProjectSettings()), {}, 'a denied resolver must leave project settings empty');
++}
++
++/** A reload without a resolver keeps the existing trust state in both directions. */
++async function reloadWithoutResolverKeepsTrust() {
++	const pipeline = await createResourcePipeline(workspaceRoot);
++
++	pipeline.scenario.override = true;
++	await pipeline.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), true, 'approval must establish trust');
++
++	const decisionsBefore = pipeline.events.filter((event) => event[0] === 'extension-decision').length;
++	await pipeline.loader.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), true, 'reload without a resolver must retain approval');
++	assert.deepEqual(
++		extensionNames(pipeline),
++		['cli.ts', 'global.ts', 'project.ts'],
++		'reload without a resolver must keep approved project extensions',
++	);
++	assert.equal(
++		pipeline.events.filter((event) => event[0] === 'extension-decision').length,
++		decisionsBefore,
++		'reload without a resolver must not re-run the trust decision',
++	);
++
++	pipeline.scenario.override = undefined;
++	pipeline.scenario.stored = false;
++	pipeline.scenario.hasUI = false;
++	await pipeline.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), false, 'revocation must establish denial');
++
++	await pipeline.loader.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), false, 'reload without a resolver must retain revocation');
++	assert.deepEqual(
++		extensionNames(pipeline),
++		['cli.ts', 'global.ts'],
++		'reload without a resolver must keep revoked project extensions out',
++	);
++}
++
++/** Stored decisions are still authoritative for headless runs; only "unknown" denies. */
++async function storedDecisionsAreHonored() {
++	const allowed = await createResourcePipeline(workspaceRoot);
++	allowed.scenario.override = undefined;
++	allowed.scenario.stored = true;
++	allowed.scenario.hasUI = false;
++	allowed.scenario.policy = 'ask';
++	const allowedReload = await allowed.reload();
++	assert.equal(allowed.settings.isProjectTrusted(), true, 'a stored approval must still grant headless trust');
++	assert.deepEqual(
++		toHost(allowedReload.names),
++		['cli.ts', 'global.ts', 'project.ts'],
++		'a stored approval must resolve project extensions',
++	);
++
++	const denied = await createResourcePipeline(workspaceRoot);
++	denied.scenario.override = undefined;
++	denied.scenario.stored = false;
++	denied.scenario.hasUI = false;
++	denied.scenario.policy = 'ask';
++	const deniedReload = await denied.reload();
++	assert.equal(denied.settings.isProjectTrusted(), false, 'a stored denial must keep headless trust off');
++	assert.deepEqual(toHost(deniedReload.names), ['cli.ts', 'global.ts'], 'a stored denial must exclude project extensions');
++}
++
++/** Revocation must discard cached project configuration immediately, before any reload. */
++async function revocationIsImmediate() {
++	const pipeline = await createResourcePipeline(workspaceRoot);
++	pipeline.scenario.override = true;
++	await pipeline.reload();
++	assert.equal(pipeline.settings.getDefaultModel(), 'project-model', 'approval must load project settings first');
++
++	// The real trust resolver now denies; the consumer of that decision must drop cached
++	// project configuration synchronously instead of waiting for the next reload.
++	pipeline.scenario.override = undefined;
++	pipeline.scenario.stored = false;
++	pipeline.scenario.hasUI = false;
++	const denied = await pipeline.resolve(pipeline.loader.getExtensions());
++	assert.equal(denied, false, 'the resolver must deny the revoked project');
++
++	pipeline.settings.setProjectTrusted(denied);
++	assert.deepEqual(
++		toHost(pipeline.settings.getProjectSettings()),
++		{},
++		'revoking trust must discard cached project settings immediately',
++	);
++	assert.equal(
++		pipeline.settings.getDefaultModel(),
++		'global-model',
++		'revoking trust must immediately fall back to global settings',
++	);
++	assert.equal(
++		pipeline.settings.getCompactionReserveTokens(),
++		8192,
++		'revoking trust must immediately restore global-only compaction settings',
++	);
++	assert.equal(
++		JSON.parse(pipeline.storageData.project).defaultModel,
++		'project-model',
++		'revoking trust must leave the stored project settings file untouched',
++	);
++	assert.throws(
++		() => pipeline.settings.setProjectPackages(['npm:blocked']),
++		/refusing to write project settings/,
++		'revoked trust must still refuse project settings writes',
++	);
++}
++
++/** An available UI still resolves "ask" prompts; the fix must not deny everything. */
++async function interactiveAskStillPrompts() {
++	const pipeline = await createResourcePipeline(workspaceRoot);
++	pipeline.scenario.override = undefined;
++	pipeline.scenario.stored = null;
++	pipeline.scenario.hasUI = true;
++	pipeline.scenario.policy = 'ask';
++
++	const reload = await pipeline.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), true, 'a UI approval must grant trust');
++	assert.deepEqual(
++		toHost(reload.names),
++		['cli.ts', 'global.ts', 'project.ts'],
++		'a UI approval must resolve project extensions',
++	);
++	assert.deepEqual(
++		pipeline.consentWrites,
++		[],
++		'a session-only approval must not persist a trust decision',
++	);
++}
++
++prepareFixtures();
++try {
++	await headlessAskDenies();
++	await approvalThenRevocation();
++	await resolverOrdering();
++	await reloadWithoutResolverKeepsTrust();
++	await revocationIsImmediate();
++	await storedDecisionsAreHonored();
++	await interactiveAskStillPrompts();
++	console.log('regression: 7 project-trust scenarios passed');
++} finally {
++	cleanupFixtures();
++}
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..e0964d7
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,75 @@
++# Repair: revocation must clear cached resources and settings
++
++## Symptom chain
++
++A headless (`hasUI: false`) reload with no stored trust decision under `ask` policy silently
++granted trust, and a previous approval could never be revoked: the next resolved resource set
++kept project configuration and project extensions. Three independent defects on the
++producer → consumer path caused this.
++
++## Root causes and fixes
++
++1. `packages/coding-agent/src/core/project-trust.ts:86-89` (producer)
++   `resolveProjectTrusted` returned `true` when the prompt could not be shown (`hasUI` false).
++   Missing UI is not consent; an unanswerable `ask` must fail closed. Now returns `false`, while
++   `trustOverride`, stored decisions and the `always`/`never` policies keep their existing
++   semantics, and an available UI still returns the selected option.
++
++2. `packages/coding-agent/src/core/settings-manager.ts:523-527` (state owner)
++   `setProjectTrusted(false)` assigned `projectSettings` to itself — a no-op — so the cached
++   project configuration, its merged view and `defaultModel`/`compaction` overrides survived
++   revocation until something re-read storage. Revocation now resets `projectSettings` to `{}`
++   and rebuilds the merged view from global settings immediately.
++
++3. `packages/coding-agent/src/core/resource-loader.ts:453-455` (consumer)
++   `reload()` computed `projectTrusted` from `resolveProjectTrust` but then unconditionally called
++   `settingsManager.setProjectTrusted(true)`, discarding a denial. It now forwards the resolver's
++   decision. The resolver is still consulted exactly once per reload, after a pre-trust extension
++   pass (`loadProjectTrustExtensions`) that excludes project extensions and project settings, and
++   the reload without a resolver still never touches the retained trust state.
++
++Why the ordering matters: the loader's pre-trust pass sets trust to `false`, asks the resolver,
++then applies the answer and reloads settings for that final state. Package resolution afterwards
++reads `settingsManager.isProjectTrusted()` and the merged settings, so both the settings cache and
++the trust flag must agree; a stale flag or stale project settings each leak project extensions
++back into the resolved set.
++
++## Regression coverage (`.prale-eval/regression.mjs`)
++
++The script drives the real modules through `subject.mjs`: real `resolveProjectTrusted`, real
++`DefaultResourceLoader.reload`/`extensionsResult`, real `SettingsManager` parsing/merge/trust code
++and real package-resolution ordering; only storage, package manager, extension loader, trust
++event, trust store and UI are faked boundaries. Values crossing the VM boundary are normalized
++before strict comparison because guest-realm arrays/objects carry different prototypes.
++
++Scenarios:
++
++- headless `ask` with no stored decision denies, keeps only global + CLI extensions, clears
++  project settings, keeps global `defaultModel`/`compaction`, and writes no consent entry;
++- approval resolves project extensions and merges project settings, then revocation removes the
++  project extension, restores global settings and leaves the stored project file untouched;
++- while the resolver promise is pending, trust stays denied and project settings stay hidden; the
++  denial is applied only after the resolver settles (ordering controlled with promises, no timers);
++- reload without a resolver retains approval and retains revocation, without re-running the trust
++  decision;
++- stored approvals/denials are still honored headlessly (the fix does not deny everything);
++- an interactive `ask` approval still grants session-only trust and persists nothing;
++- direct revocation via the real resolver output asserts the immediate discard contract that a
++  later `reload()` would otherwise mask (the reload re-reads storage as untrusted).
++
++Mutation check (performed locally, each file restored to the fixture baseline alone):
++
++| mutated file | result |
++| --- | --- |
++| `project-trust.ts` | fails `headless reload without a stored decision and "ask" policy must not grant trust` |
++| `settings-manager.ts` | fails `revoking trust must discard cached project settings immediately` |
++| `resource-loader.ts` | fails `headless reload without a stored decision and "ask" policy must not grant trust` |
++
++Every failure is an uncaught `node:assert/strict` assertion (exit 1), not a crash or import error.
++
++## Scope
++
++Only the three listed production modules changed, plus files under `.prale-eval/`. Existing APIs,
++the interactive prompt path, stored-decision handling and unrelated settings behavior are intact.
++No dependencies, network, credentials or timers are used; scratch inputs under
++`.prale-eval/.tmp-regression` are created and removed by the script itself.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..831ae73
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,40 @@
++{
++  "task_id": "advanced/resource-consistency/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root on Node 24.14.0 with no dependencies, network or credentials. The script loads the real submitted project-trust.ts, settings-manager.ts and resource-loader.ts through .prale-eval/subject.mjs (only settings storage, package manager, extension loader, trust event, trust store and UI are faked boundaries) and asserts seven scenarios: (1) headless reload with no stored decision under 'ask' denies, resolves only global+cli extensions, clears project settings, keeps global defaultModel and compaction, and writes no consent entry; (2) approval resolves project extensions and merges project settings, then revocation drops the project extension, restores global settings and leaves the stored project file untouched; (3) while the trust resolver promise is pending, trust stays denied and project settings stay hidden, with the denial applied only after the promise settles (ordering controlled by promises, no timers/randomness); (4) reload without a resolver retains approval and retains revocation and does not re-run the trust decision; (5) stored approvals/denials are still honored headlessly; (6) an interactive 'ask' approval still grants session-only trust without persisting; (7) the resolver's denial immediately discards cached project settings and blocks project writes before any reload. Mutation check performed locally: restoring each listed file alone to the fixture baseline makes the script exit 1 with an uncaught node:assert/strict AssertionError (project-trust.ts -> 'headless reload without a stored decision and \"ask\" policy must not grant trust'; settings-manager.ts -> 'revoking trust must discard cached project settings immediately'; resource-loader.ts -> 'headless reload without a stored decision and \"ask\" policy must not grant trust'), so every regression is detected independently and no failure is a crash, import error or timeout. Scratch fixtures under .prale-eval/.tmp-regression are created and removed by the script; no type-checker or dependency-based test runner is installed in this workspace, so validation is limited to the subject-driven regression plus the harness's own TypeScript-stripping module load."
++  },
++  "claims": [
++    {
++      "claim": "A headless reload with no stored decision under the ask policy denies access instead of granting implicit consent.",
++      "evidence": "packages/coding-agent/src/core/project-trust.ts:86-89 returns false when projectTrustContext.hasUI is false; regression scenario headlessAskDenies asserts isProjectTrusted() === false and no consent writes."
++    },
++    {
++      "claim": "Revoking trust immediately discards cached project configuration in SettingsManager.",
++      "evidence": "packages/coding-agent/src/core/settings-manager.ts:523-527 resets projectSettings to {} on setProjectTrusted(false) and rebuilds the merged view; regression scenario revocationIsImmediate asserts empty project settings, global-only defaultModel/compaction and retained stored file before any reload."
++    },
++    {
++      "claim": "The resource loader applies the resolver's trust decision, so project extensions leave the next resolved resource set while global and CLI resources remain.",
++      "evidence": "packages/coding-agent/src/core/resource-loader.ts:453-455 forwards projectTrusted to setProjectTrusted; regression scenarios approvalThenRevocation and resolverOrdering assert ['cli.ts','global.ts'] after revocation and a pre-trust set without project extensions."
++    },
++    {
++      "claim": "Reload without a resolver retains the existing trust state.",
++      "evidence": "resource-loader.ts reload only touches trust inside the options?.resolveProjectTrust branch; regression scenario reloadWithoutResolverKeepsTrust asserts approval and revocation both survive a resolver-less reload without re-running the decision."
++    },
++    {
++      "claim": "Each listed module has an independent regression that the single regression script detects when that file alone is restored to its faulty baseline.",
++      "evidence": "Mutation runs from the workspace root: project-trust.ts, settings-manager.ts and resource-loader.ts each yield exit 1 with a distinct uncaught node:assert/strict AssertionError; the script exits 0 on the repair."
++    }
++  ],
++  "deliverables": [
++    "packages/coding-agent/src/core/project-trust.ts",
++    "packages/coding-agent/src/core/settings-manager.ts",
++    "packages/coding-agent/src/core/resource-loader.ts",
++    ".prale-eval/regression.mjs",
++    ".prale-eval/repair.md",
++    ".prale-eval/result.json"
++  ]
++}
+snapshot .prale-eval/regression.mjs - 573195c4dc3d9b9776894baca99779d8105f54444de436d7388ccce25a640c96
+snapshot .prale-eval/repair.md - a652828739882ec2ca2b0f6934a3783a5c4b7894a35ca6b2bf69238078cb4145
+snapshot .prale-eval/result.json - fb38300b2d876204c971bb507a1d5f2c3386e51ae2a3e1086ac63312fd3fdda0
+snapshot packages/coding-agent/src/core/project-trust.ts a1c67c3b41b19dc25ecbb5fcded44272861acec433a4e31d013cc55e128bbe47 1b0f356153f8f6192aade838b0c99dd5125c80b54162fa4c8678b16516bf6a37
+snapshot packages/coding-agent/src/core/resource-loader.ts 076fed822b4c7a151bb59becc911d376eab3ae0eecbc7ecbdf90b2adc827b22b 6ea2332845e057dbf6b23870f80478e02246c5702fd00b720e041140b3f9ef56
+snapshot packages/coding-agent/src/core/settings-manager.ts 28a0f3cb4c296aa5f3a380fa4ee1f1ae34ed3e969531fccdd9c185f5a903f2f5 844bafe8e3a8321f2a32bd474bc807328421f12087afd7e52d0c398bc217602b

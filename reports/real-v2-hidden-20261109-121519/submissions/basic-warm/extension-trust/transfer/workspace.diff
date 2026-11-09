@@ -1,0 +1,209 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 699143e..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(false);
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..8677039
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,163 @@
++/**
++ * Regression for extension-trust/transfer.
++ *
++ * Exercises the real DefaultResourceLoader.reload() lifecycle through the
++ * boundary fakes exported by subject.mjs. The incident: after the untrusted
++ * bootstrap pass, reload() discarded the explicit project-trust decision and
++ * forced the project back to untrusted, so trusted project extensions were
++ * never resolved while an already-trusted project could also leak into the
++ * bootstrap pass.
++ *
++ * Run from the workspace root:
++ *   node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from 'node:assert/strict';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { createTrustSubject } from './subject.mjs';
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
++const names = (extensions) => Array.from(extensions, (extension) => path.basename(extension.path));
++
++function resolveEvents(events) {
++	return events.filter((event) => event[0] === 'resolve');
++}
++
++function extensionEvents(events) {
++	return events.filter((event) => event[0] === 'extensions');
++}
++
++function indexOfEvent(events, event) {
++	const index = events.findIndex((candidate) => JSON.stringify(candidate) === JSON.stringify(event));
++	assert.notEqual(index, -1, `expected event ${JSON.stringify(event)} in ${JSON.stringify(events)}`);
++	return index;
++}
++
++/**
++ * Runs one explicit trust decision and returns the observable lifecycle.
++ * `initialTrusted` models the persisted trust state before the bootstrap pass.
++ */
++async function runDecision(decision, initialTrusted) {
++	const subject = await createTrustSubject(root, { initialTrusted });
++	let sawBootstrapExtensions;
++	await subject.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			sawBootstrapExtensions = extensionsResult;
++			return decision;
++		},
++	});
++	return {
++		...subject,
++		sawBootstrapExtensions,
++		extensions: names(subject.loader.getExtensions().extensions),
++	};
++}
++
++// ---------------------------------------------------------------------------
++// Explicit true decision: bootstrap must stay untrusted, then the decision
++// must be transferred to the settings manager and used for final resolution.
++// ---------------------------------------------------------------------------
++{
++	const { events, state, sawBootstrapExtensions, extensions } = await runDecision(true, true);
++	const bootstrapNames = names(sawBootstrapExtensions.extensions);
++
++	// The bootstrap pass must not include project extensions, even though the
++	// persisted state before reload was trusted.
++	assert.deepEqual(
++		bootstrapNames,
++		['cli.ts', 'user.ts'],
++		`bootstrap must exclude project extensions, got ${JSON.stringify(bootstrapNames)}`,
++	);
++	const bootstrapResolve = resolveEvents(events)[0];
++	assert.deepEqual(
++		bootstrapResolve,
++		['resolve', false],
++		`bootstrap package resolution must run untrusted, got ${JSON.stringify(bootstrapResolve)}`,
++	);
++
++	// The explicit decision must be installed on the settings manager, and the
++	// settings must be reloaded for that trust state before final resolution.
++	assert.equal(
++		state.trusted,
++		true,
++		`explicit true decision was ignored; settings trust is ${JSON.stringify(state.trusted)}`,
++	);
++	const transferred = indexOfEvent(events, ['set', true]);
++	const settingsReload = indexOfEvent(events, ['settings', true]);
++	const finalResolve = indexOfEvent(events, ['resolve', true]);
++	assert.ok(
++		transferred < settingsReload,
++		`settings must be reloaded after applying the decision: ${JSON.stringify(events)}`,
++	);
++	assert.ok(
++		settingsReload < finalResolve,
++		`settings must be reloaded before final resource resolution: ${JSON.stringify(events)}`,
++	);
++
++	// Trusted project extensions are resolved and loaded exactly once, reusing
++	// the bootstrap-preloaded user/CLI extensions.
++	assert.deepEqual(
++		extensions,
++		['cli.ts', 'user.ts', 'project.ts'],
++		`trusted project extensions must load after an explicit true decision, got ${JSON.stringify(extensions)}`,
++	);
++	const projectLoadIndex = events.findIndex(
++		(event) => event[0] === 'extensions' && event[1].includes('project.ts'),
++	);
++	assert.notEqual(projectLoadIndex, -1, 'project extension was never loaded');
++	assert.ok(
++		projectLoadIndex > transferred,
++		'project extensions must not be loaded during the untrusted bootstrap pass',
++	);
++	assert.equal(
++		extensionEvents(events).filter(([, loaded]) => loaded.includes('project.ts')).length,
++		1,
++		`project extension must be loaded by exactly one pass, got ${JSON.stringify(events)}`,
++	);
++	assert.equal(
++		extensions.filter((name) => name === 'project.ts').length,
++		1,
++		`project extension must be loaded exactly once, got ${JSON.stringify(extensions)}`,
++	);
++}
++
++// ---------------------------------------------------------------------------
++// Explicit false decision: it is honored too. Project extensions stay out and
++// user/CLI extensions survive the second settings reload.
++// ---------------------------------------------------------------------------
++{
++	const { events, state, sawBootstrapExtensions, extensions } = await runDecision(false, true);
++	const bootstrapNames = names(sawBootstrapExtensions.extensions);
++
++	assert.deepEqual(
++		bootstrapNames,
++		['cli.ts', 'user.ts'],
++		`bootstrap must exclude project extensions, got ${JSON.stringify(bootstrapNames)}`,
++	);
++	assert.equal(
++		state.trusted,
++		false,
++		`explicit false decision must be honored; settings trust is ${JSON.stringify(state.trusted)}`,
++	);
++	const finalResolve = resolveEvents(events).at(-1);
++	assert.deepEqual(
++		finalResolve,
++		['resolve', false],
++		`final package resolution must reflect the false decision, got ${JSON.stringify(finalResolve)}`,
++	);
++	assert.deepEqual(
++		extensions,
++		['cli.ts', 'user.ts'],
++		`untrusted project extensions must stay excluded, got ${JSON.stringify(extensions)}`,
++	);
++	assert.ok(!extensions.includes('project.ts'), 'project extension leaked into an untrusted reload');
++}
++
++// A false decision from an already-untrusted persisted state must also work.
++{
++	const { state, extensions } = await runDecision(false, false);
++	assert.equal(state.trusted, false);
++	assert.deepEqual(extensions, ['cli.ts', 'user.ts']);
++}
++
++console.log('extension-trust/transfer regression passed');
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..be49581
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,18 @@
++{
++  "task_id": "extension-trust/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "summary": "DefaultResourceLoader.reload() discarded the explicit project-trust decision returned by resolveProjectTrust and forced project trust back to false after the untrusted bootstrap pass. It now installs the resolved boolean, so both true and false decisions are honored, the follow-up settings reload reflects that decision before package resolution, and project extensions remain excluded from the bootstrap pass.",
++  "changes": [
++    "packages/coding-agent/src/core/resource-loader.ts: pass the resolved projectTrusted value to settingsManager.setProjectTrusted instead of hardcoding false"
++  ],
++  "deliverables": [
++    ".prale-eval/regression.mjs",
++    ".prale-eval/result.json"
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran the regression from the workspace root with Node 24.14.0; it exited 0 and printed 'extension-trust/transfer regression passed'. The script loads the real packages/coding-agent/src/core/resource-loader.ts through .prale-eval/subject.mjs and asserts the full reload lifecycle for explicit true, explicit false, and already-untrusted false decisions: (1) the bootstrap pass resolves with project trust false and preloads only CLI/user extensions even when the persisted state was trusted; (2) an explicit true decision is written to the settings manager, settings are reloaded for that state before final package resolution, and the final extension set contains cli.ts, user.ts, and exactly one project.ts; (3) an explicit false decision keeps project.ts excluded while CLI/user extensions remain loaded; (4) event ordering proves set(true) precedes settings reload with true, which precedes the final resolve with true. Reverting the one-line fix locally made the regression fail fast with 'AssertionError: explicit true decision was ignored; settings trust is false' and exit 1, then the fix was restored and the script passed again. No network, npm install, or optional validation dependency was needed. The repository's vitest suites were not run because only Node's built-in VM/TypeScript support is required for this focused regression."
++  }
++}
+snapshot .prale-eval/regression.mjs - 854ad6b1c82c78ede9f7df27fc70c0830f2d73d539a8bec88a26bbefd45a8350
+snapshot .prale-eval/result.json - c742c79886e53946d33931b231f298275c64c9f83ae79f690b3082d373504afb
+snapshot packages/coding-agent/src/core/resource-loader.ts a031f345d80d20a71812a6f187730475cc80914586ca01bb0d88118193d445db 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

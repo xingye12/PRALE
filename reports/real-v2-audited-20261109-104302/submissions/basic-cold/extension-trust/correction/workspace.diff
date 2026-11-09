@@ -1,0 +1,199 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 8da4475..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -450,7 +450,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		let preTrustExtensions: LoadExtensionsResult | undefined;
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+-			const projectTrusted = false;
++			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+ 			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..1e94b67
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,138 @@
++/**
++ * Regression for extension-trust/correction.
++ *
++ * The loader must consult the reload-provided trust resolver exactly once, expose it
++ * the untrusted bootstrap result, await its asynchronous decision, and then apply that
++ * decision: project resources load after `true`, stay out after `false`.
++ *
++ * Run from the workspace root:
++ *   node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from 'node:assert/strict';
++import path from 'node:path';
++import { createTrustSubject } from './subject.mjs';
++
++const root = path.resolve(import.meta.dirname, '..');
++const RELOAD_TIMEOUT_MS = 20_000;
++// Spread into a host-realm array: the loader's arrays come from another VM context.
++const names = (extensionsResult) => [...extensionsResult.extensions].map((extension) => path.basename(extension.path)).sort();
++
++/** Runs one reload against the real DefaultResourceLoader and records boundary events. */
++async function reloadWithTrustDecision(decision) {
++	const { loader, events, state } = await createTrustSubject(root);
++	const observations = [];
++
++	const record = (label, extensionsResult) => {
++		observations.push({
++			label,
++			trusted: state.trusted,
++			loadedTrust: state.loadedTrust,
++			extensions: names(extensionsResult),
++		});
++		events.push([label]);
++	};
++
++	let calls = 0;
++	const reload = loader.reload({
++		async resolveProjectTrust({ extensionsResult }) {
++			calls += 1;
++			record('resolver-enter', extensionsResult);
++			// Suspends the reload: the loader must wait for this promise to settle.
++			await new Promise((resolve) => setTimeout(resolve, 10));
++			record('resolver-exit', extensionsResult);
++			return decision;
++		},
++	});
++
++	// Safety net so a deadlocked loader fails instead of hanging the validation run.
++	let timer;
++	const timeout = new Promise((_resolve, reject) => {
++		timer = setTimeout(() => reject(new Error(`reload did not settle within ${RELOAD_TIMEOUT_MS}ms`)), RELOAD_TIMEOUT_MS);
++	});
++	try {
++		await Promise.race([reload, timeout]);
++	} finally {
++		clearTimeout(timer);
++	}
++
++	return { loader, events, state, observations, calls };
++}
++
++/** Index of the first event matching `name` at or after `from`. */
++function indexOf(events, name, from = 0) {
++	return events.findIndex((event, index) => index >= from && event[0] === name);
++}
++
++async function checkTrustedDecisionAllowsProjectResources() {
++	const { loader, events, state, observations, calls } = await reloadWithTrustDecision(true);
++
++	assert.equal(calls, 1, 'the reload must call the trust resolver exactly once');
++
++	// The resolver observes the untrusted bootstrap load: user/CLI resources only.
++	const [bootstrap] = observations;
++	assert.equal(bootstrap.label, 'resolver-enter', 'the resolver must run during reload');
++	assert.equal(bootstrap.trusted, false, 'the resolver must observe an untrusted project trust state');
++	assert.deepEqual(bootstrap.extensions, ['cli.ts', 'user.ts'], 'the resolver must observe the untrusted bootstrap result');
++
++	// The bootstrap load happens before the resolver runs.
++	const bootstrapLoad = indexOf(events, 'extensions');
++	const resolverEnter = indexOf(events, 'resolver-enter');
++	assert.ok(bootstrapLoad >= 0, 'the untrusted bootstrap extensions must be loaded before resolving trust');
++	assert.ok(bootstrapLoad < resolverEnter, 'the bootstrap extensions must load before the resolver is consulted');
++
++	// Asynchronous ordering: nothing is decided or reloaded while the resolver is pending.
++	const resolverExit = indexOf(events, 'resolver-exit');
++	assert.ok(resolverExit > resolverEnter, 'the reload must await the resolver promise');
++	assert.deepEqual(
++		events.slice(resolverEnter + 1, resolverExit),
++		[],
++		'the loader must not apply a decision while the async resolver is still pending',
++	);
++
++	// A `true` decision is applied: project settings get reloaded as trusted and
++	// project resources are resolved afterwards.
++	const appliedTrust = indexOf(events, 'set', resolverExit);
++	assert.ok(appliedTrust >= 0, 'the resolver decision must be applied to project trust settings');
++	assert.deepEqual(events[appliedTrust], ['set', true], 'a true decision must be propagated to the settings manager');
++	const resolvedTrusted = indexOf(events, 'resolve', appliedTrust);
++	assert.ok(resolvedTrusted >= 0, 'project resources must be resolved after the trust decision');
++	assert.deepEqual(events[resolvedTrusted], ['resolve', true], 'project resources must be resolved with the trusted decision');
++
++	const finalNames = names(loader.getExtensions());
++	assert.deepEqual(finalNames, ['cli.ts', 'project.ts', 'user.ts'], 'project resources must load after a true decision');
++	assert.equal(
++		events.flatMap((event) => (event[0] === 'extensions' ? event[1] : [])).filter((name) => name === 'user.ts').length,
++		1,
++		'user extensions must be reused from the untrusted bootstrap instead of being loaded twice',
++	);
++	assert.equal(state.trusted, true, 'the loader must leave the settings manager in the resolved trust state');
++}
++
++async function checkFalseDecisionDeniesProjectResources() {
++	const { loader, events, state, observations, calls } = await reloadWithTrustDecision(false);
++
++	assert.equal(calls, 1, 'the reload must call the trust resolver exactly once');
++	const [bootstrap] = observations;
++	assert.deepEqual(bootstrap.extensions, ['cli.ts', 'user.ts'], 'the resolver must observe the untrusted bootstrap result');
++	assert.equal(bootstrap.trusted, false, 'the resolver must observe an untrusted project trust state');
++
++	const resolverExit = indexOf(events, 'resolver-exit');
++	assert.ok(resolverExit > 0, 'the reload must await the resolver promise');
++	assert.deepEqual(
++		events.slice(indexOf(events, 'resolver-enter') + 1, resolverExit),
++		[],
++		'the loader must not apply a decision while the async resolver is still pending',
++	);
++
++	const finalNames = names(loader.getExtensions());
++	assert.deepEqual(finalNames, ['cli.ts', 'user.ts'], 'project resources must stay out after a false decision');
++	assert.ok(
++		!events.slice(resolverExit).some((event) => event[0] === 'resolve' && event[1] === true),
++		'project resources must never be resolved as trusted after a false decision',
++	);
++	assert.equal(state.trusted, false, 'the loader must leave the settings manager in the resolved trust state');
++}
++
++await checkTrustedDecisionAllowsProjectResources();
++await checkFalseDecisionDeniesProjectResources();
++console.log('extension-trust regression: trust resolver consulted once and its decision applied asynchronously');
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..466b786
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,33 @@
++{
++  "task_id": "extension-trust/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "The loader no longer hard-codes trust to false; it consults the reload-provided trust resolver exactly once and awaits it before applying the decision.",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:452"
++    },
++    {
++      "claim": "The resolver observes the untrusted bootstrap result loaded by loadProjectTrustExtensions (user/CLI extensions only, no project resources).",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:435-441,452"
++    },
++    {
++      "claim": "A true decision allows project resources (project extension is loaded after the decision); a false decision denies them (project extension stays out).",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:452-459"
++    },
++    {
++      "claim": "TASK.md requires the repaired source, a standalone .prale-eval/regression.mjs that exits zero when fixed and asserts on the original fault, and this result file.",
++      "citation": "TASK.md"
++    }
++  ],
++  "deliverables": [
++    "packages/coding-agent/src/core/resource-loader.ts",
++    ".prale-eval/regression.mjs",
++    ".prale-eval/result.json"
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "The only source change is the trust resolution in DefaultResourceLoader.reload: `const projectTrusted = false;` became `const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });`, so the resolver runs once, receives the untrusted bootstrap LoadExtensionsResult, is awaited (the reload pauses while its promise is pending), and its boolean result is passed to settingsManager.setProjectTrusted before settings/package resources are re-resolved. .prale-eval/regression.mjs loads the real resource-loader.ts through .prale-eval/subject.mjs createTrustSubject (boundary fakes only) and asserts: resolver called exactly once in both decisions; it observes state.trusted=false with only cli.ts and user.ts in the bootstrap result (no project.ts); no settings/resolve/extensions event occurs between resolver-enter and resolver-exit (async ordering preserved); after a true decision the settings manager receives true and package resolution observes true, the final extension set is [cli.ts, project.ts, user.ts] (project resources allowed) and user.ts is loaded only once (pre-trust result reused); after a false decision the final set stays [cli.ts, user.ts] and no trusted resolution ever happens (project resources denied). Verified both directions by temporarily reverting the one-line fix: the regression then fails with `AssertionError [ERR_ASSERTION]: the reload must call the trust resolver exactly once (0 !== 1)`, and a fire-and-forget resolver variant fails with an ordering assertion, so it is not a printed-success script. Optional repo test suite (vitest) could not be run because no node_modules are installed in this workspace and dependencies must not be installed; the standalone Node 24 regression is the focused validation and exits 0."
++  }
++}
+snapshot .prale-eval/regression.mjs - b4616b60ef00a59b0cea530ed2525eddded59ecb7a0e8b6961ad4448d3b52b61
+snapshot .prale-eval/result.json - 0e6b0a73f81bd60b44dfc72dbcfffc24e979e1acc80cea434637ce75b5b1efe6
+snapshot packages/coding-agent/src/core/resource-loader.ts 6a048348c4244f97563dcfad20d08c75b6d36c27b52116fbcc8509754cc46ed6 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

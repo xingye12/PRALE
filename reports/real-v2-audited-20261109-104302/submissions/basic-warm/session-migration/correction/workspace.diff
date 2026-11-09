@@ -1,0 +1,182 @@
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index c598980..29e31e7 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -121,7 +121,8 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const fileName = file.split("/").pop() || file.split("\\").pop();
+ 			const newPath = join(correctDir, fileName!);
+ 
+-			// Existing destinations are incorrectly overwritten. // Skip if target exists
++			// Never clobber an existing destination: leave both copies untouched and keep migrating others.
++			if (existsSync(newPath)) continue;
+ 
+ 			renameSync(file, newPath);
+ 		} catch {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..5c8d5bc
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,121 @@
++/**
++ * Standalone regression for the legacy session migration collision policy.
++ *
++ * Invariant under test (drive the real production code, no re-implementation):
++ *   When `migrateSessionsFromAgentRoot()` finds a legacy `*.jsonl` session whose
++ *   destination already exists, the existing destination must win: both the
++ *   destination bytes and the legacy source bytes stay untouched, and the
++ *   migration keeps moving unrelated sessions.
++ *
++ * Run from the workspace root:
++ *   node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++
++import { loadMigrations } from "./subject.mjs";
++
++const root = dirname(dirname(fileURLToPath(import.meta.url)));
++
++/** Same directory encoding as session-manager.ts / migrations.ts. */
++function sessionDirFor(agentDir, cwd) {
++	const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
++	return join(agentDir, "sessions", safePath);
++}
++
++function sessionBody(cwd, marker) {
++	return `${JSON.stringify({ type: "session", version: 3, cwd })}\n${JSON.stringify({ role: "user", marker })}\n`;
++}
++
++/** Host-realm, order-stable listing so sorting/array assertions are realm-safe. */
++function listing(dir) {
++	return Array.from(readdirSync(dir), (entry) => String(entry)).sort();
++}
++
++const COLLIDE_CWD = "/work/alpha";
++const MOVE_CWD = "/work/beta";
++
++const CHECKED = [];
++function check(name, fn) {
++	fn();
++	CHECKED.push(name);
++}
++
++const tmpRoot = mkdtempSync(join(root, ".prale-eval", "tmp-collision-"));
++try {
++	const agentDir = join(tmpRoot, "agent");
++	mkdirSync(agentDir, { recursive: true });
++
++	// --- fixture: one colliding session and one unrelated session -----------
++	const legacyCollision = join(agentDir, "collision.jsonl");
++	const collisionSourceBytes = sessionBody(COLLIDE_CWD, "legacy-source-copy");
++	writeFileSync(legacyCollision, collisionSourceBytes);
++
++	const collideDir = sessionDirFor(agentDir, COLLIDE_CWD);
++	mkdirSync(collideDir, { recursive: true });
++	const collideDest = join(collideDir, "collision.jsonl");
++	const destinationBytes = sessionBody(COLLIDE_CWD, "already-migrated-destination");
++	writeFileSync(collideDest, destinationBytes);
++	assert.notStrictEqual(collisionSourceBytes, destinationBytes, "fixture must have distinct colliding bytes");
++
++	const legacyMove = join(agentDir, "keep-moving.jsonl");
++	const moveBytes = sessionBody(MOVE_CWD, "unrelated-session");
++	writeFileSync(legacyMove, moveBytes);
++
++	// Non-session noise must be ignored by the migration filter.
++	writeFileSync(join(agentDir, "notes.txt"), "not a session\n");
++
++	const module = await loadMigrations(root, agentDir);
++	assert.equal(typeof module.migrateSessionsFromAgentRoot, "function", "migrations module must export the migration");
++
++	// --- drive the real production migration ---------------------------------
++	module.migrateSessionsFromAgentRoot();
++
++	check("existing destination bytes are never overwritten", () => {
++		assert.equal(readFileSync(collideDest, "utf8"), destinationBytes);
++	});
++
++	check("colliding legacy source is left in place with its bytes intact", () => {
++		assert.ok(existsSync(legacyCollision), "colliding legacy source must not be deleted");
++		assert.equal(readFileSync(legacyCollision, "utf8"), collisionSourceBytes);
++	});
++
++	check("no replacement/duplicate artifact is created next to the collision", () => {
++		assert.deepEqual(listing(collideDir), ["collision.jsonl"]);
++	});
++
++	check("unrelated legacy session still migrates to its session directory", () => {
++		assert.equal(existsSync(legacyMove), false, "unrelated legacy source should have been moved");
++		const moveDest = join(sessionDirFor(agentDir, MOVE_CWD), "keep-moving.jsonl");
++		assert.ok(existsSync(moveDest), "unrelated session must land in its session directory");
++		assert.equal(readFileSync(moveDest, "utf8"), moveBytes);
++	});
++
++	check("agent root keeps only the un-migratable collision plus the non-session file", () => {
++		assert.deepEqual(listing(agentDir), ["collision.jsonl", "notes.txt", "sessions"]);
++	});
++
++	// --- idempotency: a second startup pass must still leave both copies -----
++	module.migrateSessionsFromAgentRoot();
++
++	check("repeated migration is stable: destination bytes unchanged", () => {
++		assert.equal(readFileSync(collideDest, "utf8"), destinationBytes);
++	});
++
++	check("repeated migration is stable: legacy source bytes unchanged", () => {
++		assert.ok(existsSync(legacyCollision), "colliding legacy source must survive repeated migration");
++		assert.equal(readFileSync(legacyCollision, "utf8"), collisionSourceBytes);
++	});
++
++	check("repeated migration does not resurrect or duplicate the migrated session", () => {
++		const moveDir = sessionDirFor(agentDir, MOVE_CWD);
++		assert.deepEqual(listing(moveDir), ["keep-moving.jsonl"]);
++	});
++
++	assert.equal(CHECKED.length, 8, "all collision-policy assertions must run");
++	console.log(`regression passed (${CHECKED.length} checks): ${CHECKED.join("; ")}`);
++} finally {
++	rmSync(tmpRoot, { recursive: true, force: true });
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..eaba9d5
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,32 @@
++{
++  "task_id": "session-migration/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "packages/coding-agent/src/migrations.ts: migrateSessionsFromAgentRoot() now skips the move when the destination path already exists, so an existing destination always wins and neither copy is overwritten or deleted.",
++      "citations": [
++        "packages/coding-agent/src/migrations.ts:124-126"
++      ]
++    },
++    {
++      "claim": "Colliding legacy source files are left byte-identical in the agent root, and unrelated legacy sessions in the same pass still migrate into sessions/<encoded-cwd>/.",
++      "citations": [
++        ".prale-eval/regression.mjs",
++        "packages/coding-agent/src/migrations.ts:104-130"
++      ]
++    },
++    {
++      "claim": "The regression exercises the real production module (loaded with read-only .prale-eval/subject.mjs across the real fs boundary); it exits zero on the repaired source and fails with an AssertionError on the original fault (missing existsSync(newPath) guard), as shown by the temporary negative control.",
++      "citations": [
++        ".prale-eval/regression.mjs",
++        ".prale-eval/subject.mjs"
++      ]
++    }
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root on Node v24.14.0 with the repaired source: exit 0, 8 assertions passed (destination bytes preserved, colliding legacy source preserved byte-for-byte, no duplicate/replacement artifact, unrelated session still migrated, agent-root listing stable, plus idempotency checks across a second migration pass). Negative control: removing only the `if (existsSync(newPath)) continue;` guard from migrations.ts made the same command exit 1 with `AssertionError: Expected values to be strictly equal` on the existing-destination bytes (renameSync clobbered the destination and consumed the source); the fix was then restored and the run passed again. The script uses only node: builtins plus the read-only subject.mjs helper, writes fixtures under a mkdtemp directory inside .prale-eval and removes it in a finally block, so no dependencies or network are needed. Limitation: the repository has no node_modules installed, so the package's vitest/tsc suites could not be run; verification relied on the dependency-free standalone regression above."
++  }
++}
+snapshot .prale-eval/regression.mjs - 0904a781c3add145f081bf33ec9c7fe6667bc97f9df60a13d0c8cd040229042a
+snapshot .prale-eval/result.json - c382828278c1f8cd802a2f9a4aa4d9b5c2b998f88823ed5035b8abfa9feb6ecc
+snapshot packages/coding-agent/src/migrations.ts 7813fb4c7fa0fd2c5ff50f48ee7f16d7622ba49f26b58e2085b6d6fa8501f56d dd08b1e7cc819b1a80941550da3895ff8f2cdecfe8519a58b3a024b32b895645

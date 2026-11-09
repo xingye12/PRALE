@@ -1,0 +1,41 @@
+{
+  "task_id": "advanced/session-integrity/transfer",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claims": [
+    {
+      "claim": "The legacy session migration re-encoded the cwd locally and dropped backslashes, writing migrated files outside the reader's canonical directory.",
+      "citation": "faulty baseline (HEAD) packages/coding-agent/src/migrations.ts:111-118: safePath uses /[/:]/g while faulty baseline core/session-manager.ts:592 used /[/\\\\]/g"
+    },
+    {
+      "claim": "The canonical session directory encoding must collapse /, \\ and : per the repository's own contract test.",
+      "citation": "packages/coding-agent/test/sdk-session-manager.test.ts:38"
+    },
+    {
+      "claim": "The canonical encoder now handles all three separators and is documented as the single source of truth.",
+      "citation": "packages/coding-agent/src/core/session-manager.ts:585-601"
+    },
+    {
+      "claim": "The migration now delegates to the session manager's exported getDefaultSessionDir(cwd, agentDir) instead of duplicating the encoding; no public API changed.",
+      "citation": "packages/coding-agent/src/migrations.ts:10 (import) and packages/coding-agent/src/migrations.ts:112-116 (delegation)"
+    },
+    {
+      "claim": "Migrated files are verified through the real session reader (SessionManager.list/open, loadEntriesFromFile) across module boundaries, with byte equality, entry order, Unicode and malformed-line tolerance.",
+      "citation": ".prale-eval/regression.mjs:103-181 (round trip through SessionManager.list/open and loadEntriesFromFile)"
+    },
+    {
+      "claim": "Collisions do not overwrite data and repeated migration is a no-op.",
+      "citation": ".prale-eval/regression.mjs:175-180 (repeated migration is a no-op) and .prale-eval/regression.mjs:183-216 (collision keeps both files)"
+    }
+  ],
+  "deliverables": [
+    ".prale-eval/regression.mjs",
+    ".prale-eval/repair.md",
+    ".prale-eval/result.json"
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Exit 0 on the repaired tree: 5 absolute POSIX path-contract cases (cwd containing '/', '\\', ':' and Unicode, including the Windows-style fragment /mnt/c/C:\\Users\\dev\\プロジェクト 😀/repo) plus a name-collision case pass. The script links the real modules via the read-only .prale-eval/subject.mjs (createSessionPipeline); only getAgentDir and fs.readdirSync ordering are faked. Assertions cross module boundaries: getDefaultSessionDir(cwd, agentDir) must equal join(agentDir, 'sessions', '--'+cwd.replace(/^[/\\\\]/,'').replace(/[/\\\\:]/g,'-')+'--'); after migrateSessionsFromAgentRoot() the file exists in that directory with byte-identical content (Buffer.compare === 0) and is gone from the agent root; SessionManager.list(cwd) then finds exactly one session with the original header id/cwd, messageCount 2 for a file containing one malformed line, and the Unicode firstMessage intact; loadEntriesFromFile() returns entries in file order (session, message, message, session_info) and SessionManager.open() returns the same id order with Unicode payloads preserved. Two extra migration runs leave a byte-for-byte snapshot of the agent dir unchanged, and a pre-existing colliding target file keeps its exact bytes while the colliding legacy source is preserved. Mutation check: restoring only packages/coding-agent/src/core/session-manager.ts to its HEAD baseline fails with AssertionError 'session manager lookup must encode slashes, backslashes and colons for cwd \"/srv/pi/work:main/app\"'; restoring only packages/coding-agent/src/migrations.ts to its HEAD baseline fails with AssertionError 'migration must place legacy-backslash.jsonl in the canonical session dir for cwd \"/srv/pi/work\\\\legacy\\\\deep\"'. Both are uncaught node:assert/strict failures, not crashes, import errors or timeouts. Temporary fixtures live under .prale-eval/.tmp-session-migration/ and are removed in a finally block. Limitation: no node_modules are installed in the workspace, so npm-based checks (tsgo --noEmit, biome, vitest) were not run and no dependencies were installed; TypeScript syntax validity is still exercised each run because subject.mjs parses both edited modules with node:module.stripTypeScriptTypes."
+  }
+}

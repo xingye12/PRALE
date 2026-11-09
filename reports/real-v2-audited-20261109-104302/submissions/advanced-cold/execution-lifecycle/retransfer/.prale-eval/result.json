@@ -1,0 +1,40 @@
+{
+  "task_id": "advanced/execution-lifecycle/retransfer",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node 24 (v24.14.0) and no installed dependencies. The script loads the submitted harness modules through .prale-eval/subject.mjs, so runtime/drive/tools.ts (real recoverToolInvocation), execution/tools.ts (real executeToolCall) and execution/effect-gate.ts (real createGate) all execute live; only checkpoint storage, progress transport, hook delivery and tool bodies are promise-based fakes. Assertions use uncaught node:assert/strict checks and promise ordering (microtask settle loop, no timers, randomness, network or credentials). Repaired tree: exit 0, 'execution lifecycle fences: all cross-module assertions passed'. Cross-module coverage: (1) gate close-then-beginAbort still refuses admit with the terminal error and keeps signal.reason terminal, close wins over a pending abort, and the first cancellation wins between repeated aborts; (2) a closed gate plus late beginAbort makes executeToolCall refuse with the terminal error without invoking the tool or delivering updates; (3) updates fired after tool completion are sealed (both plain and {checkpoint:true}) while mid-flight live and checkpoint updates are still delivered; (4) cancelled safe/safe recovery records only read+publish (no clear, no invoke, no update, no tool context) and stages the interruption marker with checkpoint content/details; (5) non-cancelled safe/safe recovery completes the full clear -> invoke -> effect-complete -> seal -> drain -> publish sequence exactly once and preserves details {kept:true} and usage {output:3}, and a non-safe replay still stages the checkpoint outcome. Regression detection was verified locally by restoring each source file alone to its faulty baseline (beginAbort === 'aborting' guard, acceptingUpdates = true in finally, missing !cancelled guard): each run exited 1 with an AssertionError (late beginAbort reopened the closed gate / updates emitted after completion must be sealed / a cancelled recovery must not clear its checkpoint), never an import error, crash or timeout; the sources were then restored and the suite re-passed."
+  },
+  "claims": [
+    {
+      "claim": "A cancelled recovery still executes",
+      "files": ["packages/agent/src/harness/runtime/drive/tools.ts"],
+      "evidence": "recoverToolInvocation ignored its cancelled argument; now the safe-replay branch requires !cancelled, so a cancelled recovery reads the checkpoint and publishes a single interrupted outcome without clearReplayCheckpoint or performToolInvocation."
+    },
+    {
+      "claim": "A completed tool can emit new updates",
+      "files": ["packages/agent/src/harness/execution/tools.ts"],
+      "evidence": "executeToolCall reset its update latch to true in the completion finally; it now seals (acceptingUpdates = false) so live and checkpoint-bearing callbacks after completion are dropped."
+    },
+    {
+      "claim": "beginAbort cannot reopen a closed gate or replace its terminal error",
+      "files": ["packages/agent/src/harness/execution/effect-gate.ts"],
+      "evidence": "beginAbort only short-circuited while aborting and overwrote the closed state; it now returns unless the gate is open, keeping the terminal error and abort reason authoritative."
+    },
+    {
+      "claim": "Non-cancelled safe/safe recovery must still complete, preserve usage/details and publish once",
+      "files": ["packages/agent/src/harness/runtime/drive/tools.ts", "packages/agent/src/harness/execution/tools.ts"],
+      "evidence": "The regression asserts the full clear -> invoke -> effect-complete -> seal -> drain -> publish sequence with one publish, details {kept:true} and usage {output:3}, and that mid-flight updates are still delivered."
+    }
+  ],
+  "deliverables": [
+    "packages/agent/src/harness/runtime/drive/tools.ts",
+    "packages/agent/src/harness/execution/tools.ts",
+    "packages/agent/src/harness/execution/effect-gate.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/repair.md",
+    ".prale-eval/result.json"
+  ]
+}

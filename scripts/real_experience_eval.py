@@ -149,6 +149,18 @@ def materialize_stage(*, capsule: Capsule, fixture: Path, destination: Path, tas
         shutil.copy2(fixture / "TASK.md", destination / "TASK.md")
     else:
         (destination / "TASK.md").write_text(task_text, encoding="utf-8")
+    support = fixture / "workspace"
+    if support.is_dir():
+        for source in support.rglob("*"):
+            if source.is_symlink():
+                raise RealExperienceError("fixture support must not contain symlinks")
+            if source.is_file():
+                relative = source.relative_to(support)
+                if relative.parts[0] != ".prale-eval":
+                    raise RealExperienceError("fixture support must be under .prale-eval")
+                target = destination / relative
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(source, target)
     _git(destination, "init")
     _git(destination, "config", "user.email", "fixture@example.invalid")
     _git(destination, "config", "user.name", "PRALE real-eval fixture")
@@ -170,6 +182,7 @@ def run_stage(
     oracle_stage_token: str | None = None,
     submission_dir: Path | None = None,
     validation_timeout_seconds: float = 60,
+    target_visibility: str = "listed",
 ) -> dict[str, Any]:
     """Run one independent stage and evaluate it with an oracle outside cwd."""
 
@@ -179,6 +192,14 @@ def run_stage(
         raise RealExperienceError("validation timeout must be positive")
     if not (fixture / "TASK.md").is_file() or not (fixture / "oracle.py").is_file():
         raise RealExperienceError(f"fixture is incomplete: {fixture}")
+    if target_visibility not in {"listed", "hidden"}:
+        raise RealExperienceError("target visibility must be listed or hidden")
+    if target_visibility == "hidden":
+        if task_text is not None:
+            raise RealExperienceError("hidden targets cannot be combined with custom task text")
+        from real_experience_tasks import task_for_visibility
+
+        task_text = task_for_visibility(fixture, target_visibility)
     with tempfile.TemporaryDirectory(prefix="prale-real-eval-") as temporary:
         root = Path(temporary)
         workspace = materialize_stage(
@@ -188,21 +209,59 @@ def run_stage(
         if not baseline:
             raise RealExperienceError("could not resolve fixture baseline commit")
         before = _workspace_snapshot(workspace)
+        fixture_metadata = _object(fixture / "fixture.json") if (fixture / "fixture.json").is_file() else {}
+        oracle_version = fixture_metadata.get("oracle_version")
+        behavioral = capsule.benchmark_id == "prale-experience-real-v2" and oracle_version in {3, 4}
+        fault_source = root / "original-fault.ts"
+        if behavioral:
+            if fixture_metadata.get("source_commit") != capsule.base_commit:
+                raise RealExperienceError("behavioral fixture does not match capsule commit")
+            targets = fixture_metadata.get("targets") if oracle_version == 4 else [fixture_metadata.get("target")]
+            if not isinstance(targets, list) or not targets:
+                raise RealExperienceError("behavioral fixture requires target sources")
+            if oracle_version == 4:
+                fault_source = root / "original-fault"
+            for target in targets:
+                if not isinstance(target, str) or not (workspace / target).resolve().is_relative_to(
+                    workspace.resolve()
+                ):
+                    raise RealExperienceError("invalid behavioral fixture target")
+                captured = fault_source / target if oracle_version == 4 else fault_source
+                captured.parent.mkdir(parents=True, exist_ok=True)
+                captured.write_bytes((workspace / target).read_bytes())
+            if oracle_version == 4:
+                from real_experience_advanced_oracle import capture_baseline
+
+                capture_baseline(workspace, fault_source, baseline)
+            else:
+                from real_experience_manifest import capture_manifest
+
+                capture_manifest(workspace, fault_source.with_suffix(".baseline.json"), baseline)
         home = root / "home"
         home.mkdir()
         (root / "tmp").mkdir()
         environment = {"HOME": str(home), "TMPDIR": str(root / "tmp"), "PRALE_EVAL_WORKSPACE": str(workspace)}
         started = time.monotonic()
         try:
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [piece.replace("{workspace}", str(workspace)) for piece in agent_command],
                 cwd=workspace,
                 env={**os.environ, **environment},
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=timeout_seconds,
-                check=False,
+                start_new_session=True,
             )
+            try:
+                stdout, stderr = process.communicate(timeout=timeout_seconds)
+                completed = subprocess.CompletedProcess(process.args, process.returncode, stdout, stderr)
+            finally:
+                # Stop descendants before the oracle observes the final workspace.
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.communicate()
             agent_status = "completed" if completed.returncode == 0 else "failed"
             agent_output = (completed.stdout + completed.stderr)[-20_000:]
         except subprocess.TimeoutExpired as error:
@@ -215,9 +274,24 @@ def run_stage(
             )
             agent_output = ((timeout_stdout or "") + (timeout_stderr or ""))[-20_000:]
         oracle_command = ["python", str(fixture / "oracle.py"), str(workspace)]
-        if oracle_stage_token is not None:
+        if behavioral:
+            oracle_command.extend([str(fault_source), baseline])
+        elif oracle_stage_token is not None:
             oracle_command.append(oracle_stage_token)
-        oracle = subprocess.run(oracle_command, capture_output=True, text=True, check=False)
+        try:
+            oracle = subprocess.run(
+                oracle_command, capture_output=True, text=True, check=False, timeout=validation_timeout_seconds
+            )
+            oracle_output = (oracle.stdout + oracle.stderr)[-20_000:]
+            accepted = oracle.returncode == 0
+            oracle_result = _last_json_object(oracle.stdout) if behavioral else None
+        except subprocess.TimeoutExpired:
+            accepted = False
+            oracle_output = "hidden oracle timed out"
+            oracle_result = {"status": "timed_out"} if behavioral else None
+        if behavioral:
+            accepted = accepted and agent_status == "completed" and isinstance(oracle_result, dict)
+            accepted = bool(accepted and oracle_result and oracle_result.get("status") == "passed")
         after = _workspace_snapshot(workspace)
         snapshot_delta = _snapshot_delta(before, after)
         diff = _workspace_diff(workspace, baseline) + snapshot_delta
@@ -230,15 +304,31 @@ def run_stage(
         )
         adapter_result = _last_json_object(agent_output)
         result = {
-            "acceptance": "passed" if oracle.returncode == 0 else "failed",
+            "acceptance": "passed" if accepted else "failed",
             "agent_status": agent_status,
             "duration_seconds": stage_duration_seconds,
             "agent_output": agent_output,
-            "oracle_output": (oracle.stdout + oracle.stderr)[-20_000:],
+            "oracle_output": oracle_output,
             "diff_sha256": hashlib.sha256(diff.encode()).hexdigest(),
             "files_changed": sorted(set(_changed_files(workspace, baseline)).union(_snapshot_changed(before, after))),
             "adapter_result": adapter_result,
         }
+        result["target_visibility"] = target_visibility
+        if isinstance(adapter_result, dict) and adapter_result.get("accounting_version") == 2:
+            result.update(
+                {
+                    "accounting_version": 2,
+                    "wall_duration_seconds": stage_duration_seconds,
+                    "duration_seconds": adapter_result["duration_seconds"],
+                    "usage": adapter_result.get("usage", {}),
+                    "usage_complete": adapter_result.get("usage_complete", False),
+                    "cost_usd": adapter_result.get("cost_usd"),
+                    "promotion": adapter_result.get("promotion", {}),
+                    "total": adapter_result.get("total", {}),
+                }
+            )
+        if behavioral:
+            result["oracle_result"] = oracle_result
         if execution is not None:
             result["execution"] = execution
         if submission_dir is not None:

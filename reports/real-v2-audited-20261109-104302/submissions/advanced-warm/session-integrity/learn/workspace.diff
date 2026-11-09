@@ -1,0 +1,358 @@
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index 70c6a18..7770c76 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -51,7 +51,8 @@ export function migrateAuthToAuthJson(): string[] {
+ 			const settings = JSON.parse(stripBom(content));
+ 			if (settings.apiKeys && typeof settings.apiKeys === "object") {
+ 				for (const [provider, key] of Object.entries(settings.apiKeys)) {
+-					if (typeof key === "string") {
++					// OAuth credentials win over legacy settings API keys for the same provider.
++					if (typeof key === "string" && migrated[provider] === undefined) {
+ 						migrated[provider] = { type: "api_key", key };
+ 						providers.push(provider);
+ 					}
+diff --git a/packages/coding-agent/src/utils/text.ts b/packages/coding-agent/src/utils/text.ts
+index 6c8a436..737466e 100644
+--- a/packages/coding-agent/src/utils/text.ts
++++ b/packages/coding-agent/src/utils/text.ts
+@@ -5,5 +5,5 @@ export function splitBom(content: string): { bom: string; text: string } {
+ 
+ /** Remove a leading UTF-8 byte order mark from decoded text. */
+ export function stripBom(content: string): string {
+-	return content;
++	return splitBom(content).text;
+ }
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100755
+index 0000000..5cdb389
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,211 @@
++/**
++ * Cross-module regression for legacy credential migration.
++ *
++ * Loads the submitted `utils/text.ts` and `migrations.ts` through the real
++ * module graph in `subject.mjs` (only fs/config boundaries are synthesized),
++ * then asserts observable behaviour across the text -> migration boundary:
++ * leading-BOM removal only, interior/plain text preservation, OAuth precedence
++ * over same-provider settings API keys, retention of unrelated settings,
++ * archiving of successfully migrated OAuth input, untouched malformed input,
++ * and no migration at all when auth.json already exists.
++ *
++ * Node 24: `node --experimental-vm-modules .prale-eval/regression.mjs`
++ */
++import assert from "node:assert/strict";
++import * as fs from "node:fs";
++import * as path from "node:path";
++import { createSessionPipeline } from "./subject.mjs";
++
++const workspace = path.resolve(import.meta.dirname, "..");
++const sandbox = path.join(workspace, ".prale-eval", ".regression-tmp");
++const BOM = "\uFEFF";
++
++/** Values cross the vm realm boundary, so normalize before deep comparison. */
++const plain = (value) => JSON.parse(JSON.stringify(value));
++const read = (file) => fs.readFileSync(file, "utf8");
++const agentDirFor = (name) => {
++	const dir = path.join(sandbox, name);
++	fs.rmSync(dir, { recursive: true, force: true });
++	fs.mkdirSync(dir, { recursive: true });
++	return dir;
++};
++
++async function pipelineFor(agentDir) {
++	return await createSessionPipeline(workspace, agentDir);
++}
++
++async function textDecoding() {
++	const agentDir = agentDirFor("text-decoding");
++	const { text } = await pipelineFor(agentDir);
++
++	// Plain text is untouched.
++	assert.equal(text.stripBom("plain text"), "plain text", "plain text must be preserved");
++	assert.equal(text.stripBom(""), "", "empty text must be preserved");
++
++	// Exactly one leading BOM is removed.
++	assert.equal(text.stripBom(`${BOM}plain text`), "plain text", "leading BOM must be removed");
++	assert.equal(text.stripBom(`${BOM}${BOM}double`), `${BOM}double`, "only one leading BOM may be removed");
++
++	// BOMs that are not leading are content, not encoding markers.
++	assert.equal(text.stripBom(`interior${BOM}bom`), `interior${BOM}bom`, "interior BOM must be preserved");
++	assert.equal(text.stripBom(`trailing${BOM}`), `trailing${BOM}`, "trailing BOM must be preserved");
++	assert.equal(text.stripBom(`text ${BOM} mid`), `text ${BOM} mid`, "embedded BOM must be preserved");
++
++	// splitBom keeps its public contract while stripBom is built on the same rule.
++	assert.deepEqual(plain(text.splitBom(`${BOM}content`)), { bom: BOM, text: "content" });
++	assert.deepEqual(plain(text.splitBom("content")), { bom: "", text: "content" });
++	assert.deepEqual(plain(text.splitBom(`content${BOM}`)), { bom: "", text: `content${BOM}` });
++}
++
++async function bomEncodedMigration() {
++	const agentDir = agentDirFor("bom-encoded");
++	const oauthSource = `${BOM}${JSON.stringify({
++		anthropic: { access: "oauth-anthropic", refresh: "refresh-anthropic", expires: 4102444800000 },
++		openai: { access: `oauth${BOM}openai` },
++	})}`;
++	const settingsSource = `${BOM}${JSON.stringify({
++		apiKeys: { anthropic: "settings-anthropic-key", google: `api${BOM}google` },
++		theme: "dark",
++		defaultModel: "kept-model",
++		compaction: { reserveTokens: 8192, keepRecentTokens: 2000 },
++	})}`;
++	const oauthPath = path.join(agentDir, "oauth.json");
++	const settingsPath = path.join(agentDir, "settings.json");
++	const authPath = path.join(agentDir, "auth.json");
++	fs.writeFileSync(oauthPath, oauthSource, "utf8");
++	fs.writeFileSync(settingsPath, settingsSource, "utf8");
++
++	const { migration } = await pipelineFor(agentDir);
++	const providers = migration.migrateAuthToAuthJson();
++
++	// OAuth is migrated first; the same-provider settings key must not overwrite it.
++	assert.deepEqual([...providers], ["anthropic", "openai", "google"], "OAuth providers must precede new API-key providers");
++
++	const auth = JSON.parse(read(authPath));
++	assert.equal(auth.anthropic.type, "oauth", "OAuth credential must win over same-provider settings API key");
++	assert.equal(auth.anthropic.access, "oauth-anthropic");
++	assert.equal(auth.anthropic.refresh, "refresh-anthropic");
++	assert.equal(auth.anthropic.key, undefined, "settings API key must not leak into the OAuth credential");
++	// Interior BOM in OAuth text survives decoding.
++	assert.equal(auth.openai.type, "oauth");
++	assert.equal(auth.openai.access, `oauth${BOM}openai`, "interior BOM must survive OAuth decoding");
++	// Providers only present in settings still migrate as API keys, BOM-free.
++	assert.deepEqual(auth.google, { type: "api_key", key: `api${BOM}google` });
++
++	// Unrelated settings are retained; only apiKeys is consumed.
++	const settings = JSON.parse(read(settingsPath));
++	assert.equal(settings.apiKeys, undefined, "apiKeys must be removed once migrated");
++	assert.equal(settings.theme, "dark", "unrelated setting must be retained");
++	assert.equal(settings.defaultModel, "kept-model", "unrelated setting must be retained");
++	assert.deepEqual(settings.compaction, { reserveTokens: 8192, keepRecentTokens: 2000 });
++
++	// Successfully migrated OAuth input is archived byte-for-byte and removed.
++	assert.equal(fs.existsSync(oauthPath), false, "migrated oauth.json must be moved away");
++	assert.equal(read(`${oauthPath}.migrated`), oauthSource, "archived OAuth input must keep its original bytes");
++}
++
++async function malformedOAuthInput() {
++	const agentDir = agentDirFor("malformed-oauth");
++	const oauthSource = `${BOM}{"anthropic": {"access": `;
++	const settingsSource = JSON.stringify({ apiKeys: { google: "api-google" }, theme: "light" });
++	const oauthPath = path.join(agentDir, "oauth.json");
++	const settingsPath = path.join(agentDir, "settings.json");
++	fs.writeFileSync(oauthPath, oauthSource, "utf8");
++	fs.writeFileSync(settingsPath, settingsSource, "utf8");
++
++	const { migration } = await pipelineFor(agentDir);
++	const providers = migration.migrateAuthToAuthJson();
++
++	assert.deepEqual([...providers], ["google"], "settings API keys still migrate when OAuth input is malformed");
++	const auth = JSON.parse(read(path.join(agentDir, "auth.json")));
++	assert.deepEqual(auth, { google: { type: "api_key", key: "api-google" } });
++	// Malformed data is left exactly where it was, unarchived.
++	assert.equal(fs.existsSync(oauthPath), true, "malformed oauth.json must not be removed");
++	assert.equal(fs.existsSync(`${oauthPath}.migrated`), false, "malformed oauth.json must not be archived");
++	assert.equal(read(oauthPath), oauthSource, "malformed oauth.json must keep its original bytes");
++}
++
++async function malformedSettingsInput() {
++	const agentDir = agentDirFor("malformed-settings");
++	const oauthSource = JSON.stringify({ anthropic: { access: "oauth-anthropic" } });
++	const settingsSource = `${BOM}{"apiKeys": {"google": "unterminated"`;
++	const oauthPath = path.join(agentDir, "oauth.json");
++	const settingsPath = path.join(agentDir, "settings.json");
++	fs.writeFileSync(oauthPath, oauthSource, "utf8");
++	fs.writeFileSync(settingsPath, settingsSource, "utf8");
++
++	const { migration } = await pipelineFor(agentDir);
++	const providers = migration.migrateAuthToAuthJson();
++
++	assert.deepEqual([...providers], ["anthropic"], "OAuth still migrates when settings input is malformed");
++	const auth = JSON.parse(read(path.join(agentDir, "auth.json")));
++	assert.equal(auth.anthropic.type, "oauth");
++	assert.equal(read(settingsPath), settingsSource, "malformed settings.json must keep its original bytes");
++	assert.equal(read(`${oauthPath}.migrated`), oauthSource, "valid OAuth input is still archived");
++}
++
++async function existingAuthFileBlocksMigration() {
++	const agentDir = agentDirFor("existing-auth");
++	const authSource = `${JSON.stringify({ github: { type: "api_key", key: "existing-token" } })}\n`;
++	const oauthSource = JSON.stringify({ anthropic: { access: "oauth-anthropic" } });
++	const settingsSource = JSON.stringify({ apiKeys: { google: "api-google" }, theme: "dark" });
++	const authPath = path.join(agentDir, "auth.json");
++	const oauthPath = path.join(agentDir, "oauth.json");
++	const settingsPath = path.join(agentDir, "settings.json");
++	fs.writeFileSync(authPath, authSource, "utf8");
++	fs.writeFileSync(oauthPath, oauthSource, "utf8");
++	fs.writeFileSync(settingsPath, settingsSource, "utf8");
++
++	const { migration } = await pipelineFor(agentDir);
++	const providers = migration.migrateAuthToAuthJson();
++
++	assert.deepEqual([...providers], [], "an existing auth.json must block all credential migration");
++	assert.equal(read(authPath), authSource, "existing auth.json must not be rewritten");
++	assert.equal(read(oauthPath), oauthSource, "oauth.json must not be consumed when auth.json exists");
++	assert.equal(fs.existsSync(`${oauthPath}.migrated`), false, "oauth.json must not be archived when auth.json exists");
++	assert.equal(read(settingsPath), settingsSource, "settings.json must not be rewritten when auth.json exists");
++}
++
++async function plainCredentialMigration() {
++	const agentDir = agentDirFor("plain-credentials");
++	const settingsSource = JSON.stringify({ apiKeys: { google: "api-google", openai: "api-openai" }, theme: "solarized" });
++	const settingsPath = path.join(agentDir, "settings.json");
++	fs.writeFileSync(settingsPath, settingsSource, "utf8");
++
++	const { migration } = await pipelineFor(agentDir);
++	const providers = migration.migrateAuthToAuthJson();
++
++	assert.deepEqual([...providers], ["google", "openai"]);
++	const auth = JSON.parse(read(path.join(agentDir, "auth.json")));
++	assert.deepEqual(auth, {
++		google: { type: "api_key", key: "api-google" },
++		openai: { type: "api_key", key: "api-openai" },
++	});
++	const settings = JSON.parse(read(settingsPath));
++	assert.equal(settings.apiKeys, undefined);
++	assert.equal(settings.theme, "solarized", "unrelated settings survive a plain (BOM-free) migration");
++}
++
++async function main() {
++	fs.rmSync(sandbox, { recursive: true, force: true });
++	try {
++		// Ordered steps; every assertion is synchronous and deterministic.
++		const steps = [
++			textDecoding,
++			bomEncodedMigration,
++			malformedOAuthInput,
++			malformedSettingsInput,
++			existingAuthFileBlocksMigration,
++			plainCredentialMigration,
++		];
++		for (const step of steps) {
++			await step();
++			await Promise.resolve();
++		}
++		console.log("credential migration regression: passed");
++	} finally {
++		fs.rmSync(sandbox, { recursive: true, force: true });
++	}
++}
++
++await main();
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..716e628
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,89 @@
++# Repair: legacy credentials lose encoding and provider precedence
++
++## Producer/consumer flow
++
++`migrateAuthToAuthJson()` in `packages/coding-agent/src/migrations.ts` is the
++consumer. It reads two legacy inputs from the agent directory with real fs IO
++and decodes both through `stripBom()` from `packages/coding-agent/src/utils/text.ts`
++(the producer of decoded text):
++
++- `oauth.json` → `JSON.parse(stripBom(readFileSync(oauthPath, "utf-8")))`
++- `settings.json` → `JSON.parse(stripBom(content))`
++
++The decoded values are merged into `auth.json`, the OAuth input is archived as
++`oauth.json.migrated`, and the consumed `apiKeys` block is dropped from
++`settings.json` while every other setting is written back.
++
++## Defects
++
++1. `utils/text.ts` — `stripBom()` was a no-op (`return content;`) while its
++   sibling `splitBom()` implemented the correct rule. Every BOM-encoded input
++   therefore reached `JSON.parse()` with a leading U+FEFF, threw, and was
++   swallowed by the migration's per-file `catch`. Result: OAuth credentials and
++   settings API keys silently disappeared and the OAuth input was never even
++   archived (no credential file appeared at all).
++
++2. `migrations.ts` — settings API keys were merged after OAuth with an
++   unconditional assignment:
++
++   ```ts
++   if (typeof key === "string") {
++       migrated[provider] = { type: "api_key", key };
++       providers.push(provider);
++   }
++   ```
++
++   For a provider present in both inputs, the settings fallback overwrote the
++   OAuth credential and the provider was reported twice. This is data
++   destruction, not a merge: OAuth is the richer credential and must win.
++
++## Fix
++
++- `stripBom()` now delegates to the existing `splitBom()` and returns
++  `text`, so exactly one leading BOM is removed. Plain text, interior BOMs,
++  trailing BOMs and a second leading BOM are preserved byte-for-byte — the
++  function is a decoder, not a sanitizer. `splitBom()` itself is unchanged and
++  keeps its public contract, so other consumers (edit tools, frontmatter,
++  settings manager, theme loader, …) are unaffected.
++- The API-key merge is now guarded by `migrated[provider] === undefined`, so a
++  provider already populated from `oauth.json` is neither overwritten nor
++  reported twice. Providers that exist only in `settings.json` still migrate as
++  `{ type: "api_key", key }`. Unrelated settings keys are untouched by the
++  existing `delete settings.apiKeys` + write-back, successful OAuth input is
++  still renamed to `oauth.json.migrated` only after a successful parse, and the
++  `existsSync(authPath)` early return still blocks all credential migration when
++  `auth.json` already exists.
++
++Both changes are minimal and keep the existing exported APIs.
++
++## Validation
++
++`.prale-eval/regression.mjs` builds the real module graph with
++`.prale-eval/subject.mjs` (`createSessionPipeline`: real `migrations.ts`, real
++`utils/text.ts`, real `fs`/`path`; only `config.ts` and the keybindings boundary
++are synthesized) and asserts across the text → migration boundary on isolated
++agent directories under `.prale-eval/`:
++
++- `stripBom` on plain text, leading BOM, double leading BOM, interior, trailing
++  and embedded BOMs; `splitBom` contract.
++- BOM-encoded `oauth.json` + BOM-encoded `settings.json`: OAuth wins for a
++  shared provider, other providers become API keys, interior BOMs survive both
++  decodes, unrelated settings (`theme`, `defaultModel`, `compaction`) are
++  retained, `apiKeys` is consumed, and the OAuth input is archived byte-for-byte
++  at `oauth.json.migrated`.
++- Malformed `oauth.json`: left in place, unarchived, byte-identical, while
++  settings API keys still migrate.
++- Malformed `settings.json`: left byte-identical while OAuth still migrates and
++  is archived.
++- Pre-existing `auth.json`: no migration, no rewrites, nothing archived.
++- Plain (BOM-free) settings API keys still migrate.
++
++Detection was checked by restoring each faulty baseline in isolation:
++
++- `stripBom` no-op only → `AssertionError: leading BOM must be removed` (exit 1).
++- unguarded API-key merge only → `AssertionError: OAuth providers must precede
++  new API-key providers` (exit 1).
++
++Both failures are assertion failures, not import/crash errors. Temporary inputs
++are created under `.prale-eval/.regression-tmp` and removed in a `finally`
++block, so no state is left behind.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..c44af82
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/session-integrity/learn",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired both listed modules. packages/coding-agent/src/utils/text.ts: stripBom now returns splitBom(content).text, removing exactly one leading U+FEFF while preserving plain text, interior, trailing and embedded BOM characters (splitBom's contract is unchanged). packages/coding-agent/src/migrations.ts: the settings.json apiKeys merge is now guarded with `migrated[provider] === undefined`, so an OAuth credential from oauth.json is never overwritten by a same-provider API key and the provider is not reported twice; providers only present in settings still migrate, unrelated settings keys are still retained on write-back, oauth.json is archived as oauth.json.migrated only after a successful parse, malformed oauth.json/settings.json stay byte-identical and unarchived, and an existing auth.json still returns early with no migration. `node --experimental-vm-modules .prale-eval/regression.mjs` exits 0 and prints 'credential migration regression: passed'; it loads the real submitted migrations.ts, utils/text.ts and real fs/path through .prale-eval/subject.mjs createSessionPipeline (only config.ts/keybindings boundaries synthesized) and asserts BOM decoding, OAuth-over-api-key precedence, retained settings, archived/untouched inputs, and the auth.json early return. Fault isolation was verified: restoring only the no-op stripBom baseline fails with AssertionError 'leading BOM must be removed' (exit 1), and restoring only the unguarded apiKeys merge baseline fails with AssertionError 'OAuth providers must precede new API-key providers' (exit 1); both are uncaught node:assert/strict failures, not crashes or import errors. Temporary inputs live under .prale-eval/.regression-tmp and are deleted in a finally block, so nothing is left behind. No dependencies were installed; the pre-existing vitest suites were not run because node_modules is absent and installing is out of scope."
++  }
++}
+snapshot .prale-eval/regression.mjs - 727b0cf47072f46c56b29e291d97a22ad7fe8a92b7edca5e2532e82cdbe09d73
+snapshot .prale-eval/repair.md - f461808d0dea51bb697ce3e15069c5d18443d349448239824493f1b0c0f526d2
+snapshot .prale-eval/result.json - c82ae2343c71f3904ed6ba99f0b484fbe8f8303b28380bb96ce7a1a17a6e9982
+snapshot packages/coding-agent/src/migrations.ts 7d8c3395c9d39dfef07dab485d37f130e8a76e4099d6a6a855761df1fc209002 ef971414fb95ad4666af5686178f619dccff86b18c6c224d8ff3df7c3284b8e0
+snapshot packages/coding-agent/src/utils/text.ts 0b5de8bab384026b57f84b2a7a678b0e8204e86fa0e7af9aa045a394b7ecf79a bb323f9607c499115b532021f4f0163c6df04d834aee9c32c3c77b273bd2d7c6

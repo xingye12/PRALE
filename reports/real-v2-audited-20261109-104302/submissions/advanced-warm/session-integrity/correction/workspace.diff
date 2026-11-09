@@ -1,0 +1,398 @@
+diff --git a/packages/coding-agent/src/core/session-manager.ts b/packages/coding-agent/src/core/session-manager.ts
+index 548b1ce..fd87a2d 100644
+--- a/packages/coding-agent/src/core/session-manager.ts
++++ b/packages/coding-agent/src/core/session-manager.ts
+@@ -661,7 +661,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
+ 	// Validate session header before repairing the file.
+ 	if (entries.length === 0) return entries;
+ 	const header = entries[0];
+-	if (header.type !== "session" && typeof (header as { id?: unknown }).id !== "string") {
++	if (header.type !== "session" || typeof (header as { id?: unknown }).id !== "string") {
+ 		return [];
+ 	}
+ 
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index cd639c3..5aba0ba 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -121,7 +121,9 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const fileName = file.split("/").pop() || file.split("\\").pop();
+ 			const newPath = join(correctDir, fileName!);
+ 
+-			// Regression: overwrite a colliding destination. // Skip if target exists
++			// Skip if target exists: existing destination bytes always win and both
++			// sides of a collision must survive, so other files keep migrating.
++			if (existsSync(newPath)) continue;
+ 
+ 			renameSync(file, newPath);
+ 		} catch {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100755
+index 0000000..0ae9b1a
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,266 @@
++/**
++ * Regression coverage for the clarified data-safety policy:
++ *
++ *  1. `migrations.ts` — a session migration must never overwrite an existing
++ *     destination file. Existing destination bytes win, both sides of a
++ *     collision survive, and unrelated session files keep migrating.
++ *  2. `core/session-manager.ts` — the session reader must reject a first entry
++ *     that is not a session header with a string ID *before* repairing a
++ *     missing final newline, so invalid files are never rewritten. Valid
++ *     headers stay readable and valid unterminated final records are repaired.
++ *
++ * Both production modules are loaded through `.prale-eval/subject.mjs`, which
++ * links the real submitted sources (migration -> real text helpers -> real
++ * session reader) and fakes only external boundaries. Assertions are uncaught
++ * `node:assert/strict` failures; no real time, randomness or network is used.
++ */
++import assert from "node:assert/strict";
++import * as fs from "node:fs";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createSessionPipeline } from "./subject.mjs";
++
++const workspaceRoot = path.resolve(fileURLToPath(new URL("..", import.meta.url)));
++const sandbox = path.join(workspaceRoot, ".prale-eval", "tmp-session-integrity");
++const agentDir = path.join(sandbox, "agent");
++
++// Deterministic fixtures: fixed timestamps and IDs, no clocks or randomness.
++const HEADER_TS = "2025-01-01T00:00:00.000Z";
++const MESSAGE_TS = "2025-01-01T00:00:01.000Z";
++
++function cleanup() {
++	fs.rmSync(sandbox, { recursive: true, force: true });
++}
++
++/** Always clean local test inputs, including when an assertion throws. */
++process.on("exit", () => {
++	try {
++		cleanup();
++	} catch {
++		// Best effort: the sandbox lives inside the workspace and is disposable.
++	}
++});
++
++function resetSandbox() {
++	cleanup();
++	fs.mkdirSync(agentDir, { recursive: true });
++}
++
++/** Mirror of the session-directory encoding shared by migration and reader. */
++function sessionDirFor(agentRoot, cwd) {
++	const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
++	return path.join(agentRoot, "sessions", safePath);
++}
++
++function header(overrides) {
++	return { type: "session", version: 3, timestamp: HEADER_TS, ...overrides };
++}
++
++function messageEntry(overrides = {}) {
++	return {
++		type: "message",
++		id: "m1",
++		parentId: null,
++		timestamp: MESSAGE_TS,
++		message: { role: "user", content: "hi", timestamp: 1 },
++		...overrides,
++	};
++}
++
++function readBytes(file) {
++	return fs.readFileSync(file, "utf8");
++}
++
++function writeBytes(file, content) {
++	fs.mkdirSync(path.dirname(file), { recursive: true });
++	fs.writeFileSync(file, content);
++}
++
++function report(name) {
++	console.log(`ok - ${name}`);
++}
++
++const { migration, session } = await createSessionPipeline(workspaceRoot, agentDir);
++
++// ---------------------------------------------------------------------------
++// 1. Migration collision safety: existing destination bytes win, both sides
++//    survive, and other migrations continue.
++// ---------------------------------------------------------------------------
++resetSandbox();
++
++const collisionCwd = path.join(sandbox, "projects", "alpha");
++const siblingCwd = path.join(sandbox, "projects", "beta");
++const invalidCwd = path.join(sandbox, "projects", "gamma");
++
++const collisionDestDir = sessionDirFor(agentDir, collisionCwd);
++const collisionDest = path.join(collisionDestDir, "collide.jsonl");
++// Pre-existing destination bytes (different session) that must never change.
++const destinationBytes = `${JSON.stringify(header({ id: "destination-session", cwd: collisionCwd }))}\n${JSON.stringify(
++	messageEntry({ id: "dest-message" }),
++)}\n`;
++writeBytes(collisionDest, destinationBytes);
++
++const collisionSource = path.join(agentDir, "collide.jsonl");
++const collisionSourceBytes = `${JSON.stringify(header({ id: "source-session", cwd: collisionCwd }))}\n`;
++writeBytes(collisionSource, collisionSourceBytes);
++
++const siblingSource = path.join(agentDir, "sibling.jsonl");
++const siblingSourceBytes = `${JSON.stringify(header({ id: "sibling-session", cwd: siblingCwd }))}\n`;
++writeBytes(siblingSource, siblingSourceBytes);
++const siblingDest = path.join(sessionDirFor(agentDir, siblingCwd), "sibling.jsonl");
++
++// A header that the migration still relocates but the reader must reject: it
++// has the header shape but no string ID, and no terminating newline.
++const invalidSource = path.join(agentDir, "no-id.jsonl");
++const invalidHeaderBytes = JSON.stringify({ type: "session", version: 3, cwd: invalidCwd });
++writeBytes(invalidSource, invalidHeaderBytes);
++const invalidDest = path.join(sessionDirFor(agentDir, invalidCwd), "no-id.jsonl");
++
++migration.migrateSessionsFromAgentRoot();
++
++assert.equal(readBytes(collisionDest), destinationBytes, "existing destination bytes must win a collision");
++assert.equal(fs.existsSync(collisionSource), true, "the colliding source file must survive the migration");
++assert.equal(readBytes(collisionSource), collisionSourceBytes, "the colliding source bytes must be preserved");
++assert.equal(fs.existsSync(siblingSource), false, "a non-colliding session must still be migrated");
++assert.equal(fs.existsSync(siblingDest), true, "a non-colliding session must reach its session directory");
++assert.equal(readBytes(siblingDest), siblingSourceBytes, "a migrated session must keep its bytes");
++report("migration preserves both sides of a collision and continues other migrations");
++
++// Cross-module consumer check: the migrated artifact is readable by the real
++// session reader opened through SessionManager.
++const migrated = session.SessionManager.open(siblingDest);
++assert.equal(migrated.getSessionId(), "sibling-session", "the reader must accept the migrated header ID");
++assert.equal(migrated.getCwd(), siblingCwd, "the reader must adopt the migrated header cwd");
++assert.equal(readBytes(siblingDest), siblingSourceBytes, "opening a current-version session must not rewrite it");
++const migratedEntries = session.loadEntriesFromFile(siblingDest);
++assert.equal(migratedEntries.length, 1);
++assert.equal(migratedEntries[0].id, "sibling-session");
++report("the real session reader accepts the migrated session header");
++
++// The preserved destination remains the readable session on the consumer side.
++const preserved = session.SessionManager.open(collisionDest);
++assert.equal(preserved.getSessionId(), "destination-session");
++assert.equal(readBytes(collisionDest), destinationBytes, "the surviving destination must stay byte-identical");
++report("the preserved destination is the session the reader sees");
++
++// Cross-module rejection: the relocated ID-less header is rejected by the
++// reader without any newline repair, even though it is unterminated.
++assert.equal(fs.existsSync(invalidDest), true, "the migration moved the header-shaped file");
++const rejectedRelocated = session.loadEntriesFromFile(invalidDest);
++assert.equal(rejectedRelocated.length, 0, "the reader must reject a header lacking a string ID");
++assert.equal(readBytes(invalidDest), invalidHeaderBytes, "rejecting an invalid header must not rewrite its file");
++assert.throws(
++	() => session.SessionManager.open(invalidDest),
++	"opening a file without a valid session header must fail rather than adopt it",
++);
++assert.equal(readBytes(invalidDest), invalidHeaderBytes, "a failed open must leave the invalid file untouched");
++report("the reader rejects a migrated invalid header without rewriting it");
++
++// Re-running the migration is deterministic: the collision is still intact,
++// the source still untouched, and nothing new is produced.
++migration.migrateSessionsFromAgentRoot();
++assert.equal(readBytes(collisionDest), destinationBytes, "a repeated migration must not overwrite the destination");
++assert.equal(fs.existsSync(collisionSource), true, "a repeated migration must not consume the colliding source");
++assert.equal(readBytes(collisionSource), collisionSourceBytes);
++report("repeated migration keeps the collision intact");
++
++// ---------------------------------------------------------------------------
++// 2. Reader: invalid headers are rejected without rewriting their files.
++// ---------------------------------------------------------------------------
++resetSandbox();
++
++const invalidCases = [
++	{
++		name: "header-shaped entry without an ID",
++		content: JSON.stringify({ type: "session", version: 3, cwd: "/tmp/project" }),
++	},
++	{
++		name: "header-shaped entry without an ID and with a terminator",
++		content: `${JSON.stringify({ type: "session", version: 3, cwd: "/tmp/project" })}\n`,
++	},
++	{
++		name: "header with a non-string ID",
++		content: JSON.stringify(header({ id: 7, cwd: "/tmp/project" })),
++	},
++	{
++		name: "non-session first entry with a string ID",
++		content: JSON.stringify(messageEntry()),
++	},
++];
++
++for (const { name, content } of invalidCases) {
++	const file = path.join(sandbox, "invalid", `${name.replace(/\W+/g, "-")}.jsonl`);
++	writeBytes(file, content);
++	const rejected = session.loadEntriesFromFile(file);
++	// Cross-realm arrays come from the module graph's vm context, so compare length.
++	assert.equal(rejected.length, 0, `the reader must reject ${name}`);
++	assert.equal(readBytes(file), content, `rejecting ${name} must not rewrite the file`);
++}
++report("invalid headers are rejected without newline repair or rewriting");
++
++// ---------------------------------------------------------------------------
++// 3. Reader: valid headers are accepted and valid unterminated final records
++//    are still repaired, idempotently.
++// ---------------------------------------------------------------------------
++resetSandbox();
++
++const validFile = path.join(sandbox, "valid", "unterminated.jsonl");
++const validHeaderLine = JSON.stringify(header({ id: "valid-session", cwd: "/tmp/project" }));
++const validContent = `${validHeaderLine}\n${JSON.stringify(messageEntry())}`;
++writeBytes(validFile, validContent);
++
++const validEntries = session.loadEntriesFromFile(validFile);
++assert.equal(validEntries.length, 2, "a valid session with an unterminated final record must load");
++assert.equal(validEntries[0].id, "valid-session", "the accepted header ID must be returned");
++assert.equal(readBytes(validFile), `${validContent}\n`, "a valid unterminated final record must gain one newline");
++
++// A second read is stable: the repair happened once and nothing else changes.
++assert.equal(session.loadEntriesFromFile(validFile).length, 2);
++assert.equal(readBytes(validFile), `${validContent}\n`, "repairing a valid unterminated record must be idempotent");
++report("valid unterminated records are repaired exactly once");
++
++const unterminatedHeaderFile = path.join(sandbox, "valid", "header-only.jsonl");
++writeBytes(unterminatedHeaderFile, validHeaderLine);
++const headerOnly = session.loadEntriesFromFile(unterminatedHeaderFile);
++assert.equal(headerOnly.length, 1);
++assert.equal(headerOnly[0].id, "valid-session");
++assert.equal(readBytes(unterminatedHeaderFile), `${validHeaderLine}\n`, "a valid unterminated header must be repaired");
++report("a valid unterminated header is accepted and repaired");
++
++const terminatedFile = path.join(sandbox, "valid", "terminated.jsonl");
++const terminatedContent = `${validHeaderLine}\n${JSON.stringify(messageEntry())}\n`;
++writeBytes(terminatedFile, terminatedContent);
++assert.equal(session.loadEntriesFromFile(terminatedFile).length, 2);
++assert.equal(readBytes(terminatedFile), terminatedContent, "a terminated valid session must not be rewritten");
++report("a terminated valid session is read without rewriting");
++
++const malformedTailFile = path.join(sandbox, "valid", "malformed-tail.jsonl");
++const malformedTailContent = `${validHeaderLine}\n{"type":"message"`;
++writeBytes(malformedTailFile, malformedTailContent);
++const malformedTailEntries = session.loadEntriesFromFile(malformedTailFile);
++assert.equal(malformedTailEntries.length, 1, "a valid header must survive a malformed final fragment");
++assert.equal(readBytes(malformedTailFile), `${malformedTailContent}\n`, "an unterminated tail must still be repaired");
++report("an unterminated malformed tail after a valid header is still repaired");
++
++// Cross-module handoff: the migration relocates a valid session whose final
++// record is unterminated, and the reader both accepts it and repairs exactly
++// one newline. This is the producer -> consumer flow the policy must agree on.
++const unterminatedCwd = path.join(sandbox, "projects", "delta");
++const unterminatedSource = path.join(agentDir, "unterminated.jsonl");
++const unterminatedHeaderLine = JSON.stringify(header({ id: "unterminated-session", cwd: unterminatedCwd }));
++const unterminatedSourceBytes = `${unterminatedHeaderLine}\n${JSON.stringify(messageEntry())}`;
++writeBytes(unterminatedSource, unterminatedSourceBytes);
++const unterminatedDest = path.join(sessionDirFor(agentDir, unterminatedCwd), "unterminated.jsonl");
++
++migration.migrateSessionsFromAgentRoot();
++
++assert.equal(fs.existsSync(unterminatedSource), false, "the unterminated session must migrate");
++assert.equal(readBytes(unterminatedDest), unterminatedSourceBytes, "migration must move bytes without rewriting them");
++const repairedEntries = session.loadEntriesFromFile(unterminatedDest);
++assert.equal(repairedEntries.length, 2, "the reader must accept the migrated header and its final record");
++assert.equal(repairedEntries[0].id, "unterminated-session");
++assert.equal(readBytes(unterminatedDest), `${unterminatedSourceBytes}\n`, "the reader must repair the migrated record once");
++report("a migrated unterminated session is repaired by the reader");
++
++cleanup();
++console.log("regression: session integrity behaviors verified");
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..6d6f0d1
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,71 @@
++# Repair: collision safety and invalid-header rejection
++
++## Failure chain
++
++Two producers/consumers of the same session-file contract had drifted apart from
++the clarified data-safety policy.
++
++1. **Producer — `packages/coding-agent/src/migrations.ts`**
++   `migrateSessionsFromAgentRoot()` moved legacy `~/.pi/agent/*.jsonl` files into
++   `sessions/<encoded-cwd>/` with an unconditional `renameSync(file, newPath)`.
++   On POSIX `rename(2)` silently replaces the destination, so when a session
++   file with the same name already existed at the destination the pre-existing
++   bytes were destroyed and the source disappeared too: a collision lost *both*
++   sides. The inline comment even documented the intended guard
++   (`Skip if target exists`) that had been removed.
++
++2. **Consumer — `packages/coding-agent/src/core/session-manager.ts`**
++   `loadEntriesFromFile()` validates the first parsed entry, then repairs a
++   missing final newline with `appendFileSync(..., "\n")`. The guard used
++   `&&`:
++
++   ```ts
++   if (header.type !== "session" && typeof header.id !== "string") return [];
++   ```
++
++   With `&&` the rejection only fired for entries that were *both* non-session
++   *and* ID-less. A `{"type":"session", ...}` entry without a string ID (and a
++   non-session entry carrying an ID) were accepted, and the reader then
++   *rewrote* the invalid file by appending a newline. The sibling helper
++   `parseSessionHeaderCandidate()` already used the correct disjunction, so the
++   load path disagreed with the header-discovery path.
++
++## Fix
++
++- `migrations.ts`: after computing the destination path, skip the move when the
++  destination already exists (`if (existsSync(newPath)) continue;`). Existing
++  destination bytes win, the source bytes survive on disk, and the loop keeps
++  processing every other candidate file. No API, signature or unrelated
++  behavior changed.
++- `core/session-manager.ts`: change the guard to `||`, i.e. reject unless the
++  first entry is a session header with a string ID. Because the guard returns
++  before `appendFileSync`, invalid files are returned as `[]` and are never
++  rewritten, while valid headers still reach the newline-repair step.
++
++## Cross-module agreement
++
++The migration writes the artifact the reader consumes, so both halves are now
++verified together in `.prale-eval/regression.mjs` through the real modules:
++
++- a pre-existing destination plus a same-named agent-root source: destination
++  bytes stay byte-identical, the source file is still present with its original
++  bytes, an unrelated session still migrates, and a repeat migration is
++  idempotent;
++- the migrated file is opened by the real `SessionManager.open()` and yields the
++  migrated header ID and cwd, and the preserved destination remains the session
++  the reader sees;
++- a relocated header-shaped file without a string ID is rejected by the reader
++  (and by `SessionManager.open`) with its bytes untouched, even though it is
++  unterminated — the reader never appends a newline to an invalid header;
++- a relocated *valid* session whose final record is unterminated loads both
++  entries and gains exactly one trailing newline, and a second read is stable;
++- terminated valid sessions are not rewritten, while an unterminated malformed
++  tail after a valid header is still repaired (existing behavior preserved).
++
++Fault isolation was checked by restoring each file alone to its faulty
++baseline: with the migration regression restored the script fails at the first
++collision assertion (`existing destination bytes must win a collision`) after
++the reader checks have run in other scenarios; with the session-manager
++regression restored the script fails at `the reader must reject a header lacking
++a string ID` while every migration assertion passes. Each file therefore has an
++independent detector, and no failure is a crash or import error.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..74e3336
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/session-integrity/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root with Node v24.14.0. The script loads the real submitted migrations.ts and core/session-manager.ts (plus the real utils/text.ts and utils/paths.ts) through the read-only .prale-eval/subject.mjs createSessionPipeline graph; only external boundaries (chalk, config helpers, keybindings module, message constructors) are substituted and the migration module's readdirSync is wrapped purely to make ordering deterministic. All assertions are uncaught node:assert/strict checks on observable bytes and cross-module behavior, using fixed timestamps/IDs and no real time, randomness, network, credentials or providers. Covered: (1) migration collision safety - a pre-existing destination stays byte-identical, the colliding agent-root source survives with its original bytes, an unrelated session still migrates to its session directory, and a repeated migration stays idempotent; (2) cross-module consumer checks - SessionManager.open on the migrated artifact returns the migrated header ID and cwd without rewriting it, and the preserved destination remains the session the reader sees; (3) a relocated header-shaped file lacking a string ID is rejected by loadEntriesFromFile and by SessionManager.open with its bytes untouched, even though it is unterminated; (4) a relocated valid session with an unterminated final record loads both entries and gains exactly one trailing newline, idempotently, and a terminated valid session is read without rewriting; (5) an unterminated malformed tail after a valid header is still repaired, preserving unrelated behavior. Fault isolation was verified by restoring each source file alone to its faulty baseline: with the migrations.ts baseline the run fails with the assertion error 'existing destination bytes must win a collision'; with the core/session-manager.ts baseline (conditional &&) the run fails with 'the reader must reject a header lacking a string ID' while every migration assertion passes. Both failures are assertion errors, not crashes, import errors or timeouts, so each module has an independent detector. Local fixtures are created under .prale-eval/tmp-session-integrity and removed both at the end of the run and from a process exit handler, so nothing remains in the workspace. Limitation: the repository's own vitest/tsc toolchain is not installed in this workspace (no node_modules) and installing dependencies was out of scope, so packages/coding-agent/test/session-manager/file-operations.test.ts and a typecheck could not be executed here; the required Node 24 regression script is the validation evidence and needs no optional dependency. No packages were installed."
++  }
++}
+snapshot .prale-eval/regression.mjs - e59fc08a880762091aa4960548028ef43073fc1d83c32587e40353058145e09a
+snapshot .prale-eval/repair.md - 1381b8cbbbde96c19ed06593401c7213a9084135c02d0d1ee2758fc423c9d763
+snapshot .prale-eval/result.json - 5e29b1033f7ec3db1de6a29c993d84b80f5a9702b90e4e06be96553894fbb2c2
+snapshot packages/coding-agent/src/core/session-manager.ts 0252be53dc0ab562116185d2ae26f1bcb719187d4de985ca6892292edcdf4cac ded5d65112f8666f0e3ae71dab39a302607c29a000745a3d06e00c2103c8f257
+snapshot packages/coding-agent/src/migrations.ts ea364431795f81cbb1795de23d55a2e3d7ff0e8d5a3be6caba3bfde6a3e882c7 55b98884ef1d7d217175adbf0266a8bdd29149c04a95ffd2fa749835bd43fbf9

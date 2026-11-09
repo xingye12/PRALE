@@ -1,0 +1,46 @@
+{
+  "task_id": "advanced/execution-lifecycle/retransfer",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "deliverables": [
+    "packages/agent/src/harness/runtime/drive/tools.ts",
+    "packages/agent/src/harness/execution/tools.ts",
+    "packages/agent/src/harness/execution/effect-gate.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/repair.md"
+  ],
+  "claims": [
+    {
+      "claim": "A cancelled recovery no longer clears the replay checkpoint or invokes the tool effect; recoverToolInvocation now gates its safe/safe replay path on !cancelled and falls through to the durable interrupted-outcome path, which publishes exactly one outcome preserving checkpoint content and details.",
+      "citations": [
+        "packages/agent/src/harness/runtime/drive/tools.ts:515-541",
+        "packages/agent/src/harness/runtime/drive/tools.ts:158-168"
+      ]
+    },
+    {
+      "claim": "Completion seals live and checkpoint callbacks because executeToolCall's finally block sets acceptingUpdates = false, so a tool that retains its update callback after resolving can neither emit tool_update batches (lane.emitBatch) nor write durable progress checkpoints (progress.write) wired by the drive.",
+      "citations": [
+        "packages/agent/src/harness/execution/tools.ts:125-158",
+        "packages/agent/src/harness/runtime/drive/tools.ts:381-408"
+      ]
+    },
+    {
+      "claim": "beginAbort only transitions an open gate, so a closed gate stays terminal and keeps its original error; a later admit throws that terminal error instead of AbortRequested, while aborting an open gate still yields AbortRequested with the supplied cancellation promise.",
+      "citations": [
+        "packages/agent/src/harness/execution/effect-gate.ts:41-62"
+      ]
+    },
+    {
+      "claim": "Non-cancelled safe/safe recovery still clears, invokes once under gate admission, and publishes a single outcome retaining usage and details, so no existing behaviour or API changed.",
+      "citations": [
+        "packages/agent/src/harness/runtime/drive/tools.ts:527-536",
+        "packages/agent/src/harness/execution/tools.ts:161-181"
+      ]
+    }
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node 24.14.0; output: 'regression: execution lifecycle fences passed'. The script loads the real submitted modules through .prale-eval/subject.mjs (createExecutionPipeline: real recovery scheduler, real tool executor/finalizer, real effect gate; only checkpoint storage, progress transport and outcome publication are faked) and asserts six behaviours with uncaught node:assert/strict assertions: (1) non-cancelled safe/safe recovery emits clear then invoke and publishes once with persisted arguments, details {kept:true} and usage {output:3}; (2) a cancelled recovery emits no clear and no invoke, reads the durable checkpoint, writes no progress checkpoints, emits no updates, and publishes exactly one interrupted outcome preserving checkpoint content/details {step:2}; (3) a cancelled never-replay recovery is fenced the same way; (4) after completion a retained update callback with checkpoint:true adds no tool_update, no checkpoint and no drive event, while the in-flight update+checkpoint are still delivered; (5) a closed gate stays terminal through beginAbort, its signal reason stays the terminal error, and executeToolCall throws that exact error without invoking the tool; (6) aborting an open gate still yields AbortRequested carrying the supplied cancellation promise, signalAbort aborts the signal, and a later close still wins. Async ordering is controlled only by promises (no timers, randomness, network or real IO); cross-module ordering is asserted through the observed event sequence ['clear','invoke','effect-complete','seal','drain','drain-complete','publish'] for the live path versus ['read','publish'] for the cancelled path. Mutation check performed locally: restoring each production file alone to its faulty baseline makes the script fail with a plain assertion (scheduler -> 'cancelled recovery must not clear a replay checkpoint (events: clear,invoke,...)'; executor -> 'a completed tool must not deliver live updates 2 !== 1'; gate -> 'beginAbort must not replace a closed gate terminal error'), and no crash, import error or timeout occurred. Limitation: repository dependencies (node_modules) are not installed in this workspace, so tsc type checking and the vitest suites could not be executed; correctness evidence is the dependency-free Node 24 vm-module regression script, and the changes are three single-line guards that preserve every public signature (Gate, GateControl, createGate, AbortRequested, executeToolCall, recoverToolInvocation). Temporary probe files created during investigation were removed; .prale-eval now contains only subject.mjs, regression.mjs, repair.md and result.json."
+  }
+}

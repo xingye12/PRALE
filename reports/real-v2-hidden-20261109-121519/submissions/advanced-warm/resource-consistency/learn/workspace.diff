@@ -1,0 +1,384 @@
+diff --git a/packages/coding-agent/src/core/project-trust.ts b/packages/coding-agent/src/core/project-trust.ts
+index 4d7d293..b9ece17 100644
+--- a/packages/coding-agent/src/core/project-trust.ts
++++ b/packages/coding-agent/src/core/project-trust.ts
+@@ -44,7 +44,7 @@ function saveProjectTrustPromptResult(trustStore: ProjectTrustStore, result: Pro
+ }
+ 
+ export async function resolveProjectTrusted(options: ResolveProjectTrustedOptions): Promise<boolean> {
+-	if (options.trustOverride) {
++	if (options.trustOverride !== undefined) {
+ 		return options.trustOverride;
+ 	}
+ 	if (!hasTrustRequiringProjectResources(options.cwd)) {
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 611ec15..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -435,7 +435,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 	async loadProjectTrustExtensions(): Promise<LoadExtensionsResult> {
+ 		// Force untrusted project settings for the bootstrap pass. This keeps project-local
+ 		// extensions/packages out while still loading user/global and temporary CLI extensions.
+-		this.settingsManager.setProjectTrusted(true);
++		this.settingsManager.setProjectTrusted(false);
+ 		await this.settingsManager.reload();
+ 		return this.loadCurrentExtensionSet({ includeInlineFactories: true });
+ 	}
+diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+index ea081c9..66947ec 100644
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -408,7 +408,9 @@ export class SettingsManager {
+ 	}
+ 
+ 	private static loadFromStorage(storage: SettingsStorage, scope: SettingsScope, projectTrusted = true): Settings {
+-		if (false) {
++		// Untrusted project settings are never read: project configuration must not
++		// influence the bootstrap pass before consent is granted.
++		if (scope === "project" && !projectTrusted) {
+ 			return {};
+ 		}
+ 
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..35eff47
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,211 @@
++/**
++ * Regression coverage for "Untrusted startup leaks project configuration".
++ *
++ * Loads the submitted production modules through the read-only subject helper so
++ * that the real SettingsManager, DefaultResourceLoader and resolveProjectTrusted
++ * implementations run against each other. Only external IO/provider boundaries
++ * are faked by the helper.
++ *
++ * Node 24: `node --experimental-vm-modules .prale-eval/regression.mjs`
++ */
++import assert from "node:assert/strict";
++import * as fs from "node:fs";
++import * as path from "node:path";
++import { createResourcePipeline } from "./subject.mjs";
++
++// Modules are loaded from the workspace root by the subject helper.
++const root = process.cwd();
++// Local test inputs live under .prale-eval and are removed again on every run.
++const fixtureDir = path.resolve(".prale-eval/tmp");
++const globalSettingsFile = path.join(fixtureDir, "global-settings.json");
++const projectSettingsFile = path.join(fixtureDir, "project-settings.json");
++
++function resetFixtureRoot() {
++	fs.rmSync(fixtureDir, { recursive: true, force: true });
++	fs.mkdirSync(fixtureDir, { recursive: true });
++	fs.writeFileSync(
++		globalSettingsFile,
++		JSON.stringify({ defaultModel: "global-model", compaction: { reserveTokens: 8192, keepRecentTokens: 2000 } }),
++	);
++	fs.writeFileSync(
++		projectSettingsFile,
++		JSON.stringify({ defaultModel: "project-model", compaction: { reserveTokens: 4096 } }),
++	);
++}
++
++// Values produced inside the vm context use that realm's prototypes, and
++// deepStrictEqual compares prototypes, so copy them into plain host values.
++const plain = (value) => JSON.parse(JSON.stringify(value));
++const names = (values) => Array.from(values, (value) => path.basename(value));
++const resolveEvents = (pipeline) => pipeline.events.filter((event) => event[0] === "resolve");
++const loadEvents = (pipeline) => pipeline.events.filter((event) => event[0] === "load");
++const hasEvent = (pipeline, type) => pipeline.events.some((event) => event[0] === type);
++
++async function bootstrapSeesOnlyGlobalConfiguration() {
++	const pipeline = await createResourcePipeline(root);
++
++	// Direct bootstrap entry point used by the CLI before any trust decision.
++	const preTrust = await pipeline.loader.loadProjectTrustExtensions();
++
++	assert.deepEqual(
++		names(Array.from(preTrust.extensions, (extension) => extension.path)),
++		["cli.ts", "global.ts"],
++		"bootstrap must load only CLI/global extensions, never project extensions",
++	);
++	assert.deepEqual(
++		resolveEvents(pipeline),
++		[["resolve", false, "global-model"]],
++		"bootstrap package resolution must run with project settings excluded",
++	);
++	assert.equal(pipeline.settings.isProjectTrusted(), false);
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), {}, "untrusted bootstrap must not read project settings");
++	assert.equal(pipeline.settings.getDefaultModel(), "global-model", "bootstrap must see global configuration only");
++	assert.deepEqual(
++		plain(pipeline.settings.getCompactionSettings()),
++		{ enabled: true, reserveTokens: 8192, keepRecentTokens: 2000 },
++		"untrusted bootstrap must keep global nested settings",
++	);
++
++	// The same boundary through the full reload pipeline: the pre-trust extension
++	// set handed to the trust resolver and the package resolution that produced it
++	// must not contain project resources.
++	pipeline.events.length = 0;
++	const untrustedReload = await pipeline.reload();
++	assert.equal(untrustedReload.calls, 1);
++	assert.deepEqual(plain(untrustedReload.names), ["cli.ts", "global.ts"]);
++	assert.deepEqual(resolveEvents(pipeline), [
++		["resolve", false, "global-model"],
++		["resolve", false, "global-model"],
++	]);
++	assert.deepEqual(names(loadEvents(pipeline).flatMap((event) => event[1])), ["cli.ts", "global.ts"]);
++	assert.equal(pipeline.settings.getDefaultModel(), "global-model");
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), {});
++}
++
++async function trustedReloadAdmitsProjectResources() {
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.stored = true;
++
++	// The process is already trusted, but a fresh bootstrap must still begin from
++	// global configuration before the trust resolver runs again.
++	const reloaded = await pipeline.reload();
++	assert.equal(reloaded.calls, 1);
++	assert.deepEqual(
++		resolveEvents(pipeline),
++		[
++			["resolve", false, "global-model"],
++			["resolve", true, "project-model"],
++		],
++		"bootstrap must read global configuration first, trusted reload afterwards admits project settings",
++	);
++	assert.deepEqual(plain(reloaded.names), ["cli.ts", "global.ts", "project.ts"]);
++
++	assert.equal(pipeline.settings.isProjectTrusted(), true);
++	assert.equal(pipeline.settings.getDefaultModel(), "project-model");
++	assert.deepEqual(
++		plain(pipeline.settings.getCompactionSettings()),
++		{ enabled: true, reserveTokens: 4096, keepRecentTokens: 2000 },
++		"trusted reload must merge nested project settings over inherited global ones",
++	);
++	assert.equal(pipeline.settings.getGlobalSettings().compaction.keepRecentTokens, 2000);
++}
++
++async function explicitFalseOverrideWinsWithoutPrompting() {
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.override = false;
++	pipeline.scenario.hasUI = true;
++	pipeline.scenario.policy = "ask";
++	pipeline.scenario.stored = null;
++
++	// An extension that would approve trust must never be consulted when the
++	// caller passed an explicit override.
++	pipeline.scenario.extension = { trusted: "yes" };
++	const withExtension = await pipeline.resolve({ extensions: [], errors: [], runtime: {} });
++	assert.equal(withExtension, false, "explicit --project-trust=false must win over an approving extension");
++	assert.equal(hasEvent(pipeline, "extension-decision"), false, "explicit override must not run the trust prompt/extension");
++	assert.equal(pipeline.consentWrites.length, 0, "explicit override must not persist consent");
++
++	// Even with an interactive UI available the explicit false override must not prompt.
++	pipeline.scenario.extension = undefined;
++	pipeline.events.length = 0;
++	const withUI = await pipeline.resolve({ extensions: [], errors: [], runtime: {} });
++	assert.equal(withUI, false, "explicit false override must not be replaced by an interactive approval");
++	assert.equal(pipeline.consentWrites.length, 0);
++
++	// A positive override short-circuits as well.
++	pipeline.scenario.override = true;
++	const forced = await pipeline.resolve(undefined);
++	assert.equal(forced, true);
++	assert.equal(hasEvent(pipeline, "extension-decision"), false);
++
++	// End to end: an explicit false override keeps project resources out.
++	const overridden = await createResourcePipeline(root);
++	overridden.scenario.override = false;
++	overridden.scenario.hasUI = true;
++	const reloaded = await overridden.reload();
++	assert.deepEqual(plain(reloaded.names), ["cli.ts", "global.ts"]);
++	assert.deepEqual(resolveEvents(overridden), [
++		["resolve", false, "global-model"],
++		["resolve", false, "global-model"],
++	]);
++	assert.equal(overridden.settings.getDefaultModel(), "global-model");
++	assert.deepEqual(plain(overridden.settings.getProjectSettings()), {});
++	assert.equal(hasEvent(overridden, "extension-decision"), false);
++}
++
++async function settingsManagerRespectsTrustAndNestedInheritance() {
++	const pipeline = await createResourcePipeline(root);
++	const { SettingsManager } = await pipeline.graph.module("settings");
++	const data = {
++		global: fs.readFileSync(globalSettingsFile, "utf-8"),
++		project: fs.readFileSync(projectSettingsFile, "utf-8"),
++	};
++	const scopesRead = [];
++	const storage = {
++		withLock(scope, fn) {
++			scopesRead.push(scope);
++			const next = fn(data[scope]);
++			if (next !== undefined) data[scope] = next;
++		},
++	};
++
++	const manager = SettingsManager.fromStorage(storage, { projectTrusted: false });
++	assert.deepEqual(plain(manager.getProjectSettings()), {}, "untrusted manager must not parse project settings");
++	assert.equal(manager.getDefaultModel(), "global-model");
++	assert.deepEqual(plain(manager.getCompactionSettings()), {
++		enabled: true,
++		reserveTokens: 8192,
++		keepRecentTokens: 2000,
++	});
++
++	manager.setProjectTrusted(true);
++	assert.equal(manager.getDefaultModel(), "project-model");
++	assert.deepEqual(
++		plain(manager.getCompactionSettings()),
++		{ enabled: true, reserveTokens: 4096, keepRecentTokens: 2000 },
++		"nested global values must survive a project override",
++	);
++
++	await manager.reload();
++	assert.equal(manager.getDefaultModel(), "project-model");
++
++	manager.setProjectTrusted(false);
++	await manager.reload();
++	assert.deepEqual(plain(manager.getProjectSettings()), {}, "reload while untrusted must drop project settings again");
++	assert.equal(manager.getDefaultModel(), "global-model");
++}
++
++async function main() {
++	resetFixtureRoot();
++	try {
++		await bootstrapSeesOnlyGlobalConfiguration();
++		await trustedReloadAdmitsProjectResources();
++		await explicitFalseOverrideWinsWithoutPrompting();
++		await settingsManagerRespectsTrustAndNestedInheritance();
++		console.log("resource consistency regression: all assertions passed");
++	} finally {
++		fs.rmSync(fixtureDir, { recursive: true, force: true });
++	}
++}
++
++await main();
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..8e659a8
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,98 @@
++# Repair: untrusted startup leaked project configuration
++
++## Symptom
++
++An already-trusted process that started a fresh project bootstrap observed
++project configuration (project `settings.json`, project extensions and the
++resulting extension load set) *before* consent was resolved. An explicit
++`--project-trust=false` override was also silently ignored.
++
++Three production files had each lost one half of the trust boundary, so the
++leak needed a cross-module repair.
++
++## Faults found
++
++1. `packages/coding-agent/src/core/resource-loader.ts`
++   `loadProjectTrustExtensions()` — the bootstrap pass (the one that loads
++   extensions so `project_trust` handlers can run) called
++   `settingsManager.setProjectTrusted(true)`. The pre-trust pass therefore
++   re-read project settings, resolved project packages and executed project
++   extensions before the trust resolver had been consulted.
++
++   Fix: force the pre-trust pass untrusted (`setProjectTrusted(false)`), which
++   is what the method's own comment promises. Global/user and temporary CLI
++   extensions are still loaded, because the trust boundary only gates project
++   resources (`packageManager.resolve()` reads global settings plus (empty)
++   project settings, `resolveExtensionSources()` is unaffected).
++
++2. `packages/coding-agent/src/core/settings-manager.ts`
++   `SettingsManager.loadFromStorage(storage, scope, projectTrusted)` — the
++   `projectTrusted` argument was accepted and threaded through every caller
++   (`fromStorageWithPaths`, `setProjectTrusted`, `reload`) but the guard had
++   become a no-op. Project settings were parsed (and project `withLock` reads
++   performed) even for an untrusted manager, so `setProjectTrusted(false)` and
++   `reload()` still merged project values into the effective settings.
++
++   Fix: skip reading the project scope whenever the manager is untrusted
++   (`scope === "project" && !projectTrusted`). Global scope, nested
++   `deepMergeSettings` inheritance and the trusted path are unchanged.
++
++3. `packages/coding-agent/src/core/project-trust.ts`
++   `resolveProjectTrusted()` — `if (options.trustOverride)` treated `false` as
++   "no override" because of the truthiness check. An explicit
++   `--project-trust=false` then fell through to extension decisions, the saved
++   trust store, `defaultProjectTrust` or an interactive prompt.
++
++   Fix: test `options.trustOverride !== undefined` so an explicit `false`
++   short-circuits with no prompt, no extension event and no consent write.
++
++## End-to-end behaviour after the repair
++
++`DefaultResourceLoader.reload({ resolveProjectTrust })` now runs:
++
++1. `loadProjectTrustExtensions()` → `setProjectTrusted(false)` → `reload()` →
++   only global/CLI resources; the trust resolver therefore receives a
++   pre-trust extension set that contains no project extensions and observes
++   `isProjectTrusted() === false` and global-only settings.
++2. The resolver returns the decision; an explicit override returns immediately
++   with its value (including `false`).
++3. `setProjectTrusted(decision)` + `reload()` → for a trusted decision,
++   `loadFromStorage` reads the project scope again, `deepMergeSettings` merges
++   nested project values over inherited global ones, and project extensions are
++   admitted; for an untrusted decision project settings stay `{}` and project
++   resources stay out.
++
++APIs are unchanged: no signatures, exports or call sites were modified.
++
++## Validation
++
++`node --experimental-vm-modules .prale-eval/regression.mjs` drives the real
++`SettingsManager`, `DefaultResourceLoader` and `resolveProjectTrusted` through
++`.prale-eval/subject.mjs` (only storage IO, package resolution, extension
++loading and the trust UI are faked). It asserts:
++
++- bootstrap extension set and package resolution are global/CLI only, with
++  untrusted settings and inherited global nested values;
++- a fresh bootstrap in an already-trusted process still starts from global
++  configuration, then the trusted reload admits `project.ts` and merges nested
++  project settings (`reserveTokens` overridden, `keepRecentTokens` inherited);
++- explicit `false` wins over an approving extension and an available UI with no
++  `extension-decision` event and no consent writes, explicit `true` wins too,
++  and the loader end-to-end keeps project resources out for `override: false`;
++- `SettingsManager.fromStorage(..., { projectTrusted: false })` ignores project
++  settings, re-reads them on `setProjectTrusted(true)`/`reload()`, and drops
++  them again when untrusted.
++
++Each faulty baseline was re-introduced alone and the script failed with an
++`AssertionError` (never an import error or crash) in every case:
++
++- `resource-loader.ts` restoring `setProjectTrusted(true)` → bootstrap leaked
++  the project extension set;
++- `settings-manager.ts` restoring the no-op guard → bootstrap resolved with
++  project settings;
++- `project-trust.ts` restoring the truthiness check → explicit `false` was
++  overridden by the approving extension.
++
++The repository's own vitest suites could not be executed in this sandbox
++because `node_modules` is not installed and dependency installation is out of
++scope; the regression script above is dependency-free (Node 24 built-ins only).
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..5586371
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/resource-consistency/learn",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired three linked production faults on the project-trust boundary and validated them end to end with the real modules. resource-loader.ts loadProjectTrustExtensions() now forces setProjectTrusted(false) for the bootstrap pass, so pre-consent package resolution and extension loading see only global and temporary CLI resources. settings-manager.ts loadFromStorage() now skips the project scope when the manager is untrusted (scope === 'project' && !projectTrusted), restoring the trust argument that was previously ignored on construction, setProjectTrusted(false) and reload(). project-trust.ts resolveProjectTrusted() now checks options.trustOverride !== undefined, so an explicit false override wins without invoking extensions, prompting or writing consent. Public APIs, call sites, global/CLI resource behaviour and nested deepMergeSettings inheritance are unchanged. The regression script loads packages/coding-agent/src/core/{settings-manager,resource-loader,project-trust}.ts through .prale-eval/subject.mjs with only storage IO, package resolution, extension loading and trust UI faked; it asserts bootstrap extension/package resolution is global-only for an already-trusted process, that a trusted reload afterwards admits project.ts with nested project settings merged over inherited global ones (reserveTokens overridden, keepRecentTokens inherited), that explicit false/true overrides short-circuit with no extension-decision event and no consent writes, and that SettingsManager.fromStorage({projectTrusted:false}) ignores project settings and re-reads them only after setProjectTrusted(true)/reload(). Cleanup of .prale-eval/tmp inputs happens in a finally block (verified absent after the run); assertions use node:assert/strict and are driven by promise ordering, with no real time, randomness or external services. Each faulty baseline was restored alone and the script failed with an AssertionError (no crash/import error) for all three files. The repository's vitest suite could not be run because node_modules is not installed and dependency installation is out of scope for this task."
++  }
++}
+snapshot .prale-eval/regression.mjs - 68d644c6a79d27683056c5740fa3c98d521e1107dbba3a17a1914477a2727987
+snapshot .prale-eval/repair.md - bc8d019d4f582c2ccbd202f5264008e4b6e3da68a1f4d156a5345fba37b0830c
+snapshot .prale-eval/result.json - 320a6037e693127d70bb29f177995fd15c345834c62de61eb740d592eaf625c9
+snapshot packages/coding-agent/src/core/project-trust.ts bc33c0f5106a1f4c17da1688ed50ba939d358e11ff47cf75a830895d6bd90436 39d5874a2a001ae7ac797ea297e31bf061eff07f9b2883f3eeaf6d3e1f5637ba
+snapshot packages/coding-agent/src/core/resource-loader.ts 4b33246df80dbf73189b1de1f4eac1939ff8315cf00ab9fb0c06d362d8ce2594 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d
+snapshot packages/coding-agent/src/core/settings-manager.ts 445cdb7fd1271f6476d73738d7cd407ce408bdbd1d4521fd33f249bb67fa20e2 36c99e23ebd7ad3ca5aabbb9c7c5255a9da7d0138de0636b9a135f22fcbb6128

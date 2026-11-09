@@ -1,0 +1,548 @@
+diff --git a/packages/coding-agent/src/core/project-trust.ts b/packages/coding-agent/src/core/project-trust.ts
+index 14fd6fd..93bc729 100644
+--- a/packages/coding-agent/src/core/project-trust.ts
++++ b/packages/coding-agent/src/core/project-trust.ts
+@@ -70,7 +70,7 @@ export async function resolveProjectTrusted(options: ResolveProjectTrustedOption
+ 	}
+ 
+ 	const decision = options.trustStore.get(options.cwd);
+-	if (decision) {
++	if (decision !== null && decision !== undefined) {
+ 		return decision;
+ 	}
+ 
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 699143e..50169e8 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,9 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(false);
++			// The approved/denied decision must reach settings (and therefore resource
++			// resolution); never force the untrusted bootstrap state here.
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+index 6d4ad57..c7bb2af 100644
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -187,7 +187,7 @@ function deepMergeObjects(base: Record<string, unknown>, overrides: Record<strin
+ 
+ /** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
+ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
+-	return deepMergeObjects(overrides as Record<string, unknown>, base as Record<string, unknown>) as Settings;
++	return deepMergeObjects(base as Record<string, unknown>, overrides as Record<string, unknown>) as Settings;
+ }
+ 
+ function parseTimeoutSetting(value: unknown, settingName: string): number | undefined {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..edca469
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,344 @@
++/**
++ * Executable regression for: "Remembered denial and configuration precedence disagree".
++ *
++ * Loads the submitted production modules through the read-only subject helper
++ * (`createResourcePipeline` / `createGraph`), so project-trust, SettingsManager and
++ * DefaultResourceLoader all run their real implementations. Only external boundaries
++ * (storage, package resolution, extension loading, trust UI) are faked.
++ *
++ * Run with: node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from 'node:assert/strict';
++import * as path from 'node:path';
++import { createGraph, createResourcePipeline } from './subject.mjs';
++
++const root = process.cwd();
++const names = (pipeline) => [...pipeline.loader.getExtensions().extensions].map((e) => path.basename(e.path));
++
++/** In-memory SettingsStorage fixture mirroring the real storage contract. */
++function createStorage(global, project) {
++	const data = {
++		global: global === undefined ? undefined : JSON.stringify(global),
++		project: project === undefined ? undefined : JSON.stringify(project),
++	};
++	const writes = [];
++	return {
++		data,
++		writes,
++		withLock(scope, fn) {
++			const next = fn(data[scope]);
++			if (next !== undefined) {
++				writes.push(scope);
++				data[scope] = next;
++			}
++		},
++	};
++}
++
++const GLOBAL_SETTINGS = {
++	defaultModel: 'global-model',
++	extensions: ['global'],
++	compaction: { reserveTokens: 8192, keepRecentTokens: 2000 },
++};
++const PROJECT_SETTINGS = {
++	defaultModel: 'project-model',
++	extensions: ['project'],
++	compaction: { reserveTokens: 4096 },
++};
++
++/** Reusable graph whose SettingsManager imports are wired to local, faked boundaries. */
++async function settingsModule() {
++	const graph = createGraph(root, {
++		APP_NAME: 'pi',
++		CONFIG_DIR_NAME: '.pi',
++		getAgentDir: () => path.join(root, '.fixture-agent'),
++		DEFAULT_MAX_AGENT_RETRY_DELAY_MS: 60000,
++		DEFAULT_HTTP_IDLE_TIMEOUT_MS: 60000,
++		parseHttpIdleTimeoutMs: (value) => value,
++	});
++	const { SettingsManager } = await graph.module('settings');
++	return SettingsManager;
++}
++
++/** Real resolver with a faked trust store / extension decision / UI. */
++async function projectModule() {
++	const graph = createGraph(root, {
++		APP_NAME: 'pi',
++		CONFIG_DIR_NAME: '.pi',
++		hasTrustRequiringProjectResources: () => true,
++		emitProjectTrustEvent: async () => ({ result: undefined, errors: [] }),
++		getProjectTrustOptions: () => [{ label: 'approve once', trusted: true, updates: [] }],
++	});
++	const { resolveProjectTrusted } = await graph.module('project');
++	return resolveProjectTrusted;
++}
++
++function fakeTrustStore(store = {}) {
++	const writes = [];
++	return {
++		writes,
++		get: (cwd) => store[cwd] ?? null,
++		set: (...args) => writes.push(args),
++		setMany: (...args) => writes.push(args),
++	};
++}
++
++// ---------------------------------------------------------------------------
++// 1. Resolver: a stored boolean is authoritative, denials included.
++// ---------------------------------------------------------------------------
++const resolveProjectTrusted = await projectModule();
++
++{
++	const deniedStore = fakeTrustStore({ [root]: false });
++	const allowedStore = fakeTrustStore({ [root]: true });
++	const emptyStore = fakeTrustStore();
++
++	// Stored denial must win over an allow-by-default policy...
++	assert.equal(
++		await resolveProjectTrusted({
++			cwd: root,
++			trustStore: deniedStore,
++			defaultProjectTrust: 'always',
++			projectTrustContext: { hasUI: true, ui: { select: async () => 'approve once' } },
++		}),
++		false,
++		'a remembered denial must not fall through to the allow-by-default policy',
++	);
++	// ...and must not be overridden by an interactive approval prompt.
++	assert.equal(
++		await resolveProjectTrusted({
++			cwd: root,
++			trustStore: deniedStore,
++			defaultProjectTrust: 'ask',
++			projectTrustContext: { hasUI: true, ui: { select: async () => 'approve once' } },
++		}),
++		false,
++		'a remembered denial must not be re-prompted into an approval',
++	);
++	assert.deepEqual(deniedStore.writes, [], 'resolving a stored denial must not write trust');
++
++	// A remembered approval is equally authoritative.
++	assert.equal(
++		await resolveProjectTrusted({
++			cwd: root,
++			trustStore: allowedStore,
++			defaultProjectTrust: 'never',
++			projectTrustContext: { hasUI: false, ui: { select: async () => undefined } },
++		}),
++		true,
++		'a remembered approval must not fall through to a deny-by-default policy',
++	);
++
++	// Only an absent decision defers to the configured policy.
++	assert.equal(
++		await resolveProjectTrusted({
++			cwd: root,
++			trustStore: emptyStore,
++			defaultProjectTrust: 'always',
++			projectTrustContext: { hasUI: false, ui: { select: async () => undefined } },
++		}),
++		true,
++		'the default policy applies only when no decision was stored',
++	);
++	assert.equal(
++		await resolveProjectTrusted({
++			cwd: root,
++			trustStore: emptyStore,
++			defaultProjectTrust: 'never',
++			projectTrustContext: { hasUI: false, ui: { select: async () => undefined } },
++		}),
++		false,
++		'the deny-by-default policy applies only when no decision was stored',
++	);
++	assert.equal(
++		await resolveProjectTrusted({
++			cwd: root,
++			trustStore: emptyStore,
++			defaultProjectTrust: 'ask',
++			projectTrustContext: { hasUI: false, ui: { select: async () => undefined } },
++		}),
++		false,
++		'ask-without-UI safely resolves untrusted',
++	);
++}
++
++// ---------------------------------------------------------------------------
++// 2. Settings: project values override global values only while trusted, and
++//    nested global defaults survive the merge.
++// ---------------------------------------------------------------------------
++const SettingsManager = await settingsModule();
++
++{
++	const storage = createStorage(GLOBAL_SETTINGS, PROJECT_SETTINGS);
++	const settings = SettingsManager.fromStorage(storage, { projectTrusted: true });
++
++	assert.equal(settings.isProjectTrusted(), true);
++	assert.equal(settings.getDefaultModel(), 'project-model', 'trusted project values must override global values');
++	assert.equal(settings.getGlobalSettings().defaultModel, 'global-model', 'global values must stay intact');
++	assert.equal(settings.getProjectSettings().defaultModel, 'project-model');
++	assert.equal(settings.getCompactionReserveTokens(), 4096, 'project nested value must override the global one');
++	assert.equal(
++		settings.getCompactionKeepRecentTokens(),
++		2000,
++		'nested global defaults must survive a partial project override',
++	);
++	assert.deepEqual({ ...settings.getCompactionSettings() }, {
++		enabled: true,
++		reserveTokens: 4096,
++		keepRecentTokens: 2000,
++	});
++
++	// Overrides layer on top of the trusted merge without dropping sibling defaults.
++	settings.applyOverrides({ defaultModel: 'override-model', compaction: { reserveTokens: 1024 } });
++	assert.equal(settings.getDefaultModel(), 'override-model', 'session overrides must win over project values');
++	assert.equal(settings.getCompactionReserveTokens(), 1024);
++	assert.equal(
++		settings.getCompactionKeepRecentTokens(),
++		2000,
++		'overrides must not drop nested values inherited from global settings',
++	);
++
++	// Trusting an untrusted manager loads project values again.
++	const untrusted = SettingsManager.fromStorage(createStorage(GLOBAL_SETTINGS, PROJECT_SETTINGS), {
++		projectTrusted: false,
++	});
++	assert.equal(untrusted.isProjectTrusted(), false);
++	assert.deepEqual(Object.keys(untrusted.getProjectSettings()), [], 'untrusted project settings must not load');
++	assert.equal(untrusted.getDefaultModel(), 'global-model', 'untrusted project values must not override global');
++	assert.equal(untrusted.getCompactionReserveTokens(), 8192);
++	assert.equal(untrusted.getCompactionKeepRecentTokens(), 2000);
++
++	untrusted.setProjectTrusted(true);
++	assert.equal(untrusted.getDefaultModel(), 'project-model', 'approval must reinstate project values');
++	assert.equal(untrusted.getCompactionReserveTokens(), 4096);
++	assert.equal(untrusted.getCompactionKeepRecentTokens(), 2000, 'nested global defaults must survive approval');
++
++	// Losing trust must roll back to global values, nested defaults included.
++	untrusted.setProjectTrusted(false);
++	assert.deepEqual(Object.keys(untrusted.getProjectSettings()), []);
++	assert.equal(untrusted.getDefaultModel(), 'global-model');
++	assert.deepEqual({ ...untrusted.getCompactionSettings() }, {
++		enabled: true,
++		reserveTokens: 8192,
++		keepRecentTokens: 2000,
++	});
++
++	// A reload in the trusted state keeps project configuration.
++	const trusted = SettingsManager.fromStorage(createStorage(GLOBAL_SETTINGS, PROJECT_SETTINGS), {
++		projectTrusted: true,
++	});
++	await trusted.reload();
++	assert.equal(trusted.isProjectTrusted(), true);
++	assert.equal(trusted.getDefaultModel(), 'project-model', 'an accepted reload must keep project configuration');
++	assert.equal(trusted.getCompactionKeepRecentTokens(), 2000);
++	assert.equal(trusted.getCompactionReserveTokens(), 4096);
++}
++
++// ---------------------------------------------------------------------------
++// 3. Resource assembly: the resolved decision reaches settings and therefore
++//    final resource selection.
++// ---------------------------------------------------------------------------
++{
++	// Approved through the extension trust event: project resources must load.
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.extension = { trusted: 'yes' };
++	const approved = await pipeline.reload();
++
++	assert.equal(approved.calls, 1, 'the trust decision must be resolved exactly once per reload');
++	assert.equal(pipeline.settings.isProjectTrusted(), true, 'the approval must reach SettingsManager');
++	assert.deepEqual(names(pipeline), ['cli.ts', 'global.ts', 'project.ts'], 'approved project resources must load');
++	assert.equal(pipeline.settings.getDefaultModel(), 'project-model', 'approved project configuration must apply');
++	assert.equal(
++		pipeline.settings.getCompactionKeepRecentTokens(),
++		2000,
++		'nested global defaults must survive the approved project merge',
++	);
++	const resolution = pipeline.events.filter(([kind]) => kind === 'resolve');
++	assert.deepEqual(
++		[...resolution.at(-1)],
++		['resolve', true, 'project-model'],
++		'package resolution must observe the approved trust state and project settings',
++	);
++
++	// A second, accepted reload keeps the project configuration.
++	pipeline.scenario.extension = undefined;
++	pipeline.scenario.stored = true;
++	const again = await pipeline.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), true, 'a subsequent reload must stay trusted');
++	assert.deepEqual([...again.names], ['cli.ts', 'global.ts', 'project.ts'], 'accepted reloads must keep project resources');
++	assert.equal(pipeline.settings.getDefaultModel(), 'project-model');
++}
++
++{
++	// A remembered denial wins over an allow-by-default policy at the loader boundary.
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.stored = false;
++	pipeline.scenario.policy = 'always';
++	const denied = await pipeline.reload();
++
++	assert.equal(pipeline.settings.isProjectTrusted(), false, 'the remembered denial must reach SettingsManager');
++	assert.deepEqual([...denied.names], ['cli.ts', 'global.ts'], 'denied project resources must not load');
++	assert.equal(pipeline.settings.getDefaultModel(), 'global-model');
++	assert.deepEqual(Object.keys(pipeline.settings.getProjectSettings()), []);
++}
++
++{
++	// No decision and no UI: untrusted defaults must exclude project resources.
++	const pipeline = await createResourcePipeline(root);
++	const untrusted = await pipeline.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), false);
++	assert.deepEqual([...untrusted.names], ['cli.ts', 'global.ts']);
++}
++
++{
++	// A remembered approval wins over a deny-by-default policy.
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.stored = true;
++	pipeline.scenario.policy = 'never';
++	const allowed = await pipeline.reload();
++	assert.equal(pipeline.settings.isProjectTrusted(), true);
++	assert.deepEqual([...allowed.names], ['cli.ts', 'global.ts', 'project.ts']);
++	assert.equal(pipeline.settings.getDefaultModel(), 'project-model');
++}
++
++// ---------------------------------------------------------------------------
++// 4. Asynchronous ordering: the bootstrap pass stays untrusted while the
++//    decision is pending, and the decision is applied once it settles.
++// ---------------------------------------------------------------------------
++{
++	const pipeline = await createResourcePipeline(root);
++	let releaseDecision;
++	let atDecision;
++	const decision = new Promise((resolve) => {
++		releaseDecision = resolve;
++	});
++	const pending = new Promise((resolve) => {
++		atDecision = resolve;
++	});
++	let preTrustNames;
++	let preTrustTrusted;
++
++	const reloaded = pipeline.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			preTrustTrusted = pipeline.settings.isProjectTrusted();
++			preTrustNames = [...extensionsResult.extensions].map((extension) => path.basename(extension.path));
++			atDecision();
++			await decision;
++			return true;
++		},
++	});
++
++	await pending;
++	assert.equal(preTrustTrusted, false, 'the bootstrap extension pass must run untrusted');
++	assert.deepEqual([...preTrustNames], ['cli.ts', 'global.ts'], 'the bootstrap pass must exclude project extensions');
++	assert.equal(pipeline.settings.isProjectTrusted(), false, 'trust must not apply before the decision settles');
++	assert.equal(pipeline.settings.getDefaultModel(), 'global-model');
++
++	releaseDecision(true);
++	await reloaded;
++	assert.equal(pipeline.settings.isProjectTrusted(), true, 'the settled approval must be applied');
++	assert.equal(pipeline.settings.getDefaultModel(), 'project-model');
++	assert.deepEqual(names(pipeline), ['cli.ts', 'global.ts', 'project.ts']);
++}
++
++console.log('resource-consistency regression: all assertions passed');
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..5450548
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,107 @@
++# Repair: remembered denial and configuration precedence disagree
++
++## Incident summary
++
++Two symptoms shared one root cause chain across three modules:
++
++1. A project the user had explicitly **denied** was treated as "no decision" and fell through to the
++   `defaultProjectTrust` policy (`ask`/`always`), which can allow project resources.
++2. A project the user **approved** was re-pinned to the untrusted bootstrap state by the resource
++   loader, so project settings/extensions were dropped from the final resource resolution — and the
++   settings merge itself gave global values precedence over project values when both were loaded.
++
++## Faulty production code and fixes
++
++### 1. `packages/coding-agent/src/core/project-trust.ts`
++
++`ProjectTrustStore.get()` returns `boolean | null`, but the resolver used a truthiness test:
++
++```ts
++const decision = options.trustStore.get(options.cwd);
++if (decision) {          // stored `false` is falsy -> treated as "no decision"
++	return decision;
++}
++```
++
++A remembered **denial** (`false`) therefore fell through to the allow-by-default policy (and to an
++interactive prompt). Fix: only an absent decision (`null`/`undefined`) falls through, so a stored
++boolean — approval *or* denial — is authoritative:
++
++```ts
++if (decision !== null && decision !== undefined) {
++	return decision;
++}
++```
++
++### 2. `packages/coding-agent/src/core/settings-manager.ts`
++
++`deepMergeSettings(base, overrides)` documents "project/overrides take precedence, nested objects
++merge recursively", but it passed its arguments to `deepMergeObjects` in the wrong order:
++
++```ts
++return deepMergeObjects(overrides, base);  // base won every conflict
++```
++
++Because `deepMergeObjects` copies keys from `overrides` on top of `base`, the swapped call made the
++*global* layer win over the project layer, and `applyOverrides` lose to the settings it was meant to
++override. Fix: pass `(base, overrides)`. Recursive merging is unchanged, so nested global defaults
++(`compaction.keepRecentTokens`) still survive a partial project override
++(`compaction.reserveTokens`).
++
++### 3. `packages/coding-agent/src/core/resource-loader.ts`
++
++`DefaultResourceLoader.reload()` bootstraps an untrusted pass (correct, project extensions are not
++executed before consent), then resolves project trust — but discarded the result:
++
++```ts
++const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
++this.settingsManager.setProjectTrusted(false);   // always re-pinned to untrusted
++```
++
++Consequences: `packageManager.resolve()` and every later trust-gated read
++(`discoverSystemPromptFile`, project settings load in `SettingsManager.reload`) still ran untrusted,
++so approved project configuration and extensions never reached final resource resolution. Fix:
++forward the decision, `this.settingsManager.setProjectTrusted(projectTrusted)`.
++
++The intentional untrusted bootstrap in `loadProjectTrustExtensions()` is untouched.
++
++## Cross-module behavior restored
++
++```
++resolveProjectTrusted (project-trust)
++        │  stored boolean authoritative (denial or approval)
++        ▼
++DefaultResourceLoader.reload (resource-loader)
++        │  decision forwarded, not replaced with `false`
++        ▼
++SettingsManager.setProjectTrusted + reload (settings-manager)
++        │  trusted -> project layer loaded and merged over global (nested merge)
++        ▼
++packageManager.resolve / final extension set
++           trusted  -> global + project configuration and resources
++           untrusted -> global only, nested global defaults intact
++```
++
++## Validation
++
++`node --experimental-vm-modules .prale-eval/regression.mjs` (Node 24, no dependencies) loads the real
++`project-trust`, `settings-manager` and `resource-loader` modules through `.prale-eval/subject.mjs`
++and asserts, using uncaught `node:assert/strict` assertions:
++
++- stored `false` beats `always`/`ask` and is never re-prompted; stored `true` beats `never`;
++  only `null` defers to the default policy;
++- trusted project values override global values while `getGlobalSettings()` stays intact and nested
++  global defaults survive; untrusted managers expose no project settings; toggling trust in either
++  direction and `reload()` keep the correct layer;
++- the end-to-end pipeline (resolver → loader → SettingsManager → package resolution) loads
++  `global` + `project` when approved and only `global` when denied/untrusted, observes
++  `isProjectTrusted()`/`project-model` at resolution time, and keeps project configuration on a
++  second accepted reload;
++- asynchronous ordering is driven by promises: while the trust decision is pending the bootstrap
++  pass is untrusted and project extensions are excluded; after the deferred decision settles the
++  approval is applied.
++
++Verified by restoring each production file alone to its faulty baseline: each run fails with a
++specific assertion (denial policy, project-over-global precedence, approval reaching
++SettingsManager) rather than crashing, and the fully repaired tree passes. Test inputs are
++in-memory storage fixtures, so no temporary files are left behind.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..ae3176a
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,32 @@
++{
++  "task_id": "advanced/resource-consistency/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "A stored denial is authoritative and no longer falls through to an allow-by-default policy.",
++      "evidence": "packages/coding-agent/src/core/project-trust.ts:73-76 only treats an absent decision (null/undefined) as unresolved; a stored boolean, including false, is returned directly."
++    },
++    {
++      "claim": "Project values override global values while trusted, and nested global defaults survive the merge.",
++      "evidence": "packages/coding-agent/src/core/settings-manager.ts:189-191 passes (base, overrides) to deepMergeObjects, restoring project/override precedence while the recursive merge keeps global compaction.keepRecentTokens."
++    },
++    {
++      "claim": "The resolved trust decision reaches final resource resolution instead of being replaced by the untrusted bootstrap state.",
++      "evidence": "packages/coding-agent/src/core/resource-loader.ts:453-457 forwards resolveProjectTrust's result to SettingsManager.setProjectTrusted before settings reload and packageManager.resolve(); the intentional untrusted bootstrap in loadProjectTrustExtensions (line 438) is unchanged."
++    }
++  ],
++  "deliverables": [
++    "packages/coding-agent/src/core/project-trust.ts",
++    "packages/coding-agent/src/core/settings-manager.ts",
++    "packages/coding-agent/src/core/resource-loader.ts",
++    ".prale-eval/regression.mjs",
++    ".prale-eval/repair.md",
++    ".prale-eval/result.json"
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Node 24.14.0, no dependencies installed, no network or external services. The script loads the submitted production modules through the read-only .prale-eval/subject.mjs (real project-trust, settings-manager and resource-loader; only storage, package-resolution, extension-loading and trust-UI boundaries faked) and uses uncaught node:assert/strict assertions. It covers: stored false authoritative over 'always'/'ask' without re-prompting, stored true authoritative over 'never', null deferring to the default policy; trusted project-over-global precedence with intact global settings and nested defaults, untrusted empty project settings, trust toggling in both directions and reload(); end-to-end reload where approval yields cli+global+project resources, resolution observes isProjectTrusted()=true and defaultModel='project-model', denial/untrusted yield only cli+global, and a second accepted reload keeps project configuration; plus promise-controlled async ordering showing the bootstrap pass stays untrusted while the decision is pending and the approval is applied after the deferred promise settles. Mutation check performed manually: restoring project-trust.ts alone fails 'a remembered denial must not fall through to the allow-by-default policy', restoring settings-manager.ts alone fails 'trusted project values must override global values', and restoring resource-loader.ts alone fails 'the approval must reach SettingsManager'; each is an assertion failure, not an import error or crash, and the repaired tree passes. Test inputs are in-memory storage fixtures, so no temporary files were created and nothing needed cleanup."
++  }
++}
+snapshot .prale-eval/regression.mjs - 9b7d306920a848443c50903f936d81a5c667f03ee0919fb68f89aaa717940638
+snapshot .prale-eval/repair.md - 6c3f5fcc3f7dd99ccb01c8f5d3f631d4ccb84a6adcff86696cf66d388860a0b8
+snapshot .prale-eval/result.json - acdca1174c6ae8e68fb335beda4de3fe93067cac522a6f967ed3cf6f710632b7
+snapshot packages/coding-agent/src/core/project-trust.ts fe9a9c3bc4722fbece17a5eb3bbe56b711bdc03693123fc1d69ec9ae137a40a8 c1a6ae594a0de36c807f2870796227bb63df2931fbf731215dae61d924cd21ad
+snapshot packages/coding-agent/src/core/resource-loader.ts a031f345d80d20a71812a6f187730475cc80914586ca01bb0d88118193d445db 3b23640d3b03a71c915706b6a0f3da05529383061f9205f25bdd2a21abd60ffd
+snapshot packages/coding-agent/src/core/settings-manager.ts 96d5bc028db0007656032425782b014a75082f41c077a1f8515251d6b2839938 5d1bdac20da52fdbac76d49fb9ce22d142c375e8efd5bf446bf6c047c5edac42

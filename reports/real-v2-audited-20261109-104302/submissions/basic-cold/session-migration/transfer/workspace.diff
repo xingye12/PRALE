@@ -1,0 +1,306 @@
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index 33ec276..3f02ba6 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -109,7 +109,7 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const cwd: string = header.cwd;
+ 
+ 			// Compute the correct session directory (same encoding as session-manager.ts)
+-			const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/:]/g, "-")}--`;
++			const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+ 			const correctDir = join(agentDir, "sessions", safePath);
+ 
+ 			// Create directory if needed
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..fbe61f9
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,263 @@
++/**
++ * Standalone regression for migrateSessionsFromAgentRoot (session cwd encoding).
++ *
++ * Loads the real production TypeScript module through .prale-eval/subject.mjs
++ * (Node 24 type stripping + VM modules) with only boundary fakes, and asserts
++ * the real migration behavior against a real temporary agentDir.
++ *
++ * Run from the workspace root:
++ *   node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { loadMigrations } from "./subject.mjs";
++
++const workspaceRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const tmpRoot = path.join(workspaceRoot, ".prale-eval", ".tmp-regression");
++
++function freshAgentDir(label) {
++	const dir = path.join(tmpRoot, label);
++	mkdirSync(dir, { recursive: true });
++	return dir;
++}
++
++function writeSession(agentDir, fileName, header, extraLines = []) {
++	const text = [JSON.stringify(header), ...extraLines].join("\n") + "\n";
++	const bytes = Buffer.from(text, "utf8");
++	writeFileSync(path.join(agentDir, fileName), bytes);
++	return bytes;
++}
++
++function readSession(pathname) {
++	return readFileSync(pathname);
++}
++
++/** Run the real exported migration function once against a real agentDir. */
++async function runMigration(agentDir) {
++	const module = await loadMigrations(workspaceRoot, agentDir);
++	assert.equal(
++		typeof module.migrateSessionsFromAgentRoot,
++		"function",
++		"production module must export migrateSessionsFromAgentRoot",
++	);
++	module.migrateSessionsFromAgentRoot();
++	return module;
++}
++
++function sessionEntries(agentDir) {
++	const sessionsDir = path.join(agentDir, "sessions");
++	if (!existsSync(sessionsDir)) return [];
++	return readdirSync(sessionsDir).sort();
++}
++
++// Extra message lines that must survive byte-for-byte (multibyte + CRLF + no
++// trailing newline on the last logical record).
++const PAYLOAD_LINES = [
++	'{"type":"message","role":"user","content":"héllo 🌍 — ünïcode"}',
++	'{"type":"message","role":"assistant","content":"first\\nsecond"}\r',
++	'{"type":"message","role":"user","content":"trailing"}',
++];
++
++async function checkEncodingCases() {
++	const cases = [
++		{
++			label: "windows-drive",
++			cwd: "C:\\Users\\Alice\\My Project",
++			expectedDir: "--C--Users-Alice-My Project--",
++		},
++		{
++			label: "windows-drive-forward-slashes",
++			cwd: "C:/Users/Bob/src",
++			expectedDir: "--C--Users-Bob-src--",
++		},
++		{
++			label: "posix",
++			cwd: "/home/dev/project",
++			expectedDir: "--home-dev-project--",
++		},
++		{
++			label: "unc",
++			cwd: "\\\\fileserver\\share\\team",
++			expectedDir: "---fileserver-share-team--",
++		},
++		{
++			label: "posix-backslash-remainder",
++			cwd: "/mnt/win\\Users\\Carol",
++			expectedDir: "--mnt-win-Users-Carol--",
++		},
++	];
++
++	for (const testCase of cases) {
++		const agentDir = freshAgentDir(testCase.label);
++		const fileName = "session.jsonl";
++		const bytes = writeSession(
++			agentDir,
++			fileName,
++			{ type: "session", version: 1, id: `id-${testCase.label}`, cwd: testCase.cwd },
++			PAYLOAD_LINES,
++		);
++
++		await runMigration(agentDir);
++
++		assert.equal(
++			existsSync(path.join(agentDir, fileName)),
++			false,
++			`[${testCase.label}] session should be moved out of the agent root`,
++		);
++		assert.deepEqual(
++			sessionEntries(agentDir),
++			[testCase.expectedDir],
++			`[${testCase.label}] cwd ${JSON.stringify(testCase.cwd)} must encode to ${JSON.stringify(testCase.expectedDir)}`,
++		);
++
++		const destination = path.join(agentDir, "sessions", testCase.expectedDir, fileName);
++		assert.ok(existsSync(destination), `[${testCase.label}] expected session file at ${destination}`);
++		assert.deepEqual(
++			readSession(destination),
++			bytes,
++			`[${testCase.label}] migrated session bytes must be preserved exactly`,
++		);
++		for (const entry of readdirSync(path.join(agentDir, "sessions"))) {
++			assert.ok(
++				!/[\\:]/.test(entry),
++				`[${testCase.label}] encoded directory name must not keep slashes, backslashes or colons: ${JSON.stringify(entry)}`,
++			);
++		}
++	}
++}
++
++async function checkInvalidHeadersAreIgnored() {
++	const agentDir = freshAgentDir("invalid-headers");
++	const invalid = [
++		["not-json.jsonl", "this is not json at all\n"],
++		["wrong-type.jsonl", '{"type":"message","content":"hi"}\n'],
++		["missing-cwd.jsonl", '{"type":"session","version":1}\n'],
++		["empty.jsonl", ""],
++		["blank-first-line.jsonl", "\n{\"type\":\"session\",\"cwd\":\"/tmp/later\"}\n"],
++	];
++	const original = new Map();
++	for (const [fileName, text] of invalid) {
++		const bytes = Buffer.from(text, "utf8");
++		writeFileSync(path.join(agentDir, fileName), bytes);
++		original.set(fileName, bytes);
++	}
++	writeFileSync(path.join(agentDir, "settings.json"), '{"theme":"dark"}\n');
++
++	await runMigration(agentDir);
++
++	for (const [fileName] of invalid) {
++		const pathname = path.join(agentDir, fileName);
++		assert.ok(existsSync(pathname), `invalid header session ${fileName} must be left in place`);
++		assert.deepEqual(readSession(pathname), original.get(fileName), `${fileName} bytes must be untouched`);
++	}
++	assert.equal(
++		existsSync(path.join(agentDir, "settings.json")),
++		true,
++		"non-.jsonl files must be ignored by the migration",
++	);
++	assert.deepEqual(
++		sessionEntries(agentDir),
++		[],
++		"no session directory may be created for unparsable or non-session headers",
++	);
++}
++
++async function checkNeverOverwritesExistingDestination() {
++	const agentDir = freshAgentDir("collision");
++	const sourceName = "collide.jsonl";
++	const sourceBytes = writeSession(
++		agentDir,
++		sourceName,
++		{ type: "session", version: 1, id: "newer", cwd: "/srv/data/share" },
++		PAYLOAD_LINES,
++	);
++
++	const existingDir = path.join(agentDir, "sessions", "--srv-data-share--");
++	mkdirSync(existingDir, { recursive: true });
++	const existingBytes = Buffer.from('{"type":"session","id":"already-there"}\n', "utf8");
++	writeFileSync(path.join(existingDir, sourceName), existingBytes);
++	writeFileSync(path.join(existingDir, "unrelated.jsonl"), Buffer.from("keep me\n", "utf8"));
++
++	await runMigration(agentDir);
++
++	assert.ok(existsSync(path.join(agentDir, sourceName)), "source must remain when the destination already exists");
++	assert.deepEqual(
++		readSession(path.join(agentDir, sourceName)),
++		sourceBytes,
++		"unmigrated source bytes must be untouched",
++	);
++	assert.deepEqual(
++		readSession(path.join(existingDir, sourceName)),
++		existingBytes,
++		"an existing destination must never be overwritten",
++	);
++	assert.deepEqual(sessionEntries(agentDir), ["--srv-data-share--"], "no extra session directory may appear");
++	assert.deepEqual(
++		readdirSync(existingDir).sort(),
++		[sourceName, "unrelated.jsonl"].sort(),
++		"existing session directory contents must be preserved",
++	);
++}
++
++async function checkRepeatedRunsAreSafe() {
++	const agentDir = freshAgentDir("repeat");
++	const fileName = "repeat.jsonl";
++	const bytes = writeSession(
++		agentDir,
++		fileName,
++		{ type: "session", version: 1, id: "repeat", cwd: "D:\\Work\\Repo" },
++		PAYLOAD_LINES,
++	);
++
++	await runMigration(agentDir);
++	const afterFirst = sessionEntries(agentDir);
++	assert.deepEqual(afterFirst, ["--D--Work-Repo--"], "first run must encode the drive-letter cwd");
++
++	// Two more runs: no throw, no duplicates, no data loss, stable result.
++	await runMigration(agentDir);
++	await runMigration(agentDir);
++
++	assert.deepEqual(sessionEntries(agentDir), afterFirst, "repeated runs must not create new directories");
++	assert.equal(
++		readdirSync(path.join(agentDir, "sessions", "--D--Work-Repo--")).length,
++		1,
++		"repeated runs must not duplicate the migrated session",
++	);
++	assert.deepEqual(
++		readSession(path.join(agentDir, "sessions", "--D--Work-Repo--", fileName)),
++		bytes,
++		"repeated runs must keep the migrated session bytes intact",
++	);
++	assert.equal(
++		readdirSync(agentDir).filter((entry) => entry.endsWith(".jsonl")).length,
++		0,
++		"no .jsonl file may remain in the agent root after repeated runs",
++	);
++}
++
++async function checkEmptyAndMissingAgentDirAreSafe() {
++	const emptyAgentDir = freshAgentDir("empty-agent-dir");
++	await runMigration(emptyAgentDir);
++	assert.deepEqual(sessionEntries(emptyAgentDir), [], "an empty agent dir must stay empty");
++
++	const missingAgentDir = path.join(tmpRoot, "does-not-exist");
++	await runMigration(missingAgentDir);
++	assert.equal(existsSync(missingAgentDir), false, "a missing agent dir must not be created by the migration");
++}
++
++rmSync(tmpRoot, { recursive: true, force: true });
++mkdirSync(tmpRoot, { recursive: true });
++
++try {
++	await checkEncodingCases();
++	await checkInvalidHeadersAreIgnored();
++	await checkNeverOverwritesExistingDestination();
++	await checkRepeatedRunsAreSafe();
++	await checkEmptyAndMissingAgentDirAreSafe();
++} finally {
++	rmSync(tmpRoot, { recursive: true, force: true });
++}
++
++console.log("session migration regression: all assertions passed");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..235b4f8
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,15 @@
++{
++  "task_id": "session-migration/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "deliverables": [
++    "packages/coding-agent/src/migrations.ts",
++    ".prale-eval/regression.mjs"
++  ],
++  "claims": [],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Root cause: migrateSessionsFromAgentRoot encoded the session header cwd with cwd.replace(/^[/\\\\]/, \"\").replace(/[/:]/, ...) - the replacement class omitted backslash, so Windows paths kept their backslashes (e.g. C:\\Users\\Alice\\My Project became --C-\\Users\\Alice-My Project--, a bogus single directory under sessions/). Fixed with a one-token change: the replacement class is now /[/\\\\:]/g, matching getDefaultSessionDirPath in packages/coding-agent/src/core/session-manager.ts (strip exactly one leading slash/backslash, then map every slash, backslash and colon to '-'). Regression .prale-eval/regression.mjs loads the real module via .prale-eval/subject.mjs (loadMigrations, real fs/path, temp agentDir inside .prale-eval/.tmp-regression, removed in a finally block) and runs the exported migrateSessionsFromAgentRoot against real files. It asserts exact encoded directory names for POSIX (/home/dev/project -> --home-dev-project--), drive-letter with backslashes (C:\\Users\\Alice\\My Project -> --C--Users-Alice-My Project--), drive-letter with forward slashes, UNC (\\\\fileserver\\share\\team -> ---fileserver-share-team--, exactly one leading separator removed), and mixed POSIX/backslash paths, plus that no created directory name retains '\\' or ':'. It also asserts byte-for-byte preservation of session contents (multibyte UTF-8, CRLF, trailing records), that invalid headers (malformed JSON, wrong type, missing cwd, empty file, blank first line) and non-.jsonl files stay untouched with no sessions directory created, that an existing destination is never overwritten (source and pre-existing destination bytes both unchanged, existing session dir contents preserved), that repeated runs are idempotent (no new dirs, no duplicates, bytes intact), and that empty/missing agentDirs are safe no-ops. Verified both directions: node --experimental-vm-modules .prale-eval/regression.mjs exits 0 on the repaired tree, and the identical script run against an isolated copy of the original HEAD migrations.ts fails with AssertionError on the drive-letter case (actual --C-\\Users\\Alice-My Project-- vs expected --C--Users-Alice-My Project--), exit 1. Limitation: node_modules is absent in this workspace and dependencies must not be installed, so tsc/biome/vitest were not run; the regression is the focused validation and exercises the production TypeScript through Node 24 type stripping instead."
++  }
++}
+snapshot .prale-eval/regression.mjs - e5eb57554435ee943e09f09f156c84f4457e2eca8a1a324549d1f38f24828524
+snapshot .prale-eval/result.json - ed62d861cc33ae81b5e5668378f98eb311711cc53d292f89136af27447f9e522
+snapshot packages/coding-agent/src/migrations.ts 143a77bc26bffeb28aa1c1ee90e2943c3d73c31353667155dff7e69aca0c30cb 59fc18cedfcbecd993918bb335e5e76a9f9c899c61ecf9eab110f86d976af1bc

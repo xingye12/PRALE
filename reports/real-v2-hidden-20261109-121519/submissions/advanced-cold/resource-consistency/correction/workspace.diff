@@ -1,0 +1,410 @@
+diff --git a/packages/coding-agent/src/core/project-trust.ts b/packages/coding-agent/src/core/project-trust.ts
+index b88f78b..b9ece17 100644
+--- a/packages/coding-agent/src/core/project-trust.ts
++++ b/packages/coding-agent/src/core/project-trust.ts
+@@ -62,7 +62,7 @@ export async function resolveProjectTrusted(options: ResolveProjectTrustedOption
+ 		}
+ 		if (result) {
+ 			const trusted = result.trusted === "yes";
+-			if (result.remember !== undefined) {
++			if (result.remember === true) {
+ 				options.trustStore.set(options.cwd, trusted);
+ 			}
+ 			return trusted;
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 8da4475..c1862c1 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -447,10 +447,11 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 			clearExtensionCache();
+ 		}
+ 
++		const resolveProjectTrust = options?.resolveProjectTrust;
+ 		let preTrustExtensions: LoadExtensionsResult | undefined;
+-		if (options?.resolveProjectTrust) {
++		if (resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+-			const projectTrusted = false;
++			const projectTrusted = await resolveProjectTrust({ extensionsResult: preTrustExtensions });
+ 			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+index 3c9bb5d..c7bb2af 100644
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -512,7 +512,7 @@ export class SettingsManager {
+ 	}
+ 
+ 	setProjectTrusted(trusted: boolean): void {
+-		if (this.projectTrusted !== trusted) {
++		if (this.projectTrusted === trusted) {
+ 			return;
+ 		}
+ 
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100755
+index 0000000..e9fff40
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,252 @@
++#!/usr/bin/env node
++/**
++ * Cross-module regression for the project-trust / settings / resource-loader incident.
++ *
++ * Real submitted modules are linked by subject.mjs:
++ *   project-trust.ts -> resource-loader.ts -> settings-manager.ts -> package-manager fake
++ * Only external boundaries (storage, extension event delivery, UI, package resolution,
++ * extension loading) are faked. All assertions use node:assert/strict and are left
++ * uncaught so a failing behavior exits non-zero.
++ */
++import assert from "node:assert/strict";
++import * as path from "node:path";
++import { createResourcePipeline } from "./subject.mjs";
++
++const root = process.cwd();
++const projectSettings = { defaultModel: "project-model", extensions: ["project"], compaction: { reserveTokens: 4096 } };
++const globalSettings = {
++	defaultModel: "global-model",
++	extensions: ["global"],
++	compaction: { reserveTokens: 8192, keepRecentTokens: 2000 },
++};
++
++/** Copy a value that may come from the VM realm into plain host objects. */
++function plain(value) {
++	return JSON.parse(JSON.stringify(value));
++}
++
++/** Values of every recorded event of one type. */
++function events(pipeline, type) {
++	return plain(pipeline.events.filter((event) => event[0] === type).map((event) => event.slice(1)));
++}
++
++/** Deterministically drain promise continuations; no timers or real time involved. */
++async function flushMicrotasks(turns = 1000) {
++	for (let turn = 0; turn < turns; turn += 1) {
++		await Promise.resolve();
++	}
++}
++
++function namesOf(result) {
++	return plain(result.extensions.map((extension) => path.basename(extension.path)));
++}
++
++function assertStorageUntouched(pipeline, before) {
++	assert.equal(pipeline.storageData.global, before.global, "global settings storage must not be rewritten by trust resolution");
++	assert.equal(pipeline.storageData.project, before.project, "project settings storage must not be rewritten by trust resolution");
++}
++
++// ---------------------------------------------------------------------------
++// 1. Untrusted bootstrap -> resolver exactly once -> trust reloads project.
++//    A stored approval grants access; the asynchronous gate proves the resolver
++//    only starts after the bootstrap pass is complete.
++// ---------------------------------------------------------------------------
++{
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.stored = true;
++	const before = { global: pipeline.storageData.global, project: pipeline.storageData.project };
++
++	let releaseResolver;
++	const resolverGate = new Promise((resolve) => {
++		releaseResolver = resolve;
++	});
++	let resolverCalls = 0;
++	let resolverBootstrapNames;
++	const reloadPromise = pipeline.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			resolverCalls += 1;
++			resolverBootstrapNames = namesOf(extensionsResult);
++			await resolverGate;
++			// The real cross-module resolver consumes the bootstrap result.
++			return pipeline.resolve(extensionsResult);
++		},
++	});
++
++	// The resolver body is held on resolverGate. Drain only promise continuations so
++	// the bootstrap pass can finish and reach the resolver without any wall clock.
++	await flushMicrotasks();
++
++	assert.equal(resolverCalls, 1, "the resolver must run exactly once after the untrusted bootstrap");
++	assert.deepEqual(
++		events(pipeline, "resolve"),
++		[[false, "global-model"]],
++		"the bootstrap resource resolution must see an untrusted project and global settings only",
++	);
++	assert.deepEqual(
++		events(pipeline, "load"),
++		[[["cli.ts", "global.ts"]]],
++		"bootstrap must load user/CLI extensions only",
++	);
++	assert.deepEqual(resolverBootstrapNames, ["cli.ts", "global.ts"], "resolver must receive the untrusted bootstrap extension set");
++	assert.equal(events(pipeline, "extension-decision").length, 0, "the final trust decision is still pending at the gate");
++	assert.equal(pipeline.settings.isProjectTrusted(), false, "bootstrap must leave the project untrusted");
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), {}, "bootstrap must not expose project settings");
++	assert.equal(pipeline.consentWrites.length, 0, "a stored decision is reused without writing consent");
++
++	releaseResolver();
++	await reloadPromise;
++
++	assert.equal(resolverCalls, 1, "the resolver must not run a second time during final loading");
++	assert.equal(events(pipeline, "extension-decision").length, 1, "extension decision evaluated once");
++	assert.deepEqual(
++		events(pipeline, "resolve"),
++		[
++			[false, "global-model"],
++			[true, "project-model"],
++		],
++		"after trust, resources resolve against project settings",
++	);
++	assert.deepEqual(
++		namesOf(pipeline.loader.getExtensions()),
++		["cli.ts", "global.ts", "project.ts"],
++		"trusted final loading adds project extensions to the reused bootstrap set",
++	);
++	assert.deepEqual(
++		events(pipeline, "load"),
++		[[["cli.ts", "global.ts"]], [["project.ts"]]],
++		"already-loaded user/CLI extensions are reused instead of re-executed",
++	);
++	assert.equal(pipeline.settings.isProjectTrusted(), true);
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), projectSettings);
++	assert.equal(pipeline.settings.getDefaultModel(), "project-model");
++	assert.deepEqual(plain(pipeline.settings.getGlobalSettings()), globalSettings);
++	assertStorageUntouched(pipeline, before);
++}
++
++// ---------------------------------------------------------------------------
++// 2. Denial: the same pipeline must keep the project untrusted and unloaded.
++// ---------------------------------------------------------------------------
++{
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.stored = false;
++	const before = { global: pipeline.storageData.global, project: pipeline.storageData.project };
++
++	const result = await pipeline.reload();
++
++	assert.equal(result.calls, 1, "denial still resolves trust exactly once");
++	assert.deepEqual(plain(result.names), ["cli.ts", "global.ts"], "a denied project must not load project extensions");
++	assert.equal(pipeline.settings.isProjectTrusted(), false);
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), {});
++	assert.equal(pipeline.settings.getDefaultModel(), "global-model");
++	assert.deepEqual(
++		events(pipeline, "resolve"),
++		[
++			[false, "global-model"],
++			[false, "global-model"],
++		],
++		"both bootstrap and final resolution stay untrusted after denial",
++	);
++	assert.equal(pipeline.consentWrites.length, 0, "reusing a stored denial must not rewrite consent");
++	assertStorageUntouched(pipeline, before);
++}
++
++// ---------------------------------------------------------------------------
++// 3. Extension approval without `remember` is session-only.
++// ---------------------------------------------------------------------------
++{
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.extension = { trusted: "yes" };
++	const before = { global: pipeline.storageData.global, project: pipeline.storageData.project };
++
++	const result = await pipeline.reload();
++
++	assert.equal(result.calls, 1);
++	assert.deepEqual(plain(result.names), ["cli.ts", "global.ts", "project.ts"], "session-only approval must grant access now");
++	assert.equal(pipeline.settings.isProjectTrusted(), true);
++	assert.equal(pipeline.settings.getDefaultModel(), "project-model");
++	assert.deepEqual(pipeline.consentWrites, [], "an extension decision without remember must not persist consent");
++	assert.equal(events(pipeline, "extension-decision").length, 1);
++	assertStorageUntouched(pipeline, before);
++}
++
++// ---------------------------------------------------------------------------
++// 4. Extension denial with an explicit `remember: false` is also session-only.
++// ---------------------------------------------------------------------------
++{
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.extension = { trusted: "no", remember: false };
++	const before = { global: pipeline.storageData.global, project: pipeline.storageData.project };
++
++	const result = await pipeline.reload();
++
++	assert.equal(result.calls, 1);
++	assert.deepEqual(plain(result.names), ["cli.ts", "global.ts"], "session-only denial must block project extensions");
++	assert.equal(pipeline.settings.isProjectTrusted(), false);
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), {});
++	assert.deepEqual(pipeline.consentWrites, [], "remember: false must not persist consent");
++	assertStorageUntouched(pipeline, before);
++}
++
++// ---------------------------------------------------------------------------
++// 5. Explicit `remember: true` persists both approval and denial.
++// ---------------------------------------------------------------------------
++{
++	const pipeline = await createResourcePipeline(root);
++	pipeline.scenario.extension = { trusted: "yes", remember: true };
++
++	let result = await pipeline.reload();
++	assert.equal(result.calls, 1);
++	assert.deepEqual(pipeline.consentWrites, [[root, true]], "remember: true persists approval");
++	assert.deepEqual(plain(result.names), ["cli.ts", "global.ts", "project.ts"]);
++
++	pipeline.scenario.extension = { trusted: "no", remember: true };
++	result = await pipeline.reload();
++	assert.equal(result.calls, 1);
++	assert.deepEqual(
++		pipeline.consentWrites,
++		[
++			[root, true],
++			[root, false],
++		],
++		"remember: true persists denial too",
++	);
++	assert.deepEqual(plain(result.names), ["cli.ts", "global.ts"]);
++	assert.equal(pipeline.settings.isProjectTrusted(), false);
++}
++
++// ---------------------------------------------------------------------------
++// 6. SettingsManager trust changes reload/clear project settings immediately.
++// ---------------------------------------------------------------------------
++{
++	const pipeline = await createResourcePipeline(root);
++
++	assert.equal(pipeline.settings.isProjectTrusted(), true, "fixture starts trusted");
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), projectSettings);
++
++	pipeline.settings.setProjectTrusted(false);
++	assert.equal(pipeline.settings.isProjectTrusted(), false);
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), {}, "dropping trust clears project settings");
++	assert.equal(pipeline.settings.getDefaultModel(), "global-model", "global settings remain active untrusted");
++
++	pipeline.settings.setProjectTrusted(true);
++	assert.equal(pipeline.settings.isProjectTrusted(), true);
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), projectSettings, "regaining trust reloads project settings");
++	assert.equal(pipeline.settings.getDefaultModel(), "project-model");
++
++	pipeline.settings.setProjectTrusted(false);
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), {});
++	assert.deepEqual(plain(pipeline.settings.getGlobalSettings()), globalSettings, "trust changes never mutate global settings");
++}
++
++// ---------------------------------------------------------------------------
++// 7. Pre-trust bootstrap is available on its own and never weakens trust.
++// ---------------------------------------------------------------------------
++{
++	const pipeline = await createResourcePipeline(root);
++	const bootstrap = await pipeline.loader.loadProjectTrustExtensions();
++	assert.deepEqual(namesOf(bootstrap), ["cli.ts", "global.ts"], "bootstrap exposes only non-project extensions");
++	assert.equal(pipeline.settings.isProjectTrusted(), false, "bootstrap leaves the manager untrusted");
++	assert.deepEqual(plain(pipeline.settings.getProjectSettings()), {});
++}
++
++console.log("project-trust regression: all cross-module assertions passed");
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..6b55b03
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,80 @@
++# Repair: session-only trust approval must not become persisted consent
++
++## Faults found
++
++The incident crossed three production modules. Each defect alone breaks the trust
++lifecycle, and the combination made a session-only decision look permanent:
++
++1. `packages/coding-agent/src/core/settings-manager.ts` — `setProjectTrusted` returned
++   early when the requested trust differed from the current value
++   (`if (this.projectTrusted !== trusted) return;`). The guard was inverted, so the
++   trust flag never changed, project settings were never cleared on loss of trust, and
++   were never re-read on regrant of trust.
++
++2. `packages/coding-agent/src/core/resource-loader.ts` — `reload({ resolveProjectTrust })`
++   loaded the untrusted bootstrap extension set but then hard-coded
++   `const projectTrusted = false;`, never awaiting the injected resolver. The resolver
++   therefore ran zero times, the final load stayed untrusted, and project resources
++   could not appear after approval.
++
++3. `packages/coding-agent/src/core/project-trust.ts` — the extension decision branch
++   persisted with `if (result.remember !== undefined)`. An extension returning only
++   `{ trusted: "yes" }` (or `remember: false`) silently wrote consent to the trust
++   store, turning a session-only grant/denial into a permanent one.
++
++## Cross-module repair
++
++- `setProjectTrusted` now returns only when the requested trust equals the current
++  trust (`===`). On change it clears modified project bookkeeping; losing trust empties
++  project settings and re-merges global settings; gaining trust re-reads project
++  settings from storage and recomputes the merged view.
++- `reload` captures the optional resolver once (`const resolveProjectTrust =
++  options?.resolveProjectTrust`), keeps the pre-trust bootstrap (`loadProjectTrustExtensions`
++  forces `setProjectTrusted(false)` and reloads so only user/CLI extensions load), then
++  awaits `resolveProjectTrust({ extensionsResult: preTrustExtensions })` exactly once
++  and applies the returned boolean before the final `settingsManager.reload()` and
++  resource resolution. The bootstrap result is reused by `loadFinalExtensionSet`, so
++  already-loaded user/CLI extensions are not executed twice.
++- `resolveProjectTrusted` persists only when `result.remember === true`. Approvals and
++  denials both return their decision immediately; without an explicit `remember` the
++  grant is session-scoped and the trust store is untouched. The existing prompt path
++  keeps its own semantics (only options with non-empty `updates` persist), so
++  "Trust/Do not trust (this session only)" still writes nothing.
++
++No public API signatures changed: `ResourceLoaderReloadOptions`, `SettingsManager.setProjectTrusted`,
++and `resolveProjectTrusted` keep their shapes.
++
++## Validation
++
++`.prale-eval/regression.mjs` links the real submitted modules through
++`.prale-eval/subject.mjs` (only storage, extension event delivery, UI, package
++resolution and extension loading are faked) and asserts:
++
++- the bootstrap resource/extension resolution sees `isProjectTrusted() === false`,
++  global settings only, and user/CLI extensions only;
++- the resolver starts exactly once, after bootstrap completes (a promise gate holds it
++  open while bootstrap state is inspected), and is never invoked again for the final
++  load;
++- an approval reloads project settings/extensions and reuses the preloaded set;
++- a denial leaves the project untrusted and unloaded;
++- extension `{ trusted: "yes" }`, `{ trusted: "yes", remember: false }` and
++  `{ trusted: "no", remember: false }` grant/deny for the session with zero trust-store
++  writes, while `remember: true` persists `[cwd, true]` / `[cwd, false]`;
++- `SettingsManager.setProjectTrusted(false/true)` clears/reloads project settings
++  immediately without touching global settings or storage;
++- global and project settings storage payloads are byte-identical after every reload
++  (no global configuration mutation).
++
++Ordering is controlled only with promises (microtask draining and an explicit gate);
++no timers, randomness, network or external services are used. The script creates no
++on-disk fixtures, so there is nothing to clean up.
++
++Each original single-file baseline was restored temporarily during development:
++reverting `project-trust.ts` fails the consent assertion, reverting
++`resource-loader.ts` fails the "resolver runs exactly once" assertion, and reverting
++`settings-manager.ts` fails the untrusted-bootstrap assertion — all as uncaught
++`AssertionError`s, not crashes or timeouts.
++
++`vitest`/`node_modules` is not installed in this workspace, so the repository's
++TypeScript test suite could not be executed; the mandated Node 24 regression script is
++the validation evidence.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..a300290
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/resource-consistency/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Cross-module regression passes on the repaired tree and exits 0. It links the real project-trust.ts, resource-loader.ts and settings-manager.ts through .prale-eval/subject.mjs and asserts, across module boundaries: (1) reload with resolveProjectTrust bootstraps with an untrusted SettingsManager so only user/CLI extensions and global settings are visible; (2) the resolver runs exactly once, only after bootstrap completes (held open with a promise gate), and is not re-run for final loading; (3) an approval reloads project settings, resolves project extensions and reuses the preloaded user/CLI extension set; (4) a denial keeps the project untrusted and unloaded; (5) extension decisions with no remember or remember:false grant/deny for the session with zero trust-store writes, while remember:true persists [cwd,true] and [cwd,false]; (6) SettingsManager.setProjectTrusted(false/true) clears and re-reads project settings immediately; (7) global and project settings storage payloads stay byte-identical after every reload, so global configuration is never mutated. Asynchronous ordering uses only promises (microtask draining plus an explicit resolver gate); no timers, randomness, network or external services are used, and no temporary fixtures are written. Single-file baseline checks: reverting project-trust.ts alone fails the session-only consent assertion, reverting resource-loader.ts alone fails the resolver-runs-once assertion, and reverting settings-manager.ts alone fails the untrusted-bootstrap assertion; each is an uncaught node:assert/strict AssertionError with exit code 1, not a crash, import error or timeout. Limitation: vitest/node_modules is not installed in the workspace, so the repository's TypeScript test suite was not run; the mandated Node 24 regression script is the validation evidence."
++  }
++}
+snapshot .prale-eval/regression.mjs - 84b17c5b60e99dd9ac9c6cdf21fb77eb8732eaffcce5038879bd7ee51791378b
+snapshot .prale-eval/repair.md - b386f3aa75c14e0a1f859486f1a0ebfa957751486fbf88c66c3b791241d57b07
+snapshot .prale-eval/result.json - c8d904c1f5150ea10ea82d1a037c46566797b239790cdde64f2d2e27148a0016
+snapshot packages/coding-agent/src/core/project-trust.ts 593b457cc337b5f260622dce6d59ba7307a96889bf62f1a5b65c69dee0c64759 39d5874a2a001ae7ac797ea297e31bf061eff07f9b2883f3eeaf6d3e1f5637ba
+snapshot packages/coding-agent/src/core/resource-loader.ts 6a048348c4244f97563dcfad20d08c75b6d36c27b52116fbcc8509754cc46ed6 2822ccb3750c4f6be6302c281a69e84ad20682ce8db755225ec809cb7531dc81
+snapshot packages/coding-agent/src/core/settings-manager.ts 7cca715a5e527b193007705eb51cb9b8d02e0801728172834a73e2382f2e022f 5d1bdac20da52fdbac76d49fb9ce22d142c375e8efd5bf446bf6c047c5edac42

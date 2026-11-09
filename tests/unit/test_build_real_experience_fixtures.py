@@ -5,7 +5,7 @@ def test_real_pi_experience_fixtures_cover_learn_transfer_and_correction() -> No
     rendered = render()
 
     assert len(FIXTURES) == 12
-    assert len(rendered) == 36
+    assert len(rendered) == 60
     assert {fixture.episode for fixture in FIXTURES} == {
         "extension-trust",
         "session-migration",

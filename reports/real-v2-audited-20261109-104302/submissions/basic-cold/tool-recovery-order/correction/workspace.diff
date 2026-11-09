@@ -1,0 +1,162 @@
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 9dc1a3c..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,7 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (false && !cancelled && call.replay === "safe" && tool?.replay === "safe") {
++	if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..8eb3c16
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,101 @@
++/**
++ * Regression for tool-recovery-order/correction.
++ *
++ * Exercises the real `recoverToolInvocation` in
++ * packages/agent/src/harness/runtime/drive/tools.ts through the boundary fakes
++ * provided by ./subject.mjs (checkpoint IO, tool execution, outcome publication).
++ *
++ * Contract under test:
++ *  - a call whose persisted policy is "safe" AND whose tool declares replay
++ *    "safe" is replayed exactly once when the run is not cancelled;
++ *  - the stale checkpoint is cleared BEFORE the tool is invoked;
++ *  - the invocation outcome is published only AFTER the invocation completes;
++ *  - unsafe ("never"), missing (no tool) and undeclared tools are interrupted
++ *    from the durable checkpoint instead of replayed, and a cancelled run never
++ *    replays even a safe/safe call.
++ */
++import assert from "node:assert/strict";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++
++import { createRecoverySubject } from "./subject.mjs";
++
++const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
++const recover = await createRecoverySubject(root);
++
++const INTERRUPTION_MARKER = "external outcome is unknown";
++const checkpoint = {
++	content: [{ type: "text", text: "durable-progress" }],
++	details: { step: 2 },
++};
++
++function textOf(message) {
++	return (message.content ?? [])
++		.filter((part) => part.type === "text")
++		.map((part) => part.text)
++		.join("");
++}
++
++function assertInterrupted(label, { events, outcome }) {
++	assert.ok(outcome, `${label}: an outcome must be published`);
++	assert.equal(outcome.message.isError, true, `${label}: interrupted outcome must be an error result`);
++	assert.match(textOf(outcome.message), new RegExp(INTERRUPTION_MARKER), `${label}: must explain the unknown effect`);
++	assert.match(textOf(outcome.message), /durable-progress/, `${label}: must keep the durable checkpoint content`);
++	assert.deepEqual(outcome.message.details, checkpoint.details, `${label}: must keep the checkpoint details`);
++	assert.equal(events.includes("invoke"), false, `${label}: must not re-run the tool`);
++	assert.equal(events.includes("clear"), false, `${label}: must not clear the checkpoint`);
++	assert.deepEqual(events, ["read", "publish"], `${label}: must read the checkpoint then publish the outcome`);
++}
++
++// --- 1. Safe call policy + safe tool declaration, not cancelled: replay once.
++{
++	const result = await recover("safe", "safe", false, { checkpoint });
++	const { events, outcome } = result;
++
++	assert.ok(outcome, "safe replay: an outcome must be published");
++	assert.equal(events.includes("clear"), true, "safe replay: old checkpoint must be cleared");
++	assert.equal(events.includes("invoke"), true, "safe replay: tool must be re-invoked");
++	assert.equal(events.includes("read"), false, "safe replay: the cleared checkpoint must not be read");
++
++	const cleared = events.indexOf("clear");
++	const invoked = events.indexOf("invoke");
++	const completed = events.indexOf("effect-complete");
++	const published = events.indexOf("publish");
++	assert.notEqual(cleared, -1, "safe replay: checkpoint clear missing");
++	assert.notEqual(invoked, -1, "safe replay: invocation missing");
++	assert.notEqual(completed, -1, "safe replay: invocation did not complete");
++	assert.notEqual(published, -1, "safe replay: outcome publication missing");
++	assert.ok(cleared < invoked, "safe replay: checkpoint must be cleared before invocation");
++	assert.ok(completed < published, "safe replay: outcome must be published after invocation completes");
++	assert.deepEqual(
++		events,
++		["clear", "invoke", "effect-complete", "publish"],
++		"safe replay: cleared exactly once, invoked exactly once, then published",
++	);
++
++	assert.equal(outcome.message.isError, false, "safe replay: published outcome must be the tool result, not an interruption");
++	assert.equal(textOf(outcome.message), "effect-result", "safe replay: published the invocation result");
++	assert.doesNotMatch(textOf(outcome.message), new RegExp(INTERRUPTION_MARKER), "safe replay: no interruption marker");
++	assert.deepEqual(outcome.args, { persisted: 42 }, "safe replay: replayed the persisted arguments");
++	assert.equal(outcome.recovery, true, "safe replay: the invocation is recovery-tagged");
++}
++
++// --- 2. Unsafe persisted call policy: never replay.
++assertInterrupted("unsafe call policy", await recover("never", "safe", false, { checkpoint }));
++
++// --- 3. Tool declared "never" while the call policy is safe: never replay.
++assertInterrupted("unsafe tool declaration", await recover("safe", "never", false, { checkpoint }));
++
++// --- 4. Persisted call policy safe, but the tool is absent: never replay.
++assertInterrupted("missing tool", await recover("safe", undefined, false, { checkpoint }));
++
++// --- 5. Tool present without a replay declaration (defaults to never): never replay.
++assertInterrupted("undeclared tool policy", await recover("safe", null, false, { checkpoint }));
++
++// --- 6. Cancelled run: even a safe/safe call is interrupted, not replayed.
++assertInterrupted("cancelled run", await recover("safe", "safe", true, { checkpoint }));
++
++// --- 7. Cancelled run with an unsafe call: still interrupted (restriction retained).
++assertInterrupted("cancelled unsafe run", await recover("never", "safe", true, { checkpoint }));
++
++console.log("regression: safe replay ordering and conditional restrictions hold");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..5c64e81
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,33 @@
++{
++	"task_id": "tool-recovery-order/correction",
++	"repository": "earendil-works/pi",
++	"mode": "repair",
++	"claims": [
++		{
++			"claim": "A restored effect_pending call whose persisted call policy is \"safe\" and whose tool declares replay \"safe\" is replayed when the run is not cancelled; the blanket never-replay guard is removed.",
++			"evidence": "packages/agent/src/harness/runtime/drive/tools.ts:527"
++		},
++		{
++			"claim": "The stale progress checkpoint is cleared (deleted and its persisted args materialized) before the tool is re-invoked, so the replay never reads the old checkpoint.",
++			"evidence": "packages/agent/src/harness/runtime/drive/tools.ts:528"
++		},
++		{
++			"claim": "The replayed invocation's resulting outcome is published only after the invocation completes, via the completion continuation.",
++			"evidence": "packages/agent/src/harness/runtime/drive/tools.ts:531-532"
++		},
++		{
++			"claim": "Unsafe (\"never\") call policies, missing tools, tools without a replay declaration, and cancelled runs keep the conditional restriction: the checkpoint is read and an interrupted outcome with the interruption marker is published instead of replaying.",
++			"evidence": "packages/agent/src/harness/runtime/drive/tools.ts:536-539"
++		}
++	],
++	"deliverables": [
++		"packages/agent/src/harness/runtime/drive/tools.ts",
++		".prale-eval/regression.mjs",
++		".prale-eval/result.json"
++	],
++	"validation": {
++		"command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++		"status": "passed",
++		"notes": "Ran from the workspace root with Node v24.14.0 and exited 0. The regression loads the real recoverToolInvocation from packages/agent/src/harness/runtime/drive/tools.ts through .prale-eval/subject.mjs (checkpoint clear/read, tool invocation and outcome publication are the only fakes) and asserts, not prints, the contract: (1) a safe/safe call that is not cancelled produces exactly ['clear','invoke','effect-complete','publish'], with the clear strictly before the invocation and the publication strictly after the invocation completes, the published outcome being the tool result (isError false, text 'effect-result', recovery-tagged) carrying the persisted args and no interruption marker, and the old checkpoint never read; (2) an unsafe call policy, a tool declaring 'never', an absent tool, a tool with no replay declaration, a cancelled safe/safe run and a cancelled unsafe run all keep the conditional restriction, each producing ['read','publish'] with an isError interruption result that retains the durable checkpoint content/details and contains the 'external outcome is unknown' marker, without clearing or invoking. Fault sensitivity was verified by temporarily restoring the original `if (false && ...)` guard: the same command then exited 1 with 'AssertionError [ERR_ASSERTION]: safe replay: old checkpoint must be cleared' at .prale-eval/regression.mjs:56; the fixed source was restored and re-run to green. Limitation: the repository's vitest suites (packages/agent/test/harness/runtime/drive-tools.test.ts) could not be executed because no node_modules are installed and dependencies must not be installed or fetched, so only the dependency-free Node 24 regression above was used as focused validation."
++	}
++}
+snapshot .prale-eval/regression.mjs - e8f3192c444275744323185e1588f0c6a2124a453a04e11987527b305e16589e
+snapshot .prale-eval/result.json - 9f0580ae8fdb7f47c0230ee231aa3bb1f9a7c06916f551d8a14eb5e31cb299f1
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 3dd561b18237e638e156bac54d3c51127e16f5f70dff71455f7da59317d10490 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

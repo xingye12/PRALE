@@ -1,0 +1,172 @@
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 9dc1a3c..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,7 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (false && !cancelled && call.replay === "safe" && tool?.replay === "safe") {
++	if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..3136637
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,112 @@
++/**
++ * Regression: a recovered tool call whose stored call policy and live tool
++ * declaration are both "safe" must replay exactly once when the operation was
++ * not cancelled. The old checkpoint must be cleared before the invocation and
++ * the resulting outcome published only after the invocation completes.
++ * Unsafe, missing, and cancelled declarations must still only produce the
++ * interrupted outcome without touching the tool.
++ *
++ * Standalone: `node --experimental-vm-modules .prale-eval/regression.mjs`
++ */
++import assert from "node:assert/strict";
++import * as path from "node:path";
++import { createRecoverySubject } from "./subject.mjs";
++
++const root = path.resolve(import.meta.dirname, "..");
++const recover = await createRecoverySubject(root);
++
++const INTERRUPTION_MARKER =
++	"[Tool execution was interrupted. The preceding output is the latest durable progress snapshot; newer live output may be missing, and the external outcome is unknown.]";
++
++// Message/content objects are created inside the loaded VM context, so normalize
++// them before strict deep comparison (structure matters, realm-local prototypes do not).
++const plain = (value) => JSON.parse(JSON.stringify(value));
++
++const REPLAY_EVENTS = ["clear", "invoke", "effect-complete", "publish"];
++const INTERRUPTED_EVENTS = ["read", "publish"];
++
++function assertReplayed(result, label) {
++	const { events, outcome } = result;
++	assert.deepEqual(events, REPLAY_EVENTS, `${label}: expected clear -> invoke -> publish exactly once, got ${events}`);
++	assert.ok(outcome, `${label}: expected a published outcome`);
++	assert.equal(outcome.message.isError, false, `${label}: replayed tool result must not be a synthetic error`);
++	assert.deepEqual(
++		plain(outcome.message.content),
++		[{ type: "text", text: "effect-result" }],
++		`${label}: expected the real invocation result to be published`,
++	);
++	assert.equal(
++		outcome.message.content.some(
++			(part) => typeof part.text === "string" && part.text.includes(INTERRUPTION_MARKER),
++		),
++		false,
++		`${label}: replayed outcome must not carry the interruption marker`,
++	);
++	// The cleared call (arguments restored by clearing the checkpoint) is what got invoked.
++	assert.deepEqual(outcome.args, { persisted: 42 }, `${label}: invocation must receive the cleared checkpoint args`);
++	assert.equal(outcome.recovery, true, `${label}: replay must remain a recovery invocation`);
++}
++
++function assertInterrupted(result, label) {
++	const { events, outcome } = result;
++	assert.deepEqual(
++		events,
++		INTERRUPTED_EVENTS,
++		`${label}: must not clear the checkpoint or re-invoke the tool, got ${events}`,
++	);
++	assert.ok(outcome, `${label}: expected a published outcome`);
++	assert.equal(outcome.message.isError, true, `${label}: interrupted outcome must be a synthetic error result`);
++	assert.deepEqual(
++		plain(outcome.message.content),
++		[{ type: "text", text: "durable-progress" }, { type: "text", text: INTERRUPTION_MARKER }],
++		`${label}: expected the durable checkpoint plus the interruption marker`,
++	);
++	assert.deepEqual(
++		plain(outcome.message.details),
++		{ step: 2 },
++		`${label}: checkpoint details must be preserved`,
++	);
++}
++
++// The fault of this stage: a blanket "never replay" rule suppressed every replay.
++assertReplayed(await recover("safe", "safe", false), "safe/safe replay");
++
++// Replay must happen only once, and clearing must precede the invocation while
++// publishing must wait for it to finish (checked with a real async effect).
++{
++	const order = [];
++	const result = await recover("safe", "safe", false, {
++		effect: async () => {
++			order.push("effect");
++			await new Promise((resolve) => setTimeout(resolve, 5));
++		},
++	});
++	assertReplayed(result, "safe/safe replay with async effect");
++	assert.deepEqual(order, ["effect"], "safe/safe replay: tool effect must run exactly once");
++	assert.equal(result.events.at(-1), "publish", "safe/safe replay: publish must be the last step");
++	assert.equal(
++		result.events.indexOf("clear") < result.events.indexOf("invoke"),
++		true,
++		"safe/safe replay: the old checkpoint must be cleared before invocation",
++	);
++}
++
++// Cancelled operations keep the conditional restriction even for safe/safe.
++assertInterrupted(await recover("safe", "safe", true), "cancelled safe/safe");
++assertInterrupted(await recover("safe", "safe", true, {
++	effect: async () => {
++		throw new Error("cancelled replay must never execute the tool");
++	},
++}), "cancelled safe/safe with guarded effect");
++
++// Unsafe declarations keep the conditional restriction.
++assertInterrupted(await recover("safe", "unsafe", false), "safe call, unsafe tool");
++assertInterrupted(await recover("never", "safe", false), "unsafe call, safe tool");
++assertInterrupted(await recover("never", "unsafe", false), "unsafe/unsafe");
++
++// Missing declarations keep the conditional restriction.
++assertInterrupted(await recover("safe", undefined, false), "safe call, absent tool");
++assertInterrupted(await recover(undefined, "safe", false), "missing call policy, safe tool");
++assertInterrupted(await recover("safe", null, false), "safe call, tool without replay declaration");
++
++console.log("regression: safe/safe replay and conditional restrictions verified");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..2bc9d97
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,32 @@
++{
++  "task_id": "tool-recovery-order/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "The blanket never-replay rule was the disabled guarantee `if (false && !cancelled && call.replay === \"safe\" && tool?.replay === \"safe\")` in recoverToolInvocation; it has been repaired by removing the constant `false` and keeping the existing conditional restrictions.",
++      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:527"
++    },
++    {
++      "claim": "A verified safe/safe, non-cancelled recovery clears the old checkpoint (which deletes the pending tool output and restores persisted arguments) before invocation.",
++      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:528-529 (clearReplayCheckpoint at 295-329)"
++    },
++    {
++      "claim": "The replayed invocation's outcome is published only after the invocation completes.",
++      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:530-534"
++    },
++    {
++      "claim": "Unsafe, missing, and cancelled declarations still short-circuit to the interrupted outcome built from the durable checkpoint, without clearing or re-invoking.",
++      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:536-539"
++    },
++    {
++      "claim": "Regression coverage asserts safe/safe replay ordering and the retained conditional restrictions against the real module.",
++      "evidence": ".prale-eval/regression.mjs"
++    }
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root with Node v24.14.0: exits 0 ('regression: safe/safe replay and conditional restrictions verified'). The script loads the real packages/agent/src/harness/runtime/drive/tools.ts through .prale-eval/subject.mjs and asserts on the observed boundary events/outcome: (1) safe call policy + safe tool declaration, not cancelled -> exactly ['clear','invoke','effect-complete','publish'], i.e. the old checkpoint is cleared before invocation, the effect runs exactly once, and the real (isError:false) outcome is published last, with the cleared persisted args threaded into the invocation; (2) the same with an async effect resolves the effect before 'publish'; (3) cancelled safe/safe, safe-call/unsafe-tool, unsafe-call/safe-tool, unsafe/unsafe, absent tool, missing call policy, and a tool without a replay declaration all produce exactly ['read','publish'] with the synthetic interrupted outcome (checkpoint content preserved plus the interruption marker, details kept) and never invoke the tool. Failure detection was confirmed by temporarily restoring the original fault (`if (false && ...)`), where the script failed with an AssertionError at the safe/safe replay step (actual events ['read','publish'] vs expected ['clear','invoke','effect-complete','publish']); the fix was then restored and the script re-run green. Limitation: the repository's vitest suites (e.g. packages/agent/test/harness/runtime/drive-tools.test.ts, whose 'safe-replays persisted arguments and memos while interrupting unsafe effects' case encodes this behavior) could not be executed because node_modules is not installed and installing dependencies was out of scope; no dependency or network is needed for the regression above."
++  }
++}
+snapshot .prale-eval/regression.mjs - c586b6c5ffb29584b25bf782c5dfe37594b8955ef99f403b4c837a6556a905ec
+snapshot .prale-eval/result.json - 8661253544e58f594b41e8f10df7cb19cd2d2d51c2f007c9dc7beafd5b876fd9
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 3dd561b18237e638e156bac54d3c51127e16f5f70dff71455f7da59317d10490 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

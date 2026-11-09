@@ -1,0 +1,374 @@
+diff --git a/packages/agent/src/harness/execution/effect-gate.ts b/packages/agent/src/harness/execution/effect-gate.ts
+index bbb53aa..026ff5e 100644
+--- a/packages/agent/src/harness/execution/effect-gate.ts
++++ b/packages/agent/src/harness/execution/effect-gate.ts
+@@ -40,7 +40,9 @@ export function createGate(): { gate: Gate; control: GateControl } {
+ 	return {
+ 		gate: {
+ 			admit<T>(invoke: () => T): T {
+-				// Regression: admission skips gate state.
++				// Admission is the single authorization point for every effect: a gate that is
++				// aborting or closed refuses the effect before it can start.
++				check();
+ 				return invoke();
+ 			},
+ 			signal: controller.signal,
+diff --git a/packages/agent/src/harness/execution/tools.ts b/packages/agent/src/harness/execution/tools.ts
+index 3252484..f768781 100644
+--- a/packages/agent/src/harness/execution/tools.ts
++++ b/packages/agent/src/harness/execution/tools.ts
+@@ -137,7 +137,7 @@ export function executeToolCall<TContext extends object | undefined>(
+ 		try {
+ 			const result = await call.tool.execute(
+ 				call.toolCall.id,
+-				call.toolCall.arguments,
++				call.args,
+ 				(partial, options) => {
+ 					if (acceptingUpdates) onUpdate(partial, options);
+ 				},
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 8e41e3a..51850b2 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,10 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (!cancelled && (call.replay === "safe" || tool?.replay === "safe")) {
++	// Replay is authorized only when cancellation has not won and both the durable declaration and
++	// the currently registered tool declaration are explicitly safe. A tool that is no longer
++	// registered can never be authorized, so it stays interrupted.
++	if (!cancelled && tool !== undefined && call.replay === "safe" && tool.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..81dd405
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,234 @@
++/**
++ * Cross-module regression for recovery authorization -> effect admission.
++ *
++ * The real production modules are loaded through the read-only `subject.mjs` helper:
++ *   packages/agent/src/harness/runtime/drive/tools.ts   (recovery procedure)
++ *   packages/agent/src/harness/execution/tools.ts       (effect executor)
++ *   packages/agent/src/harness/execution/effect-gate.ts (admission capability)
++ * Only the durable checkpoint storage, the progress transport and the outcome
++ * publisher are boundary fakes, so every assertion below observes behaviour that
++ * crosses real module boundaries.
++ *
++ * Ordered with promises only: no timers, randomness or external services.
++ */
++import assert from "node:assert/strict";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createExecutionPipeline } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const INTERRUPTION_MARKER = "external outcome is unknown";
++const PERSISTED = "persisted-arguments";
++const MODEL = "raw-model-arguments";
++
++const pipeline = await createExecutionPipeline(root);
++
++function text(message) {
++	return (message?.content ?? [])
++		.filter((part) => part.type === "text")
++		.map((part) => part.text)
++		.join("\n");
++}
++
++function indexOf(events, name) {
++	const index = events.indexOf(name);
++	assert.notEqual(index, -1, `expected ${name} in observable events, saw: ${events.join(", ")}`);
++	return index;
++}
++
++/** Run one recovery pass, converting any unexpected throw into an assertion failure. */
++async function recover(options, label) {
++	try {
++		return await pipeline.run(options);
++	} catch (error) {
++		assert.fail(`recovery must not throw for ${label}: ${error?.stack ?? String(error)}`);
++	}
++}
++
++/** The recovered operation must stay interrupted: no checkpoint clear, no effect, evidence kept. */
++function assertInterrupted(result, label) {
++	assert.equal(result.events.includes("invoke"), false, `${label}: tool effect must not be admitted`);
++	assert.equal(result.events.includes("clear"), false, `${label}: replay checkpoint must not be cleared`);
++	assert.ok(result.events.includes("read"), `${label}: the durable checkpoint must be read`);
++	assert.ok(result.events.includes("publish"), `${label}: an interrupted outcome must be published`);
++	assert.equal(result.outcome.message.isError, true, `${label}: interrupted outcome must be an error result`);
++	assert.match(text(result.outcome.message), /checkpoint-evidence/, `${label}: durable progress must be kept`);
++	assert.match(text(result.outcome.message), new RegExp(INTERRUPTION_MARKER), `${label}: interruption must be explicit`);
++	assert.doesNotMatch(text(result.outcome.message), new RegExp(MODEL), `${label}: stale model arguments must never surface`);
++}
++
++// 1. Both declarations safe: replay the cleared/persisted arguments and publish after the drain.
++{
++	const seen = {};
++	const result = await recover(
++		{
++			persisted: "safe",
++			declared: "safe",
++			effect: async ({ args, update, invocation, context }) => {
++				seen.args = args;
++				seen.invocation = invocation;
++				seen.context = context;
++				update({ content: [{ type: "text", text: "partial-progress" }], details: { step: 1 } }, { checkpoint: true });
++				return {
++					content: [{ type: "text", text: `replayed:${args.message}` }],
++					details: { replayed: true },
++					usage: { output: 2 },
++				};
++			},
++		},
++		"safe replay",
++	);
++
++	assert.equal(seen.args.message, PERSISTED, "the executor must invoke the tool with the persisted arguments");
++	assert.notEqual(seen.args.message, MODEL, "the executor must not replay the original model arguments");
++	assert.equal(seen.invocation.operationId, "op-1", "invocation must carry the durable operation identity");
++	assert.equal(seen.invocation.invocationId, "result-2", "invocation must carry the durable invocation identity");
++	assert.equal(seen.context.abortSignal, result.gate.signal, "the effect must run under the gate's abort signal");
++
++	const events = result.events;
++	assert.ok(indexOf(events, "clear") < indexOf(events, "invoke"), "the stale checkpoint must be cleared before invocation");
++	assert.ok(indexOf(events, "invoke") < indexOf(events, "effect-complete"), "the effect must complete after invocation");
++	assert.ok(indexOf(events, "effect-complete") < indexOf(events, "drain-complete"), "progress must drain after the effect");
++	assert.ok(
++		indexOf(events, "drain-complete") < indexOf(events, "publish"),
++		"the outcome must be published only after the durable progress drain finishes",
++	);
++	assert.equal(events.at(-1), "publish", "publication must be the last recovery step");
++
++	assert.equal(result.outcome.message.isError, false, "a replayed effect publishes its real result");
++	assert.match(text(result.outcome.message), /replayed:persisted-arguments/);
++	assert.deepEqual(result.outcome.message.details, { replayed: true });
++	assert.deepEqual(
++		result.checkpoints,
++		[{ content: [{ type: "text", text: "partial-progress" }], details: { step: 1 } }],
++		"checkpointed progress must be written to the durable progress transport",
++	);
++	const updateEvent = result.updates.find((event) => event.type === "tool_update");
++	assert.ok(updateEvent, "live tool updates must be emitted");
++	assert.equal(updateEvent.recovery, true, "recovered updates must be marked as recovery");
++	assert.equal(updateEvent.partialResult.content[0].text, "partial-progress");
++}
++
++// 2. Publication is withheld while the durable progress drain is still pending.
++{
++	let releaseDrain;
++	const drainGate = new Promise((resolve) => {
++		releaseDrain = resolve;
++	});
++	let enteredDrain;
++	const drainEntered = new Promise((resolve) => {
++		enteredDrain = resolve;
++	});
++	const observed = { published: false, outcome: undefined, result: undefined, thrown: undefined };
++	const pending = pipeline
++		.run({
++			persisted: "safe",
++			declared: "safe",
++			progressDrain: () => {
++				enteredDrain();
++				return drainGate;
++			},
++			onPublish: (value) => {
++				observed.published = true;
++				observed.outcome = value;
++			},
++		})
++		.then(
++			(value) => {
++				observed.result = value;
++			},
++			(error) => {
++				observed.thrown = error;
++			},
++		);
++
++	await drainEntered;
++	await Promise.resolve();
++	await Promise.resolve();
++	assert.equal(observed.thrown, undefined, "the drained recovery must not fail");
++	assert.equal(observed.published, false, "the outcome must not be published before the progress drain finishes");
++	assert.equal(observed.outcome, undefined, "no outcome may leak while the drain is pending");
++
++	releaseDrain();
++	await pending;
++	assert.equal(observed.thrown, undefined, "the drained recovery must not fail");
++	assert.equal(observed.published, true, "the outcome is published once the drain finishes");
++	assert.ok(
++		indexOf(observed.result.events, "drain-complete") < indexOf(observed.result.events, "publish"),
++		"publication strictly follows the completed drain",
++	);
++}
++
++// 3. Cancellation wins admission: the interrupted checkpoint is published, never executed.
++{
++	const result = await recover({ persisted: "safe", declared: "safe", cancelled: true }, "cancelled recovery");
++	assertInterrupted(result, "cancelled recovery");
++}
++
++// 4. Only the durable declaration is safe: the current tool declaration forbids replay.
++{
++	const result = await recover({ persisted: "safe", declared: "never" }, "tool declared replay never");
++	assertInterrupted(result, "tool declared replay never");
++}
++
++// 5. Only the current tool declaration is safe: the durable intent forbids replay.
++{
++	const result = await recover({ persisted: "never", declared: "safe" }, "durable intent replay never");
++	assertInterrupted(result, "durable intent replay never");
++}
++
++// 6. Neither declaration is safe.
++{
++	const result = await recover({ persisted: "never", declared: "never" }, "both declarations never");
++	assertInterrupted(result, "both declarations never");
++}
++
++// 7. The tool is no longer registered: it stays interrupted instead of executing.
++{
++	const result = await recover({ persisted: "safe", declared: undefined }, "missing tool");
++	assertInterrupted(result, "missing tool");
++}
++
++// 8. Cancellation gate already aborting: admission must refuse before the effect starts.
++{
++	const result = await recover({ persisted: "safe", declared: "safe", gateState: "aborting" }, "aborting gate");
++	assert.equal(result.events.includes("invoke"), false, "an aborting gate must refuse effect admission");
++	assert.equal(result.gate.signal.aborted, false, "cancellation must not signal before it commits");
++	assert.equal(result.outcome.message.isError, true);
++	assert.match(text(result.outcome.message), new RegExp(INTERRUPTION_MARKER));
++}
++
++// 9. Closed gate: admission refuses and the close fault propagates without any effect.
++{
++	const closedError = new Error("closed gate");
++	let effects = 0;
++	await assert.rejects(
++		async () =>
++			pipeline.run({
++				persisted: "safe",
++				declared: "safe",
++				gateState: "closed",
++				gateError: closedError,
++				effect: async () => {
++					effects += 1;
++					return { content: [{ type: "text", text: "must not run" }], details: {} };
++				},
++			}),
++		(error) => {
++			assert.equal(error, closedError, "the closed gate fault must propagate unchanged");
++			return true;
++		},
++		"a closed gate must refuse admission",
++	);
++	assert.equal(effects, 0, "a closed gate must prevent the recovered effect from starting");
++}
++
++// 10. Default effect path also proves the persisted arguments reach the tool.
++{
++	const result = await recover({}, "default effect");
++	assert.equal(result.outcome.message.isError, false);
++	assert.match(text(result.outcome.message), new RegExp(`^${PERSISTED}$`), "default effect must see persisted arguments");
++	assert.doesNotMatch(text(result.outcome.message), new RegExp(MODEL));
++}
++
++console.log("recovery authorization regression: all assertions passed");
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..d2e5ed7
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,54 @@
++# Recovery authorization must survive effect admission
++
++## Failure chain
++
++Recovery of an interrupted tool call runs through three production modules. The
++faulty baseline broke the authorization chain at every hop, so an interrupted
++operation whose durable intent was *not* replayable was executed anyway, and it
++was executed with the stale arguments of the original model response instead of
++the arguments that were persisted with the durable intent.
++
++| Hop | Module | Fault | Repair |
++| --- | --- | --- | --- |
++| Authorization | `packages/agent/src/harness/runtime/drive/tools.ts` (`recoverToolInvocation`) | Replay was admitted when *either* the durable `call.replay` declaration or the currently registered `tool.replay` declaration was `"safe"` (`a \|\| b`), and a tool that was no longer registered made `tool?.replay` `undefined`, so any `call.replay === "safe"` intent still crossed the effect boundary. | Both declarations must be `"safe"`, and the tool must still be registered (`!cancelled && tool !== undefined && call.replay === "safe" && tool.replay === "safe"`). Everything else stays interrupted: the durable checkpoint is read and an interruption outcome is published, and the old checkpoint is never cleared. |
++| Admission | `packages/agent/src/harness/execution/effect-gate.ts` (`createGate(...).gate.admit`) | `admit` invoked the procedure without consulting the gate state, so an aborting or closed gate still admitted the external effect. | `admit` performs the existing `check()` first: an aborting gate throws `AbortRequested` (carrying the cancellation promise) and a closed gate throws its stored fault before any effect can start. `Gate`/`GateControl` APIs are unchanged; the abort signal is still only signalled after cancellation commits. |
++| Effect | `packages/agent/src/harness/execution/tools.ts` (`executeToolCall`) | The executor passed `call.toolCall.arguments` — the raw model arguments — to `tool.execute`, discarding `call.args`, which for a recovered call are the cleared/persisted arguments. | The executor now passes `call.args` (the cleared, validated arguments) while still using `call.toolCall.id` for identity, so prepared/hook-replaced/recovered arguments are the ones that reach the tool. |
++
++## Ordering that is now guaranteed
++
++`recoverToolInvocation` clears the previous checkpoint (`clearReplayCheckpoint`
++deletes the pending tool-output snapshot and reads the persisted arguments)
++*before* `performToolInvocation` is entered. `performToolInvocation` seals and
++awaits the durable progress channel (`progress.drain()`) before the after-tool
++hook runs and before the outcome is published; `publishToolOutcome` is chained
++after the invocation promise resolves. So the observable recovery sequence is:
++
++```
++clear -> invoke -> (updates/checkpoints) -> effect-complete -> seal -> drain -> drain-complete -> publish
++```
++
++A cancelled recovery, an unsafe declaration on either side, a missing tool, or
++an aborting gate produces `read -> publish` with an interrupted (error) outcome
++that preserves the durable progress snapshot and the explicit interruption
++marker, and with no `clear` and no `invoke`.
++
++## Validation
++
++`.prale-eval/regression.mjs` loads the real modules through the read-only
++`.prale-eval/subject.mjs` helper and asserts cross-module behaviour only (checkpoint
++storage, progress transport and the outcome publisher are boundary fakes).
++
++```
++node --experimental-vm-modules .prale-eval/regression.mjs
++```
++
++Each faulty baseline was restored in isolation and the script failed with an
++uncaught `node:assert/strict` assertion (never a crash, import error or timeout):
++
++* `effect-gate.ts` restored -> `an aborting gate must refuse effect admission`.
++* `execution/tools.ts` restored -> `the executor must invoke the tool with the persisted arguments`
++  (`raw-model-arguments` vs `persisted-arguments`).
++* `runtime/drive/tools.ts` restored -> `tool declared replay never: tool effect must not be admitted`.
++
++No temporary inputs are needed by the script, so there is nothing left behind in
++`.prale-eval/`.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..4275f83
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,18 @@
++{
++  "task_id": "advanced/execution-lifecycle/learn",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired the authorization-to-effect chain across three real modules and verified it with .prale-eval/regression.mjs (loaded through the read-only .prale-eval/subject.mjs helper, which links the submitted TypeScript modules; only the checkpoint store, the progress transport and the outcome publisher are boundary fakes). Fixes: (1) packages/agent/src/harness/runtime/drive/tools.ts recoverToolInvocation now requires !cancelled && tool !== undefined && call.replay === \"safe\" && tool.replay === \"safe\", so both replay declarations must be safe and a missing tool stays interrupted instead of executing; (2) packages/agent/src/harness/execution/effect-gate.ts createGate().gate.admit now calls the existing check() before invoking, so an aborting gate throws AbortRequested with its cancellation promise and a closed gate throws its fault before any effect starts; (3) packages/agent/src/harness/execution/tools.ts executeToolCall now passes call.args (the cleared/validated/persisted arguments) to tool.execute instead of call.toolCall.arguments. Observed cross-module behaviour asserted: clear-before-invoke, effect-complete -> seal -> drain -> drain-complete -> publish ordering, no publish while a deferred durable progress drain is still pending, persisted arguments reaching the tool (default and custom effect), cancelled recovery publishing the interruption marker with the kept checkpoint and no clear/invoke, unsafe declarations on either side and missing tools staying interrupted, aborting gate refusing admission without invoking, and a closed gate propagating its fault with zero effects. Mutation check: restoring each faulty baseline alone (effect-gate.ts, execution/tools.ts, runtime/drive/tools.ts) made the script fail with an uncaught node:assert/strict AssertionError, not a crash, import error or timeout. No temporary inputs are created, so nothing to clean up; vitest/typescript are not installed in this workspace, so the repo's own vitest suites and tsc type-check could not be run as extra evidence."
++  },
++  "deliverables": [
++    "packages/agent/src/harness/runtime/drive/tools.ts",
++    "packages/agent/src/harness/execution/effect-gate.ts",
++    "packages/agent/src/harness/execution/tools.ts",
++    ".prale-eval/regression.mjs",
++    ".prale-eval/repair.md",
++    ".prale-eval/result.json"
++  ]
++}
+snapshot .prale-eval/regression.mjs - 539aec7a8822d4fcda61c371da516aff177dfef280a1fe80a59ca9673d5ea236
+snapshot .prale-eval/repair.md - ff96f6b260cbf38b63d249cf4e953e0ed7d339f11cfa8dc9d7e2ceaf8e74d9ca
+snapshot .prale-eval/result.json - c27944574cab525dcf4daa479ce8ea39ec507fe5daad2632b3b099c67504c21a
+snapshot packages/agent/src/harness/execution/effect-gate.ts 33a109c11b13b695ddf2486b80b2ab734bf9a0134cd3261d077e5f0f0469a796 272dadf774b65de2718ba5abeaa30053e798f982e3c0dff184776413a9dbd44d
+snapshot packages/agent/src/harness/execution/tools.ts 2be6e34d5373bc7de979f7d2295a530108c8a97c4a81810e0fb1d08df1871a4f 446b8624b365162a8878efeadcdc97ac053dc953f25155743d6a0646cf8868d5
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 9124e863ac773f90ef99595adfa658c59a75ac9020ce677d2c3fb0e9da7e4c0b c4a8296a1a91d498cf87e4e5d21f95baabbb6b469f9227991f8d2bc9785fd96d

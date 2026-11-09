@@ -1,0 +1,223 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 611ec15..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -435,7 +435,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 	async loadProjectTrustExtensions(): Promise<LoadExtensionsResult> {
+ 		// Force untrusted project settings for the bootstrap pass. This keeps project-local
+ 		// extensions/packages out while still loading user/global and temporary CLI extensions.
+-		this.settingsManager.setProjectTrusted(true);
++		this.settingsManager.setProjectTrusted(false);
+ 		await this.settingsManager.reload();
+ 		return this.loadCurrentExtensionSet({ includeInlineFactories: true });
+ 	}
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..9cced59
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,158 @@
++/**
++ * Regression for extension-trust/learn: project extensions must not leak into the
++ * project-trust bootstrap pass.
++ *
++ * The trust bootstrap in DefaultResourceLoader must force the settings manager into the
++ * untrusted state *before* reloading settings and resolving extensions, otherwise a
++ * previously-trusted state lets project-local extensions load before trust has been
++ * decided (i.e. project code runs before the user grants trust). User/global and
++ * temporary CLI extensions must keep loading during that pass.
++ *
++ * Run: node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import { createTrustSubject } from "./subject.mjs";
++
++const root = process.cwd();
++
++/** Event helpers over the recorded settings/package-manager boundary calls. */
++// VM-context values arrive with foreign array prototypes, so normalize to host arrays.
++const host = (iterable) => Array.from(iterable);
++const pick = (events, kind) => host(events.filter((e) => e[0] === kind).map((e) => e[1]));
++const sets = (events) => pick(events, "set");
++const settingsReloads = (events) => pick(events, "settings");
++const resolves = (events) => pick(events, "resolve");
++const loadBatches = (events) => pick(events, "extensions");
++const basenames = (entries) => host(entries).map((file) => String(file).split("/").pop()).sort();
++const finalExtensions = (loader) => basenames(loader.getExtensions().extensions.map((e) => e.path));
++
++/**
++ * Core invariant: up to and including the first extension resolve, the settings manager must
++ * never be trusted. Trust may only be granted after the trust resolver has decided.
++ */
++function assertUntrustedBootstrap(events, label) {
++	const firstResolve = events.findIndex((e) => e[0] === "resolve");
++	assert.ok(firstResolve > 0, `${label}: extensions must be resolved during bootstrap`);
++	const beforeResolve = events.slice(0, firstResolve);
++	const setsBefore = beforeResolve.filter((e) => e[0] === "set").map((e) => e[1]);
++	const reloadsBefore = beforeResolve.filter((e) => e[0] === "settings").map((e) => e[1]);
++
++	assert.ok(
++		setsBefore.length > 0,
++		`${label}: bootstrap must force the project trust setting before reloading settings and resolving extensions`,
++	);
++	assert.ok(
++		setsBefore.every((value) => value === false),
++		`${label}: bootstrap must force untrusted settings before resolving extensions, saw setProjectTrusted(${JSON.stringify(setsBefore)})`,
++	);
++	assert.ok(
++		reloadsBefore.length > 0 && reloadsBefore.every((value) => value === false),
++		`${label}: settings must be reloaded untrusted before resolving extensions, saw trusted=${JSON.stringify(reloadsBefore)}`,
++	);
++	assert.equal(
++		resolves(events)[0],
++		false,
++		`${label}: extensions must be resolved untrusted during bootstrap, first resolve saw trusted=${resolves(events)[0]}`,
++	);
++	assert.ok(
++		!loadBatches(events)[0].includes("project.ts"),
++		`${label}: project extension leaked into trust bootstrap: ${JSON.stringify(loadBatches(events)[0])}`,
++	);
++	assert.deepEqual(
++		basenames(loadBatches(events)[0]),
++		["cli.ts", "user.ts"],
++		`${label}: bootstrap extensions must be user/global + CLI only, got ${JSON.stringify(loadBatches(events)[0])}`,
++	);
++}
++
++const results = [];
++
++async function scenario(name, fn) {
++	const detail = await fn();
++	results.push(`${name}: ${detail}`);
++}
++
++// 1. The reported failure: the previous state was trusted, then bootstrap runs.
++//    The bootstrap pass must observe untrusted settings before resolving extensions.
++await scenario("bootstrap forces untrusted even when previous state was trusted", async () => {
++	const { loader, events, state } = await createTrustSubject(root, { initialTrusted: true });
++	const seenByTrustResolver = [];
++	await loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			seenByTrustResolver.push(basenames(extensionsResult.extensions.map((e) => e.path)));
++			return true;
++		},
++	});
++
++	// Bootstrap must run fully untrusted: settings forced, reloaded, and resolved untrusted.
++	assertUntrustedBootstrap(events, "trusted-start reload");
++
++	// The trust resolver may only see untrusted-visible (user/global + CLI) extensions.
++	assert.deepEqual(
++		seenByTrustResolver[0],
++		["cli.ts", "user.ts"],
++		"trust resolver must only see untrusted-visible (user/global + CLI) extensions",
++	);
++
++	// After trust is granted, project extensions load in the final set.
++	assert.deepEqual(
++		finalExtensions(loader),
++		["cli.ts", "project.ts", "user.ts"],
++		"trusted final extension set must include project extensions alongside user/global and CLI ones",
++	);
++	assert.equal(state.trusted, true, "settings must end up trusted after the trust resolver approves");
++	assert.equal(sets(events).at(-1), true, "the resolved trust value must be applied after the bootstrap pass");
++	return "bootstrap reloaded settings untrusted, resolved user+CLI only, then loaded project once trusted";
++});
++
++// 2. A denied trust decision must keep the project extension unloaded for the whole run.
++await scenario("denied trust keeps project extensions unloaded", async () => {
++	const { loader, events } = await createTrustSubject(root, { initialTrusted: true });
++	await loader.reload({ resolveProjectTrust: async () => false });
++
++	assertUntrustedBootstrap(events, "denied reload");
++	assert.ok(
++		resolves(events).every((value) => value === false),
++		`every extension resolution must run untrusted when trust is denied, saw ${JSON.stringify(resolves(events))}`,
++	);
++	for (const batch of loadBatches(events)) {
++		assert.ok(!batch.includes("project.ts"), `project extension loaded despite denied trust: ${JSON.stringify(batch)}`);
++	}
++	assert.deepEqual(
++		finalExtensions(loader),
++		["cli.ts", "user.ts"],
++		"denied trust must leave only user/global and CLI extensions loaded",
++	);
++	return "project extension never loaded when trust was denied";
++});
++
++// 3. Previously-untrusted state behaves identically (forcing must not depend on prior state).
++await scenario("previously untrusted state also bootstraps untrusted", async () => {
++	const { loader, events } = await createTrustSubject(root, { initialTrusted: false });
++	await loader.reload({ resolveProjectTrust: async () => true });
++
++	assertUntrustedBootstrap(events, "untrusted-start reload");
++	assert.deepEqual(
++		finalExtensions(loader),
++		["cli.ts", "project.ts", "user.ts"],
++		"granted trust must load project extensions afterwards",
++	);
++	return "untrusted start bootstraps untrusted and still loads project extensions once trusted";
++});
++
++// 4. The standalone bootstrap entry point (used by the CLI trust prompt) is equally safe.
++await scenario("loadProjectTrustExtensions bootstraps untrusted", async () => {
++	const { loader, events } = await createTrustSubject(root, { initialTrusted: true });
++	const extensionsResult = await loader.loadProjectTrustExtensions();
++
++	assertUntrustedBootstrap(events, "loadProjectTrustExtensions");
++	assert.deepEqual(
++		basenames(extensionsResult.extensions.map((e) => e.path)),
++		["cli.ts", "user.ts"],
++		`bootstrap extension set must exclude project extensions, got ${JSON.stringify(basenames(extensionsResult.extensions.map((e) => e.path)))}`,
++	);
++	return "direct bootstrap call excluded project extensions while keeping user/CLI ones";
++});
++
++for (const line of results) console.log(`ok - ${line}`);
++console.log(`regression passed (${results.length} scenarios)`);
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..9d06612
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,37 @@
++{
++  "task_id": "extension-trust/learn",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "citations": [
++    {
++      "claim": "Fault: the trust bootstrap forced project settings to trusted before reloading settings and resolving extensions, so a previously-trusted state let project-local extensions load before trust was decided.",
++      "path": "packages/coding-agent/src/core/resource-loader.ts",
++      "line": 438
++    },
++    {
++      "claim": "Fix: loadProjectTrustExtensions now calls settingsManager.setProjectTrusted(false) before settingsManager.reload(), so the untrusted setting is in force for the bootstrap resolve; user/global and temporary CLI extensions still load.",
++      "path": "packages/coding-agent/src/core/resource-loader.ts",
++      "line": 435
++    },
++    {
++      "claim": "reload() runs the bootstrap pass via loadProjectTrustExtensions before the trust resolver, then applies the resolved value for the final extension set.",
++      "path": "packages/coding-agent/src/core/resource-loader.ts",
++      "line": 452
++    },
++    {
++      "claim": "Regression exercises the real DefaultResourceLoader through .prale-eval/subject.mjs createTrustSubject; assertUntrustedBootstrap encodes the invariant that no trusted state exists before the first extension resolve, and the four scenarios cover trusted-start, denied, untrusted-start, and direct bootstrap entry points.",
++      "path": ".prale-eval/regression.mjs",
++      "line": 33
++    }
++  ],
++  "deliverables": [
++    "packages/coding-agent/src/core/resource-loader.ts",
++    ".prale-eval/regression.mjs",
++    ".prale-eval/result.json"
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Root cause: DefaultResourceLoader.loadProjectTrustExtensions (packages/coding-agent/src/core/resource-loader.ts:435) called setProjectTrusted(true) and then settingsManager.reload(), contradicting its own comment. When the previous SettingsManager state was trusted, the bootstrap pass reloaded settings as trusted and resolved project-scoped extensions/packages, so project code loaded before the resolveProjectTrust decision. Fix: one-line change to setProjectTrusted(false) before settingsManager.reload() (line 438); nothing else altered, so the post-decision setProjectTrusted(projectTrusted) at line 454 still enables project extensions once trust is granted. Validation ran from the workspace root against the fixed source with no dependencies or network: 4 scenarios pass (exit 0). Shared invariant (assertUntrustedBootstrap, regression.mjs:33): before the first package resolve no setProjectTrusted(true) or trusted settings reload may occur, the first resolve must observe untrusted, and the first loadExtensionsCached batch must be exactly [cli.ts, user.ts] with no project.ts. Scenarios: (1) previous state trusted + reload({resolveProjectTrust: approve}) - invariant holds, the extensionsResult handed to the trust resolver is user/global + CLI only, final getExtensions() is [cli.ts, project.ts, user.ts], and the last applied setting is trusted=true; (2) trust denied - invariant holds, every resolve is untrusted, project.ts is never loaded and the final set is [cli.ts, user.ts]; (3) previous state untrusted - identical untrusted bootstrap, project extensions load after approval; (4) direct loadProjectTrustExtensions() with a trusted prior state (the CLI trust-prompt path) - invariant holds and the returned set is [cli.ts, user.ts]. Fault sensitivity verified by temporarily restoring setProjectTrusted(true): the run failed with AssertionError 'trusted-start reload: bootstrap must force untrusted settings before resolving extensions, saw setProjectTrusted([true])' (exit 1); the fixed line was then restored (git diff shows only the single-line production change). Limitation: the repository vitest suites (e.g. packages/coding-agent/test/resource-loader.test.ts) could not be executed because node_modules is not installed and dependency installation/network use is out of scope, so this VM-module regression plus manual review of the unchanged post-trust path stood in for them."
++  }
++}
+snapshot .prale-eval/regression.mjs - 70074e0f20eb40d70a32e33a48895d07b69d365319adea8753b63876a8dc789b
+snapshot .prale-eval/result.json - ddd0b09aeb44519375c5aea925bba2c1ab3e16d314506a8088ba5b20963cef83
+snapshot packages/coding-agent/src/core/resource-loader.ts 4b33246df80dbf73189b1de1f4eac1939ff8315cf00ab9fb0c06d362d8ce2594 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

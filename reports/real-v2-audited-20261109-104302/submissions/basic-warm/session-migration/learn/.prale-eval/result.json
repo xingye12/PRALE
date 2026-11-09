@@ -1,0 +1,35 @@
+{
+  "task_id": "session-migration/learn",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claim": {
+    "summary": "Legacy oauth.json files written with a UTF-8 BOM now migrate instead of being silently dropped: migrateAuthToAuthJson strips the leading BOM before JSON.parse, so OAuth credentials survive the migration, settings.json apiKey fallback and OAuth-over-apiKey precedence are preserved, malformed oauth.json is left untouched (never renamed or deleted), and a pre-existing auth.json still short-circuits the migration untouched.",
+    "citations": [
+      "packages/coding-agent/src/migrations.ts:36 - oauth.json content is parsed with JSON.parse(stripBom(readFileSync(oauthPath, \"utf-8\"))), matching the already-BOM-tolerant settings.json and keybindings.json paths in the same file",
+      "packages/coding-agent/src/migrations.ts:30-31 - the existsSync(authPath) early return keeps an existing auth.json untouched",
+      "packages/coding-agent/src/migrations.ts:37-41 - parsed OAuth entries are copied with type \"oauth\" and oauth.json is archived via renameSync only after a successful parse",
+      "packages/coding-agent/src/migrations.ts:47-63 - apiKeys from settings.json only fill providers not already migrated, giving OAuth precedence and API-key fallback",
+      ".prale-eval/regression.mjs - standalone assertion regression covering BOM migration, OAuth precedence, API-key fallback, malformed-input preservation (with and without BOM), untouched pre-existing auth.json, and the plain non-BOM path"
+    ]
+  },
+  "deliverables": [
+    "packages/coding-agent/src/migrations.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/result.json"
+  ],
+  "changes": [
+    {
+      "file": "packages/coding-agent/src/migrations.ts",
+      "change": "Single-line repair in migrateAuthToAuthJson: JSON.parse(stripBom(readFileSync(oauthPath, \"utf-8\"))) so a UTF-8 BOM no longer makes JSON.parse throw and silently discard legacy OAuth credentials. stripBom was already imported and used by the sibling settings.json/keybindings.json migrations; no other behavior was altered."
+    },
+    {
+      "file": ".prale-eval/regression.mjs",
+      "change": "New standalone Node assertion script that loads the real migrations.ts through the read-only subject.mjs helper (real fs/path, only getAgentDir and stripBom faked) against per-case temporary agent directories and asserts six scenario checks with node:assert/strict."
+    }
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node v24.14.0 (TypeScript strip + VM modules available, no dependencies or network). Exit code 0 with 'regression: 6 scenario checks passed'. Scenarios: (1) oauth.json prefixed with a UTF-8 BOM migrates both providers, auth.json contains type=oauth entries with the exact credentials, and oauth.json is archived as oauth.json.migrated with its original content; (2) OAuth precedence with API-key fallback - OAuth providers win over same-named settings.json apiKeys, API-key-only providers still migrate as type=api_key, non-string keys are skipped, apiKeys is removed from settings.json and unrelated settings survive; (3) malformed oauth.json (truncated JSON, with and without a BOM) keeps identical bytes at its original path, is never renamed to .migrated, and does not block the apiKeys fallback or create a spurious auth.json; (4) a pre-existing auth.json short-circuits the migration, returning [] and leaving auth.json, oauth.json and settings.json byte-identical; (5) plain non-BOM oauth.json still migrates, guarding against regression in the untriggered path. Fault replay: with the original line restored via 'git show HEAD:packages/coding-agent/src/migrations.ts', the same command exited 1 with AssertionError 'BOM-prefixed oauth.json must migrate every OAuth provider' (actual [], expected ['anthropic','github-copilot']), i.e. the regression detects exactly this stage's fault rather than passing trivially; the fix was then restored and the run repeated at exit 0. The script creates its temp agent directories inside the workspace (falling back to the OS temp dir) and removes them in a finally block. Limitation: repository typecheck/lint (tsc/biome/vitest) was not run because installing dependencies is out of scope for this environment, so validation relies on the compiled-through-strip production module exercised by the regression."
+  }
+}

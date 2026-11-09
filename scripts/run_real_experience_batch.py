@@ -37,6 +37,9 @@ def main() -> int:
     parser.add_argument("--fixtures", type=Path, default=Path("evals/experience-real-v2/fixtures"))
     parser.add_argument("--repository-id", default="pi-b455975")
     parser.add_argument("--model")
+    parser.add_argument("--target-visibility", choices=("listed", "hidden"), default="listed")
+    parser.add_argument("--promotion-timeout", type=float, default=900)
+    parser.add_argument("--submission-dir", type=Path)
     parser.add_argument("--max-budget-usd", type=float, default=10.0)
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--allow-host-execution", action="store_true")
@@ -66,7 +69,7 @@ def main() -> int:
             str(adapter_output),
         ]
         if args.adapter == "prale":
-            command.extend(["--repository-id", args.repository_id])
+            command.extend(["--repository-id", args.repository_id, "--promotion-timeout", str(args.promotion_timeout)])
         if args.model:
             command.extend(["--model", args.model])
         if args.adapter == "claude-code":
@@ -76,7 +79,9 @@ def main() -> int:
             fixture=fixture,
             agent_command=command,
             allow_host_execution=True,
-            timeout_seconds=args.timeout + 30,
+            timeout_seconds=args.timeout + (args.promotion_timeout if args.adapter == "prale" else 0) + 120,
+            target_visibility=args.target_visibility,
+            submission_dir=args.submission_dir / episode / stage if args.submission_dir else None,
         )
         result.update({"episode": episode, "stage": stage, "memory_mode": args.memory_mode})
         adapter_result = result.get("adapter_result")
@@ -85,9 +90,33 @@ def main() -> int:
             result["memory_retrievals"] = adapter_result.get("memory_retrievals")
             result["usage"] = adapter_result.get("usage", {})
         runs.append(result)
-    report = {"metadata": {"system": args.adapter, "memory_mode": args.memory_mode}, "runs": runs}
-    args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        report = {
+            "metadata": {
+                "system": args.adapter,
+                "memory_mode": args.memory_mode,
+                "target_visibility": args.target_visibility,
+                "accounting_version": 2 if args.adapter == "prale" else 1,
+                "model": args.model,
+                "fixtures": str(args.fixtures),
+            },
+            "runs": runs,
+        }
+        args.output.parent.mkdir(parents=True, exist_ok=True)
+        args.output.write_text(
+            json.dumps(report, ensure_ascii=False, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+        )
+        print(
+            json.dumps(
+                {
+                    "episode": episode,
+                    "stage": stage,
+                    "acceptance": result["acceptance"],
+                    "solving_seconds": result["duration_seconds"],
+                    "promotion_seconds": result.get("promotion", {}).get("duration_seconds"),
+                }
+            ),
+            flush=True,
+        )
     return 0
 
 

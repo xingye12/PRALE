@@ -1,0 +1,420 @@
+diff --git a/packages/agent/src/harness/execution/effect-gate.ts b/packages/agent/src/harness/execution/effect-gate.ts
+index d8b6b0f..903301f 100644
+--- a/packages/agent/src/harness/execution/effect-gate.ts
++++ b/packages/agent/src/harness/execution/effect-gate.ts
+@@ -47,7 +47,7 @@ export function createGate(): { gate: Gate; control: GateControl } {
+ 		},
+ 		control: {
+ 			beginAbort(cancellation) {
+-				if (state.status === "aborting") return;
++				if (state.status !== "open") return;
+ 				state = { status: "aborting", cancellation };
+ 			},
+ 			signalAbort() {
+diff --git a/packages/agent/src/harness/execution/tools.ts b/packages/agent/src/harness/execution/tools.ts
+index c5f4d4d..f768781 100644
+--- a/packages/agent/src/harness/execution/tools.ts
++++ b/packages/agent/src/harness/execution/tools.ts
+@@ -152,7 +152,7 @@ export function executeToolCall<TContext extends object | undefined>(
+ 				isError: true,
+ 			};
+ 		} finally {
+-			acceptingUpdates = true;
++			acceptingUpdates = false;
+ 		}
+ 	});
+ }
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 0d017a1..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,7 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (call.replay === "safe" && tool?.replay === "safe") {
++	if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..5268c19
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,255 @@
++/**
++ * Cross-module lifecycle fence regression.
++ *
++ * Loads the real recovery scheduler (runtime/drive/tools.ts), the real tool
++ * executor (execution/tools.ts) and the real effect gate (execution/effect-gate.ts)
++ * through `.prale-eval/subject.mjs`. Only durable checkpoint storage, progress
++ * transport and event delivery are faked by the helper.
++ *
++ * Every assertion below is observable behavior across a module boundary and is
++ * controlled with promises only: no timers, randomness, network or credentials.
++ */
++import assert from "node:assert/strict";
++import { createExecutionPipeline } from "./subject.mjs";
++
++const root = process.cwd();
++const pipeline = await createExecutionPipeline(root);
++const gateModule = await pipeline.graph.module("gate");
++const executionModule = await pipeline.graph.module("execution");
++
++/** Flush only microtask work so late callbacks have every chance to escape. */
++async function settleMicrotasks() {
++	for (let index = 0; index < 4; index += 1) await Promise.resolve();
++}
++
++function admittedError(gate) {
++	try {
++		gate.admit(() => "invoked");
++	} catch (error) {
++		return error;
++	}
++	return undefined;
++}
++
++function toolMessage(outcome) {
++	assert.equal(typeof outcome, "object");
++	assert.notEqual(outcome, null);
++	assert.equal(outcome.message.role, "toolResult");
++	return outcome.message;
++}
++
++function textOf(message) {
++	return message.content.flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
++}
++
++// ---------------------------------------------------------------------------
++// Gate: a closed gate is terminal; beginAbort can neither reopen it nor replace
++// its terminal error. A still-open gate must keep refusing admission normally.
++// ---------------------------------------------------------------------------
++{
++	const terminal = new Error("terminal gate error");
++	const { gate, control } = gateModule.createGate();
++	control.close(terminal);
++	assert.equal(gate.signal.aborted, true);
++	assert.equal(gate.signal.reason, terminal);
++	assert.equal(admittedError(gate), terminal);
++
++	// beginAbort after close must be a no-op rather than reviving the gate.
++	control.beginAbort(Promise.resolve());
++	const afterAbort = admittedError(gate);
++	assert.equal(afterAbort, terminal, "beginAbort must not replace the terminal gate error");
++	assert.notEqual(afterAbort instanceof gateModule.AbortRequested, true);
++	assert.equal(gate.signal.reason, terminal);
++
++	// A later signalAbort/close must keep the first terminal error as well.
++	control.signalAbort();
++	control.close(new Error("second terminal error"));
++	assert.equal(admittedError(gate), terminal);
++	assert.equal(gate.signal.reason, terminal);
++}
++
++{
++	// Abort-first gates still refuse admission with AbortRequested and only
++	// signal after cancellation commits; a second beginAbort keeps the first.
++	let resolveCancellation;
++	const cancellation = new Promise((resolve) => {
++		resolveCancellation = resolve;
++	});
++	const { gate, control } = gateModule.createGate();
++	control.beginAbort(cancellation);
++	const first = admittedError(gate);
++	assert.equal(first instanceof gateModule.AbortRequested, true);
++	assert.equal(first.cancellation, cancellation);
++	assert.equal(gate.signal.aborted, false);
++	control.beginAbort(Promise.resolve());
++	const second = admittedError(gate);
++	assert.equal(second instanceof gateModule.AbortRequested, true);
++	assert.equal(second.cancellation, cancellation);
++	resolveCancellation();
++	await cancellation;
++	control.signalAbort();
++	assert.equal(gate.signal.aborted, true);
++}
++
++// ---------------------------------------------------------------------------
++// Executor + gate: a gate closed while (or before) execution is admitted must
++// surface its terminal error and must never invoke the tool effect.
++// ---------------------------------------------------------------------------
++{
++	let invoked = false;
++	const terminal = new Error("executor terminal error");
++	const cleared = {
++		toolCall: { type: "toolCall", id: "call-direct", name: "fixture-tool", arguments: { message: "direct" } },
++		tool: {
++			name: "fixture-tool",
++			async execute() {
++				invoked = true;
++				return { content: [], details: {} };
++			},
++		},
++		args: { message: "direct" },
++	};
++	const invocation = { invocationId: "result-direct", operationId: "op-direct", turnId: "turn-direct" };
++	const { gate, control } = gateModule.createGate();
++	control.close(terminal);
++	control.beginAbort(Promise.resolve());
++
++	assert.throws(
++		() => executionModule.executeToolCall(cleared, gate, () => {}, {}, invocation, {}),
++		(error) => error === terminal,
++		"terminal gate error must survive beginAbort",
++	);
++	assert.equal(invoked, false);
++}
++
++// ---------------------------------------------------------------------------
++// Scheduler: a cancelled safe/safe recovery reads the durable checkpoint but
++// never clears it and never re-invokes the effect; it publishes exactly once.
++// ---------------------------------------------------------------------------
++{
++	const cancelled = await pipeline.run({ cancelled: true, persisted: "safe", declared: "safe" });
++	assert.deepEqual(cancelled.events, ["read", "publish"]);
++	assert.equal(cancelled.events.includes("clear"), false, "cancelled recovery must not clear the checkpoint");
++	assert.equal(cancelled.events.includes("invoke"), false, "cancelled recovery must not invoke the tool");
++	assert.equal(cancelled.events.filter((event) => event === "publish").length, 1);
++	assert.deepEqual(cancelled.checkpoints, []);
++
++	const message = toolMessage(cancelled.outcome);
++	assert.equal(message.isError, true);
++	assert.deepEqual(message.details, { step: 2 });
++	assert.equal(message.usage, undefined);
++	assert.match(textOf(message), /external outcome is unknown/);
++	assert.match(textOf(message), /checkpoint-evidence/);
++	assert.equal(message.content.at(-1).text.includes("external outcome is unknown"), true);
++}
++
++// Cancellation fences the effect even when only the persisted call is replayable
++// and the tool itself advertises side effects (unsafe) - nothing may run.
++{
++	const cancelled = await pipeline.run({ cancelled: true, persisted: "never", declared: "never" });
++	assert.equal(cancelled.events.includes("clear"), false);
++	assert.equal(cancelled.events.includes("invoke"), false);
++	assert.equal(cancelled.events.filter((event) => event === "publish").length, 1);
++	assert.equal(toolMessage(cancelled.outcome).isError, true);
++}
++
++// ---------------------------------------------------------------------------
++// Scheduler: a non-cancelled safe/safe recovery still completes, re-invokes
++// with the persisted arguments, preserves usage/details and publishes once.
++// ---------------------------------------------------------------------------
++{
++	let invokedArgs;
++	const replayed = await pipeline.run({
++		persisted: "safe",
++		declared: "safe",
++		effect: async ({ args }) => {
++			invokedArgs = args;
++			return {
++				content: [{ type: "text", text: args.message }],
++				details: { kept: true },
++				usage: { output: 3 },
++			};
++		},
++	});
++	assert.deepEqual(invokedArgs, { message: "persisted-arguments" });
++	assert.deepEqual(replayed.events, ["clear", "invoke", "effect-complete", "seal", "drain", "drain-complete", "publish"]);
++	assert.equal(replayed.events.filter((event) => event === "publish").length, 1);
++	assert.ok(replayed.events.indexOf("seal") < replayed.events.indexOf("publish"));
++
++	const message = toolMessage(replayed.outcome);
++	assert.equal(message.isError, false);
++	assert.equal(textOf(message), "persisted-arguments");
++	assert.deepEqual(message.details, { kept: true });
++	assert.deepEqual(message.usage, { output: 3 });
++	assert.equal(replayed.outcome.terminate, false);
++}
++
++// ---------------------------------------------------------------------------
++// Executor: live and checkpoint callbacks are sealed once the tool completes.
++// A captured update callback invoked after completion must not emit an update
++// event, write another checkpoint, or publish a second outcome.
++// ---------------------------------------------------------------------------
++{
++	let lateUpdate;
++	const completed = await pipeline.run({
++		effect: async ({ args, update }) => {
++			update({ content: [{ type: "text", text: "partial" }], details: { step: 1 } }, { checkpoint: true });
++			lateUpdate = update;
++			return {
++				content: [{ type: "text", text: args.message }],
++				details: { kept: true },
++				usage: { output: 3 },
++			};
++		},
++	});
++
++	// Updates produced while the effect was live are still delivered once.
++	assert.equal(completed.events.filter((event) => event === "update").length, 1);
++	assert.deepEqual(completed.checkpoints, [{ content: [{ type: "text", text: "partial" }], details: { step: 1 } }]);
++	assert.equal(completed.updates.length, 1);
++	assert.equal(completed.events.filter((event) => event === "publish").length, 1);
++
++	const frozenEvents = [...completed.events];
++	const frozenUpdates = completed.updates.length;
++	const frozenCheckpoints = completed.checkpoints.length;
++	const frozenOutcome = JSON.stringify(completed.outcome);
++
++	assert.equal(typeof lateUpdate, "function");
++	lateUpdate({ content: [{ type: "text", text: "late" }], details: { step: 9 } }, { checkpoint: true });
++	await settleMicrotasks();
++
++	assert.deepEqual(completed.events, frozenEvents, "late update must not emit events after completion");
++	assert.equal(completed.updates.length, frozenUpdates, "late update must not be delivered after completion");
++	assert.equal(
++		completed.checkpoints.length,
++		frozenCheckpoints,
++		"late checkpoint callback must not persist after completion",
++	);
++	assert.equal(JSON.stringify(completed.outcome), frozenOutcome, "late update must not republish an outcome");
++	assert.equal(toolMessage(completed.outcome).isError, false);
++}
++
++// A failing effect also seals its live callback: the error result is final and
++// late progress may not reopen the invocation.
++{
++	let lateUpdate;
++	const failed = await pipeline.run({
++		effect: async ({ update }) => {
++			lateUpdate = update;
++			throw new Error("effect failed");
++		},
++	});
++	const message = toolMessage(failed.outcome);
++	assert.equal(message.isError, true);
++	assert.equal(textOf(message), "effect failed");
++	assert.equal(failed.updates.length, 0);
++
++	const frozenEvents = [...failed.events];
++	lateUpdate({ content: [{ type: "text", text: "late" }], details: {} }, { checkpoint: true });
++	await settleMicrotasks();
++	assert.deepEqual(failed.events, frozenEvents);
++	assert.equal(failed.updates.length, 0);
++	assert.equal(failed.checkpoints.length, 0);
++}
++
++process.stdout.write("lifecycle fence regression: ok\n");
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..7ec4c39
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,92 @@
++# Lifecycle fences across scheduler, executor and gate
++
++The incident had three coupled lifecycle leaks. Each leak lives in a different
++module, and each is observable only through a module boundary, so the repair
++touches one line per file while the regression exercises all three together.
++
++## 1. Scheduler: a cancelled recovery replayed the effect
++
++`packages/agent/src/harness/runtime/drive/tools.ts`
++
++`runParallel` computes whether the durable operation is already
++`cancel_requested` and hands that flag to `recoverToolInvocation(..., cancelled)`.
++The parameter was accepted but never consulted, so the `replay === "safe" &&
++tool.replay === "safe"` branch still called `clearReplayCheckpoint` (deleting the
++durable progress checkpoint and re-reading persisted arguments) and then
++`performToolInvocation` (re-invoking the external effect) even though the
++operation had been cancelled.
++
++Repair: the safe/safe replay branch is now guarded by `!cancelled`. A cancelled
++recovery falls through to the existing interruption path - read the durable
++checkpoint and publish exactly one interrupted outcome. It never clears the
++checkpoint and never invokes the tool. The non-cancelled safe/safe path is
++untouched, so persisted arguments, details and usage still flow through
++`finalizeToolCall`/`createToolResultMessage` and the outcome is published once.
++This matches the sequential cancellation branch, which already read the
++checkpoint and published an interrupted (non-terminating) result.
++
++## 2. Executor: a completed tool kept accepting live updates
++
++`packages/agent/src/harness/execution/tools.ts`
++
++`executeToolCall` wraps the tool's update callback in an `acceptingUpdates`
++latch. The latch was reopened in the `finally` block (`acceptingUpdates = true`)
++instead of being closed, so a callback captured by the tool could be invoked
++after `execute` resolved and after the drive had sealed progress, draining and
++publishing its outcome. Late updates then emitted new `tool_update` events and
++wrote new checkpoints against a finished invocation.
++
++Repair: the `finally` now sets `acceptingUpdates = false`, the same pattern used
++by `executeAgentLoop` and the bash tool. The latch closes before the
++`ExecutedToolCall` promise settles, so both the live update channel and the
++checkpoint channel (the drive passes `progress.write` from that same callback)
++are sealed at completion, for successful and throwing effects alike. Updates
++produced while the effect is running are still delivered exactly once.
++
++## 3. Gate: `beginAbort` could reopen a closed gate
++
++`packages/agent/src/harness/execution/effect-gate.ts`
++
++`beginAbort` only ignored calls while the gate was already `aborting`, so a
++cancellation request that arrived after `close(error)` replaced the terminal
++`closed` state with `aborting`. `gate.admit` then threw a fresh
++`AbortRequested` instead of the terminal error, i.e. the gate was reopened and
++its terminal error was lost for every later admission.
++
++Repair: `beginAbort` returns unless the state is still `open`
++(`if (state.status !== "open") return;`). A closed gate keeps its `closed`
++state, its terminal error and its abort reason; a second `beginAbort` on an
++aborting gate still keeps the first cancellation promise. Abort-first
++admission (`AbortRequested` with the cancellation promise, signal only after
++`signalAbort`) is unchanged.
++
++## Cross-module consequence
++
++The repair is deliberately a set of fences rather than a reordering of the
++pipeline: cancellation is decided from the durable operation state before the
++scheduler replays anything, completion is sealed inside the executor that owns
++the callback lifetime, and the gate's owner-side controls can only move the
++lifecycle forward. The regression script
++(`node --experimental-vm-modules .prale-eval/regression.mjs`) loads the real
++modules through `.prale-eval/subject.mjs` and asserts:
++
++- a cancelled safe/safe recovery emits only `read`/`publish`, with no `clear`,
++  no `invoke`, no checkpoints, and one interrupted result carrying the
++  checkpoint content plus the interruption marker;
++- a cancelled unsafe recovery likewise never invokes and publishes once;
++- a non-cancelled safe/safe recovery still clears, invokes with persisted
++  arguments, preserves `details` and `usage`, seals before publishing, and
++  publishes exactly once;
++- a captured update callback used after completion emits no events, writes no
++  checkpoint and cannot republish the outcome (successful and throwing effects);
++- `beginAbort` after `close` neither revives the gate nor replaces its terminal
++  error, including through `executeToolCall`, which must surface the terminal
++  error and must not invoke the tool.
++
++Each repaired file alone was reverted to its faulty baseline while validating:
++each restoration produced a failing `node:assert/strict` assertion (the
++scheduler case fails on `clear`/`invoke` events, the executor case on post
++completion events, the gate case on `AbortRequested` replacing the terminal
++error), never an import error or crash. TypeScript type checking and the
++repository's Vitest suite could not be run because `node_modules` is absent in
++this workspace; the regression relies only on Node 24 built-ins.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..3d951f3
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/execution-lifecycle/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired three coupled lifecycle fences. (1) runtime/drive/tools.ts: recoverToolInvocation now honors its cancelled argument, so a cancelled recovery reads the durable checkpoint and publishes one interrupted outcome instead of clearing the checkpoint and re-invoking the effect; the non-cancelled safe/safe replay still clears, invokes with persisted arguments, preserves details/usage and publishes once. (2) execution/tools.ts: executeToolCall's update latch is now closed in finally (acceptingUpdates = false), so live updates and checkpoint writes stop when the effect completes, for both successful and throwing effects. (3) execution/effect-gate.ts: beginAbort returns unless the gate is open, so a closed gate cannot be reopened and its terminal error cannot be replaced (verified through gate.admit and executeToolCall). The regression loads the real modules via .prale-eval/subject.mjs with only checkpoint storage/progress/event IO faked, uses uncaught node:assert/strict assertions and microtask-only ordering (no timers, randomness, network or credentials). Focused validation additionally restored each repaired file alone to its faulty baseline (packages/agent/src/harness/runtime/drive/tools.ts, packages/agent/src/harness/execution/tools.ts, packages/agent/src/harness/execution/effect-gate.ts); every single-file restoration produced an assertion failure (scheduler: clear/invoke observed; executor: post-completion update event; gate: AbortRequested replacing the terminal error) rather than a crash, import error or timeout. Limitation: the repository's TypeScript type check and Vitest suites could not be executed because node_modules/dependencies are not installed in this workspace; the script itself needs only Node 24 built-ins."
++  }
++}
+snapshot .prale-eval/regression.mjs - 133b93d33e6e473932d2e64a219736dcdea6a1730810cae89c01bcafa7d87159
+snapshot .prale-eval/repair.md - 997ca4989d8102986e34d08484c92fee0142d42e03368b622a35a4b230d36b1f
+snapshot .prale-eval/result.json - 7ddc7f6abe42cf391b36bf97c9ded2bf86dbef614f0c51120a8a0091691af4d3
+snapshot packages/agent/src/harness/execution/effect-gate.ts 4c8e7c0f6030414c0c61aef6bc17956f2068e12fd64b738552de96625b7054d8 eb2e140917ec55d7297f13208bb696bcd38666cf806b842c319946555ec7d37c
+snapshot packages/agent/src/harness/execution/tools.ts 8f40f7c5dd737337d133806787c66b4fc5faea71c7055fe08d81c7cb953f5ed0 446b8624b365162a8878efeadcdc97ac053dc953f25155743d6a0646cf8868d5
+snapshot packages/agent/src/harness/runtime/drive/tools.ts b2524808354ec933cf95d04e437f97fa62c935f362dc28e2c9a2cb21fa91c97e 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

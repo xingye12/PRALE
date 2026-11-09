@@ -1,0 +1,198 @@
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 9dc1a3c..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,7 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (false && !cancelled && call.replay === "safe" && tool?.replay === "safe") {
++	if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..056e1ea
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,159 @@
++/**
++ * Regression for tool-recovery-order/correction.
++ *
++ * Exercises the real `recoverToolInvocation` from
++ * packages/agent/src/harness/runtime/drive/tools.ts (loaded by the read-only
++ * subject helper with boundary fakes) and asserts the safe-replay contract:
++ *
++ *   - a call whose persisted intent and live tool declaration are both "safe"
++ *     replays exactly once when it was not cancelled:
++ *       clear old checkpoint -> invoke -> publish resulting outcome
++ *   - every other declaration (unsafe/never, missing, cancelled) keeps the
++ *     conservative interrupted-checkpoint outcome and never re-invokes.
++ *
++ * Exits zero when the repaired production code is present; fails with a
++ * descriptive assertion when the blanket never-replay rule (`false && ...`)
++ * is restored.
++ */
++import assert from 'node:assert/strict';
++import path from 'node:path';
++import { fileURLToPath } from 'node:url';
++import { createRecoverySubject } from './subject.mjs';
++
++// Workspace root, resolved from this file so the script does not depend on cwd.
++const root = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
++const recover = await createRecoverySubject(root);
++
++const INTERRUPTION_MARKER =
++	'[Tool execution was interrupted. The preceding output is the latest durable progress snapshot; newer live output may be missing, and the external outcome is unknown.]';
++const CHECKPOINT = { content: [{ type: 'text', text: 'durable-progress' }], details: { step: 2 } };
++
++// Cross-realm safe normalizers: values produced inside the VM module context
++// have foreign prototypes, so compare stable primitive projections instead.
++const textOf = (outcome) =>
++	Array.from(outcome?.message?.content ?? [], (part) => String(part?.text ?? ''));
++const detailsOf = (outcome) => JSON.stringify(outcome?.message?.details ?? null);
++
++/** Run one recovery scenario and assert the durable event ordering contract. */
++async function scenario(label, { callPolicy, toolPolicy, cancelled = false, checkpoint = CHECKPOINT }) {
++	const result = await recover(callPolicy, toolPolicy, cancelled, { checkpoint });
++	assert.ok(Array.isArray(result.events), `${label}: recovery must report observable boundary events`);
++	return { label, events: Array.from(result.events), outcome: result.outcome };
++}
++
++function assertReplayed(label, { events, outcome }) {
++	assert.deepEqual(
++		events,
++		['clear', 'invoke', 'effect-complete', 'publish'],
++		`${label}: safe/safe call must replay once: clear old checkpoint, invoke, then publish after completion`,
++	);
++	const clearAt = events.indexOf('clear');
++	const invokeAt = events.indexOf('invoke');
++	const completedAt = events.indexOf('effect-complete');
++	const publishAt = events.indexOf('publish');
++	assert.ok(clearAt < invokeAt, `${label}: old checkpoint must be cleared before invocation, saw ${events.join(' -> ')}`);
++	assert.ok(completedAt < publishAt, `${label}: outcome must be published only after invocation completes, saw ${events.join(' -> ')}`);
++	assert.equal(outcome?.message?.isError, false, `${label}: replayed call must publish the live tool result`);
++	assert.deepEqual(textOf(outcome), ['effect-result'], `${label}: published outcome must be the replay result`);
++	assert.ok(
++		!textOf(outcome).includes(INTERRUPTION_MARKER),
++		`${label}: replayed call must not publish the interruption marker`,
++	);
++}
++
++function assertInterrupted(label, { events, outcome }) {
++	assert.ok(
++		!events.includes('invoke') && !events.includes('effect-complete'),
++		`${label}: restricted declaration must never replay the tool effect, saw ${events.join(' -> ')}`,
++	);
++	assert.deepEqual(
++		events,
++		['read', 'publish'],
++		`${label}: restricted declaration must read the durable checkpoint then publish it`,
++	);
++	assert.equal(outcome?.message?.isError, true, `${label}: interrupted recovery must be reported as an error outcome`);
++	const text = textOf(outcome);
++	assert.equal(text.at(-1), INTERRUPTION_MARKER, `${label}: interrupted outcome must end with the interruption marker`);
++	assert.deepEqual(
++		text.slice(0, -1),
++		['durable-progress'],
++		`${label}: interrupted outcome must preserve the durable checkpoint content`,
++	);
++	assert.equal(detailsOf(outcome), JSON.stringify({ step: 2 }), `${label}: interrupted outcome must preserve checkpoint details`);
++}
++
++// 1. The repaired behavior: both the persisted intent and the live declaration
++//    are safe, and the call was not cancelled.
++assertReplayed(
++	'not cancelled (safe intent, safe declaration)',
++	await scenario('not cancelled (safe intent, safe declaration)', {
++		callPolicy: 'safe',
++		toolPolicy: 'safe',
++		cancelled: false,
++	}),
++);
++
++// 1b. Replay ordering must hold even when the effect yields asynchronously.
++assertReplayed(
++	'not cancelled (async effect)',
++	await recover('safe', 'safe', false, {
++		checkpoint: CHECKPOINT,
++		effect: () => new Promise((resolve) => setTimeout(resolve, 5)),
++	}).then((result) => ({ label: 'not cancelled (async effect)', events: Array.from(result.events), outcome: result.outcome })),
++);
++
++// 2. Cancelled declarations stay restricted: no replay, no checkpoint clearing.
++{
++	const cancelled = await scenario('cancelled (safe/safe)', {
++		callPolicy: 'safe',
++		toolPolicy: 'safe',
++		cancelled: true,
++	});
++	assertInterrupted('cancelled (safe/safe)', cancelled);
++	assert.ok(
++		!cancelled.events.includes('clear'),
++		`cancelled (safe/safe): must not clear the checkpoint of a cancelled call, saw ${cancelled.events.join(' -> ')}`,
++	);
++}
++
++// 3. Unsafe live declaration (tool says "never") stays restricted.
++assertInterrupted(
++	'unsafe declaration (safe intent, never declaration)',
++	await scenario('unsafe declaration (safe intent, never declaration)', {
++		callPolicy: 'safe',
++		toolPolicy: 'never',
++		cancelled: false,
++	}),
++);
++
++// 4. Unsafe persisted intent (recorded "never", live "safe") stays restricted.
++assertInterrupted(
++	'unsafe intent (never intent, safe declaration)',
++	await scenario('unsafe intent (never intent, safe declaration)', {
++		callPolicy: 'never',
++		toolPolicy: 'safe',
++		cancelled: false,
++	}),
++);
++
++// 5. Missing declaration: the tool is no longer registered after restart.
++assertInterrupted(
++	'missing declaration',
++	await scenario('missing declaration', {
++		callPolicy: 'safe',
++		toolPolicy: undefined,
++		cancelled: false,
++	}),
++);
++
++// 6. Tool present but without an explicit replay policy (defaults to never).
++assertInterrupted(
++	'undeclared replay policy',
++	await scenario('undeclared replay policy', {
++		callPolicy: 'safe',
++		toolPolicy: null,
++		cancelled: false,
++	}),
++);
++
++console.log('tool-recovery-order regression: 9 assertions groups passed');
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..50668d5
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,11 @@
++{
++  "task_id": "tool-recovery-order/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired packages/agent/src/harness/runtime/drive/tools.ts: recoverToolInvocation now replays a safe/safe effect_pending call instead of applying a blanket never-replay rule. The faulty guard was the dead-code short circuit `if (false && !cancelled && call.replay === \"safe\" && tool?.replay === \"safe\")`, which made every recovered tool effect fall through to the interrupted-checkpoint path; the minimal fix removes the leading `false &&` and leaves the conditional restrictions (`!cancelled`, persisted intent replay === \"safe\", live declaration replay === \"safe\") untouched. With the guard live, safe replay keeps the required ordering: clearReplayCheckpoint (deletes the stale pendingToolOutput value and re-reads the persisted args from operationToolArgs) runs before performToolInvocation, and publishToolOutcome settles the freshly produced result afterwards, so the durable checkpoint is cleared before invocation and the real outcome replaces it once the effect completes. `.prale-eval/regression.mjs` loads the real TypeScript module through the read-only `.prale-eval/subject.mjs` boundary fakes and asserts on observable event ordering rather than printed output: (1) safe intent + safe declaration, not cancelled -> events exactly [clear, invoke, effect-complete, publish] with a non-error \"effect-result\" outcome and no interruption marker; (1b) same ordering with an async effect; (2) cancelled safe/safe -> [read, publish], error outcome, no clear/invoke; (3) safe intent but \"never\" declaration -> interrupted checkpoint outcome, no replay; (4) recorded \"never\" intent with safe declaration -> interrupted, no replay; (5) missing tool declaration -> interrupted, no replay; (6) tool without an explicit replay policy -> interrupted, no replay. Interrupted cases additionally assert the durable checkpoint content (\"durable-progress\") and details ({step:2}) survive plus the trailing interruption marker. Verified bidirectionally: with the fix in place the script exits 0 (9 assertion groups pass); after temporarily restoring the original `false &&` fault the script fails immediately with AssertionError on `not cancelled (safe intent, safe declaration)` (actual events [read, publish] vs expected [clear, invoke, effect-complete, publish]), then the fix was restored and the run re-confirmed zero. The script resolves the workspace root from its own URL, so it does not depend on the invocation cwd. No dependencies were installed and no network was used; Node v24.14.0 provides TypeScript stripping and node:vm SourceTextModule. The repo's own vitest suites were not run because workspace dependencies are not installed, which is why the standalone assertion script is the focused validation.",
++    "limitations": "Repository vitest suites were skipped: node_modules are not installed in this workspace and dependency installation is out of scope."
++  }
++}
+snapshot .prale-eval/regression.mjs - 24718fa4a29359042d1bcd3439a71158ded7752601eccad5955a82f752168cdc
+snapshot .prale-eval/result.json - d24a0bfb76606fa2d7a3d732820c9290243e89650f0952a1a7ace156bb467b8a
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 3dd561b18237e638e156bac54d3c51127e16f5f70dff71455f7da59317d10490 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

@@ -1,0 +1,165 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 72decd8..e4bcecf 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,8 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(true);
++			// Apply the actual decision: a denied trust must not be upgraded to approval.
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..a9bb3d5
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,101 @@
++/**
++ * Regression for extension-trust/retransfer.
++ *
++ * A resource reload must preserve the trust decision it was given:
++ *  - bootstrap pass: project resources absent, user/global and CLI present;
++ *  - decision false: project resources stay absent after reload;
++ *  - decision true: project resources become available after reload.
++ *
++ * The original fault applied `setProjectTrusted(true)` unconditionally after
++ * `resolveProjectTrust`, so a denied decision was upgraded to approval and the
++ * project extension reappeared on the reload.
++ */
++import assert from "node:assert/strict";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createTrustSubject } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const stem = (extension) => path.basename(extension.path).replace(/\.[^.]+$/, "");
++// Array.from keeps the result in this realm; VM-realm arrays fail strict deep equality.
++const names = (extensions) => Array.from(extensions, stem).sort();
++
++function extensionNames(loader) {
++	return names(loader.getExtensions().extensions);
++}
++
++async function reloadWithDecision(decision, options = {}) {
++	const subject = await createTrustSubject(root, options);
++	let bootstrapExtensions;
++	let bootstrapTrust;
++	await subject.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			bootstrapExtensions = extensionsResult.extensions;
++			bootstrapTrust = subject.state.trusted;
++			return decision;
++		},
++	});
++	return { ...subject, bootstrapExtensions, bootstrapTrust };
++}
++
++// --- Denied decision: project resources must not be transferred into approval.
++{
++	const { loader, state, bootstrapExtensions, bootstrapTrust } = await reloadWithDecision(false, {
++		initialTrusted: true,
++	});
++
++	assert.deepEqual(
++		names(bootstrapExtensions),
++		["cli", "user"],
++		"bootstrap pass must load user/global and CLI extensions but not project extensions",
++	);
++	assert.equal(bootstrapTrust, false, "bootstrap pass must run with project trust disabled");
++
++	assert.deepEqual(
++		extensionNames(loader),
++		["cli", "user"],
++		"denied project trust must not load project resources after reload",
++	);
++	assert.equal(state.trusted, false, "denied project trust must leave the loader/settings untrusted");
++	assert.equal(
++		state.loadedTrust,
++		false,
++		"settings reload after a denied decision must observe the denied trust state",
++	);
++}
++
++// --- Approved decision: project resources become available after reload.
++{
++	const { loader, state, bootstrapExtensions, bootstrapTrust } = await reloadWithDecision(true, {
++		initialTrusted: false,
++	});
++
++	assert.deepEqual(
++		names(bootstrapExtensions),
++		["cli", "user"],
++		"bootstrap pass must load user/global and CLI extensions but not project extensions",
++	);
++	assert.equal(bootstrapTrust, false, "bootstrap pass must run with project trust disabled");
++
++	assert.deepEqual(
++		extensionNames(loader),
++		["cli", "project", "user"],
++		"approved project trust must load project resources plus user/global and CLI resources",
++	);
++	assert.equal(state.trusted, true, "approved project trust must be recorded on the settings manager");
++	assert.equal(state.loadedTrust, true, "settings reload after approval must observe the approved trust state");
++}
++
++// --- A later reload without a new decision keeps the denied state.
++{
++	const first = await reloadWithDecision(false);
++	await first.loader.reload();
++	assert.deepEqual(
++		extensionNames(first.loader),
++		["cli", "user"],
++		"a follow-up reload without a trust decision must not revive project resources after denial",
++	);
++	assert.equal(first.state.trusted, false, "a follow-up reload must preserve the denied trust state");
++}
++
++console.log("extension-trust/retransfer regression passed");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..6887d05
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,35 @@
++{
++  "task_id": "extension-trust/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "A project-trust denial returned by reload's resolveProjectTrust callback was overwritten with approval, so the post-decision pass reloaded project resources.",
++      "citations": [
++        "packages/coding-agent/src/core/resource-loader.ts:451-456"
++      ]
++    },
++    {
++      "claim": "The reload now applies the actual trust decision to the settings manager before the finalized settings reload, preserving bootstrap exclusion and post-decision phase separation for user/global, project, and CLI resources.",
++      "citations": [
++        "packages/coding-agent/src/core/resource-loader.ts:454-455"
++      ]
++    },
++    {
++      "claim": "The standalone regression exercises the real DefaultResourceLoader reload lifecycle through .prale-eval/subject.mjs and asserts bootstrap exclusion, denial, approval, and follow-up reload behavior.",
++      "citations": [
++        ".prale-eval/regression.mjs"
++      ]
++    }
++  ],
++  "deliverables": [
++    "packages/coding-agent/src/core/resource-loader.ts",
++    ".prale-eval/regression.mjs",
++    ".prale-eval/result.json"
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root with Node v24.14.0 (exit 0). The regression loads the real packages/coding-agent/src/core/resource-loader.ts through .prale-eval/subject.mjs and checks four behaviors. (1) During the bootstrap pass project extensions are absent while user/global and CLI extensions are present, and trust is disabled. (2) When resolveProjectTrust returns false, the post-reload extension set remains user+CLI only and the settings manager stays untrusted with the finalized settings reload observing false. (3) When resolveProjectTrust returns true, project extensions appear alongside user/global and CLI, and trust is recorded as true. (4) A follow-up reload with no trust decision after a denial does not revive project resources. I verified fault detection by temporarily restoring the original unconditional setProjectTrusted(true): the script failed at the denial assertion with actual ['cli','project','user'] versus expected ['cli','user'], then the fix was restored and the script passed again. The repository's vitest suites could not be run because no node_modules are installed and dependencies must not be installed; the standalone Node regression is the focused validation and needs no dependencies or network."
++  }
++}
+snapshot .prale-eval/regression.mjs - b602019ddf454670920599684b13df2d1c67cdc989e8e4c3ac13a9330a926b92
+snapshot .prale-eval/result.json - 280038d40f3f42b2932c769147d2b29225a2053b9620d3a2ac36081b26c4821b
+snapshot packages/coding-agent/src/core/resource-loader.ts 076fed822b4c7a151bb59becc911d376eab3ae0eecbc7ecbdf90b2adc827b22b 2992b69503b0994e5592df32f6d778e8b6e343b4ce2e8bc0d0959d7e5af472e1

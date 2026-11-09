@@ -1,0 +1,67 @@
+{
+  "task_id": "session-migration/learn",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claims": [
+    {
+      "claim": "Legacy oauth.json prefixed with a UTF-8 BOM is parsed (BOM stripped) instead of being silently skipped, so its OAuth credentials migrate into auth.json.",
+      "citations": [
+        {
+          "path": "packages/coding-agent/src/migrations.ts",
+          "lines": "36",
+          "note": "migrateAuthToAuthJson now reads oauth.json with stripBom(readFileSync(oauthPath, \"utf-8\")) before JSON.parse, matching the stripBom usage already applied to settings.json, keybindings.json and auth-storage.ts."
+        }
+      ]
+    },
+    {
+      "claim": "OAuth credentials are preserved verbatim (type: \"oauth\" plus every field of the legacy record), settings.json apiKeys remain the fallback, and OAuth wins for providers present in both sources.",
+      "citations": [
+        {
+          "path": "packages/coding-agent/src/migrations.ts",
+          "lines": "37-41",
+          "note": "Existing merge loop and the `if (!migrated[provider])` guard are unchanged; only the decode step was repaired."
+        },
+        {
+          "path": ".prale-eval/regression.mjs",
+          "lines": "46-99",
+          "note": "Regression case 1 asserts provider set, exact auth.json payload, oauth precedence over apiKeys, non-string apiKeys skipped, and 0600 mode."
+        }
+      ]
+    },
+    {
+      "claim": "Malformed input is never destroyed: an unparseable oauth.json (with or without BOM) is left in place with its exact bytes, is not renamed to .migrated, and does not block the apiKeys fallback.",
+      "citations": [
+        {
+          "path": "packages/coding-agent/src/migrations.ts",
+          "lines": "34-44",
+          "note": "Parse failure is still caught before renameSync, so the legacy file stays untouched."
+        },
+        {
+          "path": ".prale-eval/regression.mjs",
+          "lines": "101-141",
+          "note": "Regression cases 2 and 3 assert the malformed oauth.json survives byte-for-byte and no bogus auth.json is written."
+        }
+      ]
+    },
+    {
+      "claim": "An existing auth.json is left completely untouched (byte-for-byte), and the migration is a no-op for oauth.json and settings.json in that case.",
+      "citations": [
+        {
+          "path": "packages/coding-agent/src/migrations.ts",
+          "lines": "27-28",
+          "note": "Early return when auth.json exists is unchanged."
+        },
+        {
+          "path": ".prale-eval/regression.mjs",
+          "lines": "143-164",
+          "note": "Regression case 4 asserts unchanged auth.json, unrenamed oauth.json and unrewritten settings.json."
+        }
+      ]
+    }
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node v24.14.0: exit 0, output 'migrateAuthToAuthJson regression: all assertions passed' (only Node's experimental-feature warnings for stripTypeScriptTypes and VM modules). The script loads the real packages/coding-agent/src/migrations.ts through the read-only .prale-eval/subject.mjs loader (real fs/path, explicit boundary fakes, caller-owned temp agentDir under .prale-eval/.regression-tmp, cleaned up in a finally block) and asserts on migrateAuthToAuthJson only. Six scenarios: (1) BOM-prefixed oauth.json migrates with OAuth credentials preserved verbatim, exact 0600 auth.json payload, OAuth precedence over settings.apiKeys, non-string apiKeys skipped, and oauth.json moved to oauth.json.migrated with its original BOM bytes; (2) BOM-prefixed but unparseable oauth.json is skipped without blocking the api_key fallback, keeps its exact bytes at oauth.json, and leaves no .migrated file; (3) unparseable oauth.json alone produces no providers and no auth.json; (4) an existing auth.json stays byte-identical and oauth.json/settings.json are untouched (early return); (5) a BOM-free oauth.json still migrates; (6) a BOM-prefixed settings.json apiKeys fallback still migrates. Fault detection was verified by temporarily reverting line 36 to JSON.parse(readFileSync(oauthPath, \"utf-8\")): the script then exited 1 with AssertionError 'BOM-prefixed oauth.json must migrate its OAuth providers alongside settings.json API-key fallbacks' (actual ['openai','shared'] vs expected ['anthropic','openai','shared']); the fix was then restored. No dependencies or network were used; vitest/tsc were not run because node_modules is absent, and no optional validation dependency was required."
+  }
+}

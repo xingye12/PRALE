@@ -1,0 +1,41 @@
+{
+  "task_id": "tool-recovery-order/learn",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claims": [
+    {
+      "source": "TASK.md:3",
+      "claim": "Replay requires BOTH persisted call policy and current tool declaration to be safe, and no cancellation; otherwise publish an interrupted outcome with the durable checkpoint, without clearing it or invoking the tool.",
+      "status": "implemented",
+      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts recoverToolInvocation: `if (!cancelled && call.replay === \"safe\" && tool?.replay === \"safe\")` gate the clearReplayCheckpoint + performToolInvocation path; every other combination falls through to readCheckpoint + publishToolOutcome(interruptedOutcome(toolCall, checkpoint))."
+    },
+    {
+      "source": "TASK.md:5",
+      "claim": "Repair the target source with minimal changes and add `.prale-eval/regression.mjs`, a standalone assertion script that exits zero when fixed and fails with an assertion on the original fault; run it as `node --experimental-vm-modules .prale-eval/regression.mjs`.",
+      "status": "implemented",
+      "evidence": "One-line change in the target file; .prale-eval/regression.mjs drives the real recoverToolInvocation through .prale-eval/subject.mjs boundary fakes using node:assert/strict only."
+    },
+    {
+      "source": "TASK.md:7",
+      "claim": "Write `.prale-eval/result.json` with task_id, repository, mode, and a validation object whose command is exactly `node --experimental-vm-modules .prale-eval/regression.mjs`, status `passed`, and substantive notes.",
+      "status": "implemented",
+      "evidence": "This file."
+    },
+    {
+      "source": "TASK.md:9",
+      "claim": "Only the target source is modified and regression files are added under `.prale-eval/`; TASK.md, subject.mjs, package locks, Git configuration, and harness files are untouched.",
+      "status": "implemented",
+      "evidence": "git status: ` M packages/agent/src/harness/runtime/drive/tools.ts`, `?? .prale-eval/regression.mjs`, `?? .prale-eval/result.json` only; TASK.md and .prale-eval/subject.mjs remain clean. No dependency installation, no network use."
+    }
+  ],
+  "deliverables": [
+    "packages/agent/src/harness/runtime/drive/tools.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/result.json"
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Fault: recoverToolInvocation replayed an interrupted (effect_pending) call when EITHER the persisted call policy OR the live tool declaration was \"safe\" (`call.replay === \"safe\" || tool?.replay === \"safe\"`), so a call persisted as replay:\"never\" was re-executed merely because the current tool declared replay:\"safe\", and a call persisted as \"safe\" was re-executed with a tool that now declares \"never\"/no policy — replaying an effect whose safety was never established by both sides. Repair: the single condition in recoverToolInvocation now requires `!cancelled && call.replay === \"safe\" && tool?.replay === \"safe\"`; the interrupted branch is unchanged, so the durable checkpoint is read, published with the interruption marker, never cleared, and the tool is never invoked. The regression loads the real production module via .prale-eval/subject.mjs (createRecoverySubject) and asserts, with node:assert/strict, the exact boundary event sequence and published outcome for: both-safe (clear, invoke, effect-complete, publish; persisted args {persisted:42} reused; recovery flagged; tool result, not an interruption), call=safe/tool=never, call=never/tool=safe (the original fault), never/never, tool present without a replay policy, tool absent, cancelled=true despite both-safe, a checkpoint without details (no invented details key), an empty checkpoint (marker only), plus a full 2x4x2 matrix asserting replay occurs iff both declarations are safe and the batch is not cancelled, and that any other recovery never invokes the tool. Verified both directions: with the repaired source the script exits 0 and prints one summary line ('interrupted tool recovery policy: all assertions passed'); after temporarily restoring the original either/or condition it exits 1 with `AssertionError [ERR_ASSERTION]: persisted=safe tool=never: unsafe recovery replayed the interrupted tool (events [\"clear\",\"invoke\",\"effect-complete\",\"publish\"])`, and the case-3 assertion pins the mirrored direction as well. The fixed source was then restored (git diff shows exactly the one changed line). Syntax/type-strip validity of the real tools.ts is proven by the subject loading and evaluating the module. Limitation: the repository's own suites could not be executed — node_modules is absent (no vitest/biome/tsgo) and the task forbids installing dependencies or using the network, so the focused production validation is the subject-driven regression above; no optional validation dependency was available to add beyond it."
+  }
+}

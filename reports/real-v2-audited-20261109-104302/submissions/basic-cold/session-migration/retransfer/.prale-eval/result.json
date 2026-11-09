@@ -1,0 +1,15 @@
+{
+  "task_id": "session-migration/retransfer",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claim": "In migrateSessionsFromAgentRoot (packages/coding-agent/src/migrations.ts), a filename collision in a legacy session batch aborted the whole loop, so every later file in the batch stayed unmigrated. The fix skips only the colliding file (return -> continue), keeping both the legacy source copy and the pre-existing destination copy, continuing the batch, staying idempotent on repeat runs, and leaving malformed/non-session headers untouched.",
+  "changes": [
+    "packages/coding-agent/src/migrations.ts: in migrateSessionsFromAgentRoot, replaced `if (existsSync(newPath)) return;` with `if (existsSync(newPath)) continue;` so an existing destination file skips only that file instead of terminating the migration loop.",
+    ".prale-eval/regression.mjs: standalone Node assertion script that loads the real production module via .prale-eval/subject.mjs (loadMigrations) with the real fs/path boundary and a caller-owned temporary agentDir under .prale-eval/, then asserts batch continuation, both-copies preservation, idempotency, and untouched malformed headers."
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node v24.14.0 (TypeScript stripping + VM modules built in; no dependencies installed, no network used). The script builds 8 legacy session .jsonl files in a scratch agentDir plus 4 malformed/non-session files (invalid JSON, session header without cwd, blank first line, wrong header type). It reads the directory in the same order the production loop sees it, picks the first valid file as the colliding one, pre-creates its destination copy with sentinel content, and then calls the real migrateSessionsFromAgentRoot(). Assertions: (1) the colliding file remains in the agent root with byte-identical content; (2) its pre-existing destination copy is not overwritten (both copies preserved); (3) all 7 non-colliding files were moved to their encoded session directories with unchanged content, proving the batch continued past the collision; (4) all 4 malformed/non-session files remain in the agent root byte-for-byte intact; (5) a second run leaves a full recursive snapshot of the agentDir unchanged (idempotent). Exit code 0 with the summary line 'migration regression: 7 files migrated, 1 collision skipped with both copies preserved, 4 malformed headers untouched, second run idempotent'. Fault detection was verified by temporarily restoring the original `return` in a scratch copy of the source: the regression then exited 1 with AssertionError 'non-colliding file legacy-1.jsonl must be moved out of the agent root; a collision must not stop the batch'. The fixed source was restored and the script re-run green. No optional validation dependency was unavailable; only an experimental-feature warning for stripTypeScriptTypes/VM modules is printed to stderr."
+  }
+}

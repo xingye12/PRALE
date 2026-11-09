@@ -66,3 +66,127 @@ def test_prale_meter_counts_agent_and_memory_turns_tokens_and_priced_cost() -> N
         "total_tokens": 165,
     }
     assert metrics["cost_usd"] == pytest.approx(0.000144)
+
+
+def test_meter_separates_failed_agent_requests_and_memory_usage():
+    class Provider:
+        async def generate(self, request):
+            if request.operation_id == "failure":
+                raise TimeoutError("provider timeout")
+            return AssistantResult(content="[]", usage={"prompt_tokens": 20, "completion_tokens": 2})
+
+    async def collect():
+        meter = _MeteredProvider(Provider())
+        with pytest.raises(TimeoutError):
+            await meter.generate(GenerationRequest("s", "main", "failure", ()))
+        await meter.generate(GenerationRequest("s", "l2", "memory", ()))
+        return meter.metrics({}, phase="solving"), meter.metrics({}, phase="promotion")
+
+    solving, promotion = asyncio.run(collect())
+    assert solving["model_attempts"] == 1
+    assert solving["failed_model_attempts"] == 1
+    assert solving["unknown_usage_attempts"] == 1
+    assert solving["usage"] == {}
+    assert solving["cost_usd"] is None
+    assert promotion["usage"]["total_tokens"] == 22
+    assert promotion["failed_model_attempts"] == 0
+
+
+@pytest.mark.parametrize("promotion_failure", [False, True])
+def test_prale_primary_metrics_exclude_promotion(tmp_path, monkeypatch, promotion_failure):
+    from types import SimpleNamespace
+
+    import real_experience_adapters as adapter
+
+    clock = [0.0]
+    monkeypatch.setattr(adapter, "time", SimpleNamespace(monotonic=lambda: clock[0]))
+
+    class Provider:
+        async def generate(self, request):
+            memory = request.lane != "main"
+            clock[0] += 5 if memory else 2
+            return AssistantResult(
+                content="[]" if memory else "done",
+                usage={"prompt_tokens": 20 if memory else 10, "completion_tokens": 1},
+            )
+
+    async def promote(runtime, store, scope):
+        await runtime._extractor.extract_l1(())
+        if promotion_failure:
+            raise RuntimeError("promotion failed")
+
+    monkeypatch.setattr(adapter, "_promote", promote)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "TASK.md").write_text("Finish without tools.")
+    prompt = tmp_path / "memory.md"
+    prompt.write_text("Return JSON.")
+    result = asyncio.run(
+        adapter.run_prale(
+            workspace=workspace,
+            state_dir=tmp_path / "state",
+            memory_mode="warm",
+            repository_id="test",
+            provider=Provider(),
+            memory_prompt=prompt,
+            timeout_seconds=5,
+            l1_turn_threshold=5,
+            memory_phase="learn",
+            pricing={"input": 1.0, "output": 2.0},
+        )
+    )
+    assert result["terminal_status"] == "completed"
+    assert result["duration_seconds"] == 2
+    assert result["usage"]["total_tokens"] == 11
+    assert result["promotion"]["duration_seconds"] == 5
+    assert result["promotion"]["usage"]["total_tokens"] == 21
+    assert result["promotion"]["status"] == ("failed" if promotion_failure else "completed")
+    assert result["total"]["duration_seconds"] == 7
+    assert result["total"]["usage"]["total_tokens"] == 32
+    assert result["cost_usd"] == pytest.approx(0.000012)
+    assert result["promotion"]["cost_usd"] == pytest.approx(0.000022)
+
+
+def test_failed_solve_is_checkpointed_before_promotion(tmp_path, monkeypatch):
+    import json
+
+    import real_experience_adapters as adapter
+
+    class Provider:
+        async def generate(self, request):
+            await asyncio.Event().wait()
+
+    progress = tmp_path / "state/adapter.json"
+
+    async def promote(runtime, store, scope):
+        checkpoint = json.loads(progress.read_text())
+        assert checkpoint["terminal_status"] == "timed_out"
+        assert checkpoint["unknown_usage_attempts"] == 1
+        assert checkpoint["promotion"]["status"] == "not_run"
+
+    monkeypatch.setattr(adapter, "_promote", promote)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "TASK.md").write_text("Solve the incident.")
+    prompt = tmp_path / "memory.md"
+    prompt.write_text("Return JSON.")
+    result = asyncio.run(
+        adapter.run_prale(
+            workspace=workspace,
+            state_dir=tmp_path / "state",
+            memory_mode="warm",
+            repository_id="test",
+            provider=Provider(),
+            memory_prompt=prompt,
+            timeout_seconds=0.02,
+            l1_turn_threshold=5,
+            memory_phase="learn",
+            pricing={},
+            progress_path=progress,
+        )
+    )
+    assert result["terminal_status"] == "timed_out"
+    assert result["usage_complete"] is False
+    assert result["cost_usd"] is None
+    assert result["promotion"]["status"] == "completed"
+    assert json.loads(progress.read_text()) == result

@@ -33,7 +33,7 @@ def build_report(results: Mapping[str, Any]) -> dict[str, Any]:
         midpoint = len(values) // 2
         return values[midpoint] if len(values) % 2 else (values[midpoint - 1] + values[midpoint]) / 2
 
-    summary = {}
+    summary: dict[str, Any] = {}
     for stage, items in stages.items():
         summary[stage] = {
             "runs": len(items),
@@ -43,6 +43,27 @@ def build_report(results: Mapping[str, Any]) -> dict[str, Any]:
             "memory_retrieval_observable_rate": sum(item.get("memory_retrievals") is not None for item in items)
             / len(items),
         }
+    if metadata.get("accounting_version") == 2:
+        for stage, items in stages.items():
+            passed = [item for item in items if item.get("acceptance") == "passed"]
+            observed = [
+                item
+                for item in passed
+                if item.get("usage_complete") is True
+                and isinstance(item.get("usage"), Mapping)
+                and "total_tokens" in item["usage"]
+            ]
+            durations = [
+                item["duration_seconds"] for item in passed if isinstance(item.get("duration_seconds"), (int, float))
+            ]
+            summary[stage]["solving_given_pass"] = {
+                "duration_observations": len(durations),
+                "mean_duration_seconds": sum(durations) / len(durations) if durations else None,
+                "token_observations": len(observed),
+                "mean_total_tokens": sum(item["usage"]["total_tokens"] for item in observed) / len(observed)
+                if observed
+                else None,
+            }
     return {"benchmark_id": "prale-experience-real-v2", "metadata": dict(metadata), "summary": summary, "runs": runs}
 
 

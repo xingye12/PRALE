@@ -1,0 +1,184 @@
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index 8796fc7..116bdfe 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -121,7 +121,8 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const fileName = file.split("/").pop() || file.split("\\").pop();
+ 			const newPath = join(correctDir, fileName!);
+ 
+-			if (existsSync(newPath)) return; // Skip if target exists
++			// Skip only the colliding file: keep both copies and migrate the rest of the batch.
++			if (existsSync(newPath)) continue;
+ 
+ 			renameSync(file, newPath);
+ 		} catch {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..aaed3f4
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,140 @@
++/**
++ * Regression for session-migration/retransfer.
++ *
++ * Incident: when one legacy session file in the ~/.pi/agent batch collided with
++ * an already-migrated session of the same name, migrateSessionsFromAgentRoot()
++ * bailed out of the whole loop (`return`) instead of skipping just that file, so
++ * every later file in the batch silently stayed unmigrated.
++ *
++ * Expected behavior after the fix:
++ *   - the colliding file is skipped, both copies are preserved byte-for-byte,
++ *   - the remaining files in the same batch are still migrated,
++ *   - malformed headers are left untouched,
++ *   - running the migration again changes nothing (idempotent).
++ *
++ * Runs against the real production module through .prale-eval/subject.mjs
++ * (real fs/path, faked getAgentDir/stripBom). No dependencies, no network.
++ */
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { fileURLToPath } from "node:url";
++import { loadMigrations } from "./subject.mjs";
++
++const root = dirname(dirname(fileURLToPath(import.meta.url)));
++const scratchRoot = join(root, ".prale-eval");
++const agentDir = mkdtempSync(join(scratchRoot, "tmp-migration-"));
++
++const write = (path, text) => {
++	mkdirSync(dirname(path), { recursive: true });
++	writeFileSync(path, text, "utf8");
++};
++
++/** Same encoding as session-manager.ts / migrations.ts. */
++const sessionDir = (agentDirPath, cwd) =>
++	join(agentDirPath, "sessions", `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
++
++const header = (cwd) => `${JSON.stringify({ type: "session", version: 3, id: cwd, cwd, timestamp: "2025-01-01T00:00:00.000Z" })}\n`;
++const sessionBody = (cwd) => `${header(cwd)}${JSON.stringify({ type: "message", role: "user", content: [{ type: "text", text: `hello from ${cwd}` }] })}\n`;
++
++/** Recursive snapshot of relative path -> file bytes, used for the idempotency check. */
++function snapshot(dir) {
++	const out = new Map();
++	const walk = (current, prefix) => {
++		for (const entry of readdirSync(current, { withFileTypes: true }).sort((a, b) => (a.name < b.name ? -1 : 1))) {
++			const relative = prefix ? `${prefix}/${entry.name}` : entry.name;
++			const absolute = join(current, entry.name);
++			if (entry.isDirectory()) walk(absolute, relative);
++			else out.set(relative, readFileSync(absolute, "utf8"));
++		}
++	};
++	walk(dir, "");
++	return out;
++}
++
++const assertSameSnapshot = (actual, expected, message) => {
++	assert.deepEqual([...actual.keys()], [...expected.keys()], `${message}: file set changed`);
++	for (const [file, content] of expected) {
++		assert.equal(actual.get(file), content, `${message}: content of ${file} changed`);
++	}
++};
++
++const migration = await loadMigrations(root, agentDir);
++assert.equal(typeof migration.migrateSessionsFromAgentRoot, "function", "production module must export migrateSessionsFromAgentRoot");
++
++try {
++	// Legacy batch: several well-formed session files plus one malformed header.
++	const legacy = [
++		{ name: "legacy-1.jsonl", cwd: "/work/alpha" },
++		{ name: "legacy-2.jsonl", cwd: "/work/beta" },
++		{ name: "legacy-3.jsonl", cwd: "/work/gamma" },
++		{ name: "legacy-4.jsonl", cwd: "/work/delta" },
++	];
++	const malformedName = "legacy-0-broken.jsonl";
++	const malformedContent = "{ this is not a session header\n";
++
++	for (const { name, cwd } of legacy) write(join(agentDir, name), sessionBody(cwd));
++	write(join(agentDir, malformedName), malformedContent);
++
++	// readdir order is filesystem dependent; probe it so the collision is always
++	// processed before at least one later file (no files are added/removed after this).
++	const order = readdirSync(agentDir).filter((name) => name.endsWith(".jsonl"));
++	const validOrder = order.filter((name) => name !== malformedName);
++	assert.ok(validOrder.length === legacy.length, `expected ${legacy.length} well-formed legacy files, saw ${validOrder.length}`);
++
++	const byName = new Map(legacy.map((entry) => [entry.name, entry]));
++	const colliderName = validOrder[0];
++	const collider = byName.get(colliderName);
++	const laterNames = validOrder.slice(1);
++	assert.ok(laterNames.length >= 1, "regression needs a file that follows the colliding one in readdir order");
++
++	// Pre-existing migrated copy that the batch entry collides with (different bytes).
++	const colliderTargetPath = join(sessionDir(agentDir, collider.cwd), colliderName);
++	const colliderTargetContent = `${header(collider.cwd)}${JSON.stringify({ type: "message", role: "assistant", content: [{ type: "text", text: "already migrated copy" }] })}\n`;
++	write(colliderTargetPath, colliderTargetContent);
++
++	const original = new Map(legacy.map(({ name, cwd }) => [name, sessionBody(cwd)]));
++
++	// ---- first run -------------------------------------------------------
++	migration.migrateSessionsFromAgentRoot();
++
++	// The colliding file is skipped only: source stays put, existing target untouched.
++	assert.ok(existsSync(join(agentDir, colliderName)), `colliding file ${colliderName} must remain in the agent root`);
++	assert.equal(readFileSync(join(agentDir, colliderName), "utf8"), original.get(colliderName), "colliding source copy must be preserved byte-for-byte");
++	assert.ok(existsSync(colliderTargetPath), `already-migrated copy ${colliderTargetPath} must be preserved`);
++	assert.equal(readFileSync(colliderTargetPath, "utf8"), colliderTargetContent, "already-migrated copy must not be overwritten");
++
++	// Every later file in the batch is still migrated (this is the fault: `return` did not).
++	for (const name of laterNames) {
++		const { cwd } = byName.get(name);
++		const sourcePath = join(agentDir, name);
++		const targetPath = join(sessionDir(agentDir, cwd), name);
++		assert.equal(existsSync(sourcePath), false, `${name} should have been migrated out of the agent root despite the earlier collision`);
++		assert.ok(existsSync(targetPath), `${name} should exist at ${targetPath}`);
++		assert.equal(readFileSync(targetPath, "utf8"), original.get(name), `${name} must be migrated with its content intact`);
++	}
++
++	// Malformed headers are untouched.
++	assert.ok(existsSync(join(agentDir, malformedName)), "malformed header file must stay in the agent root");
++	assert.equal(readFileSync(join(agentDir, malformedName), "utf8"), malformedContent, "malformed header file must not be modified");
++
++	// Nothing was lost: every legacy file is accounted for exactly once.
++	const sessionsRoot = join(agentDir, "sessions");
++	const migratedFiles = existsSync(sessionsRoot)
++		? readdirSync(sessionsRoot, { recursive: true, withFileTypes: true })
++				.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
++				.map((entry) => entry.name)
++		: [];
++	assert.equal(migratedFiles.length, legacy.length, `expected ${legacy.length} migrated session files, saw ${migratedFiles.length}: ${migratedFiles.join(", ")}`);
++
++	// ---- repeated runs are idempotent -----------------------------------
++	const firstSnapshot = snapshot(agentDir);
++	migration.migrateSessionsFromAgentRoot();
++	assertSameSnapshot(snapshot(agentDir), firstSnapshot, "second run");
++	migration.migrateSessionsFromAgentRoot();
++	assertSameSnapshot(snapshot(agentDir), firstSnapshot, "third run");
++
++	console.log("regression ok: collision skipped, remaining batch migrated, malformed header untouched, reruns idempotent");
++} finally {
++	rmSync(agentDir, { recursive: true, force: true });
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..531346c
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,15 @@
++{
++  "task_id": "session-migration/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "summary": "migrateSessionsFromAgentRoot() in packages/coding-agent/src/migrations.ts aborted the whole batch with `return` when a legacy session file collided with an already-migrated session of the same name. It now uses `continue`, so only the colliding file is skipped (both copies preserved) and every later file in the batch still migrates; malformed headers remain untouched and reruns are idempotent.",
++  "changes": [
++    "packages/coding-agent/src/migrations.ts: in migrateSessionsFromAgentRoot(), replaced `if (existsSync(newPath)) return;` with `if (existsSync(newPath)) continue;` (plus a clarifying comment) so a name collision skips only that file instead of ending the migration loop.",
++    ".prale-eval/regression.mjs: standalone Node assertion script that loads the real module via .prale-eval/subject.mjs with real fs/path and a temporary agentDir."
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root on Node v24.14.0; exits 0 with 'regression ok: collision skipped, remaining batch migrated, malformed header untouched, reruns idempotent'. The script creates a temporary agentDir inside .prale-eval/ containing well-formed legacy session files plus one malformed header, probes readdirSync order so a colliding entry is always processed before at least one later file, pre-creates the colliding target copy with different bytes, and then runs the real migrateSessionsFromAgentRoot(). Assertions: (1) the colliding source file is still present in the agent root with byte-identical content; (2) the pre-existing migrated copy is unchanged (both copies preserved, no overwrite); (3) every file that followed the collider in the batch was moved into sessions/--<encoded-cwd>--/ with its content intact; (4) the malformed-header file is untouched; (5) exactly four session files exist under sessions/ (nothing lost); (6) a second and third run leave the whole tree byte-identical (idempotent). Fault detection was verified by temporarily reverting the one-line fix: the script then fails with 'AssertionError: legacy-2.jsonl should have been migrated out of the agent root despite the earlier collision' and exit code 1, and passes again with the fix restored. No dependencies or network were used; temporary fixtures are removed in a finally block."
++  }
++}
+snapshot .prale-eval/regression.mjs - 44f23b98b40fcc5ffad1f35b7460bd92fae07b3da1bf8fa3bbfd6b3f26821740
+snapshot .prale-eval/result.json - 5741049ff8d5eb29fe4c0353352919101a9cb9dc5f1bd711e9bbb6740e75550f
+snapshot packages/coding-agent/src/migrations.ts 33c2bc5d6f55f30c8eb6d60400aba867c049b056976b526845b692f967cae0ec bc5e29049f1dcec5527a5af6c3a4dc6aa35cf6edb18792c5ef7a67324b2f657d

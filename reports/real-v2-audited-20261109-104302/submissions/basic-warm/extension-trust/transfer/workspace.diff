@@ -1,0 +1,132 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 699143e..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(false);
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..b6d37e7
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,94 @@
++/**
++ * Regression for extension trust transfer after bootstrap.
++ *
++ * Exercises the real DefaultResourceLoader lifecycle through the read-only
++ * subject helper. The boundary fakes report which trust state each settings
++ * reload actually persisted and which extensions the package manager resolved
++ * from that state.
++ */
++import assert from "node:assert/strict";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createTrustSubject } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const basenames = (extensionsResult) =>
++	extensionsResult.extensions.map((extension) => path.basename(extension.path));
++const sameMembers = (actual, expected) =>
++	assert.deepEqual([...actual].sort(), [...expected].sort());
++
++async function exercise({ initialTrusted, decision, label }) {
++	const { loader, events, state } = await createTrustSubject(root, { initialTrusted });
++
++	const decisions = [];
++	await loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			decisions.push(basenames(extensionsResult));
++			return decision;
++		},
++	});
++
++	assert.equal(decisions.length, 1, `${label}: resolveProjectTrust must run exactly once`);
++
++	// Bootstrap must never expose project-local extensions to the trust decision.
++	const bootstrapExtensions = decisions[0];
++	assert.ok(
++		!bootstrapExtensions.includes("project.ts"),
++		`${label}: project extension leaked into the bootstrap pass: ${bootstrapExtensions.join(", ")}`,
++	);
++	sameMembers(bootstrapExtensions, ["user.ts", "cli.ts"]);
++
++	// The decision must be applied to settings and reloaded before final resolution.
++	const resolveEvents = events
++		.map((event, index) => (event[0] === "resolve" ? index : -1))
++		.filter((index) => index !== -1);
++	assert.ok(resolveEvents.length >= 2, `${label}: expected bootstrap and final resolve events`);
++
++	const bootstrapResolveIndex = resolveEvents[0];
++	assert.equal(
++		events[bootstrapResolveIndex][1],
++		false,
++		`${label}: bootstrap must resolve packages with project trust disabled`,
++	);
++
++	const finalResolveIndex = resolveEvents[resolveEvents.length - 1];
++	const settingsBeforeFinal = events
++		.slice(0, finalResolveIndex)
++		.filter((event) => event[0] === "settings");
++	const finalSettings = settingsBeforeFinal[settingsBeforeFinal.length - 1];
++	assert.ok(
++		finalSettings !== undefined,
++		`${label}: settings were never reloaded before final resource resolution`,
++	);
++	assert.equal(
++		finalSettings[1],
++		decision,
++		`${label}: settings were reloaded with ${finalSettings[1]} instead of the explicit decision ${decision}`,
++	);
++	assert.equal(
++		events[finalResolveIndex][1],
++		decision,
++		`${label}: final package resolution saw trust ${events[finalResolveIndex][1]} instead of ${decision}`,
++	);
++	assert.equal(state.trusted, decision, `${label}: settings manager retained the wrong trust state`);
++
++	// The final extension set must follow the decision, while user/CLI stay loaded.
++	const finalExtensions = basenames(loader.getExtensions());
++	if (decision) {
++		sameMembers(finalExtensions, ["user.ts", "project.ts", "cli.ts"]);
++	} else {
++		sameMembers(finalExtensions, ["user.ts", "cli.ts"]);
++		assert.ok(
++			!finalExtensions.includes("project.ts"),
++			`${label}: project extension loaded despite an explicit false decision`,
++		);
++	}
++}
++
++// An explicit true must be honored even when the previous state was untrusted.
++await exercise({ initialTrusted: false, decision: true, label: "explicit true" });
++
++// An explicit false must be honored even when the previous state was trusted.
++await exercise({ initialTrusted: true, decision: false, label: "explicit false" });
++
++console.log("trust transfer regression passed");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..4ae3715
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "extension-trust/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired DefaultResourceLoader.reload so the explicit resolveProjectTrust result is transferred to SettingsManager before the final settings reload and package resolution (previously it always forced false after bootstrap). The standalone regression loads the real resource-loader.ts through .prale-eval/subject.mjs and asserts: the bootstrap pass resolves packages untrusted and exposes only user/CLI extensions (no project extension); settings are reloaded with the explicit decision before final resource resolution; an explicit true applies even when the prior state was untrusted and loads user, project, and CLI extensions; an explicit false applies even when the prior state was trusted and keeps the project extension excluded. Ran the regression on the fixed checkout (exit 0) and replayed it against a temporary copy with the original setProjectTrusted(false) fault, where it failed with AssertionError (exit 1) at the settings-reload assertion, confirming fault detection. Vitest/TypeScript test dependencies are not installed in this workspace and were not installed; the requested VM-based regression is the focused validation."
++  }
++}
+snapshot .prale-eval/regression.mjs - 6f60000a6700ec646b73fca6194f7d364ea8993700b5edc90a791b320c8d6435
+snapshot .prale-eval/result.json - 06b1a4c966293d5968f67162a0fa1065a3836bd22653c608da5e43f0a619f2fa
+snapshot packages/coding-agent/src/core/resource-loader.ts a031f345d80d20a71812a6f187730475cc80914586ca01bb0d88118193d445db 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

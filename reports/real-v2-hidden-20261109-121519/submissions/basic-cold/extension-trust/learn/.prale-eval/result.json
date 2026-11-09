@@ -1,0 +1,37 @@
+{
+  "task_id": "extension-trust/learn",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "citations": [
+    {
+      "claim": "Fault: the trust bootstrap forced project settings to trusted before reloading settings and resolving extensions, so a previously-trusted state let project-local extensions load before trust was decided.",
+      "path": "packages/coding-agent/src/core/resource-loader.ts",
+      "line": 438
+    },
+    {
+      "claim": "Fix: loadProjectTrustExtensions now calls settingsManager.setProjectTrusted(false) before settingsManager.reload(), so the untrusted setting is in force for the bootstrap resolve; user/global and temporary CLI extensions still load.",
+      "path": "packages/coding-agent/src/core/resource-loader.ts",
+      "line": 435
+    },
+    {
+      "claim": "reload() runs the bootstrap pass via loadProjectTrustExtensions before the trust resolver, then applies the resolved value for the final extension set.",
+      "path": "packages/coding-agent/src/core/resource-loader.ts",
+      "line": 452
+    },
+    {
+      "claim": "Regression exercises the real DefaultResourceLoader through .prale-eval/subject.mjs createTrustSubject; assertUntrustedBootstrap encodes the invariant that no trusted state exists before the first extension resolve, and the four scenarios cover trusted-start, denied, untrusted-start, and direct bootstrap entry points.",
+      "path": ".prale-eval/regression.mjs",
+      "line": 33
+    }
+  ],
+  "deliverables": [
+    "packages/coding-agent/src/core/resource-loader.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/result.json"
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Root cause: DefaultResourceLoader.loadProjectTrustExtensions (packages/coding-agent/src/core/resource-loader.ts:435) called setProjectTrusted(true) and then settingsManager.reload(), contradicting its own comment. When the previous SettingsManager state was trusted, the bootstrap pass reloaded settings as trusted and resolved project-scoped extensions/packages, so project code loaded before the resolveProjectTrust decision. Fix: one-line change to setProjectTrusted(false) before settingsManager.reload() (line 438); nothing else altered, so the post-decision setProjectTrusted(projectTrusted) at line 454 still enables project extensions once trust is granted. Validation ran from the workspace root against the fixed source with no dependencies or network: 4 scenarios pass (exit 0). Shared invariant (assertUntrustedBootstrap, regression.mjs:33): before the first package resolve no setProjectTrusted(true) or trusted settings reload may occur, the first resolve must observe untrusted, and the first loadExtensionsCached batch must be exactly [cli.ts, user.ts] with no project.ts. Scenarios: (1) previous state trusted + reload({resolveProjectTrust: approve}) - invariant holds, the extensionsResult handed to the trust resolver is user/global + CLI only, final getExtensions() is [cli.ts, project.ts, user.ts], and the last applied setting is trusted=true; (2) trust denied - invariant holds, every resolve is untrusted, project.ts is never loaded and the final set is [cli.ts, user.ts]; (3) previous state untrusted - identical untrusted bootstrap, project extensions load after approval; (4) direct loadProjectTrustExtensions() with a trusted prior state (the CLI trust-prompt path) - invariant holds and the returned set is [cli.ts, user.ts]. Fault sensitivity verified by temporarily restoring setProjectTrusted(true): the run failed with AssertionError 'trusted-start reload: bootstrap must force untrusted settings before resolving extensions, saw setProjectTrusted([true])' (exit 1); the fixed line was then restored (git diff shows only the single-line production change). Limitation: the repository vitest suites (e.g. packages/coding-agent/test/resource-loader.test.ts) could not be executed because node_modules is not installed and dependency installation/network use is out of scope, so this VM-module regression plus manual review of the unchanged post-trust path stood in for them."
+  }
+}

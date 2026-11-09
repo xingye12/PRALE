@@ -1,0 +1,315 @@
+diff --git a/packages/coding-agent/src/core/session-manager.ts b/packages/coding-agent/src/core/session-manager.ts
+index a661f04..fd87a2d 100644
+--- a/packages/coding-agent/src/core/session-manager.ts
++++ b/packages/coding-agent/src/core/session-manager.ts
+@@ -653,7 +653,7 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
+ 
+ 		pending += decoder.end();
+ 		const finalEntry = parseSessionEntryLine(pending);
+-		// Regression: discard final JSONL entry.
++		if (finalEntry) entries.push(finalEntry);
+ 	} finally {
+ 		closeSync(fd);
+ 	}
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index 8796fc7..3f02ba6 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -121,7 +121,7 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const fileName = file.split("/").pop() || file.split("\\").pop();
+ 			const newPath = join(correctDir, fileName!);
+ 
+-			if (existsSync(newPath)) return; // Skip if target exists
++			if (existsSync(newPath)) continue; // Skip if target exists
+ 
+ 			renameSync(file, newPath);
+ 		} catch {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100755
+index 0000000..fa528f2
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,193 @@
++#!/usr/bin/env node
++/**
++ * Cross-module regression for advanced/session-integrity/retransfer.
++ *
++ * Loads the real submitted migrations.ts and core/session-manager.ts through
++ * the read-only subject helper. Only the agent-dir boundary, process.cwd and
++ * the migration readdir ordering are supplied by the harness; all migration,
++ * JSONL parsing, newline repair and session loading code is the real source.
++ *
++ * Scenario: a legacy agent-root batch whose first file collides with an
++ * existing destination and whose last file is a valid session whose final
++ * JSONL record has no trailing newline. The collision must not stop the
++ * batch, and the migrated tail must read back exactly once, in order, with
++ * ordered Unicode payloads, malformed-line skipping, one newline repair and
++ * idempotent re-reads.
++ */
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, readFileSync, rmdirSync, rmSync, writeFileSync } from "node:fs";
++import { join } from "node:path";
++import { fileURLToPath } from "node:url";
++import { createSessionPipeline } from "./subject.mjs";
++
++const root = fileURLToPath(new URL("..", import.meta.url));
++const workDir = join(root, ".prale-eval", "tmp", "retransfer");
++const agentDir = join(workDir, "agent");
++const collisionCwd = join(workDir, "project-collision");
++const tailCwd = join(workDir, "project-tail");
++
++const TIMESTAMP = "2026-01-01T00:00:00.000Z";
++
++function sessionDirFor(cwd) {
++	return join(agentDir, "sessions", `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`);
++}
++
++function customEntry(id, parentId, data) {
++	return { type: "custom", id, parentId, timestamp: TIMESTAMP, customType: "legacy", data };
++}
++
++function writeSessionFile(path, header, records, { terminate = true } = {}) {
++	const lines = [JSON.stringify(header), ...records.map((record) => (typeof record === "string" ? record : JSON.stringify(record)))];
++	const content = lines.join("\n") + (terminate ? "\n" : "");
++	writeFileSync(path, content, "utf8");
++	return content;
++}
++
++function resetWorkDir() {
++	rmSync(workDir, { recursive: true, force: true });
++	mkdirSync(agentDir, { recursive: true });
++}
++
++resetWorkDir();
++try {
++	// ---------------------------------------------------------------------
++	// Fixture: collision first (sorted readdir), valid unterminated tail last.
++	// ---------------------------------------------------------------------
++	const collisionHeader = {
++		type: "session",
++		version: 3,
++		id: "collision-source",
++		timestamp: TIMESTAMP,
++		cwd: collisionCwd,
++	};
++	const collisionSource = join(agentDir, "00-collision.jsonl");
++	writeSessionFile(collisionSource, collisionHeader, [
++		customEntry("source-entry", null, "source bytes must survive ✓"),
++	]);
++
++	// Existing destination with independent bytes must remain byte-identical.
++	const collisionDir = sessionDirFor(collisionCwd);
++	mkdirSync(collisionDir, { recursive: true });
++	const collisionDestination = join(collisionDir, "00-collision.jsonl");
++	writeSessionFile(
++		collisionDestination,
++		{ ...collisionHeader, id: "collision-destination" },
++		[customEntry("destination-entry", null, "destination bytes must survive 保持")],
++	);
++
++	const sourceBytesBefore = readFileSync(collisionSource);
++	const destinationBytesBefore = readFileSync(collisionDestination);
++
++	const tailHeader = { type: "session", version: 3, id: "tail-session", timestamp: TIMESTAMP, cwd: tailCwd };
++	const tailEntries = [
++		customEntry("tail-1", null, "héllo — 世界 🌍"),
++		"this malformed line must be skipped",
++		customEntry("tail-2", "tail-1", "Ω ✅ 二番目"),
++		customEntry("tail-3", "tail-2", "最終レコード 🚀"),
++	];
++	const tailSource = join(agentDir, "99-tail.jsonl");
++	const tailContentBefore = writeSessionFile(tailSource, tailHeader, tailEntries, { terminate: false });
++	assert.ok(tailContentBefore.endsWith("}"), "fixture tail must not end with a newline");
++
++	const tailDestination = join(sessionDirFor(tailCwd), "99-tail.jsonl");
++
++	// ---------------------------------------------------------------------
++	// Real migration -> real session reader.
++	// ---------------------------------------------------------------------
++	const { migration, session } = await createSessionPipeline(root, agentDir);
++	migration.migrateSessionsFromAgentRoot();
++
++	// Collision: later migrations continue; both byte streams stay untouched.
++	assert.ok(existsSync(collisionSource), "collision source must not be moved or removed");
++	assert.ok(existsSync(collisionDestination), "collision destination must remain in place");
++	assert.deepEqual(
++		readFileSync(collisionSource),
++		sourceBytesBefore,
++		"collision source bytes must be unchanged",
++	);
++	assert.deepEqual(
++		readFileSync(collisionDestination),
++		destinationBytesBefore,
++		"collision destination bytes must be unchanged",
++	);
++
++	// The file after the collision must still be migrated.
++	assert.ok(existsSync(tailDestination), "valid session after the collision must be migrated");
++	assert.equal(existsSync(tailSource), false, "migrated tail must no longer exist in the agent root");
++	assert.equal(
++		readFileSync(tailDestination, "utf8"),
++		tailContentBefore,
++		"migration must move the tail bytes without altering them",
++	);
++
++	// Reading the migrated file repairs only the missing trailing newline.
++	const firstRead = session.loadEntriesFromFile(tailDestination);
++	// Project records into host arrays: values created inside the subject VM have
++	// sandbox-realm Array prototypes and would otherwise fail deep equality.
++	const firstReadShape = Array.from(firstRead, (entry) => entry.id);
++	assert.deepEqual(
++		firstReadShape,
++		["tail-session", "tail-1", "tail-2", "tail-3"],
++		"reader must retain every valid record in order, including the unterminated final record",
++	);
++	assert.equal(
++		firstRead.filter((entry) => entry.id === "tail-3").length,
++		1,
++		"unterminated final record must be retained exactly once",
++	);
++	assert.equal(firstRead.at(-1)?.id, "tail-3", "final record must remain the tail");
++	assert.deepEqual(
++		Array.from(firstRead)
++			.filter((entry) => entry.type === "custom")
++			.map((entry) => entry.data),
++		["héllo — 世界 🌍", "Ω ✅ 二番目", "最終レコード 🚀"],
++		"ordered Unicode payloads must be preserved and the malformed line skipped",
++	);
++	assert.equal(
++		readFileSync(tailDestination, "utf8"),
++		`${tailContentBefore}\n`,
++		"reader must append exactly one newline after the unterminated final record",
++	);
++
++	// Idempotent re-read: same projection, no duplicate tail, no extra newline.
++	const secondRead = session.loadEntriesFromFile(tailDestination);
++	assert.deepEqual(
++		Array.from(secondRead),
++		Array.from(firstRead),
++		"re-reading must return the same records exactly once",
++	);
++	assert.equal(
++		readFileSync(tailDestination, "utf8"),
++		`${tailContentBefore}\n`,
++		"re-reading must not append another newline",
++	);
++
++	// Cross-check through the session-manager consumer boundary.
++	const manager = session.SessionManager.open(tailDestination);
++	assert.equal(manager.getHeader()?.id, "tail-session", "session header must be discovered");
++	assert.deepEqual(
++		Array.from(manager.getEntries(), (entry) => entry.id),
++		["tail-1", "tail-2", "tail-3"],
++		"SessionManager must expose the record before the repaired newline",
++	);
++	assert.equal(manager.getLeafId(), "tail-3", "leaf must be the formerly unterminated record");
++
++	// Appending after the repaired newline must create a separate valid record.
++	const appendedId = manager.appendCustomEntry("after-tail", { text: "appended ✓" });
++	const afterAppend = session.loadEntriesFromFile(tailDestination);
++	assert.deepEqual(
++		Array.from(afterAppend, (entry) => entry.id),
++		["tail-session", "tail-1", "tail-2", "tail-3", appendedId],
++		"appending must not merge with or duplicate the repaired tail record",
++	);
++	assert.equal(afterAppend.filter((entry) => entry.id === "tail-3").length, 1, "tail record must stay unique");
++
++	console.log("session-integrity/retransfer regression: passed");
++} finally {
++	rmSync(workDir, { recursive: true, force: true });
++	try {
++		rmdirSync(join(root, ".prale-eval", "tmp"));
++	} catch {
++		// Another local run still owns the shared parent; leave it in place.
++	}
++}
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..8d54a0c
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,63 @@
++# Repair: resume a mixed legacy batch without dropping its tail
++
++## Failure chain
++
++The incident crosses two real modules:
++
++1. `packages/coding-agent/src/migrations.ts` — `migrateSessionsFromAgentRoot()` walks the
++   agent root and moves legacy `*.jsonl` sessions into `sessions/<encoded-cwd>/`. When a
++   destination path already existed (a collision), the loop executed `return`, which exited
++   the **whole migration function**. Every file ordered after the colliding file was left in
++   the agent root, including the later valid session that needed migration.
++
++2. `packages/coding-agent/src/core/session-manager.ts` — `loadEntriesFromFile()` reads JSONL
++   incrementally with a `StringDecoder`, parses newline-delimited records, and repairs a
++   missing trailing newline. It computed `const finalEntry = parseSessionEntryLine(pending)`
++   for the unterminated final fragment but never pushed it into `entries`. The repair then
++   appended `"\n"`, permanently consuming the final record on the next read: the record was
++   dropped (and could never be recovered by a re-read).
++
++## Minimal fixes
++
++- `migrations.ts`: change the destination-collision guard from `return` to `continue`.
++  The colliding source and destination bytes are still untouched, but iteration proceeds to
++  the remaining files in the batch.
++- `core/session-manager.ts`: push the parsed final fragment when it is a valid entry:
++  `if (finalEntry) entries.push(finalEntry);`. Malformed/blank trailing fragments still parse
++  to `null` and are skipped, and the existing `if (pending) appendFileSync(..., "\n")`
++  newline repair remains unchanged.
++
++No APIs, signatures, path encoding, header validation, malformed-line skipping, or unrelated
++migration behavior were changed.
++
++## Cross-module behavior now guaranteed
++
++- A collision leaves both byte streams identical and does not stop later migrations.
++- A valid migrated session whose last record has no newline reads back with every record in
++  file order, retaining the final record exactly once.
++- Ordered Unicode payloads survive, and malformed interior lines are skipped.
++- The reader appends exactly one newline; a second read returns identical records and does
++  not append another newline (idempotent recovery).
++- `SessionManager.open()` sees the formerly unterminated record as the leaf, and appending a
++  new entry after the repaired newline creates a separate valid record rather than merging
++  with or duplicating the tail.
++
++## Validation
++
++Command: `node --experimental-vm-modules .prale-eval/regression.mjs`
++
++`.prale-eval/regression.mjs` loads the submitted production modules through the read-only
++`.prale-eval/subject.mjs` VM helper (`createSessionPipeline`), so real `migrations.ts`, real
++`core/session-manager.ts`, and the real path/text helpers execute; only the agent-dir
++boundary and deterministic `readdirSync` ordering are provided by the harness. Temporary
++inputs live under `.prale-eval/tmp/` and are removed by the suite.
++
++The suite passes on the repair. Restoring either source file alone to its faulty baseline was
++verified to fail with an explicit `node:assert/strict` `AssertionError`, not an import error,
++crash, or timeout:
++
++- migrations baseline: `valid session after the collision must be migrated`
++- session-manager baseline: `reader must retain every valid record in order, including the unterminated final record`
++
++No optional validation dependencies were unavailable; Node 24 is sufficient and no network,
++credentials, or deployment were used.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..a7a866d
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/session-integrity/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired two independent regressions across the real producer/consumer flow. In packages/coding-agent/src/migrations.ts, migrateSessionsFromAgentRoot() now uses continue instead of return when a destination file already exists, so a leading collision no longer aborts the batch and leaves the later valid session unmigrated; colliding source and destination bytes remain unchanged. In packages/coding-agent/src/core/session-manager.ts, loadEntriesFromFile() now pushes the parsed unterminated final JSONL record before appending the newline repair, so the tail is retained exactly once and remains recoverable. The regression loads the submitted modules through the read-only .prale-eval/subject.mjs createSessionPipeline VM helper (real migrations, session manager, and path/text helpers; only the agent-dir boundary and deterministic readdir ordering are harness-provided). It builds a legacy agent-root batch with a first-file collision and a last-file valid session whose final record has no newline, then asserts collision byte preservation, continued migration, ordered Unicode payloads, malformed-line skipping, exactly-once tail retention, a single newline repair, idempotent re-read, SessionManager leaf discovery, and safe append after repair. Baseline mutation checks were run individually: restoring only migrations.ts failed with 'valid session after the collision must be migrated' and restoring only session-manager.ts failed with 'reader must retain every valid record in order, including the unterminated final record', both as uncaught node:assert/strict AssertionErrors rather than crashes or import errors. Temporary fixtures under .prale-eval/tmp are cleaned up. No optional dependencies were unavailable and no network, credentials, or deployment were used."
++  }
++}
+snapshot .prale-eval/regression.mjs - 09375e48ed7f7d173ab2db5c0caa84c523f69a9f51598d844c1c99bbc59df388
+snapshot .prale-eval/repair.md - 241fd4a26732de8e372dee5c7f2b50582ed520e1c184688986c0fe8f80922fff
+snapshot .prale-eval/result.json - d8120948ea72694dfedea2e97ecd32e44c78c2b399a4ddcb7f19510c5484aeff
+snapshot packages/coding-agent/src/core/session-manager.ts cb25d6399c7dd959748f1c32fe158d4ed7b9c5c3b2b1d1ca6af5faffd19bd4a0 ded5d65112f8666f0e3ae71dab39a302607c29a000745a3d06e00c2103c8f257
+snapshot packages/coding-agent/src/migrations.ts 33c2bc5d6f55f30c8eb6d60400aba867c049b056976b526845b692f967cae0ec 59fc18cedfcbecd993918bb335e5e76a9f9c899c61ecf9eab110f86d976af1bc

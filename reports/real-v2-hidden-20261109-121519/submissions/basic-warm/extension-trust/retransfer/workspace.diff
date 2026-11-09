@@ -1,0 +1,167 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 72decd8..88490cc 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,8 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(true);
++			// Apply the decision itself: a denied decision must keep project resources out.
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..ee518df
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,128 @@
++/**
++ * Regression: a project trust decision must be transferred as-is on every reload.
++ *
++ * Phase separation required of DefaultResourceLoader.reload():
++ *   - the bootstrap pass (loadProjectTrustExtensions) never exposes project resources;
++ *   - a denied (false) decision keeps project resources out of the final set;
++ *   - an approved (true) decision exposes project resources;
++ *   - user/global and CLI extensions stay available in every phase.
++ *
++ * The original fault unconditionally called setProjectTrusted(true) after the
++ * resolver returned, so a denied decision silently became approval.
++ */
++import assert from "node:assert/strict";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createTrustSubject } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++
++const BOOTSTRAP_ONLY = ["cli.ts", "user.ts"];
++const DENIED = ["cli.ts", "user.ts"];
++const APPROVED = ["cli.ts", "project.ts", "user.ts"];
++
++function names(extensions) {
++	// Copy into this realm: arrays created inside the VM context have a different
++	// Array.prototype, which deepStrictEqual correctly treats as a mismatch.
++	return Array.from(extensions, (extension) => path.basename(extension.path)).sort();
++}
++
++function resolveDecisions(events) {
++	return events.filter(([kind]) => kind === "resolve").map(([, trusted]) => trusted);
++}
++
++function extensionLoads(events) {
++	return events
++		.filter(([kind]) => kind === "extensions")
++		.map(([, loaded]) => loaded.slice().sort());
++}
++
++async function deniedThenApproved() {
++	const { loader, events, state } = await createTrustSubject(root);
++	let bootstrap = null;
++
++	await loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			bootstrap = names(extensionsResult.extensions);
++			return false;
++		},
++	});
++
++	// Bootstrap happens before any trust decision and must not see project resources.
++	assert.deepEqual(bootstrap, BOOTSTRAP_ONLY, "bootstrap must exclude project extensions while keeping user/CLI");
++	// The denied decision must be the one applied to settings.
++	assert.equal(state.trusted, false, "a denied decision must not mark the project trusted");
++	assert.deepEqual(
++		names(loader.getExtensions().extensions),
++		DENIED,
++		"after a denied decision only user/CLI extensions may remain loaded",
++	);
++	assert.equal(
++		state.loadedTrust,
++		false,
++		"the final resource resolution must run with the denied trust state",
++	);
++	assert.deepEqual(resolveDecisions(events), [false, false], "every resolve must observe the denied trust state");
++	assert.ok(
++		!extensionLoads(events).some((loaded) => loaded.includes("project.ts")),
++		"project extensions must never be loaded after a denied decision",
++	);
++
++	// A later reload with the same denied decision must stay denied.
++	await loader.reload({ resolveProjectTrust: async () => false });
++	assert.equal(state.trusted, false, "a repeated denied decision must not flip trust");
++	assert.deepEqual(names(loader.getExtensions().extensions), DENIED, "repeated denied reload must stay project-free");
++
++	// And an explicit approval on a fresh reload must make project resources available.
++	await loader.reload({ resolveProjectTrust: async () => true });
++	assert.equal(state.trusted, true, "an approved decision must mark the project trusted");
++	assert.deepEqual(
++		names(loader.getExtensions().extensions),
++		APPROVED,
++		"after approval project extensions must join user/CLI extensions",
++	);
++	assert.equal(state.loadedTrust, true, "the final resolution after approval must observe trusted settings");
++}
++
++async function approvedThenDenied() {
++	const { loader, state } = await createTrustSubject(root);
++
++	await loader.reload({ resolveProjectTrust: async () => true });
++	assert.deepEqual(names(loader.getExtensions().extensions), APPROVED, "approval must load project resources");
++
++	// A fresh reload with a denied decision must retract project resources.
++	await loader.reload({ resolveProjectTrust: async () => false });
++	assert.equal(state.trusted, false, "a fresh denied decision must revoke the earlier approval");
++	assert.deepEqual(
++		names(loader.getExtensions().extensions),
++		DENIED,
++		"a fresh denied decision must not leave project resources loaded",
++	);
++	assert.equal(state.loadedTrust, false, "a fresh denied decision must resolve resources as untrusted");
++}
++
++async function reloadWithoutResolverRespectsTrustState() {
++	const trusted = await createTrustSubject(root, { initialTrusted: true });
++	await trusted.loader.reload();
++	assert.deepEqual(
++		names(trusted.loader.getExtensions().extensions),
++		APPROVED,
++		"a reload without a resolver must keep an already trusted project available",
++	);
++	assert.equal(trusted.state.trusted, true, "a reload without a resolver must not change trust");
++
++	const untrusted = await createTrustSubject(root, { initialTrusted: false });
++	await untrusted.loader.reload();
++	assert.deepEqual(
++		names(untrusted.loader.getExtensions().extensions),
++		DENIED,
++		"a reload without a resolver must keep an untrusted project absent",
++	);
++	assert.equal(untrusted.state.trusted, false, "a reload without a resolver must not grant trust");
++}
++
++await deniedThenApproved();
++await approvedThenDenied();
++await reloadWithoutResolverRespectsTrustState();
++
++console.log("regression: trust decisions preserved across resource reloads");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..fe33b6f
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "extension-trust/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired DefaultResourceLoader.reload in packages/coding-agent/src/core/resource-loader.ts:451-456: the resolver result was previously discarded and setProjectTrusted(true) was always called, so a denied project trust decision became approval. It now applies setProjectTrusted(projectTrusted), preserving the bootstrap pass (loadProjectTrustExtensions forces untrusted, lines 435-441), the denied final set, and later approved reloads while user/global and CLI resources stay loaded. Ran the exact validation command from the workspace root: exits 0 using only Node 24 built-ins (node:assert/strict plus .prale-eval/subject.mjs), no npm install or network. The regression asserts bootstrap excludes project extensions, denied decisions keep trust false and extensions limited to user/CLI across repeated and fresh reloads, approvals include project resources, and reloads without a resolver respect the existing trust state. It was also replayed against the original fault (setProjectTrusted(true)) and failed there with AssertionError 'a denied decision must not mark the project trusted' (true !== false), so it detects this stage's fault rather than merely printing success."
++  }
++}
+snapshot .prale-eval/regression.mjs - 954fbd0abc2e16ba0373e8cfbbd6759c6a2dda97fa4e006b98fa56a7de2db2d2
+snapshot .prale-eval/result.json - 6368f68d8d6caa1a23a2b99f5c51af44fc8b9c1b70838c8453fb95d6b949bc6f
+snapshot packages/coding-agent/src/core/resource-loader.ts 076fed822b4c7a151bb59becc911d376eab3ae0eecbc7ecbdf90b2adc827b22b d5cbd892f01cbccce2ad954b6e97f4fec6f8ef74b5bd7b359ca4d3425d9fd699

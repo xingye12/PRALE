@@ -1,0 +1,44 @@
+{
+  "task_id": "tool-recovery-order/transfer",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "summary": "recoverToolInvocation replayed any call persisted with replay \"safe\" without rechecking the current tool declaration, so a tool that became unsafe or disappeared after restart still executed. It now replays only when the persisted intent is safe, the tool is still declared, that declaration still declares replay \"safe\", and the operation was not cancelled; every other recovered call settles as an interrupted outcome.",
+  "claims": [
+    {
+      "claim": "Recovery ignores a changed or missing current tool declaration.",
+      "resolution": "packages/agent/src/harness/runtime/drive/tools.ts: recoverToolInvocation now looks up toolCall name in toolsByName and requires tool?.replay === \"safe\" in addition to call.replay === \"safe\"."
+    },
+    {
+      "claim": "Recheck it against persisted replay policy; only both-safe, non-cancelled calls replay.",
+      "resolution": "Replay branch condition is now !cancelled && call.replay === \"safe\" && tool?.replay === \"safe\"; persisted \"never\" intents, changed declarations, and cancelled operations all take the interrupted branch that only reads the checkpoint."
+    },
+    {
+      "claim": "Missing tools must settle as interrupted rather than throw or execute.",
+      "resolution": "A missing tool (undefined lookup) fails the both-safe test, so no clearReplayCheckpoint/performToolInvocation runs; the call is published via interruptedOutcome with the durable checkpoint plus the interruption marker and isError: true."
+    }
+  ],
+  "changes": [
+    {
+      "file": "packages/agent/src/harness/runtime/drive/tools.ts",
+      "description": "Minimal repair of the recovery replay guard: the current tool declaration's replay policy is rechecked against the persisted effect_pending policy before replaying; a missing tool can no longer reach tool execution."
+    },
+    {
+      "file": ".prale-eval/regression.mjs",
+      "description": "Standalone Node assertion regression that drives the real recoverToolInvocation/interruptedOutcome through .prale-eval/subject.mjs with explicit boundary fakes."
+    },
+    {
+      "file": ".prale-eval/result.json",
+      "description": "This validation record."
+    }
+  ],
+  "deliverables": [
+    ".prale-eval/regression.mjs",
+    ".prale-eval/result.json",
+    "packages/agent/src/harness/runtime/drive/tools.ts"
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "The regression loads packages/agent/src/harness/runtime/drive/tools.ts with Node 24 TypeScript stripping and fakes only checkpoint IO, tool execution and outcome publication. Seven cases run: (1) persisted safe + current declaration safe + not cancelled replays (clear, invoke, effect, publish; non-error outcome); (2) persisted safe but declaration now \"never\" settles interrupted (read, publish; no clear/invoke); (3) persisted safe but tool missing settles interrupted without throwing; (4) persisted safe but declaration has no replay policy settles interrupted; (5) cancelled both-safe call settles interrupted; (6) persisted \"never\" with safe declaration settles interrupted; (7) missing tool consults only the checkpoint and publishes an isError outcome. Interrupted assertions also check toolCallId/toolName, terminate=false, preserved checkpoint text \"durable-progress\" and details {step:2}, and the interruption marker mentioning that the external outcome is unknown. Exit code is 0 on the repaired code (7 cases passed). Reverting the guard to the original `!cancelled && call.replay === \"safe\"` makes the script fail with AssertionError 'changed declaration (safe -> never): unexpected boundary calls' and exit 1, confirming it detects this stage's fault. Limitation: node_modules is not installed in this workspace and dependencies must not be installed, so the repository's vitest suites (for example packages/agent/test/harness/runtime/drive-tools.test.ts) and tsc typechecking could not be executed here; the focused standalone regression above was used instead."
+  }
+}
