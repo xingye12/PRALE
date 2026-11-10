@@ -166,3 +166,13 @@ ruff format --check .
 任务规划工具 `task_create / task_get / task_update / task_list` 在同一 Session 的全部 lane 与子 agent 间共享任务；不同 Session 隔离。复杂任务可先拆分、设置依赖，再显式推进 pending → in_progress → completed；owner 仅记录负责人，不启动 agent。前置任务未完成时不能开始或完成下游任务，删除保留 tombstone 并移除关联依赖。metadata 按键合并，null 删除键。task_list 默认 50 条、最大 100，支持 status、offset、limit。
 
 Library 显式注册 `Harness.open(..., tools=create_task_tools())`，也可直接使用 `await harness.tasks.create(subject, description)`、`get(task_id)`、`update(task_id, status="completed")` 和 `list(status="pending")`。任务 DTO 不可变。模型工具遵守 tools allow-list；只读子角色仅获得 task_get/task_list，写工具需角色显式允许。启用任务工具后，每次生成自动附带有界任务概览；概览及版本冻结在 generation intent 中，不重复写入历史。详见 [任务方案](specs/task-planning-implementation-plan.md)。
+
+Bash 执行前默认拒绝常见危险命令：`sudo`、`mkfs` 系列、`dd of=/dev/...`、
+`curl/wget ... | sh/bash`、Git 强推（含 `--force-with-lease` 和 `+refspec`）、
+fork bomb、递归删除 `/` 或家目录、递归将这些目录设为 `777`、关机和重启。
+命中后审批和 `danger-full-access` 均不能覆盖；配置的执行前缀也会检查。
+检测使用 tree-sitter Bash AST，保留引号、重定向、管道与子命令结构，递归检查
+`$(...)`、反引号、进程替换、字面量 `shell -c` / `eval` 及 shell 的 here-doc / here-string。
+普通引用文本与 here-doc 数据不会当成命令；解析失败、动态命令名或无法确定的嵌套代码直接拒绝，
+`rm/chmod/dd` 与 Git push 的未知风险参数也保守拒绝。解析器随基础依赖安装，无分词回退。
+不模拟完整 Shell 环境、不读取外部脚本，也不能识别其它解释器内的全部危险操作，仍需沙箱隔离。

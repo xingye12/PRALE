@@ -74,6 +74,7 @@ _QUERY_CONCEPT_HINTS: Final = {
 _DEFAULT_SKIPPED_DIRS = frozenset(
     {
         ".git",
+        ".eval-state",
         ".mypy_cache",
         ".pytest_cache",
         ".ruff_cache",
@@ -84,6 +85,8 @@ _DEFAULT_SKIPPED_DIRS = frozenset(
         "venv",
         "dist",
         "build",
+        "reports",
+        "evals",
         "__pycache__",
     }
 )

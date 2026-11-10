@@ -10,6 +10,7 @@ from agent_harness.integrations.repository_explorer import (
     RepositoryExplorerConfig,
     RepositoryExplorerTool,
     RepositoryTag,
+    TreeSitterRepositoryIndexer,
 )
 from agent_harness.runtime.generation import AssistantResult, ToolCall
 from agent_harness.storage.memory import MemoryStorage
@@ -17,6 +18,25 @@ from agent_harness.storage.memory import MemoryStorage
 
 def _tool(root: Path) -> RepositoryExplorerTool:
     return RepositoryExplorerTool(RepositoryExplorerConfig(root, root.parent / f"{root.name}-index"))
+
+
+def test_repository_explorer_excludes_evaluation_artifacts_before_scan_limits(tmp_path: Path) -> None:
+    async def scenario() -> None:
+        from agent_harness.integrations.repository_explorer import RepositoryScanLimits
+
+        (tmp_path / "service.py").write_text("def helper(): return 1\n")
+        for name in (".eval-state", "reports", "evals"):
+            directory = tmp_path / name
+            directory.mkdir()
+            (directory / "artifact.py").write_text("def artifact(): return 2\n")
+        config = RepositoryExplorerConfig(
+            tmp_path, tmp_path.parent / f"{tmp_path.name}-index", limits=RepositoryScanLimits(max_files=1)
+        )
+        indexed = await TreeSitterRepositoryIndexer(config).index(include_tests=True)
+        assert [item.relative_path for item in indexed] == ["service.py"]
+        assert any(tag.name == "helper" for tag in indexed[0].tags)
+
+    asyncio.run(scenario())
 
 
 def test_repository_explorer_indexes_python_symbols_and_excludes_known_paths(tmp_path: Path) -> None:

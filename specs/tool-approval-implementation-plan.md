@@ -129,3 +129,24 @@ Web 默认注册可持续等待的审批通道；无人打开页面时也保留�
 和获批的宿主 Bash 不受这些挂载约束。不新增持久状态或改变恢复重放语义。
 验收覆盖挂载顺序、普通仓库/worktree、能力身份变化、实际写入/替换/删除拒绝与普通文件可写。
 原 `pi-harness-implementation-plan.md` 在当前工作树已删除，本次不恢复该用户改动。
+
+## 常见危险 Bash 命令拦截
+
+优先于 Bash 沙箱自动允许及宿主审批：sudo、mkfs 系列、dd 写 /dev、下载管道进入
+shell、Git 强推（含 force-with-lease）、fork bomb、关机重启、递归删除根目录或家目录、
+递归将根目录或家目录 chmod 777 均直接 deny。检查常见命令包装和字面量嵌套 shell，
+执行前同时检查 command_prefix。旧授权不能覆盖拒绝。不新增持久化格式。
+检测改用 tree-sitter Bash AST（基础依赖 tree-sitter/tree-sitter-bash 0.25 系列），不再使用
+shlex。沿 command、pipeline、redirect、function、command/process substitution 节点检查，
+保留单/双引号、转义、ANSI-C 引号与词拼接语义；HOME/tilde 展开与引用的字面量区别处理。
+重定向的目的地不作为命令，重定向后实际参数仍检查；直接写设备也拒绝。下载来源只在同一
+管道内传播，stdout 文件重定向和 stdin 替换影响判断；此来源跟踪保守，不声称是完整数据流分析。
+普通 here-doc 是数据，仅扫描实际展开的子命令；shell 接收的 here-doc/here-string 作为代码检查。
+字面量 shell -c/eval 递归解析，解析失败、动态命令名、未知嵌套代码和 rm/chmod/dd/Git push 的
+未知风险参数直接拒绝，不回退分词放行。所有分支及函数体保守检查，不执行变量求值或外部程序。
+SHELL_GUARD_VERSION=2、POLICY_VERSION=4 使旧授权重新评估，无 schema 迁移，不重写历史；
+已有 never 未知效果仍沿用 unknown 收束，不重新执行。外部脚本、启动配置、别名、其它解释器和
+任意动态数据流仍不构成静态可判定边界；保留沙箱。
+验收：引号/注释/普通 here-doc 不误判，双引号子命令、反引号、函数、进程替换、重定向参数、
+实际下载管道及嵌套代码被识别；memory/SQLite 均落盘 rejected，重开记录一致，不创建工具 effect
+span，拒绝不能转为 allow_once；既有 approval conformance/crash recovery 继续通过。

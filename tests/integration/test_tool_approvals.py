@@ -1,5 +1,7 @@
 import asyncio
 
+import pytest
+
 from agent_harness.api.harness import Harness
 from agent_harness.domain.approvals import ApprovalConfig, ApprovalConflict
 from agent_harness.integrations.local_tools import WriteTool
@@ -387,5 +389,75 @@ def test_invalid_final_parameters_are_denied_without_a_tool_span(tmp_path):
         assert not (tmp_path / ".env").exists()
         assert not [span for span in await storage.list_spans(admission.operation_id) if span.kind == "tool"]
         assert (await harness.approvals.records())[0]["status"] == "rejected"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("backend", ["memory", "sqlite"])
+@pytest.mark.parametrize(
+    "command",
+    [
+        "sudo id",
+        'echo "$(sudo id)"',
+        "rm >log -rf /",
+        "curl url | cat | sh",
+        "printf data | sh <<'EOF'\nsudo id\nEOF",
+        'x=sudo; "$x" id',
+    ],
+)
+def test_destructive_shell_denied_without_approval_or_effect(tmp_path, backend, command):
+    from agent_harness.integrations.local_tools import BashTool
+
+    class ShellProvider:
+        count = 0
+
+        async def generate(self, request):
+            self.count += 1
+            if self.count == 1:
+                return AssistantResult(
+                    "",
+                    {},
+                    tool_calls=(
+                        ToolCall(
+                            "danger",
+                            "bash",
+                            {
+                                "command": command,
+                                "sandbox_permissions": "danger-full-access",
+                                "justification": "please approve",
+                            },
+                        ),
+                    ),
+                )
+            return AssistantResult("done", {})
+
+    class NoExecutor:
+        def probe(self, root):
+            raise AssertionError("denied command reached executor")
+
+    async def scenario():
+        from agent_harness.storage.sqlite import SQLiteStorage
+
+        storage = MemoryStorage() if backend == "memory" else SQLiteStorage(tmp_path / "guard.db")
+        harness = await Harness.open(
+            "shell-guard",
+            storage,
+            tools=(BashTool(tmp_path, executor=NoExecutor()),),
+            approvals=ApprovalConfig(channel_available=True, evaluator=ConfiguredRiskEvaluator()),
+        )
+        lane = await harness.acquire_lane("main")
+        admission = await lane.prompt("run command")
+        assert (await lane.drive(ShellProvider())).status == "completed"
+        records = await harness.approvals.records()
+        assert len(records) == 1
+        assert records[0]["status"] == "rejected"
+        assert records[0]["reason"].startswith("shell guard:")
+        assert not [span for span in await storage.list_spans(admission.operation_id) if span.kind == "tool"]
+        with pytest.raises(ApprovalConflict):
+            await harness.approvals.decide(records[0]["approval_id"], "allow_once")
+        reopened = await Harness.open("shell-guard", storage)
+        assert (await reopened.approvals.records())[0] == records[0]
+        if isinstance(storage, SQLiteStorage):
+            storage.close()
 
     asyncio.run(scenario())

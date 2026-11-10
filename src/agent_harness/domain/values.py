@@ -55,3 +55,15 @@ def operation_context_reductions(operation_id: str) -> ListAddress[dict[str, obj
     """Append-only audit of request-only reductions frozen into an intent."""
 
     return ListAddress(f"operation/{operation_id}/context_reductions")
+
+
+def operation_steps(operation_id: str) -> ValueAddress[int]:
+    """Consumed main-agent generation steps, committed with effect intents."""
+
+    return ValueAddress(f"operation/{operation_id}/steps")
+
+
+def operation_tool_loop(operation_id: str) -> ValueAddress[dict[str, object]]:
+    """Consecutive error streak and quarantined actions for one operation."""
+
+    return ValueAddress(f"operation/{operation_id}/tool_loop")

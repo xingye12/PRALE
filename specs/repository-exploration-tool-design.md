@@ -98,7 +98,7 @@ tree-sitter 的每种语言标签查询（`.scm`）是实现的一部分，必�
 
 ### 5.1 文件发现与标签
 
-发现器从 `workspace root` 开始，遵循部署指定的忽略规则（至少 `.git`、**实际配置的** repository-index cache、依赖/构建产物的默认排除），只接纳 resolve 后仍在根内的普通文件，并设置文件数、单文件字节数、总字节数和扫描时间上限。任一上限被越过时返回 `repository_scan_limit_exceeded`，不得以未说明的部分图伪装成完整排名。`path_prefixes` 不是扫描裁剪：引用图依赖全局 reference 分布，首次调用或 cache 冷启动必须对所有合格文件 `stat`，并读取/解析全部缺失或改变的文件；其成本与仓库规模成正比，扫描上限正是为此设置。`include_tests=false` 是唯一可从发现集排除的一类约定路径：目录名 `test`、`tests`、`__tests__`，或文件名 `test_*`、`*_test.*`、`*.test.*`、`*.spec.*`。符号提取优先使用 tree-sitter 查询的 `definition` 与 `reference` 标签；不支持的语言只产生文件节点，绝不把文件当作可执行文本处理。
+发现器从 `workspace root` 开始，遵循部署指定的忽略规则（至少 `.git`、**实际配置的** repository-index cache、依赖/构建产物的默认排除，以及 `.eval-state`、`reports`、`evals` 评测目录），只接纳 resolve 后仍在根内的普通文件，并设置文件数、单文件字节数、总字节数和扫描时间上限。任一上限被越过时返回 `repository_scan_limit_exceeded`，不得以未说明的部分图伪装成完整排名。`path_prefixes` 不是扫描裁剪：引用图依赖全局 reference 分布，首次调用或 cache 冷启动必须对所有合格文件 `stat`，并读取/解析全部缺失或改变的文件；其成本与仓库规模成正比，扫描上限正是为此设置。`include_tests=false` 是唯一可从发现集排除的一类约定路径：目录名 `test`、`tests`、`__tests__`，或文件名 `test_*`、`*_test.*`、`*.test.*`、`*.spec.*`。符号提取优先使用 tree-sitter 查询的 `definition` 与 `reference` 标签；不支持的语言只产生文件节点，绝不把文件当作可执行文本处理。
 
 每个标签是 `(relative_path, name, role, symbol_kind, line)`：
 

@@ -27,6 +27,7 @@ from agent_harness.domain.operations import ActiveOperation, OperationResult, Op
 from agent_harness.domain.session import SessionMutator
 from agent_harness.domain.subagents import SubagentError
 from agent_harness.domain.tasks import TASK_NAMES, TaskError
+from agent_harness.domain.tool_loop import action_key, blocked_result, observe
 from agent_harness.domain.tool_prune import ContextView, context_view, message_hash, prune_content
 from agent_harness.domain.types import OperationStatus
 from agent_harness.domain.values import (
@@ -34,6 +35,8 @@ from agent_harness.domain.values import (
     lane_tip,
     operation_context_reductions,
     operation_state,
+    operation_steps,
+    operation_tool_loop,
 )
 from agent_harness.runtime.generation import AssistantResult, ChatProvider, GenerationDelta, GenerationRequest, ToolCall
 from agent_harness.runtime.lane import Lane
@@ -58,6 +61,9 @@ from agent_harness.storage.protocol import (
     UsageRow,
     Write,
 )
+
+MAIN_AGENT_MAX_STEPS = 120
+
 
 _TERMINAL_OUTCOME: dict[OperationStatus, EffectOutcome] = {
     "completed": "completed",
@@ -337,6 +343,12 @@ class Drive:
                     await self._consume_inbox()
                     await self._transition(operation, OperationState(at="assistant.ready", control="running", data={}))
                 case "assistant.ready":
+                    if not self._lane.subagent_run_id:
+                        steps = await self._lane._session.get_value(operation_steps(operation.meta.operation_id))
+                        if (steps or 0) >= MAIN_AGENT_MAX_STEPS:
+                            return await self._settle_terminal_at_tip(
+                                operation, "failed", error_code="step_limit_exceeded"
+                            )
                     if (
                         self._lane.subagents
                         and self._lane.subagent_run_id
@@ -846,6 +858,21 @@ class Drive:
                 and self._lane.subagent_run_id
             ):
                 writes.extend(await self._lane.subagents.generation_writes(mutator, self._lane.subagent_run_id))
+            if (
+                next_state.at == "assistant.effect_pending"
+                and operation.state.at == "assistant.ready"
+                and not self._lane.subagent_run_id
+            ):
+                steps = await mutator.get_value(operation_steps(operation.meta.operation_id)) or 0
+                if steps >= MAIN_AGENT_MAX_STEPS:
+                    raise RuntimeError("step budget must be checked before preparing generation")
+                writes.append(SetValue(operation_steps(operation.meta.operation_id), steps + 1))
+            if next_state.at == "assistant.effect_pending" and operation.state.at == "assistant.ready":
+                guard = await mutator.get_value(operation_tool_loop(operation.meta.operation_id)) or {}
+                if guard.get("recovery_pending"):
+                    writes.append(
+                        SetValue(operation_tool_loop(operation.meta.operation_id), {**guard, "recovery_pending": False})
+                    )
             writes.append(SetValue(operation_state(operation.meta.operation_id), next_state))
             await mutator.commit(writes)
 
@@ -1801,6 +1828,10 @@ class Drive:
             )
             if not isinstance(event, dict):
                 raise RuntimeError("before_tool must return a tool request object")
+        guard = await self._lane._session.get_value(operation_tool_loop(operation.meta.operation_id)) or {}
+        veto = blocked_result(guard, action_key(planned["tool_name"], event.get("arguments", planned["arguments"])))
+        if veto is not None:
+            return operation, planned, {**event, "loop_veto": veto}, False
         request = await self._lane.approvals.prepare(self._lane, operation, planned, event)
         latest = await self._required_operation()
         if latest.state.control != "running":
@@ -1828,6 +1859,8 @@ class Drive:
                 else "completed"
             )
             error_code = None
+            if any(call.get("error_code") == "tool_loop_detected" and call.get("terminate") for call in calls):
+                status, error_code = "failed", "tool_loop_detected"
             if self._lane.subagent_run_id and any(call.get("error_code") == "capability_unavailable" for call in calls):
                 status, error_code = "failed", "capability_unavailable"
             return await self._settle_terminal_at_tip(operation, status, error_code)
@@ -1884,6 +1917,9 @@ class Drive:
             await self._run_parallel_tools(operation, calls)
             return
         operation, planned, tool_event, allowed = await self._authorize_tool(operation, planned)
+        if not allowed and tool_event.get("loop_veto"):
+            await self._settle_tool(operation, planned, tool_event["loop_veto"], outcome="aborted")
+            return None
         if not allowed:
             missing = self._lane.tools.get(planned["tool_name"]) is None
             await self._settle_tool(
@@ -2087,6 +2123,7 @@ class Drive:
         """Run one contiguous opt-in batch; durable writes retain source order."""
 
         batch: list[dict] = []
+        actions: set[str] = set()
         for call in calls:
             if not isinstance(call, dict) or call.get("status") != "planned":
                 continue
@@ -2096,12 +2133,20 @@ class Drive:
                 or self._lane.approvals.assess(self._lane, call).decision != "allow"
             ):
                 break
+            key = action_key(call["tool_name"], call["arguments"])
+            if key in actions:
+                break
+            actions.add(key)
             batch.append(call)
         if not batch:
             return
         prepared: list[tuple[dict, dict]] = []
         for call in batch:
             operation, active, event, allowed = await self._authorize_tool(operation, call)
+            if not allowed and event.get("loop_veto"):
+                if not prepared:
+                    await self._settle_tool(operation, active, event["loop_veto"], outcome="aborted")
+                break
             if not allowed:
                 if not prepared:
                     await self._settle_tool(
@@ -2115,6 +2160,12 @@ class Drive:
                         },
                         outcome="aborted",
                     )
+                break
+            if any(
+                action_key(previous["tool_name"], previous["arguments"])
+                == action_key(active["tool_name"], active["arguments"])
+                for previous, _ in prepared
+            ):
                 break
             prepared.append((active, event))
         if not prepared:
@@ -2240,6 +2291,9 @@ class Drive:
                     }
                 result = await self._lane.hooks.run("after_tool", result)
                 outcome, error_class = _tool_outcome(result)
+            guard = await mutator.get_value(operation_tool_loop(operation.meta.operation_id)) or {}
+            guard, result = observe(guard, active["tool_name"], active["arguments"], result, outcome)
+            task_changes.append(SetValue(operation_tool_loop(operation.meta.operation_id), guard))
             data = operation.state.data
             assert isinstance(data, dict) and isinstance(data.get("calls"), list)
             parent_id = await mutator.get_value(lane_tip(self._lane.name))
@@ -2299,6 +2353,9 @@ class Drive:
                 raise RuntimeError("tool batch intent was already settled or replaced")
             data = operation.state.data
             assert isinstance(data, dict) and isinstance(data.get("calls"), list)
+            guard = await mutator.get_value(operation_tool_loop(operation.meta.operation_id)) or {}
+            for index, (call, result, (outcome, _)) in enumerate(zip(active, results, outcomes)):
+                guard, results[index] = observe(guard, call["tool_name"], call["arguments"], result, outcome)
             active_ids = {call["tool_call_id"] for call in active}
             by_id = {call["tool_call_id"]: result for call, result in zip(active, results)}
             outcomes_by_id = {call["tool_call_id"]: outcome for call, (outcome, _) in zip(active, outcomes)}
@@ -2315,7 +2372,7 @@ class Drive:
                 for call in data["calls"]
             ]
             parent_id = await mutator.get_value(lane_tip(self._lane.name))
-            writes = []
+            writes = [SetValue(operation_tool_loop(operation.meta.operation_id), guard)]
             writes.extend(
                 self._lane.trace_writes(
                     operation.meta.operation_id,

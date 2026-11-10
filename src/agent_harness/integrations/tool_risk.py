@@ -9,7 +9,7 @@ from pathlib import Path
 from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.entries import JsonValue
 
-POLICY_VERSION = 2
+POLICY_VERSION = 4
 
 
 class LocalToolRisk:

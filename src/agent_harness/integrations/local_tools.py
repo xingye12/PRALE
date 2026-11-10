@@ -22,6 +22,7 @@ from typing import Final
 from agent_harness.domain.approvals import RiskAssessment
 from agent_harness.domain.entries import JsonValue
 from agent_harness.integrations.shell import BubblewrapExecutor, ShellCapability, ShellExecutor
+from agent_harness.integrations.shell_guard import SHELL_GUARD_VERSION, blocked_shell_reason
 from agent_harness.integrations.tool_risk import LocalToolRisk
 from agent_harness.runtime.tools import AgentTool, ToolExecutionResult
 
@@ -389,6 +390,11 @@ class BashTool(LocalToolRisk):
         base = super(BashTool, self).assess_risk(arguments)
         if not isinstance(arguments, dict):
             return base
+        command = arguments.get("command")
+        if isinstance(command, str):
+            reason = blocked_shell_reason(" ".join((*self.command_prefix, command)), Path(self.cwd).resolve())
+            if reason:
+                return replace(base, decision="deny", reason=reason)
         permission = arguments.get("sandbox_permissions", "workspace-write")
         if permission not in {"workspace-write", "danger-full-access"}:
             return replace(base, decision="deny", reason="invalid sandbox_permissions")
@@ -417,7 +423,7 @@ class BashTool(LocalToolRisk):
         )
         executor_type = f"{type(self.executor).__module__}.{type(self.executor).__qualname__}"
         identity = hashlib.sha256(
-            f"{base.capability_version}:{executor_type}:{capability}:{mode}:{self.cwd}".encode()
+            f"{SHELL_GUARD_VERSION}:{base.capability_version}:{executor_type}:{capability}:{mode}:{self.cwd}".encode()
         ).hexdigest()
         if arguments.get("command") == "pwd" and not self.command_prefix and permission != "danger-full-access":
             return replace(base, decision="allow", reason="working directory query", capability_version=identity)
@@ -426,6 +432,9 @@ class BashTool(LocalToolRisk):
     async def execute(self, arguments: JsonValue) -> ToolExecutionResult:
         if not isinstance(arguments, dict) or not isinstance(arguments.get("command"), str):
             return _error("command must be a string")
+        denial = blocked_shell_reason(" ".join((*self.command_prefix, arguments["command"])), Path(self.cwd).resolve())
+        if denial:
+            return _error(denial)
         timeout = arguments.get("timeout")
         if timeout is not None and (not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or timeout <= 0):
             return _error("timeout must be a positive number of seconds")

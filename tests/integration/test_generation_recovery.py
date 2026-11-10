@@ -752,3 +752,69 @@ def test_parallel_tool_registry_returns_results_in_source_order() -> None:
         assert [result.content for result in results] == [{"echo": "first"}, {"echo": "second"}]
 
     asyncio.run(scenario())
+
+
+def test_main_agent_tool_loop_stops_after_120_steps_and_next_run_has_fresh_budget() -> None:
+    class LoopProvider:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def generate(self, request):
+            self.calls += 1
+            assert self.calls <= 120, "main agent exceeded its step budget"
+            return AssistantResult(
+                content="",
+                usage={},
+                tool_calls=(ToolCall(f"call-{self.calls}", "echo", {"value": "repeat"}),),
+            )
+
+    async def scenario() -> None:
+        storage = MemoryStorage()
+        harness = await Harness.open("step-session", storage, tools=(EchoTool(),))
+        lane = await harness.acquire_lane("main")
+        await lane.prompt("loop", operation_id="loop")
+        provider = LoopProvider()
+        result = await lane.drive(provider)
+        assert result.status == "failed"
+        assert result.error_code == "step_limit_exceeded"
+        assert provider.calls == 120
+        await lane.prompt("finish", operation_id="next")
+        assert (await lane.drive(SuccessfulProvider())).status == "completed"
+
+    asyncio.run(scenario())
+
+
+def test_main_agent_follow_ups_share_step_budget() -> None:
+    async def scenario() -> None:
+        harness = await Harness.open("step-session", MemoryStorage())
+        harness.on_hook("before_run_end", lambda event: {"follow_up": "continue"})
+        lane = await harness.acquire_lane("main")
+        await lane.prompt("loop", operation_id="loop")
+        provider = SuccessfulProvider()
+        result = await lane.drive(provider)
+        assert result.error_code == "step_limit_exceeded"
+        assert len(provider.requests) == 120
+
+    asyncio.run(scenario())
+
+
+def test_main_agent_last_step_can_complete_and_retry_does_not_consume_another_step() -> None:
+    from agent_harness.domain.values import operation_steps
+    from agent_harness.storage.protocol import SetValue
+
+    async def scenario() -> None:
+        storage = MemoryStorage()
+        harness = await Harness.open("step-session", storage, retry=RetryPolicy(base_delay_ms=0))
+        lane = await harness.acquire_lane("main")
+        await lane.prompt("finish", operation_id="last")
+
+        async def seed(mutator):
+            await mutator.commit([SetValue(operation_steps("last"), 119)])
+
+        await harness._session.mutate(seed)
+        provider = FlakyProvider()
+        assert (await lane.drive(provider)).status == "completed"
+        assert provider.calls == 2
+        assert await harness._session.get_value(operation_steps("last")) == 120
+
+    asyncio.run(scenario())
