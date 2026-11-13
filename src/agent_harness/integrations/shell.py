@@ -44,7 +44,15 @@ class ShellExecutor(Protocol):
 
 @dataclass(frozen=True)
 class BubblewrapExecutor:
-    version: str = "bwrap-workspace-v2"
+    version: str = "bwrap-workspace-v3"
+    hidden_paths: tuple[Path, ...] = ()
+
+    def _hidden_directories(self) -> tuple[Path, ...]:
+        result: list[Path] = []
+        for path in sorted({path.resolve() for path in self.hidden_paths}, key=lambda p: (len(p.parts), str(p))):
+            if not any(path.is_relative_to(parent) for parent in result):
+                result.append(path)
+        return tuple(result)
 
     def _readonly_mounts(self, cwd: Path) -> tuple[tuple[Path, Path], ...]:
         paths = [cwd / name for name in READONLY_WORKSPACE_PATHS]
@@ -69,6 +77,11 @@ class BubblewrapExecutor:
             for source, target in self._readonly_mounts(cwd)
             for argument in ("--ro-bind", str(source), str(target))
         )
+        hidden = tuple(
+            argument
+            for path in self._hidden_directories()
+            for argument in ("--tmpfs", str(path), "--remount-ro", str(path))
+        )
         return (
             executable,
             "--die-with-parent",
@@ -89,6 +102,7 @@ class BubblewrapExecutor:
             str(cwd),
             str(cwd),
             *readonly,
+            *hidden,
             "--chdir",
             str(cwd),
             "--",
@@ -100,6 +114,8 @@ class BubblewrapExecutor:
         # /tmp itself (or an ancestor of it) cannot be both private and workspace-writable.
         if cwd in {Path("/"), Path("/tmp")} or any(cwd.is_relative_to(p) for p in (Path("/dev"), Path("/proc"))):
             return ShellCapability(False, self.version, "workspace overlaps sandbox system mounts")
+        if any(cwd.resolve().is_relative_to(path) for path in self._hidden_directories()):
+            return ShellCapability(False, self.version, "workspace is inside a hidden directory")
         try:
             wrapper = self._wrapper(cwd)
             executable = Path(wrapper[0])
@@ -107,7 +123,7 @@ class BubblewrapExecutor:
                 (str(source), str(target), source.stat().st_dev, source.stat().st_ino)
                 for source, target in self._readonly_mounts(cwd)
             )
-            digest = hashlib.sha256(repr(mount_identity).encode()).hexdigest()
+            digest = hashlib.sha256(repr((mount_identity, self._hidden_directories())).encode()).hexdigest()
             identity = f"{self.version}:{executable.resolve()}:{executable.stat().st_mtime_ns}:{digest}"
             result = subprocess.run(
                 (*wrapper, "/bin/true"),

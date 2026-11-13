@@ -274,3 +274,98 @@ def test_stage_uses_solving_metrics_and_keeps_promotion_separate(tmp_path):
     assert result["promotion"]["duration_seconds"] == 500
     assert result["promotion"]["status"] == "failed"
     assert "wall_duration_seconds" in result
+
+
+def test_discovery_workspace_hides_mutation_timestamps(tmp_path: Path) -> None:
+    import os
+
+    source = _source(tmp_path)
+    (source / "untouched.txt").write_text("unrelated source\n")
+    (source / "source-link").symlink_to("untouched.txt")
+    _git(source, "add", ".")
+    _git(source, "commit", "-m", "unrelated source")
+    capsule = build_capsule(repository_root=source, output=tmp_path / "capsule", container_image="node@sha256:test")
+    fixture = _fixture(tmp_path)
+    (fixture / "fixture.json").write_text(json.dumps({"public_support_version": 1}))
+    destination = tmp_path / "workspace"
+    materialize_stage(capsule=capsule, fixture=fixture, destination=destination)
+    assert (destination / "app.txt").read_text() == "broken\n"
+    assert (destination / "source-link").is_symlink()
+    assert os.readlink(destination / "source-link") == "untouched.txt"
+    assert (
+        len(
+            {
+                path.lstat().st_mtime_ns
+                for path in (
+                    destination,
+                    destination / "app.txt",
+                    destination / "untouched.txt",
+                    destination / "source-link",
+                    destination / "TASK.md",
+                )
+            }
+        )
+        == 1
+    )
+    import re
+
+    index = _git_output(destination, "ls-files", "--debug")
+    assert len(set(re.findall(r"mtime: (\d+:\d+)", index))) == 1
+    assert _git_output(destination, "status", "--short") == ""
+
+
+@pytest.mark.parametrize("name", ["oracle.py", "fixture.json", "mutation.patch"])
+@pytest.mark.parametrize("origin", ["capsule", "support", "mutation"])
+def test_real_stage_rejects_private_validation_files_before_agent_launch(tmp_path, name, origin):
+    source, fixture = _source(tmp_path), _fixture(tmp_path)
+    if origin == "capsule":
+        private = source / "nested" / name
+        private.parent.mkdir()
+        private.write_text("private validation data")
+        _git(source, "add", ".")
+        _git(source, "commit", "-m", "contaminated snapshot")
+    elif origin == "mutation":
+        patch = fixture / "mutation.patch"
+        patch.write_text(
+            patch.read_text()
+            + f"diff --git a/{name} b/{name}\nnew file mode 100644\n"
+            + f"--- /dev/null\n+++ b/{name}\n@@ -0,0 +1 @@\n+private validation data\n"
+        )
+    else:
+        private = fixture / "workspace" / ".prale-eval" / name
+        private.parent.mkdir(parents=True)
+        private.write_text("private validation data")
+    capsule = build_capsule(repository_root=source, output=tmp_path / "capsule", container_image="test")
+    marker = tmp_path / "agent-started"
+    with pytest.raises(RealExperienceError, match="private validation artifact"):
+        run_stage(
+            capsule=capsule,
+            fixture=fixture,
+            agent_command=[sys.executable, "-c", f"from pathlib import Path; Path({str(marker)!r}).touch()"],
+            allow_host_execution=True,
+            timeout_seconds=10,
+        )
+    assert not marker.exists()
+
+
+def test_agent_only_receives_public_task_and_sources(tmp_path):
+    source, fixture = _source(tmp_path), _fixture(tmp_path)
+    (fixture / "fixture.json").write_text(json.dumps({"secret": "target location"}))
+    capsule = build_capsule(repository_root=source, output=tmp_path / "capsule", container_image="test")
+    script = (
+        "from pathlib import Path; "
+        "root = Path.cwd(); "
+        "assert not any(p.name in {'oracle.py', 'fixture.json', 'mutation.patch'} for p in root.parent.rglob('*')); "
+        "assert Path('TASK.md').is_file(); "
+        "assert Path('app.txt').read_text() == 'broken\\n'; "
+        "Path('app.txt').write_text('working\\n')"
+    )
+    result = run_stage(
+        capsule=capsule,
+        fixture=fixture,
+        agent_command=[sys.executable, "-c", script],
+        allow_host_execution=True,
+        timeout_seconds=10,
+    )
+    assert result["agent_status"] == "completed", result["agent_output"]
+    assert result["acceptance"] == "passed"

@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import pytest
 from real_experience_adapters import _claude_metrics, _claude_summary, _MeteredProvider
@@ -190,3 +191,13 @@ def test_failed_solve_is_checkpointed_before_promotion(tmp_path, monkeypatch):
     assert result["cost_usd"] is None
     assert result["promotion"]["status"] == "completed"
     assert json.loads(progress.read_text()) == result
+
+
+def test_eval_shell_hides_repository_and_custom_state(tmp_path):
+    import real_experience_adapters as adapter
+
+    state = tmp_path / "custom-state"
+    executor = adapter._eval_shell_executor(state)
+    masked = executor._hidden_directories()
+    assert Path(adapter.__file__).resolve().parents[1] / ".eval-state" in masked
+    assert state.resolve() in masked

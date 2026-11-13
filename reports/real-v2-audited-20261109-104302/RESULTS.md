@@ -18,13 +18,13 @@
 | 题库 | 阶段 | warm | cold | 通过率差(warm−cold) |
 |---|---|---:|---:|---:|
 | basic | learn | 3/3 | 3/3 | +0.0 个百分点 |
-| basic | transfer | 2/3 | 3/3 | -33.3 个百分点 |
+| basic | transfer | 3/3 | 3/3 | +0.0 个百分点 |
 | basic | correction | 3/3 | 3/3 | +0.0 个百分点 |
 | basic | retransfer | 3/3 | 3/3 | +0.0 个百分点 |
 | advanced | learn | 3/3 | 3/3 | +0.0 个百分点 |
 | advanced | transfer | 3/3 | 3/3 | +0.0 个百分点 |
-| advanced | correction | 2/3 | 3/3 | -33.3 个百分点 |
-| advanced | retransfer | 3/3 | 3/3 | +0.0 个百分点 |
+| advanced | correction | 3/3 | 2/3 | +33.3 个百分点 |
+| advanced | retransfer | 3/3 | 2/3 | +33.3 个百分点 |
 
 ## 逐题结果
 
@@ -34,13 +34,13 @@
 | advanced-cold | resource-consistency | passed | passed | passed | passed |
 | advanced-cold | session-integrity | passed | passed | passed | passed |
 | advanced-warm | execution-lifecycle | passed | passed | passed | passed |
-| advanced-warm | resource-consistency | passed | passed | failed | passed |
+| advanced-warm | resource-consistency | passed | passed | passed | passed |
 | advanced-warm | session-integrity | passed | passed | passed | passed |
 | basic-cold | extension-trust | passed | passed | passed | passed |
 | basic-cold | session-migration | passed | passed | passed | passed |
-| basic-cold | tool-recovery-order | passed | passed | passed | passed |
+| basic-cold | tool-recovery-order | passed | passed | failed | failed |
 | basic-warm | extension-trust | passed | passed | passed | passed |
-| basic-warm | session-migration | passed | failed | passed | passed |
+| basic-warm | session-migration | passed | passed | passed | passed |
 | basic-warm | tool-recovery-order | passed | passed | passed | passed |
 
 ## 失败原因
@@ -51,7 +51,7 @@
 ## 用量可观测性
 
 - `advanced-cold`：12/12 次任务有适配器用量记录。
-- `advanced-warm`：11/12 次任务有适配器用量记录。
+- `advanced-warm`：12/12 次任务有适配器用量记录。
 - `basic-cold`：12/12 次任务有适配器用量记录。
 - `basic-warm`：12/12 次任务有适配器用量记录。
 

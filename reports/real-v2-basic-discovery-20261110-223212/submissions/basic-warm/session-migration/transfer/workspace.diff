@@ -1,0 +1,165 @@
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index 33ec276..3f02ba6 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -109,7 +109,7 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const cwd: string = header.cwd;
+ 
+ 			// Compute the correct session directory (same encoding as session-manager.ts)
+-			const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/:]/g, "-")}--`;
++			const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+ 			const correctDir = join(agentDir, "sessions", safePath);
+ 
+ 			// Create directory if needed
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..948e101
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,127 @@
++/**
++ * Regression for session-migration/transfer.
++ *
++ * Exercises the real `migrateSessionsFromAgentRoot` production function through
++ * `.prale-eval/subject.mjs` (real fs/path, caller-owned temp agentDir) and asserts
++ * that legacy `~/.pi/agent/*.jsonl` sessions are relocated into the canonical
++ * encoded session directory for POSIX, drive-letter and UNC cwds, that session
++ * bytes survive unchanged, invalid headers are ignored, an existing destination
++ * is never overwritten, and repeated runs stay safe.
++ *
++ * Run from the workspace root:
++ *   node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { loadMigrations } from "./subject.mjs";
++
++const here = path.dirname(fileURLToPath(import.meta.url));
++const root = path.dirname(here);
++
++/**
++ * Independent, character-by-character statement of the required encoding:
++ * drop exactly one leading slash/backslash, then turn every slash, backslash
++ * and colon into "-", wrapped in "--".
++ */
++function encodedDirName(cwd) {
++	let rest = cwd;
++	if (rest.startsWith("/") || rest.startsWith("\\")) rest = rest.slice(1);
++	let encoded = "";
++	for (const ch of rest) encoded += ch === "/" || ch === "\\" || ch === ":" ? "-" : ch;
++	return `--${encoded}--`;
++}
++
++function sessionBytes(cwd, extraLines = []) {
++	const header = JSON.stringify({ type: "session", version: 3, id: `sess-${cwd.length}`, timestamp: "2025-01-01T00:00:00.000Z", cwd });
++	return `${[header, ...extraLines].join("\n")}\n`;
++}
++
++const posixCwd = "/home/alice/work/demo";
++const driveCwd = "C:\\Users\\alice\\work\\demo";
++const forwardDriveCwd = "D:/projects/app";
++const uncCwd = "\\\\fileserver\\team\\share\\demo";
++
++const fixtures = [
++	{ file: "posix-session.jsonl", cwd: posixCwd, bytes: sessionBytes(posixCwd, [JSON.stringify({ type: "message", role: "user", content: "hi" }), JSON.stringify({ type: "message", role: "assistant", content: "hello" })]) },
++	{ file: "drive-session.jsonl", cwd: driveCwd, bytes: sessionBytes(driveCwd, [JSON.stringify({ type: "message", role: "user", content: "windows" })]) },
++	{ file: "forward-drive-session.jsonl", cwd: forwardDriveCwd, bytes: sessionBytes(forwardDriveCwd) },
++	// CRLF session: byte preservation must not depend on line-ending normalization.
++	{ file: "unc-session.jsonl", cwd: uncCwd, bytes: sessionBytes(uncCwd, [JSON.stringify({ type: "message", role: "user", content: "unc" })]).replace(/\n/g, "\r\n") },
++];
++
++// Files whose headers must be ignored, left byte-identical at the agent root.
++const untouched = [
++	{ file: "not-json.jsonl", bytes: "{ this is not json\nstill data\n" },
++	{ file: "wrong-type.jsonl", bytes: `${JSON.stringify({ type: "message", cwd: "/home/alice/work/demo" })}\n` },
++	{ file: "missing-cwd.jsonl", bytes: `${JSON.stringify({ type: "session", id: "x" })}\n` },
++];
++
++const collisionCwd = "/home/alice/work/demo";
++const collisionFile = "collision-session.jsonl";
++const collisionSource = sessionBytes(collisionCwd, [JSON.stringify({ type: "message", role: "user", content: "must not clobber" })]);
++const collisionExisting = "PRE-EXISTING-DESTINATION\n";
++
++const tmpRoot = mkdtempSync(path.join(here, ".tmp-migration-"));
++const agentDir = path.join(tmpRoot, "agent");
++
++try {
++	mkdirSync(agentDir, { recursive: true });
++	for (const fixture of fixtures) writeFileSync(path.join(agentDir, fixture.file), fixture.bytes);
++	for (const entry of untouched) writeFileSync(path.join(agentDir, entry.file), entry.bytes);
++	writeFileSync(path.join(agentDir, collisionFile), collisionSource);
++
++	// Pre-create the canonical destination for the collision file with foreign content.
++	const collisionDir = path.join(agentDir, "sessions", encodedDirName(collisionCwd));
++	mkdirSync(collisionDir, { recursive: true });
++	writeFileSync(path.join(collisionDir, collisionFile), collisionExisting);
++
++	const migrations = await loadMigrations(root, agentDir);
++	assert.equal(typeof migrations.migrateSessionsFromAgentRoot, "function", "production migrateSessionsFromAgentRoot must be exported");
++
++	migrations.migrateSessionsFromAgentRoot();
++
++	// 1. POSIX, drive-letter, forward-slash drive and UNC sessions land in the canonical directory.
++	for (const fixture of fixtures) {
++		const expectedDir = path.join(agentDir, "sessions", encodedDirName(fixture.cwd));
++		const expectedPath = path.join(expectedDir, fixture.file);
++		assert.ok(existsSync(expectedPath), `${fixture.cwd} must migrate to ${expectedDir} (got: ${readdirSync(path.join(agentDir, "sessions")).join(", ")})`);
++		assert.equal(readFileSync(expectedPath).toString("utf8"), fixture.bytes, `${fixture.file} bytes must be preserved verbatim`);
++		assert.ok(!existsSync(path.join(agentDir, fixture.file)), `${fixture.file} must no longer sit at the agent root`);
++	}
++
++	// 2. Invalid headers are ignored and their files are untouched.
++	for (const entry of untouched) {
++		const sourcePath = path.join(agentDir, entry.file);
++		assert.ok(existsSync(sourcePath), `${entry.file} must be left in place`);
++		assert.equal(readFileSync(sourcePath).toString("utf8"), entry.bytes, `${entry.file} must not be rewritten`);
++	}
++
++	// 3. An existing destination is never overwritten.
++	assert.equal(readFileSync(path.join(collisionDir, collisionFile)).toString("utf8"), collisionExisting, "existing destination must not be overwritten");
++	assert.ok(existsSync(path.join(agentDir, collisionFile)), "blocked source session must remain at the agent root");
++	assert.equal(readFileSync(path.join(agentDir, collisionFile)).toString("utf8"), collisionSource, "blocked source session must keep its bytes");
++
++	// 4. Repeated runs are safe: nothing changes, nothing is lost, no duplicates appear.
++	const snapshot = () => {
++		const result = {};
++		const walk = (dir) => {
++			for (const entry of readdirSync(dir, { withFileTypes: true })) {
++				const full = path.join(dir, entry.name);
++				if (entry.isDirectory()) walk(full);
++				else result[path.relative(agentDir, full)] = readFileSync(full).toString("utf8");
++			}
++		};
++		walk(agentDir);
++		return result;
++	};
++	const before = snapshot();
++	migrations.migrateSessionsFromAgentRoot();
++	migrations.migrateSessionsFromAgentRoot();
++	assert.deepEqual(snapshot(), before, "repeated migration runs must be idempotent");
++
++	console.log("regression: session migration encoding verified");
++} finally {
++	rmSync(tmpRoot, { recursive: true, force: true });
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..7db88d8
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "session-migration/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Root cause: migrateSessionsFromAgentRoot() in packages/coding-agent/src/migrations.ts encoded the session directory with `.replace(/[/:]/g, \"-\")`, which never replaced backslashes and so diverged from the canonical encoder used by session-manager.ts and agent session repo.ts (`--${cwd.replace(/^[/\\\\]/, \"\").replace(/[/\\\\:]/g, \"-\")}--`). POSIX cwds happened to work, but Windows drive-letter cwds (C:\\Users\\alice\\work\\demo became `--C:\\Users\\alice\\work\\demo--` instead of `--C--Users-alice-work-demo--`) and UNC cwds (\\\\fileserver\\team\\share\\demo became `--\\fileserver\\team\\share\\demo--` instead of `---fileserver-team-share-demo--`) were migrated into directories the session manager never reads, i.e. sessions appeared lost after migration. Fix is the one-token regex correction so all slash, backslash and colon characters are encoded to '-' after stripping exactly one leading separator, matching the canonical encoder byte-for-byte. No other behavior changed: session bytes are still moved with renameSync (no rewriting), invalid/foreign headers are still skipped, an existing destination is still never overwritten, and the file leaves the agent root so repeated runs are idempotent. Validation: `node --experimental-vm-modules .prale-eval/regression.mjs` exits 0 (only Node's ExperimentalWarning lines on stderr). The regression loads the real migrations.ts through .prale-eval/subject.mjs loadMigrations (real fs/path, temp agentDir under .prale-eval) and asserts POSIX (/home/alice/work/demo -> --home-alice-work-demo--), drive-letter (C:\\Users\\alice\\work\\demo -> --C--Users-alice-work-demo--), forward-slash drive (D:/projects/app -> --D--projects-app--) and UNC (\\\\fileserver\\team\\share\\demo -> ---fileserver-team-share-demo--) placement with byte-exact content (including a CRLF session), that non-JSON / wrong-type / missing-cwd headers stay untouched at the agent root, that a pre-existing destination file keeps its content and the colliding source stays put, and that two extra runs leave the whole agentDir tree byte-identical (idempotency). Differential check performed: reverting only the regex to the original `/[/:]/g` makes the script fail with `AssertionError ... C:\\Users\\alice\\work\\demo must migrate to .../sessions/--C--Users-alice-work-demo--`, so the regression is a real fault detector rather than a success print; the fix was then restored and the script re-run to green. Repo-wide vitest/biome were not run because node_modules is absent and installing dependencies is out of scope for this workspace, so the standalone Node 24 assertion script is the focused validation artifact."
++  }
++}
+snapshot .prale-eval/regression.mjs - 0d23f7aa02aac5875cbc17ecb22b3e2b8f9b45c0c43747799acc5c1525b0dec6
+snapshot .prale-eval/result.json - 0a13731ef6e140b95f91a31e70aff76ddfd5156c9e7655f190daf165eaed2c93
+snapshot packages/coding-agent/src/migrations.ts 143a77bc26bffeb28aa1c1ee90e2943c3d73c31353667155dff7e69aca0c30cb 59fc18cedfcbecd993918bb335e5e76a9f9c899c61ecf9eab110f86d976af1bc

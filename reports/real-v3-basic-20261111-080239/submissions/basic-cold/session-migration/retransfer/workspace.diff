@@ -1,0 +1,296 @@
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index 8796fc7..aded520 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -121,7 +121,9 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const fileName = file.split("/").pop() || file.split("\\").pop();
+ 			const newPath = join(correctDir, fileName!);
+ 
+-			if (existsSync(newPath)) return; // Skip if target exists
++			// Skip only this file when the destination already exists: overwriting would destroy a
++			// different session, and stopping here would strand every later legacy file in the batch.
++			if (existsSync(newPath)) continue;
+ 
+ 			renameSync(file, newPath);
+ 		} catch {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..42d2eff
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,242 @@
++/**
++ * Regression: session-migration/retransfer
++ *
++ * `migrateSessionsFromAgentRoot()` moves legacy `~/.pi/agent/*.jsonl` sessions into
++ * `~/.pi/agent/sessions/<encoded-cwd>/`. When one legacy file collides with a file that
++ * already occupies its destination, the batch must skip only that file (keeping both
++ * copies intact), must not overwrite the existing destination, must keep going for the
++ * remaining files, must be idempotent on repeated runs, and must leave files with
++ * malformed headers untouched.
++ *
++ * The original fault returned from the whole loop on the first collision, so every
++ * later file in the batch was stranded in the legacy root forever.
++ *
++ * Runs the real `packages/coding-agent/src/migrations.ts` with an in-memory fs/path
++ * boundary so the assertions observe production control flow, not a reimplementation.
++ */
++import assert from "node:assert/strict";
++import path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createGraph } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const MIGRATIONS = "packages/coding-agent/src/migrations.ts";
++
++const AGENT_DIR = "/fake-home/.pi/agent";
++const CWD = "/work/project";
++const SESSION_DIR = path.join(AGENT_DIR, "sessions", "--work-project--");
++
++/** Minimal in-memory filesystem exposing only the surface the migration touches. */
++function createMemoryFileSystem() {
++	const files = new Map(); // path -> contents
++	const dirs = new Set(); // path
++
++	const parentOf = (target) => path.dirname(target);
++	function addDir(target) {
++		if (dirs.has(target)) return;
++		dirs.add(target);
++		const parent = parentOf(target);
++		if (parent !== target) addDir(parent);
++	}
++
++	const fs = {
++		existsSync(target) {
++			return dirs.has(target) || files.has(target);
++		},
++		mkdirSync(target) {
++			addDir(target);
++		},
++		readdirSync(target) {
++			if (!dirs.has(target)) {
++				const error = new Error(`ENOENT: no such directory, scandir '${target}'`);
++				error.code = "ENOENT";
++				throw error;
++			}
++			const prefix = target.endsWith("/") ? target : `${target}/`;
++			const names = new Set();
++			// Insertion order is preserved so the batch order is deterministic:
++			// colliding file, malformed file, then the file that must still migrate.
++			for (const candidate of [...files.keys(), ...dirs]) {
++				if (!candidate.startsWith(prefix)) continue;
++				const rest = candidate.slice(prefix.length);
++				if (rest === "") continue;
++				names.add(rest.split("/")[0]);
++			}
++			return [...names];
++		},
++		readFileSync(target) {
++			if (!files.has(target)) {
++				const error = new Error(`ENOENT: no such file, open '${target}'`);
++				error.code = "ENOENT";
++				throw error;
++			}
++			return files.get(target);
++		},
++		writeFileSync(target, contents) {
++			if (!dirs.has(parentOf(target))) {
++				const error = new Error(`ENOENT: no such directory, open '${target}'`);
++				error.code = "ENOENT";
++				throw error;
++			}
++			files.set(target, String(contents));
++		},
++		renameSync(from, to) {
++			if (!files.has(from)) {
++				const error = new Error(`ENOENT: no such file, rename '${from}'`);
++				error.code = "ENOENT";
++				throw error;
++			}
++			// Real rename replaces the destination, so a buggy call is still observable.
++			files.set(to, files.get(from));
++			files.delete(from);
++		},
++		rmSync(target, options) {
++			if (files.delete(target)) return;
++			if (options?.recursive !== true && dirs.delete(target)) return;
++			if (!options?.force) {
++				const error = new Error(`ENOENT: no such file or directory, rm '${target}'`);
++				error.code = "ENOENT";
++				throw error;
++			}
++		},
++	};
++
++	return {
++		fs,
++		addFile(target, contents) {
++			addDir(parentOf(target));
++			files.set(target, contents);
++		},
++		read: (target) => files.get(target),
++		has: (target) => files.has(target),
++		namesIn(target) {
++			// Direct children only, like readdirSync without { recursive: true }.
++			const prefix = target.endsWith("/") ? target : `${target}/`;
++			const names = new Set();
++			for (const candidate of [...files.keys(), ...dirs]) {
++				if (!candidate.startsWith(prefix)) continue;
++				const rest = candidate.slice(prefix.length);
++				if (rest === "") continue;
++				names.add(rest.split("/")[0]);
++			}
++			return [...names].sort();
++		},
++		snapshot() {
++			return {
++				files: [...files.entries()].sort(([left], [right]) => left.localeCompare(right)),
++				dirs: [...dirs].sort(),
++			};
++		},
++	};
++}
++
++/** Load the real migration module against the fake filesystem boundary. */
++async function loadMigrations(memory) {
++	const graph = createGraph(
++		root,
++		{ migrations: MIGRATIONS },
++		{
++			getAgentDir: () => AGENT_DIR,
++			getBinDir: () => path.join(AGENT_DIR, "bin"),
++			CONFIG_DIR_NAME: ".pi",
++			migrateKeybindingsConfig: (config) => ({ config, migrated: false }),
++			stripBom: (value) => value,
++			default: Object.assign((text) => String(text), {
++				green: (text) => String(text),
++				yellow: (text) => String(text),
++				red: (text) => String(text),
++				dim: (text) => String(text),
++			}),
++		},
++		{ [MIGRATIONS]: memory.fs },
++	);
++	const migrations = await graph.module("migrations");
++	assert.equal(
++		typeof migrations.migrateSessionsFromAgentRoot,
++		"function",
++		"migrations.ts must export migrateSessionsFromAgentRoot",
++	);
++	return migrations;
++}
++
++const header = (id) => JSON.stringify({ type: "session", version: 3, id, timestamp: "2024-01-01T00:00:00.000Z", cwd: CWD });
++const sessionFile = (id) =>
++	`${header(id)}\n${JSON.stringify({
++		type: "message",
++		id: `${id}-1`,
++		parentId: null,
++		timestamp: "2024-01-01T00:00:01.000Z",
++		message: { role: "user", content: "hello", timestamp: 1704067201000 },
++	})}\n`;
++
++async function main() {
++	const memory = createMemoryFileSystem();
++	memory.addFile(path.join(AGENT_DIR, "sessions", "keep.txt"), "unrelated");
++
++	// 1. Colliding legacy file: destination already holds a *different* session file.
++	const collidingSource = path.join(AGENT_DIR, "01-collision.jsonl");
++	const collidingDestination = path.join(SESSION_DIR, "01-collision.jsonl");
++	const collidingContents = sessionFile("collision");
++	const destinationContents = `${JSON.stringify({
++		type: "session",
++		version: 3,
++		id: "collision",
++		timestamp: "2024-01-01T00:00:00.000Z",
++		cwd: CWD,
++		note: "pre-existing copy",
++	})}\n`;
++	memory.addFile(collidingSource, collidingContents);
++	memory.addFile(collidingDestination, destinationContents);
++
++	// 2. Malformed header: must be left exactly as-is and must not abort the batch.
++	const malformedSource = path.join(AGENT_DIR, "02-malformed.jsonl");
++	const malformedContents = '{"type":"session","id":"truncated"\n';
++	memory.addFile(malformedSource, malformedContents);
++
++	// 3. A healthy legacy file ordered after both of the above: it must still migrate.
++	const laterSource = path.join(AGENT_DIR, "03-later.jsonl");
++	const laterDestination = path.join(SESSION_DIR, "03-later.jsonl");
++	const laterContents = sessionFile("later");
++	memory.addFile(laterSource, laterContents);
++
++	const migrations = await loadMigrations(memory);
++
++	migrations.migrateSessionsFromAgentRoot();
++
++	assert.equal(
++		memory.has(laterSource),
++		false,
++		"a collision earlier in the batch must not strand later legacy sessions in the agent root",
++	);
++	assert.equal(memory.read(laterDestination), laterContents, "the later legacy session must be moved intact");
++
++	assert.equal(memory.read(collidingSource), collidingContents, "the colliding source copy must be preserved");
++	assert.equal(
++		memory.read(collidingDestination),
++		destinationContents,
++		"the pre-existing destination copy must not be overwritten or removed",
++	);
++	assert.equal(
++		memory.has(path.join(SESSION_DIR, "02-malformed.jsonl")),
++		false,
++		"a malformed header must not be migrated",
++	);
++	assert.equal(memory.read(malformedSource), malformedContents, "a malformed header must be left untouched");
++	assert.deepEqual(
++		memory.namesIn(AGENT_DIR),
++		["01-collision.jsonl", "02-malformed.jsonl", "sessions"],
++		"only non-colliding, well-formed legacy files may leave the agent root",
++	);
++
++	// Repeated runs must be idempotent: nothing changes, nothing is lost, no error thrown.
++	const afterFirstRun = memory.snapshot();
++	migrations.migrateSessionsFromAgentRoot();
++	assert.deepEqual(memory.snapshot(), afterFirstRun, "a repeated migration run must be idempotent");
++	assert.equal(memory.read(laterDestination), laterContents, "idempotent reruns must not disturb migrated files");
++	assert.equal(memory.read(collidingSource), collidingContents, "idempotent reruns must keep the collision copy");
++	assert.equal(memory.read(malformedSource), malformedContents, "idempotent reruns must keep malformed headers");
++
++	console.log("regression: session-migration/retransfer passed");
++}
++
++await main();
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..fd0557f
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,24 @@
++{
++  "task_id": "session-migration/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "A destination collision inside the legacy session batch aborted the whole loop instead of skipping the colliding file, stranding every later legacy session in the agent root.",
++      "citation": "packages/coding-agent/src/migrations.ts:126"
++    },
++    {
++      "claim": "The repaired collision branch skips only the colliding file (both the legacy copy and the pre-existing destination copy are preserved), so the remaining batch continues and repeated runs stay idempotent.",
++      "citation": "packages/coding-agent/src/migrations.ts:124-126"
++    },
++    {
++      "claim": "Files with malformed headers are still left untouched and do not interrupt the batch.",
++      "citation": "packages/coding-agent/src/migrations.ts:127-130"
++    }
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired migrateSessionsFromAgentRoot() in packages/coding-agent/src/migrations.ts: the destination-collision branch used `return`, which exited the whole per-file loop after the first colliding legacy session; it now uses `continue`, skipping only that file, keeping both the legacy copy and the pre-existing destination copy, and letting the rest of the batch migrate. Regression runs with node v24.14.0: it loads the real production module through .prale-eval/subject.mjs createGraph() with an in-memory fs boundary (existsSync/mkdirSync/readdirSync/readFileSync/writeFileSync/renameSync/rmSync) plus boundary bindings for getAgentDir/getBinDir/CONFIG_DIR_NAME/migrateKeybindingsConfig/stripBom/chalk default, so no real files, no network, and no dependencies are touched. Seeded batch order is deterministic: (1) a legacy file whose destination already holds a different session file, (2) a file with a malformed JSON header, (3) a healthy legacy file that must still migrate. Assertions: the later healthy session must leave the agent root and its destination content must match byte-for-byte; the colliding legacy source and the pre-existing destination copy must both be preserved unchanged; the malformed header file must not be migrated and must remain byte-identical; the agent root must contain only the colliding and malformed files plus the sessions directory; a second run must be idempotent (deep-equal filesystem snapshot, no throw, no double migration). Verified the regression detects the original fault: temporarily restoring `if (existsSync(newPath)) return;` makes the script exit 1 with AssertionError 'a collision earlier in the batch must not strand later legacy sessions in the agent root'; with the repair it exits 0. Type stripping via the VM loader confirms the edited source parses. Optional validation dependencies unavailable (no node_modules installed, so vitest, tsc/tsgo and biome could not be run; scripts/check-ts-relative-imports.mjs fails with ERR_MODULE_NOT_FOUND for 'typescript'); no dependencies were installed."
++  }
++}
+snapshot .prale-eval/regression.mjs - eb50a4874efa08fb3ce2dcc7870d2d6f8609ae47e8da856485ef940fd547b5b9
+snapshot .prale-eval/result.json - 9fd48201784211bba19976e761df4686264cb9b84a81c500520ca578ddd70470
+snapshot packages/coding-agent/src/migrations.ts 33c2bc5d6f55f30c8eb6d60400aba867c049b056976b526845b692f967cae0ec ee59d6c3f8fb9b1892d567c2498ea3a96b7127321c0bea244e2f018cafe2b6d0

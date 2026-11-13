@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import Any
 
 from real_experience_manifest import _files
+from real_experience_support import subject_path
 
 CONTRACTS = Path(__file__).with_name("real_experience_contracts")
 REGRESSION = ".prale-eval/regression.mjs"
@@ -97,7 +98,7 @@ def evaluate(fixture: Path, workspace: Path, fault_source: Path, baseline: str) 
         _regular(workspace, target)
         _regular(workspace, REGRESSION)
         loader = _regular(workspace, ".prale-eval/subject.mjs")
-        if loader.read_bytes() != (CONTRACTS / "subject.mjs").read_bytes():
+        if loader.read_bytes() != subject_path(metadata, CONTRACTS).read_bytes():
             raise ValueError("read-only subject loader was modified")
         result = json.loads(_regular(workspace, ".prale-eval/result.json").read_text())
         for key, expected in (

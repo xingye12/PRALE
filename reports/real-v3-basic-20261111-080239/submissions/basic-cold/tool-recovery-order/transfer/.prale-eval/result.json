@@ -1,0 +1,60 @@
+{
+	"task_id": "tool-recovery-order/transfer",
+	"repository": "earendil-works/pi",
+	"mode": "repair",
+	"status": "passed",
+	"summary": "Durable tool recovery replayed a persisted replay:\"safe\" effect without re-checking the tool declaration it resolves at reopen. A tool that disappeared from the current configuration was passed to the effect boundary as undefined and turned into a bogus TypeError result (plus a recovery tool_start), and a tool whose declaration had become replay:\"never\" was re-executed anyway. Recovery now replays only when the persisted intent and the current declaration are both safe and the batch is not cancelled; every other case settles as interrupted with the durable progress checkpoint preserved, and a missing tool never reaches the effect boundary.",
+	"changes": [
+		{
+			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
+			"description": "recoverToolInvocation guards the replay branch with the current declaration: tool !== undefined (missing declaration falls through to the interrupted settlement) and tool.replay === \"safe\" (a downgraded declaration cannot repeat the effect). Both are combined with the persisted call.replay === \"safe\" and !cancelled, so only both-safe, non-cancelled calls replay."
+		}
+	],
+	"deliverables": [
+		"packages/agent/src/harness/runtime/drive/tools.ts",
+		".prale-eval/regression.mjs",
+		".prale-eval/result.json"
+	],
+	"citations": [
+		{
+			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
+			"lines": "515-548",
+			"claim": "recoverToolInvocation is the recovery entry point for an effect_pending tool call; the fixed guard is line 529 and the interrupted settlement fallback is the tail of the function (readCheckpoint + interruptedOutcome + publishToolOutcome)."
+		},
+		{
+			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
+			"lines": "158-171",
+			"claim": "interruptedOutcome keeps the durable checkpoint content/details/usage and appends the INTERRUPTION_MARKER text; this is the settlement the regression asserts on."
+		},
+		{
+			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
+			"lines": "295-330",
+			"claim": "clearReplayCheckpoint (replay intent publication) is only reached from the replay branch, so a guarded-out call no longer clears the durable checkpoint before deciding."
+		},
+		{
+			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
+			"lines": "350-450",
+			"claim": "performToolInvocation is the effect boundary: prepare/replay hands it the resolved declaration, so an undefined declaration would reach executeToolCall and fail there under the original code."
+		},
+		{
+			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
+			"lines": "658-695",
+			"claim": "runTools builds toolsByName from the current lane configuration filtered by the persisted activeToolNames, i.e. exactly the current declaration set recovery must re-check."
+		},
+		{
+			"path": "packages/agent/src/harness/execution/tools.ts",
+			"lines": "130-160",
+			"claim": "executeToolCall dereferences call.tool.execute inside its try block, which is why a missing declaration surfaced as a TypeError-derived error result instead of an interruption."
+		},
+		{
+			"path": "packages/agent/src/harness/pico3/kinds/tool.ts",
+			"lines": "128-158",
+			"claim": "The experimental pico3 kernel already encodes the intended rule on recovery (`if (cp.replay !== \"safe\" || (declaration.replay ?? \"unsafe\") !== \"safe\")` and a separate missing-declaration branch); the drive runtime is the implementation that violated it."
+		}
+	],
+	"validation": {
+		"command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+		"status": "passed",
+		"notes": "The regression loads the real production modules through .prale-eval/subject.mjs createGraph (drive/tools.ts plus the lane, restore, tool-placement, progress, execution and session modules it links against) and fakes only the boundary: the pi-ai argument validator, uuidv7, and the chord context helpers. It rebuilds a reopened durable tool batch exactly as the kernel persists it (assistant message with tool-call blocks, operation meta/state with effect_pending calls, persisted operationToolArgs and pendingToolOutput checkpoints) and runs runTools on it. Scenarios: (1) persisted replay:\"safe\" with the declaration gone -> asserts the tool never runs, no recovery tool_start is emitted, and the result carries the durable snapshot 'durable partial' plus the interruption marker and its details; (2) declaration downgraded to replay:\"never\" -> same interrupted settlement, zero executions; (3) declaration with no replay field (default not safe) -> interrupted with marker only and no invented details; (4) control: both policies safe -> the effect replays exactly once with the persisted arguments and publishes the real result with one recovery tool_start; (5) persisted replay:\"never\" with a now-safe declaration -> interrupted, because the durable policy cannot be upgraded; (6) mixed batch (missing + downgraded) -> both settle interrupted and are placed in source order. Verified both directions: with the fix the script exits 0, and with the original line `if (!cancelled && call.replay === \"safe\")` restored it exits 1 with AssertionError 'missing declaration: the result must report an interrupted tool execution, got: TypeError: Cannot read properties of undefined (reading \\'execute\\')'; a partial fix that only guards the missing declaration also fails it ('declaration downgraded to never: the tool effect ran even though the call must not replay'). Runtime is ~0.15s, no dependencies or network. Limitation: node_modules is absent in this checkout, so the repository's vitest suite and `npm run check` (tsc/biome) could not be run; the module graph is instead parsed and evaluated by Node 24 type stripping, which validates the edited file's syntax, and the affected existing vitest case (packages/agent/test/harness/runtime/drive-tools.test.ts, 'safe-replays persisted arguments and memos while interrupting unsafe effects') was reviewed by hand: its safe tool declares replay:\"safe\" and its unsafe one replay:\"never\", so both its expectations still hold."
+	}
+}

@@ -1,0 +1,57 @@
+{
+  "task_id": "session-migration/learn",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claims": [
+    {
+      "claim": "The legacy oauth.json migration parsed the raw file text with JSON.parse, so a leading UTF-8 BOM made the JSON parse throw and the whole oauth migration was silently skipped, leaving OAuth credentials unmigrated.",
+      "citations": [
+        "packages/coding-agent/src/migrations.ts:36",
+        "packages/coding-agent/src/utils/text.ts:7"
+      ]
+    },
+    {
+      "claim": "The repair strips the BOM (via the already-imported stripBom helper) before parsing oauth.json, matching how settings.json and keybindings.json are already read in the same file; no other production logic changed.",
+      "citations": [
+        "packages/coding-agent/src/migrations.ts:36",
+        "packages/coding-agent/src/migrations.ts:51",
+        "packages/coding-agent/src/migrations.ts:10"
+      ]
+    },
+    {
+      "claim": "OAuth credentials are still written verbatim as {type: \"oauth\", ...cred}, settings.json apiKeys are still migrated as {type: \"api_key\", key} only when the provider has no oauth entry (OAuth precedence plus API-key fallback), and the guarded `!migrated[provider]` check keeps that ordering intact.",
+      "citations": [
+        "packages/coding-agent/src/migrations.ts:37-39",
+        "packages/coding-agent/src/migrations.ts:54-57"
+      ]
+    },
+    {
+      "claim": "Malformed oauth.json input is still preserved because the archive rename only runs after a successful parse and conversion, so a parse error leaves oauth.json in place and produces no partial auth.json; an existing auth.json still short-circuits the migration untouched.",
+      "citations": [
+        "packages/coding-agent/src/migrations.ts:28",
+        "packages/coding-agent/src/migrations.ts:41-44"
+      ]
+    },
+    {
+      "claim": "The added regression loads the real migrations module through .prale-eval/subject.mjs with a temporary agentDir and asserts BOM migration, OAuth precedence over apiKeys, API-key fallback, malformed-input preservation, untouched existing auth.json, and unchanged BOM-less behavior.",
+      "citations": [
+        ".prale-eval/regression.mjs:1-19",
+        ".prale-eval/regression.mjs:63-94",
+        ".prale-eval/regression.mjs:96-125",
+        ".prale-eval/regression.mjs:127-145",
+        ".prale-eval/regression.mjs:147-166",
+        ".prale-eval/regression.mjs:168-180"
+      ]
+    }
+  ],
+  "deliverables": [
+    "packages/coding-agent/src/migrations.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/result.json"
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node v24.14.0: exit code 0 and output 'regression: oauth.json BOM migration checks passed'. The script loads the real packages/coding-agent/src/migrations.ts via .prale-eval/subject.mjs (real fs/path, faked getAgentDir + stripBom) and exercises migrateAuthToAuthJson() against temporary agent dirs created under .prale-eval and removed in a finally block. Assertions: (1) an oauth.json prefixed with U+FEFF migrates both providers, writing type \"oauth\" credentials with access/refresh/expires preserved verbatim and archiving the original bytes as oauth.json.migrated; (2) with a BOM-prefixed oauth.json plus settings.json apiKeys for the same and another provider, OAuth wins for the overlapping provider, the apiKeys-only provider falls back to type \"api_key\", apiKeys is removed and unrelated settings survive; (3) a syntactically malformed oauth.json is left byte-for-byte in place, not renamed, and produces no auth.json; (4) an existing auth.json is byte-for-byte unchanged and its legacy oauth.json is not consumed; (5) a BOM-less oauth.json still migrates. Fault detection was confirmed by copying subject.mjs/regression.mjs plus a fault-injected migrations.ts (BOM strip removed from the oauth read) into a scratch tree and replaying the script: it exited 1 with AssertionError 'legacy oauth.json with a UTF-8 BOM must report the migrated providers' (actual [], expected ['anthropic','openai-codex']). Node emits ExperimentalWarning lines for stripTypeScriptTypes/VM modules on stderr only; they do not affect the exit status. No vitest/tsc run was possible because the workspace has no node_modules and dependencies may not be installed, so TypeScript type checking beyond Node's type stripping was not performed."
+  }
+}

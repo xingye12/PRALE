@@ -37,7 +37,7 @@ def main() -> int:
     parser.add_argument("--fixtures", type=Path, default=Path("evals/experience-real-v2/fixtures"))
     parser.add_argument("--repository-id", default="pi-b455975")
     parser.add_argument("--model")
-    parser.add_argument("--target-visibility", choices=("listed", "hidden"), default="listed")
+    parser.add_argument("--target-visibility", choices=("listed", "hidden"), default="hidden")
     parser.add_argument("--promotion-timeout", type=float, default=900)
     parser.add_argument("--submission-dir", type=Path)
     parser.add_argument("--max-budget-usd", type=float, default=10.0)
@@ -49,6 +49,7 @@ def main() -> int:
     adapter = Path(__file__).with_name("real_experience_adapters.py").resolve()
     state_root = args.state_dir.resolve()
     state_root.mkdir(parents=True, exist_ok=True)
+    capsule = load_capsule(args.capsule)
     runs: list[dict[str, Any]] = []
     for index, (episode, stage, fixture) in enumerate(_fixtures(args.fixtures)):
         state = state_root if args.memory_mode == "warm" else state_root / f"cold-{index}"
@@ -75,7 +76,7 @@ def main() -> int:
         if args.adapter == "claude-code":
             command.extend(["--max-budget-usd", str(args.max_budget_usd)])
         result = run_stage(
-            capsule=load_capsule(args.capsule),
+            capsule=capsule,
             fixture=fixture,
             agent_command=command,
             allow_host_execution=True,
@@ -93,6 +94,7 @@ def main() -> int:
         report = {
             "metadata": {
                 "system": args.adapter,
+                "benchmark_id": capsule.benchmark_id,
                 "memory_mode": args.memory_mode,
                 "target_visibility": args.target_visibility,
                 "accounting_version": 2 if args.adapter == "prale" else 1,

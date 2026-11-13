@@ -1,0 +1,22 @@
+{
+  "task_id": "session-migration/learn",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "summary": "Legacy oauth.json files that start with a UTF-8 BOM were silently dropped by the startup auth migration because the OAuth branch parsed the raw file text while every other config reader (settings.json, keybindings.json, auth.json, models.json, themes) strips the BOM first. The OAuth branch now strips the BOM and validates the parsed shape before renaming oauth.json, so credentials migrate, precedence and api-key fallback are preserved, malformed input is left intact, and an existing auth.json still short-circuits the migration.",
+  "root_cause": "packages/coding-agent/src/migrations.ts: migrateAuthToAuthJson() called JSON.parse(readFileSync(oauthPath, \"utf-8\")) without stripBom(), unlike its settings.json branch in the same function and every other JSON reader in the package. JSON.parse rejects a leading U+FEFF, the surrounding try/catch swallowed the SyntaxError, so no OAuth credentials were migrated and the provider list came back empty (while oauth.json stayed behind).",
+  "changes": [
+    {
+      "path": "packages/coding-agent/src/migrations.ts",
+      "description": "Migrate the oauth.json read through the existing stripBom() helper (packages/coding-agent/src/utils/text.ts). Also validate the parsed value: the top level must be a plain object and every credential must be a plain object, checked before renameSync/writes, so a JSON-valid but structurally invalid or malformed oauth.json is never renamed to oauth.json.migrated and never contributes partial/garbage credentials to auth.json. No change to OAuth precedence (settings.json apiKeys still skip providers already migrated), api-key fallback, the mode 0o600 write, or the early return when auth.json exists."
+    },
+    {
+      "path": ".prale-eval/regression.mjs",
+      "description": "Standalone Node 24 assertion script that loads the real packages/coding-agent/src/migrations.ts together with the real packages/coding-agent/src/utils/text.ts (so the real stripBom runs) through the read-only .prale-eval/subject.mjs createGraph helper, with an in-memory fs boundary fake (existsSync/readFileSync/writeFileSync/mkdirSync/renameSync/rmSync/readdirSync) and faked config/keybindings/chalk boundaries."
+    }
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node v24.14.0; exit code 0, final line 'session-migration/learn regression: all assertions passed'. The script asserts five production behaviors of migrateAuthToAuthJson against the real source: (1) an oauth.json prefixed with U+FEFF migrates to auth.json with credentials copied verbatim (type:'oauth' plus refresh/access/expires), reports ['anthropic'], renames oauth.json to oauth.json.migrated and keeps the retired file byte-for-byte; (2) OAuth wins over a settings.json apiKeys entry for the same provider (no leaked key field), api-key fallback still migrates other providers as {type:'api_key',key}, apiKeys is deleted from settings.json and unrelated settings keys survive; (3) a malformed oauth.json is left byte-identical, is never renamed, contributes no partial credentials to auth.json, and api-key fallback still runs; (4) an existing auth.json short-circuits the migration with an empty provider list, no writes and no renames, leaving auth.json/oauth.json/settings.json byte-identical; (5) a BOM-less oauth.json still migrates. Fault detection was verified, not assumed: temporarily restoring the pre-fix line JSON.parse(readFileSync(oauthPath, \"utf-8\")) and re-running the same command exited 1 with 'AssertionError [ERR_ASSERTION]: a BOM-prefixed oauth.json must still be migrated into auth.json (actual [] vs expected [anthropic])'; restoring the fix returned exit 0. Providers are copied with Array.from because the module runs in a separate VM realm and cross-realm arrays fail deepStrictEqual. Limitation: the repository has no installed node_modules, so no dependency-based validation (tsc typecheck, vitest/bun test suites) could be run; the regression is deliberately dependency-free and needs no network."
+  }
+}

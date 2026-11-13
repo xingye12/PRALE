@@ -276,3 +276,77 @@ def test_real_worktree_pointer_and_symlink_target_are_readonly(tmp_path):
         assert target.read_text() == "original"
 
     asyncio.run(scenario())
+
+
+def test_hidden_directories_are_masked_after_workspace_bind(tmp_path, monkeypatch):
+    monkeypatch.setattr("agent_harness.integrations.shell.shutil.which", lambda name: "/usr/bin/bwrap")
+    hidden = tmp_path / ".eval-state"
+    hidden.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    wrapper = BubblewrapExecutor(hidden_paths=(hidden,))._wrapper(workspace)
+    index = wrapper.index(str(hidden), wrapper.index("--bind") + 3)
+    assert wrapper[index - 1 : index + 3] == ("--tmpfs", str(hidden), "--remount-ro", str(hidden))
+
+
+def test_hidden_configuration_changes_capability_and_rejects_hidden_workspace(tmp_path, monkeypatch):
+    import subprocess
+
+    monkeypatch.setattr("agent_harness.integrations.shell.shutil.which", lambda name: "/bin/true")
+    monkeypatch.setattr(
+        "agent_harness.integrations.shell.subprocess.run",
+        lambda *args, **kwargs: subprocess.CompletedProcess(args, 0, b"", b""),
+    )
+    hidden = tmp_path / ".eval-state"
+    hidden.mkdir()
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    executor = BubblewrapExecutor(hidden_paths=(hidden,))
+    assert executor.probe(workspace).identity != BubblewrapExecutor().probe(workspace).identity
+    assert not executor.probe(hidden / "nested").available
+
+
+def test_real_hidden_state_is_unreadable_through_absolute_paths_and_symlinks(tmp_path):
+    import shlex
+    import tempfile
+
+    # /var/tmp is necessary: the existing private /tmp would hide test files anyway.
+    with tempfile.TemporaryDirectory(prefix="prale-state-mask-", dir="/var/tmp") as external:
+        hidden = Path(external) / ".eval-state"
+        hidden.mkdir()
+        (hidden / "memory.sqlite").write_text("private-memory")
+        (tmp_path / "state-link").symlink_to(hidden, target_is_directory=True)
+        executor = BubblewrapExecutor(hidden_paths=(hidden,))
+        capability = executor.probe(tmp_path)
+        if not capability.available:
+            import os
+
+            if os.environ.get("PRALE_REQUIRE_BWRAP") == "1":
+                pytest.fail(capability.reason)
+            pytest.skip(capability.reason)
+
+        async def scenario():
+            tool = BashTool(tmp_path, executor=executor)
+            result = await tool.execute({"command": f"ls -A {shlex.quote(str(hidden))}"})
+            assert not result.is_error
+            assert not result.content.strip()
+            for command in (
+                f"cat {shlex.quote(str(hidden / 'memory.sqlite'))}",
+                "cat state-link/memory.sqlite",
+                f"echo bad > {shlex.quote(str(hidden / 'new-file'))}",
+            ):
+                assert (await tool.execute({"command": command})).is_error
+            assert not (await tool.execute({"command": "echo ok > workspace-file"})).is_error
+
+        asyncio.run(scenario())
+        assert (hidden / "memory.sqlite").read_text() == "private-memory"
+        assert not (hidden / "new-file").exists()
+
+
+def test_hidden_parent_subsumes_nested_state_and_canonicalizes_alias(tmp_path):
+    hidden = tmp_path / ".eval-state"
+    hidden.mkdir()
+    alias = tmp_path / "alias"
+    alias.symlink_to(hidden, target_is_directory=True)
+    executor = BubblewrapExecutor(hidden_paths=(hidden / "run", hidden, alias))
+    assert executor._hidden_directories() == (hidden.resolve(),)

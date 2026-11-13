@@ -13,6 +13,15 @@ REPO = Path(__file__).resolve().parents[2]
 CAPSULE = REPO / "evals/experience-real-v2/capsules/pi-b455975/source.tar"
 
 
+def submission_boundaries() -> str:
+    # Caller-owned fakes for deterministic test submissions, not fixture support.
+    # Execute these adapters through the same generic loader the agent receives.
+    legacy = (REPO / "scripts/real_experience_contracts/subject.mjs").read_text()
+    start = legacy.index("async function load(")
+    end = legacy.index("/** Real migration functions", start)
+    return legacy[:start] + "import {loadModule as load} from './subject.mjs';\n" + legacy[end:]
+
+
 def test_every_stage_has_a_real_mutation_and_explicit_behavior_contract() -> None:
     files = render()
     for fixture in FIXTURES:
@@ -78,7 +87,7 @@ def test_hidden_behavior_accepts_original_and_rejects_every_injected_fault(tmp_p
 REGRESSIONS = {
     "extension-trust": """
 import assert from 'node:assert/strict';
-import {createTrustSubject} from './subject.mjs';
+import {createTrustSubject} from './local-boundaries.mjs';
 for (const decision of [true, false]) {
   const {loader} = await createTrustSubject(process.cwd());
   const bootstrap = await loader.loadProjectTrustExtensions();
@@ -94,7 +103,7 @@ import assert from 'node:assert/strict';
 import {mkdtempSync,writeFileSync,readFileSync,mkdirSync,rmSync,existsSync} from 'node:fs';
 import {join} from 'node:path';
 import {tmpdir} from 'node:os';
-import {loadMigrations} from './subject.mjs';
+import {loadMigrations} from './local-boundaries.mjs';
 const dir = mkdtempSync(join(tmpdir(),'submitted-migration-'));
 try {
   const subject = await loadMigrations(process.cwd(), dir);
@@ -117,7 +126,7 @@ try {
 """,
     "tool-recovery-order": """
 import assert from 'node:assert/strict';
-import {createRecoverySubject} from './subject.mjs';
+import {createRecoverySubject} from './local-boundaries.mjs';
 const run = await createRecoverySubject(process.cwd());
 for (const a of ['safe','never']) for (const b of ['safe','never',undefined]) {
   for (const cancelled of [true,false]) {
@@ -136,7 +145,7 @@ def submission(tmp_path, sources, fixture):
     shutil.copytree(sources, root)
     public = root / ".prale-eval"
     public.mkdir()
-    shutil.copy2(REPO / "scripts/real_experience_contracts/subject.mjs", public / "subject.mjs")
+    shutil.copy2(REPO / "scripts/real_experience_public_subject.mjs", public / "subject.mjs")
     target = root / fixture.target
     original = target.read_text()
     target.write_text(original.replace(fixture.before, fixture.after, 1))
@@ -155,6 +164,7 @@ def submission(tmp_path, sources, fixture):
 
     capture_manifest(root, fault.with_suffix(".baseline.json"), baseline)
     target.write_text(original)
+    (public / "local-boundaries.mjs").write_text(submission_boundaries())
     (public / "regression.mjs").write_text(REGRESSIONS[fixture.episode])
     (public / "result.json").write_text(
         json.dumps(
@@ -191,7 +201,7 @@ def test_full_oracle_requires_behavior_and_mutation_sensitive_regression(tmp_pat
         "throw new SyntaxError('not a regression assertion');",
         "import assert from 'node:assert/strict'; assert.fail('always fails');",
         # A runtime error that occurs only on the faulty code must not count as a kill.
-        """import {createRecoverySubject} from './subject.mjs';
+        """import {createRecoverySubject} from './local-boundaries.mjs';
 const run = await createRecoverySubject(process.cwd());
 if (!(await run('safe','safe',false)).events.includes('invoke')) throw new TypeError('broken');""",
     ],
@@ -264,8 +274,12 @@ def test_real_capsule_stage_runs_external_oracle_and_records_replay(tmp_path, so
     }
     script = (
         "from pathlib import Path; "
+        "assert not list(Path.cwd().parent.glob('original-fault*')); "
+        "assert not any(p.name in {'oracle.py', 'fixture.json', 'mutation.patch'} "
+        "for p in Path.cwd().parent.rglob('*'))\n"
         f"assert {visibility!r} != 'hidden' or {fixture.target!r} not in Path('TASK.md').read_text(); "
         f"Path({fixture.target!r}).write_text({(sources / fixture.target).read_text()!r}); "
+        f"Path('.prale-eval/local-boundaries.mjs').write_text({submission_boundaries()!r}); "
         f"Path('.prale-eval/regression.mjs').write_text({REGRESSIONS[fixture.episode]!r}); "
         f"Path('.prale-eval/result.json').write_text({json.dumps(result)!r})"
     )

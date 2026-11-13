@@ -1,0 +1,34 @@
+{
+	"task_id": "tool-recovery-order/learn",
+	"repository": "earendil-works/pi",
+	"mode": "repair",
+	"status": "completed",
+	"claim": "An interrupted (effect_pending) tool call may be replayed only when BOTH the persisted call policy (ToolCall.replay) and the current tool declaration (AgentHarnessTool.replay) are 'safe' and the run is not cancelled; otherwise the interrupted outcome is published with the durable checkpoint, leaving it in place and never invoking the tool.",
+	"claim_citations": [
+		"packages/agent/src/harness/runtime/drive/tools.ts:527-528 (repaired gate: `!cancelled && call.replay === \"safe\" && tool?.replay === \"safe\"`)",
+		"packages/agent/src/harness/runtime/drive/tools.ts:295-330 (clearReplayCheckpoint: only the replay path deletes the pending tool output and re-invokes)",
+		"packages/agent/src/harness/runtime/drive/tools.ts:158-168 (interruptedOutcome: durable checkpoint prefix plus the interruption marker)",
+		"packages/agent/src/harness/runtime/drive/tools.ts:331-340 (readCheckpoint: the interrupted path reads, never clears, the checkpoint)",
+		"packages/agent/src/harness/pico3/kinds/tool.ts:137 (equivalent kernel rule: interrupt unless both policies are safe)"
+	],
+	"changes": [
+		{
+			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
+			"description": "recoverToolInvocation() combined the two safety declarations with `||`, so a persisted 'safe' call policy alone (or a current 'safe' declaration alone) authorized replay of an interrupted tool. Now replay requires both declarations to be safe and no cancellation."
+		},
+		{
+			"path": ".prale-eval/regression.mjs",
+			"description": "Standalone Node assertion script that drives the real recoverToolInvocation through a test-only trailer and fakes for the lane/session/execution boundaries; asserts replay only for the doubly-safe, uncancelled case and interrupted-with-checkpoint for every other combination."
+		}
+	],
+	"deliverables": [
+		"packages/agent/src/harness/runtime/drive/tools.ts",
+		".prale-eval/regression.mjs",
+		".prale-eval/result.json"
+	],
+	"validation": {
+		"command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+		"status": "passed",
+		"notes": "Ran from the workspace root with Node v24.14.0; exit 0 after the repair. The script loads the production file packages/agent/src/harness/runtime/drive/tools.ts through .prale-eval/subject.mjs createGraph() (TypeScript stripping + VM modules) with a test-only trailer exposing the private recoverToolInvocation, and supplies its own boundary fakes (lane command/settleOperation/emitBatch/hooks, session value addresses plus a reader over durable values, openToolProgress, tool-placement helpers, executeToolCall/finalizeToolCall/createToolResultMessage). Covered scenarios: (a) persisted safe + declared safe, uncancelled -> the tool is re-invoked once, the pending checkpoint is deleted exactly once, one recovery tool_start carries the persisted arguments, result is not an error; (b) persisted safe + declared never; (c) persisted never + declared safe; (d) persisted never + declared never; (e) persisted safe + declaration defaulting to undefined; (f) persisted safe + tool no longer registered; (g) persisted safe + declared safe + cancel_requested -> each of (b)-(g) asserts zero executions, zero checkpoint-clearing writes, zero replay tool_start events, exactly one recovery tool_end with isError, and an outcome carrying the durable checkpoint content ('durable partial') plus checkpoint details ({ progress: 'kept' }) and the interruption marker text. Fault sensitivity was confirmed by temporarily restoring the original `||` condition in place: the script then failed with `AssertionError: persisted safe + declared never: the interrupted tool was invoked` (actual ['write-file'] vs expected []), and it passed again after re-applying the fix. Limitations: repository dependencies are not installed in this sandbox, so `npm`/`vitest` suites (e.g. packages/agent/test/harness/runtime/drive-tools.test.ts) could not be executed; the regression instead exercises the production module directly with no external dependencies, and prints only ExperimentalWarning lines for stripTypeScriptTypes/VM modules on stderr."
+	}
+}

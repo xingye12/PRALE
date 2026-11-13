@@ -1,0 +1,803 @@
+diff --git a/packages/coding-agent/src/core/project-trust.ts b/packages/coding-agent/src/core/project-trust.ts
+index b88f78b..354aa35 100644
+--- a/packages/coding-agent/src/core/project-trust.ts
++++ b/packages/coding-agent/src/core/project-trust.ts
+@@ -62,7 +62,9 @@ export async function resolveProjectTrusted(options: ResolveProjectTrustedOption
+ 		}
+ 		if (result) {
+ 			const trusted = result.trusted === "yes";
+-			if (result.remember !== undefined) {
++			// A trusted or denied decision without an explicit remember flag only
++			// applies to this session; it must never become permanent consent.
++			if (result.remember === true) {
+ 				options.trustStore.set(options.cwd, trusted);
+ 			}
+ 			return trusted;
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 8da4475..3eb73c5 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -450,7 +450,9 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		let preTrustExtensions: LoadExtensionsResult | undefined;
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+-			const projectTrusted = false;
++			// Resolve trust exactly once from the untrusted bootstrap result, then load the
++			// final settings for that decision so project settings follow the new trust state.
++			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+ 			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+index 3c9bb5d..c7bb2af 100644
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -512,7 +512,7 @@ export class SettingsManager {
+ 	}
+ 
+ 	setProjectTrusted(trusted: boolean): void {
+-		if (this.projectTrusted !== trusted) {
++		if (this.projectTrusted === trusted) {
+ 			return;
+ 		}
+ 
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..0e8e8ec
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,619 @@
++#!/usr/bin/env node
++/**
++ * Cross-module regression for the project-trust incident.
++ *
++ *   node --experimental-vm-modules .prale-eval/regression.mjs
++ *
++ * The script links the real production modules (project-trust, trust-manager,
++ * settings-manager, resource-loader) through the read-only subject helper and
++ * replaces only the outer boundary collaborators (extension runner, lock file,
++ * package manager, extension loader, theme/skill/prompt loaders). Every
++ * assertion is observable at a module boundary:
++ *
++ *   - extension decision without `remember` must not persist consent
++ *   - a session-only prompt answer must not persist consent
++ *   - approvals and denials with `remember: true` must persist
++ *   - trust changes must reload project settings
++ *   - the resolver must run exactly once after the untrusted bootstrap and its
++ *     result must drive the final settings/extensions load
++ *   - global configuration must stay untouched
++ */
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
++import { homedir } from "node:os";
++import { isAbsolute, join, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++import { createGraph } from "./subject.mjs";
++
++const ROOT = fileURLToPath(new URL("..", import.meta.url));
++const TMP_ROOT = join(ROOT, ".prale-eval", "tmp");
++
++const PROJECT_TRUST = "packages/coding-agent/src/core/project-trust.ts";
++const TRUST_MANAGER = "packages/coding-agent/src/core/trust-manager.ts";
++const SETTINGS_MANAGER = "packages/coding-agent/src/core/settings-manager.ts";
++const RESOURCE_LOADER = "packages/coding-agent/src/core/resource-loader.ts";
++
++// ---------------------------------------------------------------------------
++// Boundary fakes for the pure path/text helpers. Kept faithful to
++// packages/coding-agent/src/utils/{paths,text}.ts so the real modules see the
++// same absolute paths they would in production.
++// ---------------------------------------------------------------------------
++const UNICODE_SPACES = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
++
++function normalizePath(input, options = {}) {
++	let normalized = options.trim ? input.trim() : input;
++	if (options.normalizeUnicodeSpaces) normalized = normalized.replace(UNICODE_SPACES, " ");
++	if (options.stripAtPrefix && normalized.startsWith("@")) normalized = normalized.slice(1);
++	if (options.expandTilde ?? true) {
++		const home = options.homeDir ?? homedir();
++		if (normalized === "~") return home;
++		if (normalized.startsWith("~/")) return join(home, normalized.slice(2));
++	}
++	return normalized;
++}
++
++function resolvePath(input, baseDir = ROOT, options = {}) {
++	const normalized = normalizePath(input, options);
++	const normalizedBaseDir = normalizePath(baseDir);
++	return isAbsolute(normalized) ? resolve(normalized) : resolve(normalizedBaseDir, normalized);
++}
++
++function canonicalizePath(path) {
++	try {
++		return realpathSync(path);
++	} catch {
++		return path;
++	}
++}
++
++function stripBom(content) {
++	return content.startsWith("\uFEFF") ? content.slice(1) : content;
++}
++
++/** One fake default export serving the two modules that import one. */
++const defaultExportFake = {
++	// proper-lockfile (trust store + settings storage)
++	lockSync: () => () => {},
++	// chalk (resource loader warnings)
++	yellow: (value) => value,
++	red: (value) => value,
++	cyan: (value) => value,
++	green: (value) => value,
++};
++
++const sharedPathBindings = { normalizePath, resolvePath, canonicalizePath, stripBom };
++
++// ---------------------------------------------------------------------------
++// Workspace-local scratch state. Everything is created under .prale-eval/tmp
++// and removed again before the script finishes.
++// ---------------------------------------------------------------------------
++const cleanupTargets = [];
++
++function scratchDir(label) {
++	const dir = join(TMP_ROOT, `${label}-${cleanupTargets.length}-${process.pid}`);
++	mkdirSync(dir, { recursive: true });
++	cleanupTargets.push(dir);
++	return dir;
++}
++
++function writeJson(filePath, value) {
++	mkdirSync(join(filePath, ".."), { recursive: true });
++	writeFileSync(filePath, `${JSON.stringify(value, null, 2)}\n`, "utf-8");
++}
++
++/** Project that must be gated by trust (.pi/settings.json exists). */
++function makeTrustRequiringProject(settings = { theme: "project" }) {
++	const root = scratchDir("project");
++	writeJson(join(root, ".pi", "settings.json"), settings);
++	return root;
++}
++
++function makeAgentDir(settings = { theme: "global" }) {
++	const root = scratchDir("agent");
++	writeJson(join(root, "settings.json"), settings);
++	return root;
++}
++
++/** Project without any trust-requiring resources. */
++function makePlainProject() {
++	return scratchDir("plain");
++}
++
++function assertGlobalConfigUntouched(agentDir, expected) {
++	assert.equal(
++		readFileSync(join(agentDir, "settings.json"), "utf-8"),
++		`${JSON.stringify(expected, null, 2)}\n`,
++		"resolving project trust must not mutate global configuration",
++	);
++}
++
++// ---------------------------------------------------------------------------
++// Graph A: project-trust.ts + trust-manager.ts (real) with the extension
++// runner's project_trust aggregation replaced by a boundary fake.
++// ---------------------------------------------------------------------------
++async function loadTrustModules(state) {
++	const graph = createGraph(
++		ROOT,
++		[PROJECT_TRUST, TRUST_MANAGER],
++		{
++			...sharedPathBindings,
++			APP_NAME: "pi",
++			CONFIG_DIR_NAME: ".pi",
++			default: defaultExportFake,
++			emitProjectTrustEvent: async (extensionsResult, event, ctx) => {
++				state.extensionCalls.push({ extensionsResult, event, ctx });
++				return { result: state.decision, errors: state.errors ?? [] };
++			},
++		},
++	);
++	return {
++		projectTrust: await graph.module(PROJECT_TRUST),
++		trustManager: await graph.module(TRUST_MANAGER),
++	};
++}
++
++function trustContext(cwd, { hasUI = true, answer } = {}) {
++	const prompts = [];
++	return {
++		prompts,
++		ctx: {
++			cwd,
++			mode: "interactive",
++			hasUI,
++			ui: {
++				select: async (title, options) => {
++					prompts.push({ title, options: [...options] });
++					return answer === undefined ? undefined : answer(options);
++				},
++				confirm: async () => false,
++				input: async () => undefined,
++				notify: () => {},
++			},
++		},
++	};
++}
++
++function trustStoreHasEntry(store, cwd) {
++	return store.get(cwd) !== null;
++}
++
++async function testExtensionDecisionWithoutRememberIsSessionOnly() {
++	const agentDir = makeAgentDir();
++	const cwd = makeTrustRequiringProject();
++	const state = { decision: { trusted: "yes" }, extensionCalls: [] };
++	const { projectTrust, trustManager } = await loadTrustModules(state);
++	const store = new trustManager.ProjectTrustStore(agentDir);
++	const { ctx } = trustContext(cwd);
++	const extensionsResult = { extensions: [], errors: [], runtime: {} };
++
++	const trusted = await projectTrust.resolveProjectTrusted({ cwd, trustStore: store, extensionsResult, projectTrustContext: ctx });
++
++	assert.equal(trusted, true, "extension approval grants access for this session");
++	assert.equal(state.extensionCalls.length, 1, "the extension trust handler runs exactly once per resolution");
++	assert.equal(state.extensionCalls[0].event.type, "project_trust");
++	assert.equal(trustStoreHasEntry(store, cwd), false, "extension approval without remember must not persist consent");
++	assert.equal(existsSync(join(agentDir, "trust.json")), false, "no trust file is written for a session-only approval");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++
++	// An explicit `remember: false` is still a session-only decision.
++	state.decision = { trusted: "yes", remember: false };
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({ cwd, trustStore: store, extensionsResult, projectTrustContext: ctx }),
++		true,
++		"explicit remember: false still grants access for this session",
++	);
++	assert.equal(trustStoreHasEntry(store, cwd), false, "remember: false must not persist consent");
++	assert.equal(existsSync(join(agentDir, "trust.json")), false, "remember: false writes no trust file");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++}
++
++async function testExtensionDenialWithoutRememberIsSessionOnly() {
++	const agentDir = makeAgentDir();
++	const cwd = makeTrustRequiringProject();
++	const state = { decision: { trusted: "no" }, extensionCalls: [] };
++	const { projectTrust, trustManager } = await loadTrustModules(state);
++	const store = new trustManager.ProjectTrustStore(agentDir);
++	const { ctx } = trustContext(cwd);
++	const extensionsResult = { extensions: [], errors: [], runtime: {} };
++
++	const trusted = await projectTrust.resolveProjectTrusted({ cwd, trustStore: store, extensionsResult, projectTrustContext: ctx });
++
++	assert.equal(trusted, false, "extension denial denies access without a persisted decision");
++	assert.equal(trustStoreHasEntry(store, cwd), false, "extension denial without remember must not persist consent");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++
++	// An explicit `remember: false` denial must stay session-only as well.
++	state.decision = { trusted: "no", remember: false };
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({ cwd, trustStore: store, extensionsResult, projectTrustContext: ctx }),
++		false,
++		"explicit remember: false still denies access for this session",
++	);
++	assert.equal(trustStoreHasEntry(store, cwd), false, "remember: false must not persist a denial");
++	assert.equal(existsSync(join(agentDir, "trust.json")), false, "remember: false writes no trust file");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++}
++
++async function testRememberedExtensionDecisionsPersist() {
++	const approvalAgent = makeAgentDir();
++	const approvalCwd = makeTrustRequiringProject();
++	const approvalState = { decision: { trusted: "yes", remember: true }, extensionCalls: [] };
++	const approval = await loadTrustModules(approvalState);
++	const approvalStore = new approval.trustManager.ProjectTrustStore(approvalAgent);
++	const approvalCtx = trustContext(approvalCwd).ctx;
++	const extensionsResult = { extensions: [], errors: [], runtime: {} };
++
++	const approved = await approval.projectTrust.resolveProjectTrusted({
++		cwd: approvalCwd,
++		trustStore: approvalStore,
++		extensionsResult,
++		projectTrustContext: approvalCtx,
++	});
++	assert.equal(approved, true);
++	assert.equal(approvalStore.get(approvalCwd), true, "remember: true persists the approval");
++
++	const denialAgent = makeAgentDir();
++	const denialCwd = makeTrustRequiringProject();
++	const denialState = { decision: { trusted: "no", remember: true }, extensionCalls: [] };
++	const denial = await loadTrustModules(denialState);
++	const denialStore = new denial.trustManager.ProjectTrustStore(denialAgent);
++
++	const denied = await denial.projectTrust.resolveProjectTrusted({
++		cwd: denialCwd,
++		trustStore: denialStore,
++		extensionsResult,
++		projectTrustContext: trustContext(denialCwd).ctx,
++	});
++	assert.equal(denied, false, "remembered denial denies access");
++	assert.equal(denialStore.get(denialCwd), false, "remember: true persists the denial");
++
++	// The remembered decision is what a later session resolves without any extension.
++	const replayState = { decision: undefined, extensionCalls: [] };
++	const replay = await loadTrustModules(replayState);
++	const replayed = await replay.projectTrust.resolveProjectTrusted({
++		cwd: denialCwd,
++		trustStore: new replay.trustManager.ProjectTrustStore(denialAgent),
++		projectTrustContext: trustContext(denialCwd, { hasUI: false }).ctx,
++	});
++	assert.equal(replayed, false, "a remembered denial is honoured by later sessions");
++}
++
++async function testSessionOnlyPromptAnswersDoNotPersist() {
++	const agentDir = makeAgentDir();
++	const cwd = makeTrustRequiringProject();
++	const state = { decision: undefined, extensionCalls: [] };
++	const { projectTrust, trustManager } = await loadTrustModules(state);
++	const store = new trustManager.ProjectTrustStore(agentDir);
++
++	const approve = trustContext(cwd, {
++		answer: (options) => options.find((option) => option === "Trust (this session only)"),
++	});
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({ cwd, trustStore: store, projectTrustContext: approve.ctx }),
++		true,
++		"a session-only approval grants access",
++	);
++	assert.equal(approve.prompts.length, 1);
++	assert.ok(approve.prompts[0].options.includes("Trust (this session only)"));
++	assert.equal(trustStoreHasEntry(store, cwd), false, "a session-only approval must not persist consent");
++
++	const deny = trustContext(cwd, {
++		answer: (options) => options.find((option) => option === "Do not trust (this session only)"),
++	});
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({ cwd, trustStore: store, projectTrustContext: deny.ctx }),
++		false,
++		"a session-only denial denies access",
++	);
++	assert.equal(trustStoreHasEntry(store, cwd), false, "a session-only denial must not persist consent");
++
++	// A later, non-interactive session must still ask again instead of inheriting consent.
++	const later = await projectTrust.resolveProjectTrusted({
++		cwd,
++		trustStore: store,
++		projectTrustContext: trustContext(cwd, { hasUI: false }).ctx,
++	});
++	assert.equal(later, false, "an earlier session-only approval is not permanent consent");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++}
++
++async function testPersistedPromptAnswersWorkForApprovalAndDenial() {
++	const approvalAgent = makeAgentDir();
++	const approvalCwd = makeTrustRequiringProject();
++	const state = { decision: undefined, extensionCalls: [] };
++	const { projectTrust, trustManager } = await loadTrustModules(state);
++	const approvalStore = new trustManager.ProjectTrustStore(approvalAgent);
++
++	const approve = trustContext(approvalCwd, { answer: () => "Trust" });
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({ cwd: approvalCwd, trustStore: approvalStore, projectTrustContext: approve.ctx }),
++		true,
++	);
++	assert.equal(approvalStore.get(approvalCwd), true, "the persisted prompt approval is stored");
++
++	const denialAgent = makeAgentDir();
++	const denialCwd = makeTrustRequiringProject();
++	const deny = trustContext(denialCwd, { answer: () => "Do not trust" });
++	const denialStore = new trustManager.ProjectTrustStore(denialAgent);
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({ cwd: denialCwd, trustStore: denialStore, projectTrustContext: deny.ctx }),
++		false,
++	);
++	assert.equal(denialStore.get(denialCwd), false, "the persisted prompt denial is stored");
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({
++			cwd: denialCwd,
++			trustStore: denialStore,
++			projectTrustContext: trustContext(denialCwd, { hasUI: false }).ctx,
++		}),
++		false,
++		"a persisted denial keeps denying later sessions",
++	);
++	assertGlobalConfigUntouched(denialAgent, { theme: "global" });
++}
++
++async function testBootstrapGatesUntrustedProjects() {
++	const agentDir = makeAgentDir();
++	const plainCwd = makePlainProject();
++	const state = { decision: { trusted: "no" }, extensionCalls: [] };
++	const { projectTrust, trustManager } = await loadTrustModules(state);
++	const store = new trustManager.ProjectTrustStore(agentDir);
++
++	// No project resources require trust: access is granted without prompting.
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({
++			cwd: plainCwd,
++			trustStore: store,
++			extensionsResult: { extensions: [], errors: [], runtime: {} },
++			projectTrustContext: trustContext(plainCwd, { hasUI: false }).ctx,
++		}),
++		true,
++	);
++	assert.equal(state.extensionCalls.length, 0, "extensions are not consulted when no project resource needs trust");
++	assert.equal(trustStoreHasEntry(store, plainCwd), false);
++
++	// An explicit override wins and still leaves the store alone.
++	const cwd = makeTrustRequiringProject();
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({ cwd, trustStore: store, trustOverride: false, projectTrustContext: trustContext(cwd).ctx }),
++		false,
++	);
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({ cwd, trustStore: store, trustOverride: true, projectTrustContext: trustContext(cwd).ctx }),
++		true,
++	);
++	assert.equal(trustStoreHasEntry(store, cwd), false, "an override never persists consent");
++
++	// defaultProjectTrust is honoured without persisting.
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({
++			cwd,
++			trustStore: store,
++			defaultProjectTrust: "always",
++			projectTrustContext: trustContext(cwd, { hasUI: false }).ctx,
++		}),
++		true,
++	);
++	assert.equal(
++		await projectTrust.resolveProjectTrusted({
++			cwd,
++			trustStore: store,
++			defaultProjectTrust: "never",
++			projectTrustContext: trustContext(cwd, { hasUI: false }).ctx,
++		}),
++		false,
++	);
++	assert.equal(trustStoreHasEntry(store, cwd), false);
++}
++
++// ---------------------------------------------------------------------------
++// Graph B: settings-manager.ts (real) with the file system as the boundary.
++// A trust change must actually reload project settings and unblock project
++// writes only while trusted.
++// ---------------------------------------------------------------------------
++async function loadSettingsManager() {
++	return createGraph(ROOT, [SETTINGS_MANAGER], {
++		...sharedPathBindings,
++		CONFIG_DIR_NAME: ".pi",
++		getAgentDir: () => join(ROOT, ".prale-eval", "tmp", "unused-agent-dir"),
++		DEFAULT_HTTP_IDLE_TIMEOUT_MS: 300_000,
++		parseHttpIdleTimeoutMs: (value) => (typeof value === "number" ? value : undefined),
++		default: defaultExportFake,
++	}).module(SETTINGS_MANAGER);
++}
++
++async function testTrustChangeReloadsProjectSettings() {
++	const settingsManager = await loadSettingsManager();
++	const agentDir = makeAgentDir({ theme: "global" });
++	const cwd = makeTrustRequiringProject({ theme: "project" });
++
++	const manager = settingsManager.SettingsManager.create(cwd, agentDir, { projectTrusted: false });
++	assert.equal(manager.isProjectTrusted(), false);
++	assert.equal(manager.getTheme(), "global", "untrusted projects do not contribute settings");
++	assert.deepEqual(manager.getProjectSettings(), {});
++	assert.throws(
++		() => manager.setProjectPackages(["npm:blocked"]),
++		/Project is not trusted/,
++		"untrusted projects cannot write project settings",
++	);
++
++	manager.setProjectTrusted(true);
++	assert.equal(manager.isProjectTrusted(), true, "changing trust updates the trust state");
++	assert.deepEqual(manager.getProjectSettings(), { theme: "project" }, "trusting a project loads its settings");
++	assert.equal(manager.getTheme(), "project", "project settings take effect after trust is granted");
++
++	// Writes become legal only after the trust change was applied.
++	manager.setProjectPackages(["npm:allowed"]);
++	await manager.flush();
++	assert.deepEqual(JSON.parse(readFileSync(join(cwd, ".pi", "settings.json"), "utf-8")), {
++		theme: "project",
++		packages: ["npm:allowed"],
++	});
++
++	manager.setProjectTrusted(false);
++	assert.equal(manager.isProjectTrusted(), false, "revoking trust updates the trust state");
++	assert.deepEqual(manager.getProjectSettings(), {}, "revoking trust drops project settings");
++	assert.equal(manager.getTheme(), "global", "global settings apply again after trust is revoked");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++}
++
++// ---------------------------------------------------------------------------
++// Graph C: resource-loader.ts + settings-manager.ts (real). The bootstrap pass,
++// the single resolver call and the final load must share one trust decision,
++// and project settings/system prompt must follow it.
++// ---------------------------------------------------------------------------
++class FakePackageManager {
++	constructor(options) {
++		this.options = options;
++	}
++	async resolve() {
++		return { extensions: [], skills: [], prompts: [], themes: [] };
++	}
++	async resolveExtensionSources() {
++		return { extensions: [], skills: [], prompts: [], themes: [] };
++	}
++}
++
++async function loadResourceModules(tracker) {
++	const graph = createGraph(ROOT, [RESOURCE_LOADER, SETTINGS_MANAGER], {
++		...sharedPathBindings,
++		CONFIG_DIR_NAME: ".pi",
++		getAgentDir: () => join(ROOT, ".prale-eval", "tmp", "unused-agent-dir"),
++		DEFAULT_HTTP_IDLE_TIMEOUT_MS: 300_000,
++		parseHttpIdleTimeoutMs: (value) => (typeof value === "number" ? value : undefined),
++		default: defaultExportFake,
++		loadThemeFromPath: (path) => ({ name: "fake", sourcePath: path }),
++		isLocalPath: () => true,
++		createEventBus: () => ({ emit() {}, on() {}, off() {} }),
++		clearExtensionCache: () => {},
++		createExtensionRuntime: () => ({}),
++		loadExtensionFromFactory: async () => {
++			throw new Error("unexpected in-memory extension factory");
++		},
++		loadExtensionsCached: async (paths, cwd, eventBus, runtime) => {
++			tracker.extensionLoads.push({ paths: [...paths], runtime });
++			return { extensions: [], errors: [], warnings: [], runtime: runtime ?? {} };
++		},
++		findGitPaths: () => undefined,
++		DefaultPackageManager: FakePackageManager,
++		loadPromptTemplates: () => ({ templates: [], diagnostics: [] }),
++		loadSkills: () => ({ skills: [], diagnostics: [] }),
++		createSourceInfo: (path, metadata) => ({ path, ...metadata }),
++		resetTimings: () => {},
++	});
++	return {
++		resourceLoader: await graph.module(RESOURCE_LOADER),
++		settingsManager: await graph.module(SETTINGS_MANAGER),
++	};
++}
++
++function makeTrustProjectWithSystemPrompt() {
++	const cwd = makeTrustRequiringProject({ theme: "project" });
++	writeFileSync(join(cwd, ".pi", "SYSTEM.md"), "project system prompt\n", "utf-8");
++	return cwd;
++}
++
++async function testResolverRunsOnceAfterUntrustedBootstrap() {
++	const tracker = { extensionLoads: [] };
++	const { resourceLoader, settingsManager } = await loadResourceModules(tracker);
++	const agentDir = makeAgentDir({ theme: "global" });
++	const cwd = makeTrustProjectWithSystemPrompt();
++	const settings = settingsManager.SettingsManager.create(cwd, agentDir, { projectTrusted: false });
++	const loader = new resourceLoader.DefaultResourceLoader({ cwd, agentDir, settingsManager: settings });
++
++	const observed = [];
++	let resolverCalls = 0;
++	await loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			resolverCalls += 1;
++			observed.push({
++				trusted: settings.isProjectTrusted(),
++				theme: settings.getTheme(),
++				bootstrapExtensionCount: extensionsResult.extensions.length,
++				bootstrapErrorCount: extensionsResult.errors.length,
++			});
++			return true;
++		},
++	});
++
++	assert.equal(resolverCalls, 1, "the resolver runs exactly once after the untrusted bootstrap");
++	assert.deepEqual(
++		observed,
++		[{ trusted: false, theme: "global", bootstrapExtensionCount: 0, bootstrapErrorCount: 0 }],
++		"the resolver sees the untrusted bootstrap state before the final load",
++	);
++	assert.equal(settings.isProjectTrusted(), true, "the resolver decision is applied to the settings manager");
++	assert.equal(settings.getTheme(), "project", "project settings load for the resolved trust state");
++	assert.equal(loader.getSystemPrompt(), "project system prompt\n", "trust-gated project resources load after approval");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++}
++
++async function testDenialKeepsProjectResourcesGated() {
++	const tracker = { extensionLoads: [] };
++	const { resourceLoader, settingsManager } = await loadResourceModules(tracker);
++	const agentDir = makeAgentDir({ theme: "global" });
++	const cwd = makeTrustProjectWithSystemPrompt();
++	const settings = settingsManager.SettingsManager.create(cwd, agentDir, { projectTrusted: false });
++	const loader = new resourceLoader.DefaultResourceLoader({ cwd, agentDir, settingsManager: settings });
++
++	let resolverCalls = 0;
++	await loader.reload({
++		resolveProjectTrust: async () => {
++			resolverCalls += 1;
++			return false;
++		},
++	});
++
++	assert.equal(resolverCalls, 1, "the resolver also runs exactly once when it denies");
++	assert.equal(settings.isProjectTrusted(), false, "a denial leaves the project untrusted");
++	assert.equal(settings.getTheme(), "global", "project settings stay unloaded after denial");
++	assert.equal(loader.getSystemPrompt(), undefined, "project system prompt stays gated after denial");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++}
++
++async function testTrustStateSurvivesRepeatedReloads() {
++	const tracker = { extensionLoads: [] };
++	const { resourceLoader, settingsManager } = await loadResourceModules(tracker);
++	const agentDir = makeAgentDir({ theme: "global" });
++	const cwd = makeTrustProjectWithSystemPrompt();
++	const settings = settingsManager.SettingsManager.create(cwd, agentDir, { projectTrusted: true });
++	const loader = new resourceLoader.DefaultResourceLoader({ cwd, agentDir, settingsManager: settings });
++
++	let resolverCalls = 0;
++	await loader.reload({
++		resolveProjectTrust: async () => {
++			resolverCalls += 1;
++			return true;
++		},
++	});
++	// Later reloads (e.g. /reload) must not re-run the trust resolver.
++	await loader.reload();
++
++	assert.equal(resolverCalls, 1, "only the reload that carries a resolver resolves trust");
++	assert.equal(settings.isProjectTrusted(), true);
++	assert.equal(settings.getTheme(), "project");
++	assert.equal(loader.getSystemPrompt(), "project system prompt\n");
++	assertGlobalConfigUntouched(agentDir, { theme: "global" });
++}
++
++// ---------------------------------------------------------------------------
++// Runner
++// ---------------------------------------------------------------------------
++rmSync(TMP_ROOT, { recursive: true, force: true });
++mkdirSync(TMP_ROOT, { recursive: true });
++
++try {
++	await testExtensionDecisionWithoutRememberIsSessionOnly();
++	await testExtensionDenialWithoutRememberIsSessionOnly();
++	await testRememberedExtensionDecisionsPersist();
++	await testSessionOnlyPromptAnswersDoNotPersist();
++	await testPersistedPromptAnswersWorkForApprovalAndDenial();
++	await testBootstrapGatesUntrustedProjects();
++	await testTrustChangeReloadsProjectSettings();
++	await testResolverRunsOnceAfterUntrustedBootstrap();
++	await testDenialKeepsProjectResourcesGated();
++	await testTrustStateSurvivesRepeatedReloads();
++	console.log("project trust regression: all assertions passed");
++} finally {
++	rmSync(TMP_ROOT, { recursive: true, force: true });
++}
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..9ae2aba
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,107 @@
++# Repair: session-only approval must not become permanent consent
++
++## Incident trace (producer → consumer)
++
++Project trust is produced by three cooperating modules in `packages/coding-agent`:
++
++1. `core/extensions/runner.ts` — `emitProjectTrustEvent()` aggregates `project_trust` handlers and
++   returns the first `yes`/`no` decision together with its optional `remember` flag.
++2. `core/project-trust.ts` — `resolveProjectTrusted()` consumes that decision (or the saved store /
++   prompt / default) and decides whether the project is trusted, and whether the decision is
++   *persisted* to `trust.json`.
++3. `core/resource-loader.ts` — `DefaultResourceLoader.reload({ resolveProjectTrust })` bootstraps the
++   loader with an intentionally **untrusted** settings pass, asks the resolver once, then applies the
++   answer by calling `SettingsManager.setProjectTrusted(...)` and reloading settings before the final
++   extension/resource load.
++4. `core/settings-manager.ts` — `setProjectTrusted()` is the consumer that must actually load or drop
++   project settings when the trust state changes.
++
++Three defects broke the invariant "a trusted decision may grant access for this session without
++persisting consent":
++
++### 1. `core/project-trust.ts` — implicit/negative `remember` was persisted
++
++```diff
++- if (result.remember !== undefined) {
+++ if (result.remember === true) {
++     options.trustStore.set(options.cwd, trusted);
++ }
++```
++
++`remember` is optional (`remember?: boolean`). The old guard persisted whenever the key was present,
++so an explicit `remember: false` — and any handler that merely set the field to false — wrote the
++decision into `trust.json`, turning a session-only answer into permanent consent. Consent is now
++persisted only for `remember === true`, covering both approval and denial.
++
++### 2. `core/settings-manager.ts` — inverted guard swallowed trust changes
++
++```diff
++- if (this.projectTrusted !== trusted) {
+++ if (this.projectTrusted === trusted) {
++     return;
++ }
++```
++
++The early return fired exactly when the trust value *changed*, so `setProjectTrusted(true)` after the
++untrusted bootstrap returned immediately: project settings were never loaded, project writes stayed
++blocked, and the "trust granted" decision had no observable effect. With the guard inverted, only a
++genuine change reloads/drops project settings.
++
++### 3. `core/resource-loader.ts` — resolver never ran and the bootstrap result was reused
++
++```diff
++ let preTrustExtensions: LoadExtensionsResult | undefined;
++ if (options?.resolveProjectTrust) {
++     preTrustExtensions = await this.loadProjectTrustExtensions();
++-    const projectTrusted = false;
+++    const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
++     this.settingsManager.setProjectTrusted(projectTrusted);
++ }
++```
++
++The untrusted bootstrap pass was correct, but its result was hard-coded back to `false` and the
++caller-supplied resolver was never invoked. Consequently `resolveProjectTrusted()` never ran after the
++untrusted bootstrap, no trust prompt/extension decision happened, and the session stayed untrusted no
++matter what the caller decided. The resolver now runs **exactly once** per resolver-carrying reload,
++receives the bootstrap `extensionsResult` (the untrusted pre-pass), and its boolean drives
++`setProjectTrusted()` before the settings reload and the final extension set. Subsequent reloads
++without a resolver still reuse the applied trust state and never re-resolve.
++
++## Boundaries preserved
++
++- No public API or signature changed; `resolveProjectTrusted`, `ProjectTrustStore`,
++  `DefaultResourceLoader.reload(options)`, `SettingsManager.setProjectTrusted` keep their contracts.
++- The untrusted bootstrap pass (`loadProjectTrustExtensions`) is unchanged, so project extensions and
++  packages remain excluded while the decision is pending.
++- Resolving trust never writes global configuration: only `trust.json` receives persisted decisions,
++  and only when `remember === true`.
++
++## Validation
++
++`.prale-eval/regression.mjs` links the real modules through `.prale-eval/subject.mjs` and fakes only
++outer boundaries (extension runner aggregation, lock file, package manager, extension loader,
++theme/skill/prompt loaders, storage files):
++
++- Graph A (`project-trust.ts` + `trust-manager.ts`): extension `yes`/`no` with absent or
++  `remember: false` grants/denies for the session but leaves `trust.json` untouched; `remember: true`
++  persists approval and denial and later sessions honour the denial; session-only prompt options never
++  persist; persisted prompt answers do; overrides and `defaultProjectTrust` never persist; a project
++  without trust-requiring resources is granted without consulting extensions.
++- Graph B (`settings-manager.ts` over real files): `false → true` loads project settings and unblocks
++  project writes, `true → false` drops them and restores global settings.
++- Graph C (`resource-loader.ts` + `settings-manager.ts`): during the resolver the manager is still
++  untrusted and sees the bootstrap extension set; the resolver runs exactly once; approval loads
++  project settings and the trust-gated `.pi/SYSTEM.md`, denial keeps both gated, a later
++  resolver-less reload does not re-resolve, and the global `settings.json` bytes never change.
++
++Mutation check (each file reverted alone to the committed baseline, then restored):
++
++| faulty file | detected by |
++| --- | --- |
++| `core/project-trust.ts` | `remember: false must not persist consent` |
++| `core/settings-manager.ts` | `changing trust updates the trust state` |
++| `core/resource-loader.ts` | `the resolver runs exactly once after the untrusted bootstrap` |
++
++Limitation: the repository's own vitest suite could not be executed because no `node_modules` are
++installed in this workspace (installation is out of scope); the standalone regression script above is
++the focused validation and exercises the real production modules.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..0da57f9
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/resource-consistency/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired three producer/consumer defects in the project-trust path. (1) core/project-trust.ts persisted an extension decision whenever the optional remember field was present; it now persists only when remember === true, so an absent or explicit false remember stays session-only for both approval and denial. (2) core/settings-manager.ts had an inverted guard in setProjectTrusted that returned early exactly when the trust value changed, so granting or revoking trust never reloaded or dropped project settings; the guard now returns only when the value is unchanged. (3) core/resource-loader.ts hard-coded projectTrusted = false after the untrusted bootstrap and never invoked options.resolveProjectTrust, so the resolver never ran and project settings/resources could never become trusted; the resolver now runs exactly once per resolver-carrying reload, receives the bootstrap LoadExtensionsResult, and its boolean is applied via setProjectTrusted before the final settings and extension load. .prale-eval/regression.mjs links the real production modules through .prale-eval/subject.mjs (project-trust + trust-manager, settings-manager over real files, resource-loader + settings-manager) and fakes only outer boundaries: extension runner aggregation, proper-lockfile, package manager, extension loader/cache, theme/skill/prompt loaders and the event bus. Assertions cover: extension yes/no with absent and remember:false never writing trust.json; remember:true persisting approval and denial and being honoured by later non-interactive sessions; session-only prompt options not persisting while persisted prompt answers do; trustOverride and defaultProjectTrust not persisting; untrusted bootstrap state observed inside the resolver; approval loading project settings and the trust-gated .pi/SYSTEM.md; denial keeping both gated; a later resolver-less reload not re-resolving; and the global agent settings.json bytes staying unchanged. Verified mutation detection: reverting each modified source file alone to its committed baseline fails the script with a distinct assertion (project-trust: 'remember: false must not persist consent'; settings-manager: 'changing trust updates the trust state'; resource-loader: 'the resolver runs exactly once after the untrusted bootstrap'), then the repair is restored and the script passes again. Limitation: the repository's own vitest suite could not be run because no node_modules are installed in this workspace (dependency installation is out of scope); the standalone Node 24 script is the focused validation and executes the real modules. All test inputs are created under .prale-eval/tmp and removed by the script's finally block; no real time, randomness, network or external services are used as evidence (asynchronous ordering is controlled with plain promises)."
++  }
++}
+snapshot .prale-eval/regression.mjs - 47e43c0f6a711fd4ccaf2d4332b3f0d3ad0814def49e427e56e024ff7502f864
+snapshot .prale-eval/repair.md - 89f6c77595586303b54639825372e57020ecf19204ff714db632a6979cbcc8b6
+snapshot .prale-eval/result.json - 7cb801779382e0d4b886909a5bbee5c3b736536d48100f579e1c3fcb3438e8ec
+snapshot packages/coding-agent/src/core/project-trust.ts 593b457cc337b5f260622dce6d59ba7307a96889bf62f1a5b65c69dee0c64759 ee0ae7d0dc1cd14d6c3137863a5e36f74c1348e7773012ef6cff7f2b68bddc19
+snapshot packages/coding-agent/src/core/resource-loader.ts 6a048348c4244f97563dcfad20d08c75b6d36c27b52116fbcc8509754cc46ed6 3ae3e2de0ca7d195644ab60aa5f7e21708b4f762e3b9741d0166ecff651ded6b
+snapshot packages/coding-agent/src/core/settings-manager.ts 7cca715a5e527b193007705eb51cb9b8d02e0801728172834a73e2382f2e022f 5d1bdac20da52fdbac76d49fb9ce22d142c375e8efd5bf446bf6c047c5edac42

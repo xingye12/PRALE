@@ -1,0 +1,349 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 8da4475..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -450,7 +450,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		let preTrustExtensions: LoadExtensionsResult | undefined;
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+-			const projectTrusted = false;
++			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+ 			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..96f1e0f
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,267 @@
++/**
++ * Regression: DefaultResourceLoader.reload() must consult the project trust resolver.
++ *
++ * Contract exercised here (see packages/coding-agent/src/core/resource-loader.ts):
++ *  1. reload({ resolveProjectTrust }) first performs an untrusted bootstrap load of
++ *     extensions and hands that LoadExtensionsResult to the resolver,
++ *  2. the resolver is called exactly once and awaited before the trusted load runs,
++ *  3. a `true` decision lets project-scoped resources load, a `false` decision denies
++ *     them, and an already-saved decision is honoured without a resolver.
++ *
++ * The real TypeScript module is evaluated with boundary fakes for its imports
++ * (settings manager, package manager, extension loader, etc.).
++ */
++import assert from "node:assert/strict";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { loadModule } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const LOADER_MODULE = "packages/coding-agent/src/core/resource-loader.ts";
++
++// Non-existent fixture paths: they are only used as path strings, never touched on disk.
++const CWD = path.join(root, ".prale-eval", "fixtures", "project");
++const AGENT_DIR = path.join(root, ".prale-eval", "fixtures", "agent");
++const USER_EXTENSION = path.join(AGENT_DIR, "extensions", "user.ts");
++const PROJECT_EXTENSION = path.join(CWD, ".pi", "extensions", "project.ts");
++
++function createExtension(extensionPath) {
++	return {
++		path: extensionPath,
++		resolvedPath: path.resolve(extensionPath),
++		sourceInfo: undefined,
++		handlers: new Map(),
++		tools: new Map(),
++		commands: new Map(),
++		flags: new Map(),
++		shortcuts: new Map(),
++		messageRenderers: new Map(),
++		entryRenderers: new Map(),
++	};
++}
++
++/** Build boundary fakes plus a fresh VM module graph around the real resource loader. */
++async function createHarness({ trusted = false } = {}) {
++	const state = {
++		trusted,
++		events: [],
++		resolverCalls: 0,
++		resolverInputs: [],
++		resolveCalls: [],
++		loadCalls: [],
++		settingsReloads: 0,
++	};
++
++	const settingsManager = {
++		isProjectTrusted: () => state.trusted,
++		setProjectTrusted: (value) => {
++			state.trusted = value;
++			state.events.push(`settings.trusted=${value}`);
++		},
++		reload: async () => {
++			state.settingsReloads += 1;
++			state.events.push(`settings.reload(trusted=${state.trusted})`);
++		},
++		getDefaultProjectTrust: () => "ask",
++	};
++
++	// Mirrors DefaultPackageManager: project-scoped resources are withheld unless the
++	// settings manager is in a trusted state.
++	class FakePackageManager {
++		constructor(options) {
++			this.settingsManager = options.settingsManager;
++		}
++
++		async resolve() {
++			const isTrusted = this.settingsManager.isProjectTrusted() === true;
++			state.resolveCalls.push(isTrusted);
++			state.events.push(`packageManager.resolve(trusted=${isTrusted})`);
++			const paths = isTrusted ? [PROJECT_EXTENSION, USER_EXTENSION] : [USER_EXTENSION];
++			return {
++				extensions: paths.map((resourcePath) => ({
++					path: resourcePath,
++					enabled: true,
++					metadata: {
++						source: "auto",
++						scope: resourcePath === PROJECT_EXTENSION ? "project" : "user",
++						origin: "package",
++					},
++				})),
++				skills: [],
++				prompts: [],
++				themes: [],
++			};
++		}
++
++		async resolveExtensionSources() {
++			return { extensions: [], skills: [], prompts: [], themes: [] };
++		}
++	}
++
++	const bindings = {
++		// chalk default import
++		default: { yellow: (value) => value, red: (value) => value, dim: (value) => value },
++		CONFIG_DIR_NAME: ".pi",
++		loadThemeFromPath: () => {
++			throw new Error("unexpected theme load");
++		},
++		canonicalizePath: (value) => path.resolve(String(value)),
++		isLocalPath: (value) => !/^(npm:|git:|github:|https?:|ssh:)/.test(String(value).trim()),
++		resolvePath: (input, baseDir = root, options = {}) => {
++			const normalized = options.trim ? String(input).trim() : String(input);
++			return path.isAbsolute(normalized) ? path.resolve(normalized) : path.resolve(baseDir, normalized);
++		},
++		stripBom: (value) => String(value).replace(/^\uFEFF/, ""),
++		createEventBus: () => ({ emit: () => {}, on: () => () => {} }),
++		clearExtensionCache: () => {},
++		createExtensionRuntime: () => ({ id: "runtime" }),
++		loadExtensionFromFactory: async (_factory, _cwd, _eventBus, _runtime, extensionPath) =>
++			createExtension(extensionPath),
++		loadExtensionsCached: async (extensionPaths, _cwd, _eventBus, runtime) => {
++			state.loadCalls.push([...extensionPaths]);
++			state.events.push(`loadExtensions(${extensionPaths.length})`);
++			return {
++				extensions: extensionPaths.map(createExtension),
++				errors: [],
++				warnings: [],
++				runtime: runtime ?? { id: "runtime" },
++			};
++		},
++		findGitPaths: () => undefined,
++		DefaultPackageManager: FakePackageManager,
++		loadPromptTemplates: () => ({ templates: [], diagnostics: [] }),
++		SettingsManager: { create: () => settingsManager },
++		loadSkills: () => ({ skills: [], diagnostics: [] }),
++		createSourceInfo: (resourcePath, metadata) => ({ path: resourcePath, ...metadata }),
++		resetTimings: () => {},
++	};
++
++	const { DefaultResourceLoader } = await loadModule(root, LOADER_MODULE, bindings);
++	assert.equal(typeof DefaultResourceLoader, "function", "real resource loader module did not load");
++
++	const loader = new DefaultResourceLoader({
++		cwd: CWD,
++		agentDir: AGENT_DIR,
++		settingsManager,
++		noContextFiles: true,
++	});
++
++	return { loader, state };
++}
++
++function extensionPaths(loader) {
++	return Array.from(loader.getExtensions().extensions, (extension) => extension.path).sort();
++}
++
++/** Assert the resolver observed the untrusted bootstrap pass and ran exactly once. */
++function assertResolverSawUntrustedBootstrap(state, label) {
++	assert.equal(state.resolverCalls, 1, `${label}: project trust resolver must be consulted exactly once`);
++	const input = state.resolverInputs[0];
++	assert.equal(
++		input.trusted,
++		false,
++		`${label}: resolver must observe the untrusted bootstrap result, saw trusted=${input.trusted}`,
++	);
++	assert.deepEqual(
++		input.paths,
++		[USER_EXTENSION],
++		`${label}: bootstrap load must contain user resources only (no project resources)`,
++	);
++}
++
++async function reloadWithResolver(decision, label) {
++	const harness = await createHarness({ trusted: false });
++	await harness.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			harness.state.resolverCalls += 1;
++			harness.state.resolverInputs.push({
++				trusted: harness.state.trusted,
++				paths: Array.from(extensionsResult.extensions, (extension) => extension.path).sort(),
++			});
++			harness.state.events.push("trustResolver.start");
++			// Async gap: the reload must not continue before this settles.
++			await new Promise((resolve) => setTimeout(resolve, 25));
++			harness.state.events.push("trustResolver.end");
++			return decision;
++		},
++	});
++	return { ...harness, label };
++}
++
++// ---------------------------------------------------------------------------
++// Scenario 1: resolver approves -> project resources load, in async order.
++// ---------------------------------------------------------------------------
++{
++	const { loader, state, label } = await reloadWithResolver(true, "trusted decision");
++	assertResolverSawUntrustedBootstrap(state, label);
++	assert.equal(state.trusted, true, `${label}: approved decision must update the settings manager trust state`);
++	assert.deepEqual(
++		extensionPaths(loader),
++		[PROJECT_EXTENSION, USER_EXTENSION].sort(),
++		`${label}: approved project resources must be loaded after the resolver returns true`,
++	);
++
++	const order = state.events;
++	const bootstrapResolve = order.indexOf("packageManager.resolve(trusted=false)");
++	const resolverStart = order.indexOf("trustResolver.start");
++	const resolverEnd = order.indexOf("trustResolver.end");
++	const trustedResolve = order.indexOf("packageManager.resolve(trusted=true)");
++	assert.ok(bootstrapResolve !== -1, `${label}: no untrusted bootstrap resolve was performed`);
++	assert.ok(resolverStart !== -1 && resolverEnd !== -1, `${label}: resolver never ran`);
++	assert.ok(trustedResolve !== -1, `${label}: no trusted resource resolve was performed`);
++	assert.ok(
++		bootstrapResolve < resolverStart,
++		`${label}: resolver must be invoked after the untrusted bootstrap load`,
++	);
++	assert.ok(
++		resolverEnd < trustedResolve,
++		`${label}: project resources resolved before the async trust decision settled (${order.join(" -> ")})`,
++	);
++	assert.equal(
++		state.loadCalls.flat().filter((loadedPath) => loadedPath === USER_EXTENSION).length,
++		1,
++		`${label}: user extension must be loaded once and reused across the trust boundary`,
++	);
++}
++
++// ---------------------------------------------------------------------------
++// Scenario 2: resolver denies -> project resources stay out, user ones remain.
++// ---------------------------------------------------------------------------
++{
++	const { loader, state, label } = await reloadWithResolver(false, "denied decision");
++	assertResolverSawUntrustedBootstrap(state, label);
++	assert.equal(state.trusted, false, `${label}: denied decision must leave the settings manager untrusted`);
++	assert.deepEqual(
++		extensionPaths(loader),
++		[USER_EXTENSION],
++		`${label}: denied project resources must not be loaded`,
++	);
++	assert.equal(
++		state.loadCalls.flat().filter((loadedPath) => loadedPath === PROJECT_EXTENSION).length,
++		0,
++		`${label}: project extension must never be loaded after a false decision`,
++	);
++}
++
++// ---------------------------------------------------------------------------
++// Scenario 3: a saved decision is honoured without calling any resolver.
++// ---------------------------------------------------------------------------
++{
++	for (const trusted of [true, false]) {
++		const harness = await createHarness({ trusted });
++		await harness.loader.reload();
++		assert.equal(
++			harness.state.resolverCalls,
++			0,
++			`no-resolver reload: resolver must not be invoked when reload has no resolveProjectTrust option`,
++		);
++		assert.equal(harness.state.trusted, trusted, "no-resolver reload: saved trust decision must be preserved");
++		assert.deepEqual(
++			extensionPaths(harness.loader),
++			trusted ? [PROJECT_EXTENSION, USER_EXTENSION].sort() : [USER_EXTENSION],
++			`no-resolver reload: saved trusted=${trusted} decision must gate project resources consistently`,
++		);
++	}
++}
++
++console.log("resource-loader project trust regression: all scenarios passed");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..3cc36e3
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,54 @@
++{
++  "task_id": "extension-trust/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "fault": {
++    "file": "packages/coding-agent/src/core/resource-loader.ts",
++    "symbol": "DefaultResourceLoader.reload()",
++    "original": "const projectTrusted = false;",
++    "explanation": "reload({ resolveProjectTrust }) performed the untrusted bootstrap extension load (loadProjectTrustExtensions(), which already forces settingsManager.setProjectTrusted(false)) and then hard-coded projectTrusted = false instead of consulting the supplied resolver. The trust resolver was never called, so an approved project never received its project-scoped settings/extensions/packages and no extension project_trust handler could ever run."
++  },
++  "repair": {
++    "file": "packages/coding-agent/src/core/resource-loader.ts",
++    "change": "const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });",
++    "notes": "One-line minimal change: the resolver is invoked exactly once, is awaited before SettingsManager.setProjectTrusted() and the subsequent trusted resource pass, and receives the untrusted bootstrap LoadExtensionsResult produced by loadProjectTrustExtensions(). No other production code touched."
++  },
++  "claims": [
++    {
++      "claim": "Policy explicitly allows project resources after a true decision.",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:450-455 (DefaultResourceLoader.reload) passing the resolver result to SettingsManager.setProjectTrusted, consumed by packages/coding-agent/src/core/package-manager.ts:1746 and resource-loader.ts:1095,1109",
++      "evidence": "regression.mjs scenario 1: resolver returns true -> project extension is loaded and settingsManager.isProjectTrusted() === true."
++    },
++    {
++      "claim": "Policy denies project resources after a false decision.",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:450-455 + packages/coding-agent/src/core/package-manager.ts:1746 (project scope withheld when !isProjectTrusted)",
++      "evidence": "regression.mjs scenario 2: resolver returns false -> only the user extension is loaded, project extension never loaded, trust state stays false."
++    },
++    {
++      "claim": "The resolver must observe an untrusted bootstrap result.",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:435-441 (loadProjectTrustExtensions forces setProjectTrusted(false) and reloads) followed by the resolver call at line 453",
++      "evidence": "regression.mjs asserts the resolver input carries the user-only bootstrap extensionsResult while settingsManager.isProjectTrusted() === false."
++    },
++    {
++      "claim": "Call the resolver once and preserve its asynchronous ordering.",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:453 (single awaited call)",
++      "evidence": "regression.mjs asserts resolverCalls === 1 and event ordering: packageManager.resolve(trusted=false) -> trustResolver.start -> trustResolver.end (after a 25ms async gap) -> packageManager.resolve(trusted=true)."
++    }
++  ],
++  "deliverables": {
++    "production": [
++      "packages/coding-agent/src/core/resource-loader.ts (repaired DefaultResourceLoader.reload)"
++    ],
++    "tests": [
++      ".prale-eval/regression.mjs"
++    ],
++    "result": [
++      ".prale-eval/result.json"
++    ]
++  },
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root with Node v24.14.0 (TypeScript stripping + --experimental-vm-modules); exit code 0, output 'resource-loader project trust regression: all scenarios passed'. The script loads the real packages/coding-agent/src/core/resource-loader.ts through .prale-eval/subject.mjs loadModule() with hand-written boundary fakes for chalk, ../config.ts, ../utils/paths.ts, ../utils/text.ts, ./event-bus.ts, ./extensions/loader.ts, ./footer-data-provider.ts, ./package-manager.ts, ./prompt-templates.ts, ./settings-manager.ts, ./skills.ts, ./source-info.ts and ./timings.ts; the fake package manager mirrors DefaultPackageManager by withholding project-scoped resources unless settingsManager.isProjectTrusted(), and every scenario uses non-existent fixture paths so no filesystem writes or network access occur. Three scenarios are asserted with node:assert/strict (no printed-success shortcuts): (1) resolver resolves true after a 25ms async gap -> resolver called exactly once, its input is the untrusted, user-only bootstrap LoadExtensionsResult, and after reload the project and user extensions are both present with the user extension loaded exactly once; (2) resolver resolves false -> project extension never loaded and trust state remains false; (3) reload() without a resolveProjectTrust option -> resolver not invoked and a previously saved trusted/untrusted decision still gates project resources. Fault re-check performed locally: reverting the repaired line back to 'const projectTrusted = false;' makes the script exit 1 with 'AssertionError: trusted decision: project trust resolver must be consulted exactly once (0 !== 1)'; restoring the fix returns exit 0. Limitation: the repository has no installed node_modules, so the upstream vitest suite (test/resource-loader.test.ts, which asserts the same contract) and any tsc typecheck could not be executed in this sandbox; validation therefore relies on the standalone Node regression described above."
++  }
++}
+snapshot .prale-eval/regression.mjs - d7d07cd092d58ab3141012367570dd2d5f12d0d7027710eb609698a15d64d45e
+snapshot .prale-eval/result.json - 6b19238b40326a293e65e7bf17a89cc8763db3b3efbe4d260bcc2800a79274e8
+snapshot packages/coding-agent/src/core/resource-loader.ts 6a048348c4244f97563dcfad20d08c75b6d36c27b52116fbcc8509754cc46ed6 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

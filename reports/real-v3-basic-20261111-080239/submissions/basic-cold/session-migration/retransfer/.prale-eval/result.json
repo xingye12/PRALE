@@ -1,0 +1,24 @@
+{
+  "task_id": "session-migration/retransfer",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claims": [
+    {
+      "claim": "A destination collision inside the legacy session batch aborted the whole loop instead of skipping the colliding file, stranding every later legacy session in the agent root.",
+      "citation": "packages/coding-agent/src/migrations.ts:126"
+    },
+    {
+      "claim": "The repaired collision branch skips only the colliding file (both the legacy copy and the pre-existing destination copy are preserved), so the remaining batch continues and repeated runs stay idempotent.",
+      "citation": "packages/coding-agent/src/migrations.ts:124-126"
+    },
+    {
+      "claim": "Files with malformed headers are still left untouched and do not interrupt the batch.",
+      "citation": "packages/coding-agent/src/migrations.ts:127-130"
+    }
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Repaired migrateSessionsFromAgentRoot() in packages/coding-agent/src/migrations.ts: the destination-collision branch used `return`, which exited the whole per-file loop after the first colliding legacy session; it now uses `continue`, skipping only that file, keeping both the legacy copy and the pre-existing destination copy, and letting the rest of the batch migrate. Regression runs with node v24.14.0: it loads the real production module through .prale-eval/subject.mjs createGraph() with an in-memory fs boundary (existsSync/mkdirSync/readdirSync/readFileSync/writeFileSync/renameSync/rmSync) plus boundary bindings for getAgentDir/getBinDir/CONFIG_DIR_NAME/migrateKeybindingsConfig/stripBom/chalk default, so no real files, no network, and no dependencies are touched. Seeded batch order is deterministic: (1) a legacy file whose destination already holds a different session file, (2) a file with a malformed JSON header, (3) a healthy legacy file that must still migrate. Assertions: the later healthy session must leave the agent root and its destination content must match byte-for-byte; the colliding legacy source and the pre-existing destination copy must both be preserved unchanged; the malformed header file must not be migrated and must remain byte-identical; the agent root must contain only the colliding and malformed files plus the sessions directory; a second run must be idempotent (deep-equal filesystem snapshot, no throw, no double migration). Verified the regression detects the original fault: temporarily restoring `if (existsSync(newPath)) return;` makes the script exit 1 with AssertionError 'a collision earlier in the batch must not strand later legacy sessions in the agent root'; with the repair it exits 0. Type stripping via the VM loader confirms the edited source parses. Optional validation dependencies unavailable (no node_modules installed, so vitest, tsc/tsgo and biome could not be run; scripts/check-ts-relative-imports.mjs fails with ERR_MODULE_NOT_FOUND for 'typescript'); no dependencies were installed."
+  }
+}

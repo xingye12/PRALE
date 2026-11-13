@@ -1,0 +1,637 @@
+diff --git a/packages/coding-agent/src/core/project-trust.ts b/packages/coding-agent/src/core/project-trust.ts
+index 14fd6fd..80f496b 100644
+--- a/packages/coding-agent/src/core/project-trust.ts
++++ b/packages/coding-agent/src/core/project-trust.ts
+@@ -69,8 +69,10 @@ export async function resolveProjectTrusted(options: ResolveProjectTrustedOption
+ 		}
+ 	}
+ 
++	// A stored decision is authoritative even when it is `false` (an explicit denial);
++	// only a missing entry (null) falls through to the default policy below.
+ 	const decision = options.trustStore.get(options.cwd);
+-	if (decision) {
++	if (decision !== null) {
+ 		return decision;
+ 	}
+ 
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 699143e..88a7b1b 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,9 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(false);
++			// The approved decision must reach the final resource assembly below, so apply it
++			// before the reload that loads project settings/resources for this trust state.
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/packages/coding-agent/src/core/settings-manager.ts b/packages/coding-agent/src/core/settings-manager.ts
+index 6d4ad57..c7bb2af 100644
+--- a/packages/coding-agent/src/core/settings-manager.ts
++++ b/packages/coding-agent/src/core/settings-manager.ts
+@@ -187,7 +187,7 @@ function deepMergeObjects(base: Record<string, unknown>, overrides: Record<strin
+ 
+ /** Deep merge settings: project/overrides take precedence, nested objects merge recursively */
+ function deepMergeSettings(base: Settings, overrides: Settings): Settings {
+-	return deepMergeObjects(overrides as Record<string, unknown>, base as Record<string, unknown>) as Settings;
++	return deepMergeObjects(base as Record<string, unknown>, overrides as Record<string, unknown>) as Settings;
+ }
+ 
+ function parseTimeoutSetting(value: unknown, settingName: string): number | undefined {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..816439d
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,473 @@
++/**
++ * Regression coverage for the "stored denial falls through to an allow-by-default policy"
++ * and "accepted reloads lose project configuration" incident.
++ *
++ * The tests link the real production modules (project trust resolver, settings manager and
++ * resource loader) through `.prale-eval/subject.mjs` and only fake the boundaries:
++ * filesystem, path helpers, package manager, extension/skill/prompt/theme loaders and the
++ * trust store. Every assertion is observable behaviour across one of those boundaries.
++ *
++ * Run with: node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import * as nodePath from "node:path";
++import { fileURLToPath } from "node:url";
++import { createGraph, loadModule } from "./subject.mjs";
++
++const root = nodePath.resolve(fileURLToPath(new URL("..", import.meta.url)));
++
++const CONFIG_DIR_NAME = ".pi";
++const PROJECT_DIR = "/virtual/project";
++const AGENT_DIR = "/virtual/agent";
++
++const PROJECT_TRUST_MODULE = "packages/coding-agent/src/core/project-trust.ts";
++const SETTINGS_MANAGER_MODULE = "packages/coding-agent/src/core/settings-manager.ts";
++const RESOURCE_LOADER_MODULE = "packages/coding-agent/src/core/resource-loader.ts";
++
++// ---------------------------------------------------------------------------
++// Shared deterministic boundary fakes
++// ---------------------------------------------------------------------------
++
++/** Deterministic, separator independent path resolution (no real filesystem access). */
++function fakeResolvePath(input, base, options) {
++	let value = String(input);
++	if (options?.normalizeUnicodeSpaces) {
++		value = value.replace(/[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g, " ");
++	}
++	if (options?.trim) {
++		value = value.trim();
++	}
++	return nodePath.posix.resolve(base === undefined ? "/" : String(base), value);
++}
++
++function fakeCanonicalizePath(input) {
++	return nodePath.posix.resolve("/", String(input));
++}
++
++function fakeIsLocalPath(value) {
++	return typeof value === "string" && (value.startsWith("/") || value.startsWith(".") || value.startsWith("~"));
++}
++
++function fakeStripBom(content) {
++	return content.charCodeAt(0) === 0xfeff ? content.slice(1) : content;
++}
++
++function toKey(value) {
++	return nodePath.posix.resolve("/", String(value));
++}
++
++/** Virtual filesystem limited to the files a scenario declares. */
++function createVirtualFs(entries) {
++	const files = new Map(Object.entries(entries).map(([file, content]) => [toKey(file), content]));
++	return {
++		files,
++		existsSync: (target) => files.has(toKey(target)),
++		readFileSync: (target) => {
++			const key = toKey(target);
++			if (!files.has(key)) {
++				throw new Error(`ENOENT: no such file or directory, open '${key}'`);
++			}
++			return files.get(key);
++		},
++		statSync: (target) => ({
++			isFile: () => files.has(toKey(target)),
++			isDirectory: () => false,
++		}),
++		readdirSync: () => [],
++		mkdirSync: () => undefined,
++		writeFileSync: () => undefined,
++	};
++}
++
++const noop = () => undefined;
++
++/** Boundary bindings shared by the settings manager and resource loader graphs. */
++function baseBindings(extra = {}) {
++	return {
++		// ../config.ts
++		CONFIG_DIR_NAME,
++		APP_NAME: "pi",
++		getAgentDir: () => AGENT_DIR,
++		// ../utils/paths.ts
++		resolvePath: fakeResolvePath,
++		canonicalizePath: fakeCanonicalizePath,
++		normalizePath: fakeCanonicalizePath,
++		isLocalPath: fakeIsLocalPath,
++		// ../utils/text.ts
++		stripBom: fakeStripBom,
++		// ./http-dispatcher.ts
++		DEFAULT_HTTP_IDLE_TIMEOUT_MS: 300000,
++		parseHttpIdleTimeoutMs: (value) =>
++			value === undefined || value === null || value === "" ? undefined : Number(value),
++		// @earendil-works/pi-ai
++		DEFAULT_MAX_AGENT_RETRY_DELAY_MS: 60000,
++		// proper-lockfile (only used by FileSettingsStorage, which these scenarios avoid)
++		lockfile: { lockSync: () => () => undefined },
++		...extra,
++	};
++}
++
++/** Storage double matching SettingsStorage: keeps the last serialized file per scope. */
++function createMemoryStorage(global, project) {
++	const files = { global, project };
++	return {
++		files,
++		withLock(scope, fn) {
++			const next = fn(files[scope]);
++			if (next !== undefined) {
++				files[scope] = next;
++			}
++		},
++	};
++}
++
++// ---------------------------------------------------------------------------
++// 1. Project trust resolver: a stored boolean is authoritative
++// ---------------------------------------------------------------------------
++
++async function projectTrustScenario() {
++	const selectCalls = [];
++	const trustReads = [];
++	const bindings = baseBindings({
++		// ./extensions/runner.ts - no extension answers the project_trust event.
++		emitProjectTrustEvent: async () => ({ result: undefined, errors: [] }),
++		// ./trust-manager.ts
++		hasTrustRequiringProjectResources: () => true,
++		getProjectTrustOptions: () => [
++			{ label: "Trust", trusted: true, updates: [{ path: PROJECT_DIR, decision: true }] },
++			{ label: "Do not trust", trusted: false, updates: [{ path: PROJECT_DIR, decision: false }] },
++		],
++	});
++	const { resolveProjectTrusted } = await loadModule(root, PROJECT_TRUST_MODULE, bindings);
++
++	const stored = (decision) => ({
++		get(cwd) {
++			trustReads.push(cwd);
++			return decision;
++		},
++		set() {
++			throw new Error("unexpected trust write");
++		},
++	});
++	const headless = { hasUI: false };
++	const interactive = {
++		hasUI: true,
++		ui: {
++			select: async (_prompt, options) => {
++				selectCalls.push(options);
++				return "Trust";
++			},
++		},
++	};
++	const resolve = (overrides) =>
++		resolveProjectTrusted({
++			cwd: PROJECT_DIR,
++			projectTrustContext: headless,
++			...overrides,
++		});
++
++	// A stored denial must win over an allow-by-default policy.
++	assert.equal(
++		await resolve({ trustStore: stored(false), defaultProjectTrust: "always" }),
++		false,
++		"stored `false` decision must be authoritative instead of falling through to defaultProjectTrust=always",
++	);
++	// A stored approval must win over a deny-by-default policy (guard against inverting the fix).
++	assert.equal(
++		await resolve({ trustStore: stored(true), defaultProjectTrust: "never" }),
++		true,
++		"stored `true` decision must be authoritative instead of falling through to defaultProjectTrust=never",
++	);
++	// Only a missing decision (null) falls through to the default policy.
++	assert.equal(await resolve({ trustStore: stored(null), defaultProjectTrust: "always" }), true);
++	assert.equal(await resolve({ trustStore: stored(null), defaultProjectTrust: "never" }), false);
++	// A stored denial must never reach the interactive prompt.
++	selectCalls.length = 0;
++	assert.equal(
++		await resolve({ trustStore: stored(false), defaultProjectTrust: "ask", projectTrustContext: interactive }),
++		false,
++		"stored denial must not prompt the user",
++	);
++	assert.equal(selectCalls.length, 0, "stored denial must not open the trust prompt");
++	// An explicit CLI override still wins over the store.
++	assert.equal(await resolve({ trustStore: stored(true), trustOverride: false }), false);
++	// The resolver consults the store for the requested cwd.
++	assert.equal(trustReads.at(-1), PROJECT_DIR, "trust store must be consulted for the project cwd");
++
++	console.log("ok 1 - project trust resolver treats a stored boolean decision as authoritative");
++}
++
++// ---------------------------------------------------------------------------
++// 2. Settings manager: project overrides global while trusted, nested defaults survive
++// ---------------------------------------------------------------------------
++
++async function loadSettingsManagerGraph() {
++	const fs = createVirtualFs({});
++	return createGraph(
++		root,
++		[SETTINGS_MANAGER_MODULE],
++		baseBindings(),
++		{
++			[SETTINGS_MANAGER_MODULE]: {
++				existsSync: fs.existsSync,
++				mkdirSync: fs.mkdirSync,
++				readFileSync: fs.readFileSync,
++				writeFileSync: fs.writeFileSync,
++			},
++		},
++	).module(SETTINGS_MANAGER_MODULE);
++}
++
++async function settingsScenario() {
++	const { SettingsManager } = await loadSettingsManagerGraph();
++
++	const globalSettings = {
++		theme: "global-theme",
++		retry: { enabled: true, maxRetries: 5, baseDelayMs: 111 },
++		compaction: { reserveTokens: 1024, keepRecentTokens: 2048 },
++	};
++	const projectSettings = {
++		theme: "project-theme",
++		retry: { maxRetries: 9 },
++	};
++
++	const storage = createMemoryStorage(JSON.stringify(globalSettings), JSON.stringify(projectSettings));
++	const manager = SettingsManager.fromStorage(storage, { projectTrusted: true });
++
++	assert.equal(manager.getTheme(), "project-theme", "trusted project value must override the global value");
++	assert.equal(manager.getRetrySettings().maxRetries, 9, "trusted project nested value must override the global one");
++	assert.equal(
++		manager.getRetrySettings().baseDelayMs,
++		111,
++		"nested global defaults must survive the project/global merge",
++	);
++	assert.equal(manager.getRetrySettings().enabled, true, "untouched global nested defaults must survive");
++	assert.equal(
++		manager.getCompactionSettings().keepRecentTokens,
++		2048,
++		"project settings must not discard unrelated global nested defaults",
++	);
++
++	// Overrides applied on top of the merged settings win, without dropping nested defaults.
++	manager.applyOverrides({ compaction: { reserveTokens: 42 } });
++	assert.equal(manager.getCompactionReserveTokens(), 42, "applyOverrides must override merged settings");
++	assert.equal(manager.getCompactionKeepRecentTokens(), 2048, "applyOverrides must keep nested merged defaults");
++
++	// Project configuration only applies while the project is trusted.
++	const untrustedStorage = createMemoryStorage(
++		JSON.stringify(globalSettings),
++		JSON.stringify(projectSettings),
++	);
++	const untrusted = SettingsManager.fromStorage(untrustedStorage, { projectTrusted: false });
++	assert.equal(untrusted.isProjectTrusted(), false);
++	assert.equal(untrusted.getTheme(), "global-theme", "untrusted project settings must be ignored");
++	assert.equal(untrusted.getRetrySettings().maxRetries, 5, "untrusted project nested values must be ignored");
++	assert.equal(untrusted.getRetrySettings().baseDelayMs, 111, "global nested defaults must still apply");
++
++	// An accepted reload re-reads project settings instead of dropping them.
++	untrusted.setProjectTrusted(true);
++	assert.equal(untrusted.getTheme(), "project-theme", "granting trust must load project settings");
++	await untrusted.reload();
++	assert.equal(untrusted.isProjectTrusted(), true, "reload must preserve the granted trust");
++	assert.equal(untrusted.getTheme(), "project-theme", "an accepted reload must keep project configuration");
++	assert.equal(untrusted.getProjectSettings().theme, "project-theme");
++	assert.equal(untrusted.getRetrySettings().maxRetries, 9, "reload must re-merge nested project values");
++	assert.equal(untrusted.getRetrySettings().baseDelayMs, 111, "reload must keep nested global defaults");
++
++	// Revoking trust clears the project layer again.
++	untrusted.setProjectTrusted(false);
++	assert.equal(untrusted.getTheme(), "global-theme", "revoking trust must drop the project layer");
++	assert.equal(untrusted.getRetrySettings().maxRetries, 5);
++
++	console.log("ok 2 - settings merge keeps trusted project overrides and nested global defaults");
++}
++
++// ---------------------------------------------------------------------------
++// 3. Resource loader: an approved decision reaches final resource resolution
++// ---------------------------------------------------------------------------
++
++const PROJECT_SYSTEM_PROMPT = "project system prompt";
++const PROJECT_APPEND_PROMPT = "project append prompt";
++
++const VIRTUAL_FILES = {
++	[`${PROJECT_DIR}/${CONFIG_DIR_NAME}/SYSTEM.md`]: PROJECT_SYSTEM_PROMPT,
++	[`${PROJECT_DIR}/${CONFIG_DIR_NAME}/APPEND_SYSTEM.md`]: PROJECT_APPEND_PROMPT,
++};
++
++function emptyResourceSet() {
++	return { extensions: [], skills: [], prompts: [], themes: [] };
++}
++
++function createResourceLoaderGraph() {
++	const fs = createVirtualFs(VIRTUAL_FILES);
++	const loadCalls = { extensionsCached: 0, packageResolve: 0 };
++
++	class FakePackageManager {
++		async resolve() {
++			loadCalls.packageResolve += 1;
++			return emptyResourceSet();
++		}
++
++		async resolveExtensionSources() {
++			return emptyResourceSet();
++		}
++	}
++
++	const bindings = baseBindings({
++		// ./event-bus.ts
++		createEventBus: () => ({ emit: noop, on: noop }),
++		// ./extensions/loader.ts
++		clearExtensionCache: noop,
++		createExtensionRuntime: () => ({ tools: new Map(), commands: new Map() }),
++		loadExtensionFromFactory: async () => ({}),
++		loadExtensionsCached: async (...args) => {
++			loadCalls.extensionsCached += 1;
++			const runtime = args.find((arg) => arg && typeof arg === "object" && !Array.isArray(arg));
++			return { extensions: [], errors: [], runtime: runtime ?? { tools: new Map(), commands: new Map() } };
++		},
++		// ./footer-data-provider.ts
++		findGitPaths: () => null,
++		// ./package-manager.ts
++		DefaultPackageManager: FakePackageManager,
++		// ./prompt-templates.ts
++		loadPromptTemplates: () => ({ templates: [], diagnostics: [] }),
++		// ./skills.ts
++		loadSkills: () => ({ skills: [], diagnostics: [] }),
++		// ./source-info.ts
++		createSourceInfo: (path, metadata) => ({ path, ...metadata }),
++		// ./timings.ts
++		resetTimings: noop,
++		// ../modes/interactive/theme/theme.ts
++		loadThemeFromPath: () => ({}),
++		// chalk
++		default: { yellow: (value) => value, red: (value) => value, dim: (value) => value },
++	});
++
++	return {
++		loadCalls,
++		graph: createGraph(
++			root,
++			[RESOURCE_LOADER_MODULE, SETTINGS_MANAGER_MODULE],
++			bindings,
++			{
++				[RESOURCE_LOADER_MODULE]: {
++					existsSync: fs.existsSync,
++					readFileSync: fs.readFileSync,
++					statSync: fs.statSync,
++					readdirSync: fs.readdirSync,
++				},
++				[SETTINGS_MANAGER_MODULE]: {
++					existsSync: fs.existsSync,
++					mkdirSync: fs.mkdirSync,
++					readFileSync: fs.readFileSync,
++					writeFileSync: fs.writeFileSync,
++				},
++			},
++		),
++	};
++}
++
++async function resourceLoaderScenario() {
++	const { graph, loadCalls } = createResourceLoaderGraph();
++	const resourceLoaderModule = await graph.module(RESOURCE_LOADER_MODULE);
++	const { SettingsManager } = await graph.module(SETTINGS_MANAGER_MODULE);
++
++	// --- approved decision -------------------------------------------------
++	// Mirrors startup: the runtime settings manager starts untrusted and the
++	// resource loader asks for the trust decision during reload().
++	const approvedStorage = createMemoryStorage(
++		JSON.stringify({ theme: "global-theme" }),
++		JSON.stringify({ theme: "project-theme" }),
++	);
++	const approvedSettings = SettingsManager.fromStorage(approvedStorage, { projectTrusted: false });
++	const approvedLoader = new resourceLoaderModule.DefaultResourceLoader({
++		cwd: PROJECT_DIR,
++		agentDir: AGENT_DIR,
++		settingsManager: approvedSettings,
++	});
++
++	let observedDuringBootstrap;
++	await approvedLoader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			observedDuringBootstrap = {
++				trusted: approvedSettings.isProjectTrusted(),
++				theme: approvedSettings.getTheme(),
++				preTrustExtensionsIsResult: Array.isArray(extensionsResult?.extensions),
++			};
++			return true;
++		},
++	});
++
++	assert.equal(
++		observedDuringBootstrap.preTrustExtensionsIsResult,
++		true,
++		"the pre-trust extension set must be handed to the trust resolver",
++	);
++	assert.equal(
++		observedDuringBootstrap.trusted,
++		false,
++		"the bootstrap pass must resolve trust without project resources",
++	);
++	assert.equal(
++		observedDuringBootstrap.theme,
++		"global-theme",
++		"project settings must stay out of the bootstrap pass",
++	);
++	assert.equal(
++		approvedSettings.isProjectTrusted(),
++		true,
++		"the approved decision must reach the settings manager after reload",
++	);
++	assert.equal(
++		approvedSettings.getTheme(),
++		"project-theme",
++		"an accepted reload must apply project configuration",
++	);
++	assert.equal(
++		approvedLoader.getSystemPrompt(),
++		PROJECT_SYSTEM_PROMPT,
++		"the approved decision must reach final resource resolution (project SYSTEM.md)",
++	);
++	assert.equal(
++		approvedLoader.getSystemPromptSource()?.path,
++		`${PROJECT_DIR}/${CONFIG_DIR_NAME}/SYSTEM.md`,
++		"resolved system prompt must point at the trusted project file",
++	);
++	assert.equal(
++		approvedLoader.getAppendSystemPrompt()[0],
++		PROJECT_APPEND_PROMPT,
++		"approved trust must resolve project append-system resources",
++	);
++	assert.ok(loadCalls.packageResolve > 0, "reload must resolve resources through the package manager");
++
++	// --- stored denial -----------------------------------------------------
++	const deniedStorage = createMemoryStorage(
++		JSON.stringify({ theme: "global-theme" }),
++		JSON.stringify({ theme: "project-theme" }),
++	);
++	const deniedSettings = SettingsManager.fromStorage(deniedStorage, { projectTrusted: false });
++	const deniedLoader = new resourceLoaderModule.DefaultResourceLoader({
++		cwd: PROJECT_DIR,
++		agentDir: AGENT_DIR,
++		settingsManager: deniedSettings,
++	});
++
++	await deniedLoader.reload({ resolveProjectTrust: async () => false });
++
++	assert.equal(deniedSettings.isProjectTrusted(), false, "a denied decision must stay untrusted after reload");
++	assert.equal(deniedSettings.getTheme(), "global-theme", "denied projects must not apply project configuration");
++	assert.equal(
++		deniedLoader.getSystemPrompt(),
++		undefined,
++		"denied projects must not resolve project-only system prompt resources",
++	);
++	assert.equal(deniedLoader.getAppendSystemPrompt().length, 0, "denied projects must not resolve project resources");
++
++	console.log("ok 3 - the resolved trust decision reaches final resource resolution");
++}
++
++await projectTrustScenario();
++await settingsScenario();
++await resourceLoaderScenario();
++
++console.log("regression ok");
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..b43a908
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,86 @@
++# Repair: stored denial vs. configuration precedence
++
++Three defects chained together across the trust → settings → resource-assembly path. Each
++one is a small code change, but the incident is only visible across module boundaries, which
++is why the regression test links the real modules together.
++
++## 1. `packages/coding-agent/src/core/project-trust.ts` — stored boolean was not authoritative
++
++`resolveProjectTrusted()` read the persisted decision from `ProjectTrustStore` and then wrote
++
++```ts
++const decision = options.trustStore.get(options.cwd);
++if (decision) {          // `false` is a legitimate stored value, but also falsy
++    return decision;
++}
++```
++
++`ProjectTrustStore.get()` returns `boolean | null`, where `false` is an *explicit denial* and
++`null` means "no decision recorded". Because the guard tested truthiness, a stored denial fell
++through to the default policy (`defaultProjectTrust`, the asynchronous extension answer path,
++or the interactive prompt) — i.e. an explicit "do not trust" was silently upgraded to
++allow-by-default. Fix: test `decision !== null`, so only a missing entry falls through and both
++stored booleans are authoritative.
++
++## 2. `packages/coding-agent/src/core/settings-manager.ts` — merge precedence was inverted
++
++`deepMergeSettings(base, overrides)` is documented as "project/overrides take precedence, nested
++objects merge recursively", but it called `deepMergeObjects(overrides, base)`, swapping the two
++layers. Consequences:
++
++* the global layer won every leaf conflict, so a trusted project value (e.g. `theme`) never
++  became effective — project configuration looked "lost" after an accepted reload;
++* `applyOverrides()` (which merges runtime overrides on top of the merged settings) was inverted
++  in the same way;
++* nested survival happened to work only for the *global* side.
++
++Fix: pass the layers in their documented order (`deepMergeObjects(base, overrides)`). Nested
++objects still merge recursively, so global defaults survive next to project overrides
++(`{ retry: { maxRetries: 9 } }` over `{ retry: { enabled: true, maxRetries: 5, baseDelayMs: 111 } }`
++yields `{ enabled: true, maxRetries: 9, baseDelayMs: 111 }`).
++
++Project values are still applied *only while trusted*: `loadFromStorage()` short-circuits the
++project scope when `projectTrusted` is false, `setProjectTrusted()` clears/loads the project
++layer, and `reload()` re-reads the project scope with the current trust state. Those paths were
++already correct and are covered by the regression test.
++
++## 3. `packages/coding-agent/src/core/resource-loader.ts` — the decision never reached assembly
++
++During `DefaultResourceLoader.reload({ resolveProjectTrust })` the loader first runs a bootstrap
++pass that forces untrusted settings (`loadProjectTrustExtensions()` → `setProjectTrusted(false)`
++→ `reload()`), then asks the resolver for the decision, then re-released the settings for the
++final resource assembly. That last step threw the answer away:
++
++```ts
++const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
++this.settingsManager.setProjectTrusted(false);   // <- decision discarded
++```
++
++So even an approved project was assembled as untrusted: project settings never reached the
++merged view, and trust-gated project resources (`SYSTEM.md`, `APPEND_SYSTEM.md`, project
++settings/packages/extensions/skills/prompts/themes) stayed out of the resolved resource set.
++Fix: apply the resolved value (`setProjectTrusted(projectTrusted)`), so the following
++`settingsManager.reload()` and every downstream resolution pass see the approved decision. The
++bootstrap pass itself is unchanged, so project-local code still never executes before the
++decision is made. This mirrors the existing correct usage in `package-manager-cli.ts`.
++
++## Cross-module behaviour asserted by `.prale-eval/regression.mjs`
++
++1. Resolver boundary: a fake trust store returning `false` is honoured against
++   `defaultProjectTrust: "always"`, never opens the interactive prompt, `true` is honoured
++   against `"never"`, and only `null` falls through to the default policy.
++2. Settings boundary: a storage double supplies global/project files; the merged view returns
++   the trusted project value, keeps nested global defaults, is unaffected while untrusted,
++   survives `reload()`, and `applyOverrides()` still wins.
++3. Assembly boundary: the real `SettingsManager` is injected into the real
++   `DefaultResourceLoader`; after `reload()` with an approving resolver the manager reports the
++   approved trust, the project configuration is in effect, and the loader resolves the
++   project-only `SYSTEM.md`/`APPEND_SYSTEM.md`; a denying resolver keeps everything global.
++
++Filesystem, path helpers, package manager, extension/skill/prompt/theme loaders and the trust
++store are boundary fakes, so no real time, randomness, network or external state is involved.
++
++Validation: `node --experimental-vm-modules .prale-eval/regression.mjs` passes on the repair and
++fails with a plain `AssertionError` (exit code 1, no crash/import error) when
++`project-trust.ts`, `settings-manager.ts`, or `resource-loader.ts` alone is restored to its
++faulty baseline.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..04b622d
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/resource-consistency/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Loaded the three real production modules through .prale-eval/subject.mjs (createGraph/loadModule) with only boundary fakes (virtual fs, path helpers, package manager, extension/skill/prompt/theme loaders, trust store) and asserted cross-boundary behaviour: (1) project-trust.ts -- a stored `false` decision wins over defaultProjectTrust 'always' and never opens the interactive prompt, a stored `true` wins over 'never', and only a `null` decision falls through to the default policy; (2) settings-manager.ts -- a trusted project value overrides the global value, nested global defaults (retry.baseDelayMs) survive the merge, untrusted projects keep global values, applyOverrides still wins, and reload() preserves the accepted trust and project configuration; (3) resource-loader.ts -- the real SettingsManager injected into the real DefaultResourceLoader reports isProjectTrusted()===true and the project configuration after reload() with an approving resolver, and the loader resolves the project-only SYSTEM.md/APPEND_SYSTEM.md, while a denying resolver keeps everything global. The repair passes (exit 0); restoring project-trust.ts, settings-manager.ts or resource-loader.ts alone to its faulty baseline fails with a plain node:assert/strict AssertionError and exit code 1 (no crash, import error or timeout). No real time, randomness, network or external services are used; asynchronous ordering is controlled with awaited promises. No optional validation dependency was needed beyond Node 24 (the repository's vitest suite is not installed in this workspace, so validation relies on this script). Temporary scratch copies used for the single-file mutation checks were kept inside .prale-eval and removed afterwards."
++  }
++}
+snapshot .prale-eval/regression.mjs - 469ce339e6938944f0a267124c83925a30ab6420335da1bbcf00efb1ca50f8b8
+snapshot .prale-eval/repair.md - 7dec4900baa4781ddb261b8966671f2255af36322cdbea445d210608fac574dd
+snapshot .prale-eval/result.json - 5d62ed9c6264fed1c112f065b678158e2a54fce9a7579c3cc74f87868c0abd39
+snapshot packages/coding-agent/src/core/project-trust.ts fe9a9c3bc4722fbece17a5eb3bbe56b711bdc03693123fc1d69ec9ae137a40a8 24fe0730fc05802a563cd5b10f64dd261b08cab4dd8a51ff69a849a30c14d3b5
+snapshot packages/coding-agent/src/core/resource-loader.ts a031f345d80d20a71812a6f187730475cc80914586ca01bb0d88118193d445db fa7179ad04b469541903dd8760cda986fb6f623c0b92f09e188a918645735ae2
+snapshot packages/coding-agent/src/core/settings-manager.ts 96d5bc028db0007656032425782b014a75082f41c077a1f8515251d6b2839938 5d1bdac20da52fdbac76d49fb9ce22d142c375e8efd5bf446bf6c047c5edac42

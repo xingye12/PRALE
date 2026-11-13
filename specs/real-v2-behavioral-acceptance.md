@@ -1,9 +1,9 @@
-# Real-v2 behavioral acceptance, basic fixture revision 4
+# Real-v2 behavioral acceptance, basic fixture revision 6
 
 This protocol changes evaluation fixtures and acceptance only. It does not
 change harness public APIs, persistence, memory promotion or recovery semantics.
 The benchmark ID remains `prale-experience-real-v2`; `fixture_revision` and
-`oracle_version` are 4 and 3 respectively. Earlier acceptance scores are not directly comparable.
+`oracle_version` are 6 and 3 respectively. Earlier acceptance scores are not directly comparable.
 
 ## ADR-001: Execute source behavior and require mutation-sensitive regression
 
@@ -13,7 +13,7 @@ correction tasks did not state the new policy, and existing tests were not run.
 
 Decision: all 12 stages receive nonempty, deterministic mutations generated
 from the bundled committed capsule. Every prompt states its observable policy,
-target file, delivery schema and executable test command. Fault baselines must
+delivery schema and executable test command; target paths remain controller-only. Fault baselines must
 fail the hidden behavioral suite; the original healthy implementation and
 semantically equivalent repairs must pass. The hidden suite is external to the
 agent workspace. Public support code contains boundary fakes and module loading,
@@ -226,3 +226,52 @@ not turn an otherwise complete solution into a solving failure. Warm promotion
 still finishes or reaches its separate budget before the next stage starts.
 Use fresh states and record both visibility and accounting version in reports.
 No core runtime API, storage format or memory policy is changed by this adapter.
+
+
+## ADR: Generic public support and discovery metadata
+
+Basic fixture revision 6 / advanced revision 5 replace public scenario-specific
+subject helpers with the same generic TypeScript module loader, marked
+public_support_version 1. No target paths or business adapters are preloaded in
+the workspace. Hidden behavior keeps its original external adapters; regression
+submissions construct their own bindings and select source modules. Oracles
+validate the versioned immutable public helper without weakening any behavior or
+mutation-kill requirement. Legacy helpers are still recognized for old metadata.
+The controller rebuilds the mutated tree and normalizes timestamps before Git
+indexing and after initialization. See [task discovery ADR](real-v2-task-discovery.md).
+
+## ADR: Delay controller validation artifacts until agent termination
+
+Background: fault copies and baseline manifests beside the temporary workspace
+expose target paths before validation, even though they are outside cwd.
+
+Decision: capture trusted fault bytes and file/config fingerprints in controller
+memory before execution. Write these validation artifacts outside the workspace
+only after agent process-group cleanup, including timeout cleanup. Never rebuild
+the trusted baseline from the submitted Git index or modified workspace. Public
+local-test support remains available during solving; hidden oracles remain external.
+
+Consequences: no original-fault files or manifests exist in the stage temporary
+directory during solving. This does not hide the host fixture repository or provide
+an OS security boundary; isolated mounts remain required for that guarantee.
+Behavioral stage integration tests assert artifact absence during agent execution
+and successful fixed/fault validation afterward.
+
+## ADR: Reject private fixture files in agent input
+
+Background: selecting TASK.md and public support avoids copying fixture internals,
+but contaminated source archives or support trees could still introduce them.
+
+Decision: reserve `oracle.py`, `fixture.json`, and `mutation.patch` at every depth
+in real-v2 agent workspaces. Reject source archive members and public support paths
+with those names; scan the mutated workspace before creating its initial Git commit
+and before launching the agent. Fail closed rather than silently deleting files.
+Keep originals in the controller's fixture directory and execute the oracle only
+after agent termination. TASK.md and public local-test support remain available.
+
+Consequences: private fixture files cannot enter the workspace via the supported
+materialization paths, including its initial Git history. This filename guard is
+not a content classifier or an OS sandbox: renamed secrets and direct access to
+host fixtures still require trusted inputs and isolated mounts. Integration tests
+cover contaminated archives/support, agent non-launch, private-file absence during
+solving, and successful external validation.

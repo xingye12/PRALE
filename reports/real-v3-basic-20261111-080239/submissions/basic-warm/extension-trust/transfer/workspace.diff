@@ -1,0 +1,313 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 699143e..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(false);
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..75cbb77
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,262 @@
++/**
++ * Regression: an explicit project-trust decision (true AND false) must be
++ * applied to the settings manager after the bootstrap (untrusted) extension
++ * pass, settings must be reloaded before the final resource resolution, and
++ * the bootstrap pass itself must keep project-local extensions excluded.
++ *
++ * Exercises the real DefaultResourceLoader.reload() + the real SettingsManager
++ * (in-memory storage) from packages/coding-agent/src/core.
++ *
++ * Run: node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import path from "node:path";
++import { createGraph } from "./subject.mjs";
++
++const root = path.resolve(import.meta.dirname, "..");
++
++const RESOURCE_LOADER = "packages/coding-agent/src/core/resource-loader.ts";
++const SETTINGS_MANAGER = "packages/coding-agent/src/core/settings-manager.ts";
++
++const cwd = path.join(root, ".prale-eval", "tmp", "project");
++const agentDir = path.join(root, ".prale-eval", "tmp", "agent");
++const userExtensionPath = path.join(agentDir, "extensions", "user.ts");
++const projectExtensionPath = path.join(cwd, ".pi", "extensions", "project.ts");
++const PROJECT_THEME = "project-theme";
++const INITIAL_GLOBAL_THEME = "initial-global-theme";
++const UPDATED_GLOBAL_THEME = "updated-global-theme";
++
++/** In-memory SettingsStorage so the real SettingsManager reads project settings on reload. */
++class FakeSettingsStorage {
++	constructor() {
++		this.data = new Map();
++	}
++	withLock(scope, fn) {
++		const current = this.data.get(scope);
++		const next = fn(current);
++		if (next !== undefined) this.data.set(scope, next);
++	}
++}
++
++function makeExtension(extensionPath) {
++	return {
++		path: extensionPath,
++		resolvedPath: extensionPath,
++		sourceInfo: { path: extensionPath, source: "local", scope: "user", origin: "top-level" },
++		tools: new Map(),
++		flags: new Map(),
++		commands: new Map(),
++		hidden: false,
++	};
++}
++
++/**
++ * Builds boundary fakes around the real loader. The fake package manager models
++ * the trust boundary: project-local extensions are only resolved when the
++ * settings manager currently considers the project trusted, so the observed
++ * extension set reveals the trust state seen at each resolution.
++ */
++function createFakes() {
++	const state = { resolveCalls: [], loadCalls: [] };
++
++	class FakePackageManager {
++		constructor(options) {
++			this.settingsManager = options.settingsManager;
++		}
++		async resolve() {
++			const trusted = this.settingsManager.isProjectTrusted();
++			state.resolveCalls.push({
++				trusted,
++				projectSettings: { ...this.settingsManager.getProjectSettings() },
++				globalSettings: { ...this.settingsManager.getGlobalSettings() },
++			});
++			const extensions = trusted ? [projectExtensionPath, userExtensionPath] : [userExtensionPath];
++			return {
++				extensions: extensions.map((extensionPath) => ({
++					path: extensionPath,
++					enabled: true,
++					metadata: {
++						source: "local",
++						scope: extensionPath === userExtensionPath ? "user" : "project",
++						origin: "top-level",
++					},
++				})),
++				skills: [],
++				prompts: [],
++				themes: [],
++			};
++		}
++		async resolveExtensionSources() {
++			return { extensions: [], skills: [], prompts: [], themes: [] };
++		}
++	}
++
++	const bindings = {
++		// DefaultResourceLoader boundaries
++		DefaultPackageManager: FakePackageManager,
++		clearExtensionCache: () => {},
++		createExtensionRuntime: () => ({}),
++		loadExtensionFromFactory: async () => makeExtension("<inline:test>"),
++		loadExtensionsCached: async (extensionPaths, _cwd, _eventBus, runtime) => {
++			state.loadCalls.push([...extensionPaths]);
++			return {
++				extensions: extensionPaths.map(makeExtension),
++				errors: [],
++				warnings: [],
++				runtime: runtime ?? {},
++			};
++		},
++		createEventBus: () => ({}),
++		findGitPaths: () => undefined,
++		loadPromptTemplates: () => ({ templates: [], diagnostics: [] }),
++		loadSkills: () => ({ skills: [], diagnostics: [] }),
++		loadThemeFromPath: () => {
++			throw new Error("no themes expected");
++		},
++		createSourceInfo: (resourcePath, metadata) => ({ path: resourcePath, ...metadata }),
++		resetTimings: () => {},
++		// Shared path/text helpers
++		CONFIG_DIR_NAME: ".pi",
++		getAgentDir: () => agentDir,
++		canonicalizePath: (value) => path.resolve(value),
++		isLocalPath: (value) => !/^(npm:|git:|github:|https?:|ssh:)/.test(value.trim()),
++		normalizePath: (value) => path.resolve(value),
++		resolvePath: (value, base) => path.resolve(typeof base === "string" ? base : root, value),
++		stripBom: (value) => (value.charCodeAt(0) === 0xfeff ? value.slice(1) : value),
++		// SettingsManager boundaries
++		DEFAULT_HTTP_IDLE_TIMEOUT_MS: 30_000,
++		parseHttpIdleTimeoutMs: () => 30_000,
++		DEFAULT_MAX_AGENT_RETRY_DELAY_MS: 60_000,
++		lockfile: { lockSync: () => () => {} },
++		// Misc
++		chalk: Object.assign((value) => String(value), {
++			red: (value) => String(value),
++			yellow: (value) => String(value),
++			dim: (value) => String(value),
++			green: (value) => String(value),
++		}),
++	};
++
++	return { state, bindings };
++}
++
++async function runScenario(decision) {
++	const storage = new FakeSettingsStorage();
++	storage.data.set("global", JSON.stringify({ theme: INITIAL_GLOBAL_THEME }));
++	storage.data.set("project", JSON.stringify({ theme: PROJECT_THEME }));
++
++	const { state, bindings } = createFakes();
++	const graph = createGraph(root, [RESOURCE_LOADER, SETTINGS_MANAGER], bindings);
++	const loaderNamespace = await graph.module(RESOURCE_LOADER);
++	const settingsNamespace = await graph.module(SETTINGS_MANAGER);
++
++	const settingsManager = settingsNamespace.SettingsManager.fromStorage(storage, { projectTrusted: false });
++	const loader = new loaderNamespace.DefaultResourceLoader({
++		cwd,
++		agentDir,
++		settingsManager,
++		noContextFiles: true,
++	});
++
++	const observed = {
++		callbackExtensions: undefined,
++		callbackTrusted: undefined,
++		callbackProjectSettings: undefined,
++		callbackGlobalTheme: undefined,
++	};
++
++	await loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			observed.callbackExtensions = Array.from(extensionsResult.extensions, (extension) => extension.path);
++			observed.callbackTrusted = settingsManager.isProjectTrusted();
++			observed.callbackProjectSettings = { ...settingsManager.getProjectSettings() };
++			observed.callbackGlobalTheme = settingsManager.getGlobalSettings().theme;
++			// A settings write that lands while the trust prompt runs must be visible to the
++			// final resource resolution: only a reload after the decision can pick it up.
++			storage.data.set("global", JSON.stringify({ theme: UPDATED_GLOBAL_THEME }));
++			return decision;
++		},
++	});
++
++	return {
++		state,
++		observed,
++		trusted: settingsManager.isProjectTrusted(),
++		projectSettings: { ...settingsManager.getProjectSettings() },
++		globalSettings: { ...settingsManager.getGlobalSettings() },
++		extensions: Array.from(loader.getExtensions().extensions, (extension) => extension.path),
++	};
++}
++
++const FAILED = [];
++
++function check(message, fn) {
++	try {
++		fn();
++	} catch (error) {
++		FAILED.push(`${message}: ${error.message}`);
++	}
++}
++
++// --- Trusted decision: the explicit "yes" must be honored after bootstrap ---
++const trusted = await runScenario(true);
++
++check("bootstrap pass keeps project extensions excluded", () => {
++	assert.deepEqual(trusted.observed.callbackExtensions, [userExtensionPath]);
++});
++check("bootstrap pass runs with an untrusted settings manager", () => {
++	assert.equal(trusted.observed.callbackTrusted, false);
++});
++check("bootstrap pass does not load project settings", () => {
++	assert.deepEqual(trusted.observed.callbackProjectSettings, {});
++});
++check("trusted decision is applied to the settings manager", () => {
++	assert.equal(trusted.trusted, true);
++});
++check("trusted project settings are loaded", () => {
++	assert.equal(trusted.projectSettings.theme, PROJECT_THEME);
++});
++check("settings are reloaded before the final resource resolution", () => {
++	assert.equal(trusted.observed.callbackGlobalTheme, INITIAL_GLOBAL_THEME);
++	assert.equal(trusted.globalSettings.theme, UPDATED_GLOBAL_THEME);
++	const finalResolve = trusted.state.resolveCalls.at(-1);
++	assert.equal(finalResolve.trusted, true);
++	assert.equal(finalResolve.projectSettings.theme, PROJECT_THEME);
++	assert.equal(finalResolve.globalSettings.theme, UPDATED_GLOBAL_THEME);
++});
++check("project extensions load once the project is trusted", () => {
++	assert.deepEqual(trusted.extensions, [projectExtensionPath, userExtensionPath]);
++});
++check("user extensions are loaded only once across bootstrap and final pass", () => {
++	const userLoads = trusted.state.loadCalls.flat().filter((extensionPath) => extensionPath === userExtensionPath);
++	assert.equal(userLoads.length, 1);
++});
++
++// --- Untrusted decision: the explicit "no" must also be honored ---
++const untrusted = await runScenario(false);
++
++check("bootstrap pass keeps project extensions excluded (untrusted)", () => {
++	assert.deepEqual(untrusted.observed.callbackExtensions, [userExtensionPath]);
++});
++check("untrusted decision keeps the settings manager untrusted", () => {
++	assert.equal(untrusted.trusted, false);
++});
++check("untrusted decision keeps project settings out", () => {
++	assert.deepEqual(untrusted.projectSettings, {});
++	const finalResolve = untrusted.state.resolveCalls.at(-1);
++	assert.equal(finalResolve.trusted, false);
++	assert.equal(finalResolve.projectSettings.theme, undefined);
++});
++check("settings are reloaded before final resolution for the untrusted decision", () => {
++	assert.equal(untrusted.observed.callbackGlobalTheme, INITIAL_GLOBAL_THEME);
++	assert.equal(untrusted.globalSettings.theme, UPDATED_GLOBAL_THEME);
++	assert.equal(untrusted.state.resolveCalls.at(-1).globalSettings.theme, UPDATED_GLOBAL_THEME);
++});
++check("project extensions stay excluded for an untrusted project", () => {
++	assert.deepEqual(untrusted.extensions, [userExtensionPath]);
++});
++
++if (FAILED.length > 0) {
++	assert.fail(`project trust regression failed:\n- ${FAILED.join("\n- ")}`);
++}
++console.log("project trust regression passed");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..0d36888
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,23 @@
++{
++  "task_id": "extension-trust/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "deliverables": [
++    ".prale-eval/regression.mjs"
++  ],
++  "claims": [
++    {
++      "claim": "DefaultResourceLoader.reload() discarded the explicit project-trust decision by forcing the settings manager back to untrusted after the bootstrap extension pass, so a trusted project never got its project-local extensions or project settings.",
++      "evidence": "packages/coding-agent/src/core/resource-loader.ts:451-456"
++    },
++    {
++      "claim": "The repair applies the resolved decision (true or false) before reloading settings and resolving final resources, keeping the bootstrap pass untrusted.",
++      "evidence": "packages/coding-agent/src/core/resource-loader.ts:453"
++    }
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "The regression loads the real DefaultResourceLoader (packages/coding-agent/src/core/resource-loader.ts) together with the real SettingsManager (packages/coding-agent/src/core/settings-manager.ts) through .prale-eval/subject.mjs, using an in-memory SettingsStorage and boundary fakes for the package manager, extension loader and path/text helpers. The fake package manager only exposes the project extension when the settings manager currently reports the project as trusted, so the observed extension set reveals the trust state at each resolution. Scenario 'trusted': the bootstrap pass must see an untrusted settings manager and only the user extension; the resolveProjectTrust callback then receives that bootstrap result; after reload the settings manager is trusted, the project settings (theme) are loaded, the final resource resolution sees the trusted state plus settings written during the prompt (proving settings were reloaded before final resolution), the project and user extensions are both loaded, and the user extension is loaded exactly once. Scenario 'untrusted': the explicit false decision stays untrusted, project settings stay out, the final resolution stays untrusted and only the user extension is loaded. Verified detection: temporarily restoring the original line `this.settingsManager.setProjectTrusted(false)` makes the script exit 1 with assertion failures ('trusted decision is applied to the settings manager', 'trusted project settings are loaded', 'settings are reloaded before the final resource resolution', 'project extensions load once the project is trusted'); with the repair it exits 0. Limitation: the repository's vitest suites (e.g. packages/coding-agent/test/resource-loader.test.ts) could not be executed because node_modules is not installed and dependencies must not be installed, so validation is the standalone VM-module regression only."
++  }
++}
+snapshot .prale-eval/regression.mjs - 82c300df50598d893b30ee05dc31d9d872cd263e1945b11f2f53f62443f0efe8
+snapshot .prale-eval/result.json - 8774faa59ffcb524c1201c64f9af2d5408dc7720b404c02ff3137c095d907ede
+snapshot packages/coding-agent/src/core/resource-loader.ts a031f345d80d20a71812a6f187730475cc80914586ca01bb0d88118193d445db 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

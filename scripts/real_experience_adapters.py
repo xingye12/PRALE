@@ -21,6 +21,7 @@ from agent_harness.integrations.deepseek import DeepSeekProvider
 from agent_harness.integrations.local_tools import create_builtin_tools
 from agent_harness.integrations.memory_provider import JsonMemoryExtractor
 from agent_harness.integrations.memory_tools import create_memory_tools
+from agent_harness.integrations.shell import BubblewrapExecutor
 from agent_harness.memory.runtime import MemoryRuntime
 from agent_harness.runtime.generation import AssistantResult, GenerationRequest
 from agent_harness.storage.memory import MemoryStorage
@@ -193,6 +194,10 @@ async def _promote(runtime: MemoryRuntime, store: SQLiteMemoryStore, scope: Memo
         await runtime._run_job(job)  # noqa: SLF001 - deterministic evaluation drain.
 
 
+def _eval_shell_executor(state_dir: Path) -> BubblewrapExecutor:
+    return BubblewrapExecutor(hidden_paths=(Path(__file__).resolve().parents[1] / ".eval-state", state_dir.resolve()))
+
+
 async def run_prale(
     *,
     workspace: Path,
@@ -228,7 +233,7 @@ async def run_prale(
     )
     calls: list[str] = []
     try:
-        tools = tuple(create_builtin_tools(workspace))
+        tools = tuple(create_builtin_tools(workspace, shell_executor=_eval_shell_executor(state_dir)))
         if store is not None and scope is not None:
             tools = (*tools, *create_memory_tools(store, scope))
         harness = await Harness.open(

@@ -278,7 +278,7 @@ def sources() -> dict[str, str]:
 def render() -> dict[Path, str]:
     original = sources()
     files: dict[Path, str] = {}
-    helper = (REPO / "scripts/real_experience_advanced/subject.mjs").read_text(encoding="utf-8")
+    helper = (REPO / "scripts/real_experience_public_subject.mjs").read_text(encoding="utf-8")
     for fixture in FIXTURES:
         base = ROOT / fixture.episode / fixture.stage
         patches: list[str] = []
@@ -299,7 +299,8 @@ def render() -> dict[Path, str]:
         files[base / "mutation.patch"] = "".join(patches)
         metadata = {
             "oracle_version": 4,
-            "fixture_revision": 3,
+            "fixture_revision": 5,
+            "public_support_version": 1,
             "suite_id": "real-v2-advanced-v1",
             "source_commit": COMMIT,
             "task_id": fixture.task_id,
@@ -313,14 +314,16 @@ def render() -> dict[Path, str]:
         files[base / "TASK.md"] = (
             f"# {fixture.title}\n\nTask ID: `{fixture.task_id}`\nRepository: `earendil-works/pi`\n\n"
             f"## Incident\n\n{fixture.request}\n\n"
-            "Investigate the producer/consumer flow across these source modules; every listed module has an "
-            "independent regression that must be repaired. Keep the existing APIs and unrelated behavior intact:\n\n"
-            + "".join(f"- `{target}`\n" for target in targets)
-            + "\n## Delivery and local validation\n\n"
-            "Modify every listed production file, and add an executable `.prale-eval/regression.mjs`. It must load "
+            "Locate the faulty production code by exploring the repository and tracing the incident across "
+            "producer/consumer boundaries. Preserve existing APIs and unrelated behavior.\n\n"
+            "## Delivery and local validation\n\n"
+            "Apply the necessary production repairs, and add an executable `.prale-eval/regression.mjs`. It must load "
             "the submitted production modules and assert observable behavior across module boundaries. The read-only "
-            "`.prale-eval/subject.mjs` helper links real local modules, with only external IO/provider boundaries "
-            "faked. Node 24 is sufficient; no dependencies, network, credentials or deployment are needed.\n\n"
+            "`.prale-eval/subject.mjs` helper provides "
+            "`createGraph(root, modules, bindings, builtinOverrides, trailers)` and "
+            "`loadModule(root, relativePath, bindings, trailer)`. Discover paths and symbols yourself, select "
+            "the real modules to link, and supply your own boundary fakes. No task-specific adapters are supplied. "
+            "Node 24 is sufficient; no dependencies, network, credentials or deployment are needed.\n\n"
             "Run `node --experimental-vm-modules .prale-eval/regression.mjs` from the workspace root. Use uncaught "
             "`node:assert/strict` assertions. The same script must pass the repair and detect the original regression "
             "in every source file when that file alone is restored to its faulty baseline. A crash, import error "
@@ -332,7 +335,8 @@ def render() -> dict[Path, str]:
             f"`{fixture.task_id}`, `repository` = `earendil-works/pi`, `mode` = `repair`, and `validation` containing "
             "`command` = `node --experimental-vm-modules .prale-eval/regression.mjs`, `status` = `passed`, "
             "and substantive `notes`. Explain the cross-module fix in `.prale-eval/repair.md`.\n\n"
-            "Only modify the listed source modules and add files under `.prale-eval/`. Do not modify TASK.md, "
+            "Modify only production code needed for this incident and add tests under `.prale-eval/`. "
+            "Do not modify TASK.md, "
             "subject.mjs, locks, Git configuration or harness files. Hidden oracles and mutation patches are not "
             "part of your workspace.\n"
         )
@@ -354,7 +358,8 @@ def render() -> dict[Path, str]:
             {
                 "benchmark_id": "prale-experience-real-v2",
                 "suite_id": "real-v2-advanced-v1",
-                "fixture_revision": 3,
+                "fixture_revision": 5,
+                "public_support_version": 1,
                 "oracle_version": 4,
                 "source_commit": COMMIT,
                 "capsule": "../capsules/pi-b455975/capsule.json",

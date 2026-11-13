@@ -117,3 +117,50 @@ These directories cannot be included through query hints or include_tests. No ca
 
 Consequences and acceptance: evaluation artifacts no longer contribute files, symbols or references;
 ordinary source files remain discoverable. Integration coverage verifies exclusion before max_files enforcement.
+
+## ADR: Real-v2 validation artifact timing
+
+Background: temporary fault copies and manifests revealed validation targets while
+the agent was still running.
+
+Decision: retain the pre-agent trusted bytes/fingerprints in controller memory and
+materialize validation artifacts only after agent process-group cleanup. Keep hidden
+validation outside the submitted workspace. See the corresponding ADR in
+`real-v2-behavioral-acceptance.md`. No harness API or persistence changes.
+
+Consequences: stage-local validation files are absent during solving; original host
+fixtures still require filesystem isolation. Basic and advanced integration tests
+verify absence during solving and successful subsequent oracle execution.
+
+## ADR: Real-v2 private input file boundary
+
+Reserve oracle.py, fixture.json and mutation.patch throughout real-v2 agent
+workspaces. Reject contaminated archives/support and mutation-created private
+paths before the baseline commit or agent launch; keep validation external.
+The detailed decision and isolation limitations are recorded in
+`real-v2-behavioral-acceptance.md`. No runtime API or persistence changes.
+
+## ADR: Independent real-v3 comment-free corpus
+
+Add `prale-experience-real-v3` with a separately generated 24-task corpus. Delete
+statements instead of adding explanatory fault comments; retain v2 artifacts.
+V3 uses the existing external behavioral acceptance and private-input protections.
+See `real-v3-comment-free-injection.md` for generation and acceptance requirements.
+No harness API, memory format or runtime persistence changes.
+
+## ADR: Hide evaluation state from agent Bash tools
+
+Background: the workspace-write Bash sandbox exposes host `/` read-only, including
+`.eval-state`, so disabling cold memory does not prevent filesystem reads of warm state.
+
+Decision: allow BubblewrapExecutor to mask configured directory paths with empty,
+read-only tmpfs mounts after workspace/config binds. Canonicalize paths, include
+mask configuration in capability identity, and reject a workspace inside a mask.
+The PRALE real-experience adapter masks this repository's `.eval-state` and its
+explicit state_dir. Controller/SQLite memory access remains outside the tool sandbox.
+There is no unsandboxed automatic fallback; existing approval rules remain in force.
+
+Consequences: agent Bash cannot read masked state via absolute paths or symlink
+aliases. This does not hide other host directories. Unit and real namespace tests
+must check mount order, identity changes, state confidentiality and host integrity.
+This changes integration configuration, not durable storage or domain dependencies.

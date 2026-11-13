@@ -1,0 +1,237 @@
+/**
+ * Regression for session-migration/retransfer.
+ *
+ * Fault: migrateSessionsFromAgentRoot() aborted the whole batch (`return`) when a
+ * legacy session file collided with an already-existing target copy, so every
+ * later file in the same batch was never migrated.
+ *
+ * Expected behavior exercised here:
+ *  - a colliding file is skipped by itself: both copies are preserved untouched,
+ *  - all remaining files in the batch still migrate,
+ *  - repeated runs are idempotent,
+ *  - malformed / non-session headers are left untouched.
+ *
+ * Uses only the real production module (via .prale-eval/subject.mjs) and the real
+ * fs/path behavior. Run from the repository root:
+ *   node --experimental-vm-modules .prale-eval/regression.mjs
+ */
+import assert from "node:assert/strict";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import * as path from "node:path";
+import { fileURLToPath } from "node:url";
+import { loadMigrations } from "./subject.mjs";
+
+const here = path.dirname(fileURLToPath(import.meta.url));
+const repoRoot = path.resolve(here, "..");
+const tempRoot = path.join(here, ".tmp");
+
+const LEGACY_CWD = "/home/tester/project";
+// Same encoding as session-manager.ts: strip leading separator, then [/\\:] -> "-".
+const SESSION_DIR_NAME = "--home-tester-project--";
+
+function sessionJsonl(id, marker) {
+	const header = { type: "session", id, cwd: LEGACY_CWD, timestamp: "2025-01-01T00:00:00.000Z" };
+	const entry = { type: "message", id: `${id}-m1`, marker };
+	return `${JSON.stringify(header)}\n${JSON.stringify(entry)}\n`;
+}
+
+function makeCase(name) {
+	const base = path.join(tempRoot, name);
+	rmSync(base, { recursive: true, force: true });
+	const agentDir = path.join(base, "agent");
+	mkdirSync(agentDir, { recursive: true });
+	return { agentDir, sessionDir: path.join(agentDir, "sessions", SESSION_DIR_NAME) };
+}
+
+function jsonlIn(dir) {
+	if (!existsSync(dir)) return [];
+	return readdirSync(dir)
+		.filter((f) => f.endsWith(".jsonl"))
+		.sort();
+}
+
+async function runMigration(agentDir) {
+	// Fresh module instance each run: the module captures agentDir through getAgentDir().
+	const migrations = await loadMigrations(repoRoot, agentDir);
+	assert.equal(
+		typeof migrations.migrateSessionsFromAgentRoot,
+		"function",
+		"production module must export migrateSessionsFromAgentRoot",
+	);
+	migrations.migrateSessionsFromAgentRoot();
+}
+
+/* ------------------------------------------------------------------ */
+/* 1. A collision must skip only that file and let the rest migrate.    */
+/* ------------------------------------------------------------------ */
+{
+	const { agentDir, sessionDir } = makeCase("collision-batch");
+
+	const names = ["legacy-1.jsonl", "legacy-2.jsonl", "legacy-3.jsonl", "legacy-4.jsonl"];
+	const contents = new Map();
+	for (const [index, name] of names.entries()) {
+		const text = sessionJsonl(`legacy-${index + 1}`, `marker-${index + 1}`);
+		contents.set(name, text);
+		writeFileSync(path.join(agentDir, name), text);
+	}
+
+	// Choose the collision deterministically from the real directory iteration order,
+	// so the batch always contains files that must migrate after the collided one.
+	const order = readdirSync(agentDir).filter((f) => f.endsWith(".jsonl"));
+	assert.equal(order.length, names.length, "all legacy files must be visible to the migration");
+	const colliding = order[0];
+	const later = order.slice(1);
+	assert.ok(later.length >= 1, "regression requires at least one file after the collision");
+
+	const existingCopy = sessionJsonl("already-migrated", "pre-existing-copy");
+	mkdirSync(sessionDir, { recursive: true });
+	writeFileSync(path.join(sessionDir, colliding), existingCopy);
+
+	await runMigration(agentDir);
+
+	// The colliding file is skipped, never overwritten or deleted: both copies survive.
+	const legacyPath = path.join(agentDir, colliding);
+	assert.ok(
+		existsSync(legacyPath),
+		`colliding legacy file ${colliding} must be preserved in the agent dir, not deleted`,
+	);
+	assert.equal(
+		readFileSync(legacyPath, "utf8"),
+		contents.get(colliding),
+		"colliding legacy copy must be left byte-for-byte intact",
+	);
+	assert.equal(
+		readFileSync(path.join(sessionDir, colliding), "utf8"),
+		existingCopy,
+		"pre-existing target copy must not be overwritten",
+	);
+
+	// Every later file in the batch still migrates: this is the actual fault.
+	for (const name of later) {
+		assert.equal(
+			existsSync(path.join(agentDir, name)),
+			false,
+			`migration aborted early: ${name} was left behind after the collision on ${colliding}`,
+		);
+		const moved = path.join(sessionDir, name);
+		assert.ok(existsSync(moved), `${name} should have been migrated to ${moved}`);
+		assert.equal(
+			readFileSync(moved, "utf8"),
+			contents.get(name),
+			`${name} must be migrated with its original content`,
+		);
+	}
+	assert.deepEqual(jsonlIn(sessionDir), [...later, colliding].sort(), "session dir should hold exactly one copy of every file");
+
+	// Repeated runs are idempotent: nothing is moved twice and nothing changes.
+	const beforeSecond = jsonlIn(sessionDir).map((name) => [name, readFileSync(path.join(sessionDir, name), "utf8")]);
+	await runMigration(agentDir);
+	const afterSecond = jsonlIn(sessionDir).map((name) => [name, readFileSync(path.join(sessionDir, name), "utf8")]);
+	assert.deepEqual(afterSecond, beforeSecond, "second migration run must not change the session directory");
+	assert.deepEqual(
+		jsonlIn(agentDir),
+		[colliding],
+		"second migration run must only leave the untouched colliding file behind",
+	);
+	assert.equal(
+		readFileSync(legacyPath, "utf8"),
+		contents.get(colliding),
+		"colliding file must stay untouched across repeated runs",
+	);
+}
+
+/* ------------------------------------------------------------------ */
+/* 2. Malformed and non-session headers stay untouched.                */
+/* ------------------------------------------------------------------ */
+{
+	const { agentDir, sessionDir } = makeCase("malformed-headers");
+
+	const broken = "this is not json at all\n";
+	const empty = "";
+	const notSession = `${JSON.stringify({ type: "message", cwd: LEGACY_CWD })}\n`;
+	const noCwd = `${JSON.stringify({ type: "session" })}\n`;
+	const files = new Map([
+		["broken.jsonl", broken],
+		["empty.jsonl", empty],
+		["not-session.jsonl", notSession],
+		["no-cwd.jsonl", noCwd],
+	]);
+	for (const [name, text] of files) writeFileSync(path.join(agentDir, name), text);
+
+	await runMigration(agentDir);
+	await runMigration(agentDir);
+
+	for (const [name, text] of files) {
+		assert.ok(existsSync(path.join(agentDir, name)), `${name} must remain in the agent dir`);
+		assert.equal(readFileSync(path.join(agentDir, name), "utf8"), text, `${name} must not be mutated or migrated`);
+	}
+	assert.deepEqual(jsonlIn(sessionDir), [], "malformed headers must not create session files");
+}
+
+/* ------------------------------------------------------------------ */
+/* 3. A collision-free batch migrates fully and is idempotent.         */
+/* ------------------------------------------------------------------ */
+{
+	const { agentDir, sessionDir } = makeCase("clean-batch");
+
+	const names = ["clean-1.jsonl", "clean-2.jsonl"];
+	const contents = new Map();
+	for (const [index, name] of names.entries()) {
+		const text = sessionJsonl(`clean-${index + 1}`, `clean-marker-${index + 1}`);
+		contents.set(name, text);
+		writeFileSync(path.join(agentDir, name), text);
+	}
+
+	await runMigration(agentDir);
+
+	assert.deepEqual(jsonlIn(agentDir), [], "every legacy session file should have been migrated");
+	assert.deepEqual(jsonlIn(sessionDir), [...names].sort(), "session dir should contain all migrated files");
+	for (const name of names) {
+		assert.equal(readFileSync(path.join(sessionDir, name), "utf8"), contents.get(name));
+	}
+
+	await runMigration(agentDir);
+	assert.deepEqual(jsonlIn(sessionDir), [...names].sort(), "idempotent rerun must not duplicate session files");
+	assert.deepEqual(jsonlIn(agentDir), [], "idempotent rerun must not resurrect legacy files");
+}
+
+/* 4. Collision on a file whose target directory already exists: the skip must   */
+/*    not delete or rename the pre-existing target either.                       */
+{
+	const { agentDir, sessionDir } = makeCase("collision-multi-cwd");
+
+	const otherCwd = "/srv/other-project";
+	const otherDirName = "--srv-other-project--";
+	const header = (id, cwd) => JSON.stringify({ type: "session", id, cwd });
+	const firstA = `${header("a", LEGACY_CWD)}\n${JSON.stringify({ marker: "a" })}\n`;
+	const firstB = `${header("b", LEGACY_CWD)}\n${JSON.stringify({ marker: "b" })}\n`;
+	const third = `${header("c", otherCwd)}\n${JSON.stringify({ marker: "c" })}\n`;
+
+	writeFileSync(path.join(agentDir, "batch-a.jsonl"), firstA);
+	writeFileSync(path.join(agentDir, "batch-b.jsonl"), firstB);
+	writeFileSync(path.join(agentDir, "batch-c.jsonl"), third);
+
+	const order = readdirSync(agentDir).filter((f) => f.endsWith(".jsonl"));
+	const colliding = order[0];
+	const existingCopy = `${header("kept", LEGACY_CWD)}\n${JSON.stringify({ marker: "kept" })}\n`;
+	mkdirSync(sessionDir, { recursive: true });
+	writeFileSync(path.join(sessionDir, colliding), existingCopy);
+
+	await runMigration(agentDir);
+
+	assert.deepEqual(
+		jsonlIn(path.join(agentDir, "sessions", otherDirName)),
+		["batch-c.jsonl"],
+		"files for other cwds must still migrate after a collision in the batch",
+	);
+	assert.deepEqual(jsonlIn(agentDir), [colliding], "only the colliding file may remain in the agent dir");
+	assert.equal(
+		readFileSync(path.join(sessionDir, colliding), "utf8"),
+		existingCopy,
+		"pre-existing target must be preserved byte-for-byte",
+	);
+}
+
+rmSync(tempRoot, { recursive: true, force: true });
+
+console.log("session-migration/retransfer regression: passed");

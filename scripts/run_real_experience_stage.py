@@ -16,6 +16,7 @@ def main() -> int:
     parser.add_argument("--stage", choices=("learn", "transfer", "correction", "retransfer"), required=True)
     parser.add_argument("--agent-command", required=True, help="command with an optional {workspace} token")
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument("--target-visibility", choices=("listed", "hidden"), default="hidden")
     parser.add_argument("--timeout", type=float, default=900)
     parser.add_argument("--allow-host-execution", action="store_true")
     args = parser.parse_args()
@@ -25,6 +26,7 @@ def main() -> int:
         agent_command=shlex.split(args.agent_command),
         allow_host_execution=args.allow_host_execution,
         timeout_seconds=args.timeout,
+        target_visibility=args.target_visibility,
     )
     result.update({"episode": args.episode, "stage": args.stage})
     args.output.parent.mkdir(parents=True, exist_ok=True)

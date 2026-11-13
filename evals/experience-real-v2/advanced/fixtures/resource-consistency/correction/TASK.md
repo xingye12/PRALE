@@ -7,15 +7,11 @@ Repository: `earendil-works/pi`
 
 Policy clarification: a trusted decision may grant access for this session without persisting consent. The resolver must run exactly once after an untrusted bootstrap; changing trust must actually reload project settings. Persist an extension decision only when remember is explicitly true. Both approval and denial must work without weakening bootstrap or mutating global configuration.
 
-Investigate the producer/consumer flow across these source modules; every listed module has an independent regression that must be repaired. Keep the existing APIs and unrelated behavior intact:
-
-- `packages/coding-agent/src/core/resource-loader.ts`
-- `packages/coding-agent/src/core/settings-manager.ts`
-- `packages/coding-agent/src/core/project-trust.ts`
+Locate the faulty production code by exploring the repository and tracing the incident across producer/consumer boundaries. Preserve existing APIs and unrelated behavior.
 
 ## Delivery and local validation
 
-Modify every listed production file, and add an executable `.prale-eval/regression.mjs`. It must load the submitted production modules and assert observable behavior across module boundaries. The read-only `.prale-eval/subject.mjs` helper links real local modules, with only external IO/provider boundaries faked. Node 24 is sufficient; no dependencies, network, credentials or deployment are needed.
+Apply the necessary production repairs, and add an executable `.prale-eval/regression.mjs`. It must load the submitted production modules and assert observable behavior across module boundaries. The read-only `.prale-eval/subject.mjs` helper provides `createGraph(root, modules, bindings, builtinOverrides, trailers)` and `loadModule(root, relativePath, bindings, trailer)`. Discover paths and symbols yourself, select the real modules to link, and supply your own boundary fakes. No task-specific adapters are supplied. Node 24 is sufficient; no dependencies, network, credentials or deployment are needed.
 
 Run `node --experimental-vm-modules .prale-eval/regression.mjs` from the workspace root. Use uncaught `node:assert/strict` assertions. The same script must pass the repair and detect the original regression in every source file when that file alone is restored to its faulty baseline. A crash, import error or timeout does not count as a detected regression. Do not use real time, randomness or external services as correctness evidence; control asynchronous ordering with promises.
 
@@ -23,4 +19,4 @@ Create local test inputs under `.prale-eval/` and clean them up so manual valida
 
 Write `.prale-eval/result.json` with `task_id` exactly `advanced/resource-consistency/correction`, `repository` = `earendil-works/pi`, `mode` = `repair`, and `validation` containing `command` = `node --experimental-vm-modules .prale-eval/regression.mjs`, `status` = `passed`, and substantive `notes`. Explain the cross-module fix in `.prale-eval/repair.md`.
 
-Only modify the listed source modules and add files under `.prale-eval/`. Do not modify TASK.md, subject.mjs, locks, Git configuration or harness files. Hidden oracles and mutation patches are not part of your workspace.
+Modify only production code needed for this incident and add tests under `.prale-eval/`. Do not modify TASK.md, subject.mjs, locks, Git configuration or harness files. Hidden oracles and mutation patches are not part of your workspace.

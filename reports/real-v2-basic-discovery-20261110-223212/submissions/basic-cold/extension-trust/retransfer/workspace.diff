@@ -1,0 +1,136 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 72decd8..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(true);
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..243e6aa
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,98 @@
++/**
++ * Regression: a denied project-trust decision must not be re-transferred into an
++ * approval on a fresh resource reload.
++ *
++ * Phase separation contract:
++ *  - bootstrap pass loads user/global and CLI resources only (project absent);
++ *  - after `resolveProjectTrust` returns false, project resources stay absent;
++ *  - after it returns true, project resources are available;
++ *  - user/global and CLI resources remain available in every phase.
++ *
++ * Exits 0 when the repaired loader preserves that contract and throws an
++ * assertion (non-zero exit) on the original fault, where a `false` decision was
++ * overwritten by `setProjectTrusted(true)`.
++ */
++import assert from 'node:assert/strict';
++import path from 'node:path';
++import { createTrustSubject } from './subject.mjs';
++
++const root = path.resolve(import.meta.dirname, '..');
++
++/** Extension basenames loaded by the real DefaultResourceLoader after a reload. */
++function loadedExtensionNames(loader) {
++	const result = loader.getExtensions();
++	assert.ok(result, 'loader must expose an extension result');
++	assert.ok(Array.isArray(result.extensions), 'extension result must contain an extensions array');
++	// Array.from keeps the array in this realm so strict deep-equal compares values only.
++	const names = Array.from(result.extensions, (extension) => path.basename(extension.path, '.ts'));
++	return names.sort();
++}
++
++function assertSameSet(actual, expected, message) {
++	assert.deepEqual(
++		actual,
++		[...expected].sort(),
++		`${message}: expected [${[...expected].sort().join(', ')}], got [${actual.join(', ')}]`,
++	);
++}
++
++// 1. Bootstrap phase separation: project resources are absent while the trust
++//    decision is being resolved, user/global and CLI are already available.
++{
++	const { loader } = await createTrustSubject(root, { initialTrusted: true });
++	let bootstrapNames;
++	await loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			bootstrapNames = Array.from(extensionsResult.extensions, (extension) =>
++				path.basename(extension.path, '.ts'),
++			).sort();
++			return false;
++		},
++	});
++	assertSameSet(bootstrapNames, ['cli', 'user'], 'bootstrap pass must not load project resources');
++}
++
++// 2. Denied decision: project resources stay absent after the reload completes,
++//    user/global and CLI remain available.
++{
++	const { loader, state } = await createTrustSubject(root, { initialTrusted: true });
++	await loader.reload({ resolveProjectTrust: async () => false });
++
++	const names = loadedExtensionNames(loader);
++	assert.ok(
++		!names.includes('project'),
++		`denied trust must keep project resources absent, got [${names.join(', ')}]`,
++	);
++	assertSameSet(names, ['cli', 'user'], 'denied trust must still load user/global and CLI resources');
++	assert.equal(state.trusted, false, 'denied trust decision must be persisted as untrusted');
++}
++
++// 3. Approved decision: project resources are available after the reload,
++//    together with user/global and CLI resources.
++{
++	const { loader, state } = await createTrustSubject(root, { initialTrusted: false });
++	await loader.reload({ resolveProjectTrust: async () => true });
++
++	assertSameSet(loadedExtensionNames(loader), ['cli', 'project', 'user'], 'approved trust must load project resources');
++	assert.equal(state.trusted, true, 'approved trust decision must be persisted as trusted');
++}
++
++// 4. A fresh reload after a denial must not re-transfer the denial into approval:
++//    the project trust state survives and project resources stay absent.
++{
++	const { loader, state } = await createTrustSubject(root, { initialTrusted: true });
++	await loader.reload({ resolveProjectTrust: async () => true });
++	assertSameSet(loadedExtensionNames(loader), ['cli', 'project', 'user'], 'approved trust must load project resources');
++
++	await loader.reload({ resolveProjectTrust: async () => false });
++	let names = loadedExtensionNames(loader);
++	assert.ok(!names.includes('project'), `fresh denied reload must not load project resources, got [${names.join(', ')}]`);
++	assertSameSet(names, ['cli', 'user'], 'fresh denied reload must keep user/global and CLI resources');
++	assert.equal(state.trusted, false, 'fresh denied reload must persist the denial');
++
++	// Plain reload without a trust callback preserves the denied state.
++	await loader.reload();
++	names = loadedExtensionNames(loader);
++	assert.ok(!names.includes('project'), `reload after denial must not load project resources, got [${names.join(', ')}]`);
++	assertSameSet(names, ['cli', 'user'], 'reload after denial must keep user/global and CLI resources');
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..ef632c0
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "extension-trust/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Root cause: DefaultResourceLoader.reload() discarded the result of options.resolveProjectTrust and unconditionally called settingsManager.setProjectTrusted(true). A denied trust decision therefore became an approval, so the final package resolve() included project resources and the loader exposed project extensions after a fresh reload. Fix: persist the decision (setProjectTrusted(projectTrusted)) so deny stays denied while approve still enables project resources; the bootstrap pass in loadProjectTrustExtensions() continues to force untrusted and is unchanged. .prale-eval/regression.mjs drives the real resource-loader.ts through .prale-eval/subject.mjs createTrustSubject with fs-backed package/extension boundary fakes and asserts: (1) the bootstrap pass exposes only user+cli extensions and no project extension; (2) after resolveProjectTrust returns false the loaded set is exactly cli+user with no project extension and state.trusted stays false; (3) after it returns true the set is cli+project+user and state.trusted is true; (4) a fresh reload that approves and is then denied drops project resources again, and a plain subsequent reload keeps them absent. Verified bidirectionally: with the original setProjectTrusted(true) line restored the script exits 1 with AssertionError 'denied trust must keep project resources absent, got [cli, project, user]'; with the fix it exits 0. Note: repo vitest suites could not be executed because node_modules/dependencies are not installed in this workspace and installing them was out of scope; validation is the dependency-free Node 24 regression above, which loads and executes the real production module."
++  }
++}
+snapshot .prale-eval/regression.mjs - 02be7043be5d5a204bc5b7a1cedb9d19807ec372d857316bc470d65d3dba0f52
+snapshot .prale-eval/result.json - 6323876037cd825d42f73bd19eff9b27a557617b4e72588ebb090113b545a753
+snapshot packages/coding-agent/src/core/resource-loader.ts 076fed822b4c7a151bb59becc911d376eab3ae0eecbc7ecbdf90b2adc827b22b 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

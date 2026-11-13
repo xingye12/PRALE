@@ -64,7 +64,12 @@ def build_report(results: Mapping[str, Any]) -> dict[str, Any]:
                 if observed
                 else None,
             }
-    return {"benchmark_id": "prale-experience-real-v2", "metadata": dict(metadata), "summary": summary, "runs": runs}
+    return {
+        "benchmark_id": metadata.get("benchmark_id", "prale-experience-real-v2"),
+        "metadata": dict(metadata),
+        "summary": summary,
+        "runs": runs,
+    }
 
 
 def main() -> int:

@@ -1,0 +1,50 @@
+{
+  "task_id": "extension-trust/learn",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "claim": {
+    "summary": "DefaultResourceLoader.loadProjectTrustExtensions() must force the settings manager into the untrusted project state (and reload settings in that state) before resolving packages and loading extensions, so project-local extensions can never execute during the trust-bootstrap pass, even when the previous trust state was trusted; user/global and temporary CLI extensions must still load.",
+    "citations": [
+      {
+        "file": "packages/coding-agent/src/core/resource-loader.ts",
+        "line": 435,
+        "symbol": "DefaultResourceLoader.loadProjectTrustExtensions",
+        "note": "Bootstrap pass: previously called this.settingsManager.setProjectTrusted(true), leaving (or escalating to) the trusted state, so project settings/packages/extensions leaked into the pre-trust extension set. Now forces setProjectTrusted(false) before reload() and the extension resolution pass."
+      },
+      {
+        "file": "packages/coding-agent/src/core/resource-loader.ts",
+        "line": 443,
+        "symbol": "DefaultResourceLoader.reload",
+        "note": "Calls loadProjectTrustExtensions() before invoking options.resolveProjectTrust, so the bootstrap extension set is what the user's trust decision is based on; project extensions are only added by the later loadFinalExtensionSet pass once trust is granted."
+      },
+      {
+        "file": "packages/coding-agent/src/core/settings-manager.ts",
+        "line": 514,
+        "symbol": "SettingsManager.setProjectTrusted",
+        "note": "Semantics relied on: setting the same trust value is a no-op, false drops project settings from the effective settings (and blocks project writes); this is why forcing untrusted must happen explicitly rather than assuming a prior false state."
+      },
+      {
+        "file": "packages/coding-agent/src/core/settings-manager.ts",
+        "line": 539,
+        "symbol": "SettingsManager.reload",
+        "note": "reload() re-reads project settings using the current projectTrusted flag, so forcing untrusted must occur before reload for project settings to be excluded."
+      },
+      {
+        "file": "packages/coding-agent/test/resource-loader.test.ts",
+        "line": 273,
+        "symbol": "should load user extensions before trust and reuse them after trust resolves",
+        "note": "Existing intent test: the pre-trust extension set contains only the user/global extension, and the project extension appears only after trust resolves."
+      }
+    ]
+  },
+  "deliverables": [
+    "packages/coding-agent/src/core/resource-loader.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/result.json"
+  ],
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Standalone Node 24 script (verified on v24.14.0) with no installed dependencies and no network. It loads the real production module packages/coding-agent/src/core/resource-loader.ts via .prale-eval/subject.mjs loadModule() and supplies its own boundary fakes for chalk, path/paths helpers, the event bus, the extension loader, footer-data-provider, package-manager, prompt-templates, skills, source-info and timings. FakePackageManager models real behavior by deriving package extension lists from the fake SettingsManager's effective settings, so project extensions only surface while the project is trusted. Scenario 1 (previous state trusted, calls loadProjectTrustExtensions directly): asserts the bootstrap loads only the CLI and user/global extensions, never the project extension, that setProjectTrusted(false) is issued before the first settings reload, that the first reload happens with trusted=false, and that every package-resolution pass in the bootstrap observes an untrusted project. Scenario 2 (full reload with a resolveProjectTrust hook from a previously trusted state): asserts the callback sees an untrusted settings manager and an extension set of exactly [cli, global], then that the project extension is loaded by the final pass once trust is granted, with user/global and CLI extensions still present. Scenario 3 (previous state untrusted) asserts the bootstrap never escalates trust. Result: exits 0 on the repaired code. Replaying the same script against the original fault (setProjectTrusted(true)) exits 1 with 'AssertionError: trust bootstrap must load only CLI and user/global extensions, got [global-ext.ts, cli-ext.ts, project-ext.ts]'. Limitation recorded: the repository's own vitest suite (packages/coding-agent/test/resource-loader.test.ts, including 'should load user extensions before trust and reuse them after trust resolves') could not be run because node_modules is not installed in this sandbox and installing dependencies is out of scope; the standalone regression substitutes for it by exercising the same production code path with faked collaborators."
+  }
+}

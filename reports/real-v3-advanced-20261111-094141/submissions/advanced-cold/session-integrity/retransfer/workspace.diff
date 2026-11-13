@@ -1,0 +1,590 @@
+diff --git a/packages/coding-agent/src/core/session-manager.ts b/packages/coding-agent/src/core/session-manager.ts
+index 7398591..6866955 100644
+--- a/packages/coding-agent/src/core/session-manager.ts
++++ b/packages/coding-agent/src/core/session-manager.ts
+@@ -295,6 +295,8 @@ function migrateV1ToV2(entries: FileEntry[]): void {
+ 		}
+ 
+ 		entry.id = generateId(ids);
++		// Remember minted ids so a colliding generator result cannot reuse an earlier entry's id.
++		ids.add(entry.id);
+ 		entry.parentId = prevId;
+ 		prevId = entry.id;
+ 
+@@ -652,7 +654,9 @@ export function loadEntriesFromFile(filePath: string): FileEntry[] {
+ 		}
+ 
+ 		pending += decoder.end();
++		// The last line may lack a trailing newline; keep that record, then repair the file below.
+ 		const finalEntry = parseSessionEntryLine(pending);
++		if (finalEntry) entries.push(finalEntry);
+ 	} finally {
+ 		closeSync(fd);
+ 	}
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..9302f48
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,425 @@
++/**
++ * Cross-module regression for "resume a mixed legacy batch without dropping its tail".
++ *
++ * Real production modules linked by this script (no copies, no adapters):
++ *   - packages/coding-agent/src/core/session-manager.ts   (JSONL session reader/producer)
++ *   - packages/coding-agent/src/core/messages.ts          (context message construction)
++ *   - packages/coding-agent/src/utils/paths.ts            (path normalization boundary)
++ *
++ * Boundary fakes supplied by this script:
++ *   - `../config.ts` exports (APP_NAME/getAgentDir/getSessionsDir)
++ *   - `@earendil-works/pi-ai` exports (uuidv7 + getCurrentSystemMessage)
++ *   - `./child-process.ts` (spawnProcessSync, only used by unrelated paths helpers)
++ *   - `crypto.randomUUID` (scripted id generator, so id collisions are deterministic)
++ *   - the `Date` global inside the module graph (a fixed clock, so no real time participates)
++ *
++ * Run from the workspace root:
++ *   node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import * as fs from "node:fs";
++import * as path from "node:path";
++import { createGraph } from "./subject.mjs";
++
++const root = process.cwd();
++const tmp = path.join(root, ".prale-eval", "tmp");
++
++const SESSION_MANAGER = "packages/coding-agent/src/core/session-manager.ts";
++const MESSAGES = "packages/coding-agent/src/core/messages.ts";
++const PATHS = "packages/coding-agent/src/utils/paths.ts";
++
++const HEADER_TS = "2026-01-02T03:04:05.678Z";
++const CLOCK_START = Date.parse(HEADER_TS);
++
++/** Deterministic clock shared with the module graph; no real time is read. */
++const clock = { now: CLOCK_START };
++
++/** Session ids handed to SessionManager.newSession()/createBranchedSession(). */
++let sessionIdCounter = 0;
++function nextSessionId() {
++	sessionIdCounter += 1;
++	return `session-${sessionIdCounter}`;
++}
++// The module graph reaches the fake clock through this binding object.
++const uuidv7 = () => nextSessionId();
++uuidv7.clock = clock;
++
++/** Scripted `crypto.randomUUID` queue, consumed by the legacy id generator. */
++let randomUuids = [];
++function randomUUID() {
++	return randomUuids.length > 0 ? randomUuids.shift() : "ffffffff-0000-4000-8000-000000000000";
++}
++
++const dateTrailer = `
++;{
++\tconst RealDate = Date;
++\tconst fakeClock = uuidv7.clock;
++\tclass FixedDate extends RealDate {
++\t\tconstructor(...args) {
++\t\t\tif (args.length === 0) super(fakeClock.now);
++\t\t\telse super(...args);
++\t\t}
++\t\tstatic now() {
++\t\t\treturn fakeClock.now;
++\t\t}
++\t}
++\tglobalThis.Date = FixedDate;
++}
++`;
++
++function removeTree(target) {
++	fs.rmSync(target, { recursive: true, force: true });
++}
++
++function headerLine(id, cwd, version) {
++	const header = { type: "session", id, timestamp: HEADER_TS, cwd };
++	if (version !== undefined) header.version = version;
++	return JSON.stringify(header);
++}
++
++function messageLine(id, text, parentId = null, timestamp = HEADER_TS) {
++	return JSON.stringify({
++		type: "message",
++		id,
++		parentId,
++		timestamp,
++		message: { role: "user", content: [{ type: "text", text }], timestamp: CLOCK_START },
++	});
++}
++
++function readLines(file) {
++	return fs.readFileSync(file, "utf8").split("\n").filter((line) => line.trim() !== "");
++}
++
++function parsedRecords(file) {
++	return readLines(file).map((line) => JSON.parse(line));
++}
++
++function textOf(entry) {
++	return list(entry.message.content)
++		.map((part) => part.text)
++		.join("");
++}
++
++/** Cross-realm values (created inside the module graph) are copied into host collections. */
++function list(value) {
++	return Array.from(value);
++}
++
++/** Plain structural copy of a cross-realm value, for strict deep comparison. */
++function plain(value) {
++	return JSON.parse(JSON.stringify(value));
++}
++
++async function loadModules() {
++	const graph = createGraph(
++		root,
++		[SESSION_MANAGER, MESSAGES, PATHS],
++		{
++			APP_NAME: "pi",
++			getAgentDir: () => path.join(tmp, "agent"),
++			getSessionsDir: () => path.join(tmp, "sessions-root"),
++			spawnProcessSync: () => {
++				throw new Error("Unexpected boundary: child-process");
++			},
++			getCurrentSystemMessage: () => undefined,
++			uuidv7,
++		},
++		{ [SESSION_MANAGER]: { randomUUID } },
++		{ [SESSION_MANAGER]: dateTrailer },
++	);
++	return {
++		sessionManager: await graph.module(SESSION_MANAGER),
++		messages: await graph.module(MESSAGES),
++		paths: await graph.module(PATHS),
++	};
++}
++
++function assertReadableMessages(modules) {
++	// messages.ts is real linked code: it must be reachable from the session-manager boundary.
++	assert.equal(typeof modules.messages.createCustomMessage, "function");
++	assert.equal(modules.messages.createBranchSummaryMessage("summary", null, HEADER_TS).role, "branchSummary");
++}
++
++async function main() {
++	removeTree(tmp);
++	fs.mkdirSync(tmp, { recursive: true });
++
++	const modules = await loadModules();
++	const { SessionManager, loadEntriesFromFile, migrateSessionEntries } = modules.sessionManager;
++	assert.equal(typeof SessionManager, "function");
++	assert.equal(typeof loadEntriesFromFile, "function");
++	assert.equal(typeof modules.paths.resolvePath, "function");
++	assertReadableMessages(modules);
++
++	await testReadsTailRecordExactlyOnce(loadEntriesFromFile);
++	await testSkipsMalformedLinesAndKeepsUnicodeOrder(loadEntriesFromFile);
++	await testResumeRepairsTailBeforeAppending(modules);
++	await testBatchTransferWithCollision(modules);
++	await testLegacyBatchMigration(modules, migrateSessionEntries);
++}
++
++/** Reading a file whose last record has no newline keeps it exactly once, then appends one. */
++async function testReadsTailRecordExactlyOnce(loadEntriesFromFile) {
++	const dir = path.join(tmp, "read");
++	fs.mkdirSync(dir, { recursive: true });
++	const file = path.join(dir, "tail.jsonl");
++	const content = [headerLine("tail", dir, 3), messageLine("entry-1", "first", null)].join("\n") + "\n";
++	// The valid final record is deliberately not newline terminated.
++	const unterminated = `${content}${messageLine("entry-2", "second", "entry-1")}`;
++	fs.writeFileSync(file, unterminated);
++
++	const entries = loadEntriesFromFile(file);
++	assert.equal(entries.length, 3, "the unterminated final record must not be dropped");
++	assert.deepEqual(
++		list(entries).map((entry) => entry.type),
++		["session", "message", "message"],
++	);
++	assert.equal(entries[2].id, "entry-2");
++	assert.equal(entries[2].parentId, "entry-1");
++	assert.equal(textOf(entries[2]), "second");
++
++	// The repair appends exactly one newline after the retained record.
++	assert.equal(fs.readFileSync(file, "utf8"), `${unterminated}\n`);
++	const records = parsedRecords(file);
++	assert.equal(records.filter((record) => record.id === "entry-2").length, 1, "final record appears exactly once");
++
++	// Re-reading is idempotent: same entries, same bytes, no duplicated record and no extra newline.
++	const reread = loadEntriesFromFile(file);
++	assert.deepEqual(
++		list(reread).map((entry) => entry.id),
++		["tail", "entry-1", "entry-2"],
++	);
++	assert.equal(fs.readFileSync(file, "utf8"), `${unterminated}\n`);
++}
++
++/** Malformed lines are skipped and Unicode payloads keep file order. */
++async function testSkipsMalformedLinesAndKeepsUnicodeOrder(loadEntriesFromFile) {
++	const dir = path.join(tmp, "mixed");
++	fs.mkdirSync(dir, { recursive: true });
++	const file = path.join(dir, "mixed.jsonl");
++	const payloads = ["héllo 🙂", "終わり", "z\u0301-last"];
++	const content =
++		`${headerLine("mixed", dir, 3)}\n` +
++		"not json at all\n" +
++		`${messageLine("entry-1", payloads[0], null)}\n` +
++		'{"type":"message","id":"broken"\n' +
++		`${messageLine("entry-2", payloads[1], "entry-1")}\n` +
++		`${messageLine("entry-3", payloads[2], "entry-2")}`;
++	fs.writeFileSync(file, content);
++
++	const entries = loadEntriesFromFile(file);
++	assert.deepEqual(
++		list(entries).map((entry) => entry.id),
++		["mixed", "entry-1", "entry-2", "entry-3"],
++		"malformed lines must be skipped without losing ordered records",
++	);
++	assert.deepEqual(
++		list(entries).slice(1).map(textOf),
++		payloads,
++		"Unicode payloads must be preserved in file order",
++	);
++	assert.equal(fs.readFileSync(file, "utf8"), `${content}\n`);
++}
++
++/** Resuming repairs the tail first, so the next appended record starts on its own line. */
++async function testResumeRepairsTailBeforeAppending(modules) {
++	const { SessionManager } = modules.sessionManager;
++	const dir = path.join(tmp, "resume");
++	fs.mkdirSync(dir, { recursive: true });
++	const file = path.join(dir, "resume.jsonl");
++	const content =
++		`${headerLine("resume", dir, 3)}\n` +
++		`${messageLine("entry-1", "retained", null)}\n` +
++		`${messageLine("entry-2", "tail", "entry-1")}`;
++	fs.writeFileSync(file, content);
++
++	const session = SessionManager.open(file, dir);
++	assert.deepEqual(
++		list(session.getEntries()).map((entry) => entry.id),
++		["entry-1", "entry-2"],
++		"resume must keep the tail entry",
++	);
++	assert.equal(session.getLeafId(), "entry-2");
++
++	const appendedId = session.appendMessage({
++		role: "user",
++		content: [{ type: "text", text: "appended" }],
++		timestamp: CLOCK_START,
++	});
++
++	// Every physical line must remain parseable: the retained tail was not merged into the append.
++	const records = parsedRecords(file);
++	assert.deepEqual(
++		records.map((record) => record.id),
++		["resume", "entry-1", "entry-2", appendedId],
++	);
++	assert.equal(records.filter((record) => record.id === "entry-2").length, 1);
++	assert.ok(fs.readFileSync(file, "utf8").endsWith("\n"), "appends must stay newline terminated");
++
++	// A fresh resume observes the appended record exactly once, in order.
++	const resumed = SessionManager.open(file, dir);
++	assert.deepEqual(
++		list(resumed.getEntries()).map((entry) => entry.id),
++		["entry-1", "entry-2", appendedId],
++	);
++}
++
++/**
++ * A batch is transferred one source at a time. The first transfer collides with an existing
++ * destination, which must leave both files byte-identical and must not stop later transfers;
++ * the last source ends with an unterminated record that must survive the transfer.
++ */
++async function testBatchTransferWithCollision(modules) {
++	const { SessionManager } = modules.sessionManager;
++	const base = path.join(tmp, "batch");
++	const sources = path.join(base, "sources");
++	const destination = path.join(base, "destination");
++	const batchCwd = path.join(base, "project");
++	for (const dir of [sources, destination, batchCwd]) fs.mkdirSync(dir, { recursive: true });
++
++	// Source 1: collides with an existing destination session of the same id and timestamp.
++	const collisionSource = path.join(sources, "collision.jsonl");
++	const collisionContent = `${headerLine("collision", batchCwd, 3)}\n${messageLine("collision-1", "kept", null)}\n`;
++	fs.writeFileSync(collisionSource, collisionContent);
++
++	// Source 2: valid session whose last JSONL record has no newline.
++	const tailSource = path.join(sources, "tail.jsonl");
++	const tailContent =
++		`${headerLine("tail-batch", batchCwd, 3)}\n` +
++		`${messageLine("tail-1", "first", null)}\n` +
++		`${messageLine("tail-2", "last", "tail-1")}`;
++	fs.writeFileSync(tailSource, tailContent);
++
++	const transfers = [
++		{ id: "collision", source: collisionSource, collides: true },
++		{ id: "tail-batch", source: tailSource, collides: false },
++	];
++
++	// Pre-create the exact destination file the first transfer targets, forcing a collision.
++	const collisionTimestamp = new Date(clock.now).toISOString().replace(/[:.]/g, "-");
++	const collisionDestination = path.join(destination, `${collisionTimestamp}_collision.jsonl`);
++	const collisionDestinationContent = `${headerLine("collision", batchCwd, 3)}\n${messageLine("stored-1", "existing", null)}\n`;
++	fs.writeFileSync(collisionDestination, collisionDestinationContent);
++
++	const outcomes = [];
++	for (const transfer of transfers) {
++		try {
++			const forked = SessionManager.forkFrom(transfer.source, batchCwd, destination, { id: transfer.id });
++			outcomes.push({ id: transfer.id, ok: true, sessionFile: forked.getSessionFile(), forked });
++		} catch (error) {
++			outcomes.push({ id: transfer.id, ok: false, error });
++		}
++		clock.now += 1_000; // fixed step; no real time participates
++	}
++
++	// The collision is reported rather than overwriting, and it did not stop later transfers.
++	assert.equal(outcomes[0].ok, false, "a colliding transfer must fail instead of overwriting");
++	assert.match(String(outcomes[0].error && outcomes[0].error.message), /EEXIST|exist/i);
++	assert.equal(outcomes[1].ok, true, "later transfers must still run after a collision");
++
++	// Colliding source and destination bytes are untouched.
++	assert.equal(fs.readFileSync(collisionSource, "utf8"), collisionContent);
++	assert.equal(fs.readFileSync(collisionDestination, "utf8"), collisionDestinationContent);
++
++	// The colliding destination is not reused by the later transfer.
++	assert.notEqual(outcomes[1].sessionFile, collisionDestination);
++	assert.equal(list(outcomes[1].forked.getEntries()).length, 2);
++
++	// The tail transfer keeps the unterminated final record exactly once and terminates the file.
++	assert.equal(
++		fs.readFileSync(tailSource, "utf8"),
++		`${tailContent}\n`,
++		"reading the source repairs exactly one missing newline",
++	);
++	const tailDestination = outcomes[1].sessionFile;
++	const tailRecords = parsedRecords(tailDestination);
++	assert.deepEqual(
++		tailRecords.map((record) => record.id),
++		["tail-batch", "tail-1", "tail-2"],
++		"the transferred session must retain its final record exactly once",
++	);
++	assert.ok(fs.readFileSync(tailDestination, "utf8").endsWith("\n"));
++
++	// Re-reading the resulting file across the module boundary is idempotent.
++	const before = fs.readFileSync(tailDestination, "utf8");
++	const reopened = SessionManager.open(tailDestination, destination);
++	assert.deepEqual(
++		list(reopened.getEntries()).map((entry) => entry.id),
++		["tail-1", "tail-2"],
++	);
++	assert.equal(fs.readFileSync(tailDestination, "utf8"), before);
++}
++
++/**
++ * The mixed legacy half of the batch: files without ids are migrated when they are opened, and a
++ * colliding id generator result must not stop later entries from migrating.
++ */
++async function testLegacyBatchMigration(modules, migrateSessionEntries) {
++	const { SessionManager } = modules.sessionManager;
++	const dir = path.join(tmp, "legacy-batch");
++	fs.mkdirSync(dir, { recursive: true });
++
++	const payloads = ["legacy hé漢字", "legacy 🙂 end"];
++	const file = path.join(dir, "legacy.jsonl");
++	const malformed = "oops not json";
++	const content =
++		`${headerLine("legacy", dir)}\n` +
++		`${malformed}\n` +
++		JSON.stringify({ type: "message", timestamp: HEADER_TS, message: { role: "user", content: payloads[0], timestamp: CLOCK_START } }) +
++		"\n" +
++		JSON.stringify({ type: "message", timestamp: HEADER_TS, message: { role: "user", content: payloads[1], timestamp: CLOCK_START } });
++	fs.writeFileSync(file, content);
++
++	randomUuids = [
++		"aaaaaaaa-0000-4000-8000-000000000001",
++		"aaaaaaaa-0000-4000-8000-000000000002",
++		"bbbbbbbb-0000-4000-8000-000000000003",
++	];
++	const session = SessionManager.open(file, dir);
++	const migrated = list(session.getEntries());
++	assert.equal(migrated.length, 2, "malformed lines are skipped and valid records are kept");
++	assert.deepEqual(migrated.map((entry) => plain(entry.message.content)), payloads);
++	assert.equal(session.getHeader().version, 3);
++	assert.equal(new Set(migrated.map((entry) => entry.id)).size, migrated.length, "colliding ids must be retried");
++	assert.deepEqual(
++		migrated.map((entry) => entry.parentId),
++		[null, migrated[0].id],
++		"later entries must still migrate after a collision",
++	);
++	for (const entry of migrated) assert.equal(entry.id.length, 8);
++
++	// The migrated file keeps every record exactly once and is newline terminated.
++	const records = parsedRecords(file);
++	assert.equal(records.filter((record) => record.type === "session").length, 1);
++	assert.deepEqual(records.slice(1).map((record) => record.id), migrated.map((entry) => entry.id));
++	assert.ok(fs.readFileSync(file, "utf8").endsWith("\n"));
++	randomUuids = [];
++
++	// The exported migration helper is the same production path.
++	const entries = [
++		{ type: "session", id: "colliding", timestamp: HEADER_TS, cwd: dir },
++		{ type: "message", timestamp: HEADER_TS, message: { role: "user", content: "one", timestamp: CLOCK_START } },
++		{ type: "message", timestamp: HEADER_TS, message: { role: "user", content: "two", timestamp: CLOCK_START } },
++	];
++	randomUuids = [
++		"aaaaaaaa-0000-4000-8000-000000000001",
++		"aaaaaaaa-0000-4000-8000-000000000002",
++		"cccccccc-0000-4000-8000-000000000003",
++	];
++	migrateSessionEntries(entries);
++	assert.equal(entries[0].version, 3);
++	assert.equal(new Set(entries.slice(1).map((entry) => entry.id)).size, 2);
++	assert.deepEqual(
++		entries.slice(1).map((entry) => entry.parentId),
++		[null, entries[1].id],
++	);
++	randomUuids = [];
++}
++
++try {
++	await main();
++	console.log("regression: ok");
++} finally {
++	removeTree(tmp);
++}
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..f0b5949
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,104 @@
++# Repair: resume a mixed legacy batch without dropping its tail
++
++Task: `advanced/session-integrity/retransfer`
++Repository: `earendil-works/pi`
++Mode: `repair`
++
++## Incident
++
++A batch of session JSONL files is resumed/transferred one file at a time. The batch starts with a
++file whose transfer target already exists (a collision) and ends with a valid session whose last
++JSONL record has no trailing newline. Two defects made that batch lossy:
++
++1. **The tail record was dropped.** `loadEntriesFromFile()` decoded the file, parsed the final,
++   newline-less fragment into `finalEntry`, and then threw it away: the variable was never used, so
++   the record vanished from the returned entries while `appendFileSync(file, "\n")` still repaired
++   the file. The record was therefore unrecoverable after the repair — the classic "dropped tail".
++2. **A colliding id silently stopped the legacy migration from being collision-checked.**
++   `migrateV1ToV2()` declared a `Set<string>` of already-minted ids and passed it to
++   `generateId()` (documented as "8 hex chars, collision-checked"), but never added the minted ids to
++   it. A generator that returns an id already used by an earlier entry of the same batch produced
++   two entries with the same id, so the tree index (`byId`) lost a node and later records were
++   re-chained onto an ambiguous parent.
++
++## Production changes (only `packages/coding-agent/src/core/session-manager.ts`)
++
++### `loadEntriesFromFile()` — keep the final record exactly once
++
++```ts
++pending += decoder.end();
++// The last line may lack a trailing newline; keep that record, then repair the file below.
++const finalEntry = parseSessionEntryLine(pending);
++if (finalEntry) entries.push(finalEntry);
++```
++
++Ordering matters and is preserved:
++
++* the fragment is parsed and pushed **before** the header validation, so a file whose only record is
++  an unterminated header is still recognized as a session (and then repaired);
++* the malformed-fragment and non-session cases still return without touching the file, because
++  `parseSessionEntryLine()` returns `null` for unparsable input and the header check still runs
++  before `appendFileSync()`;
++* the newline repair (`if (pending) appendFileSync(...)`) is unchanged, so the record is retained
++  **once** and the file ends with exactly one newline. A second read returns the same entries and
++  leaves the bytes untouched (idempotent re-read), and a subsequent append starts on its own line
++  instead of being glued onto the unterminated record.
++
++### `migrateV1ToV2()` — remember minted ids
++
++```ts
++entry.id = generateId(ids);
++// Remember minted ids so a colliding generator result cannot reuse an earlier entry's id.
++ids.add(entry.id);
++```
++
++With the id recorded, `generateId()` retries on a collision (up to 100 attempts, full-UUID fallback
++unchanged) so the id-collision at the start of a legacy batch no longer derails or corrupts the
++remaining legacy entries: every entry keeps a unique id and a parent chain that points at the
++remapped id of the previous entry.
++
++Public APIs, error messages, file formats and all unrelated behaviour are untouched; both edits are
++inside existing functions.
++
++## Cross-module behaviour verified by `.prale-eval/regression.mjs`
++
++The script links the real production modules through `.prale-eval/subject.mjs`
++(`createGraph`), so the reader, the migration and the transfer path all run as submitted code:
++
++* `packages/coding-agent/src/core/session-manager.ts` — reader/repair, resume, migration, transfer
++* `packages/coding-agent/src/core/messages.ts` — context message construction (linked, asserted)
++* `packages/coding-agent/src/utils/paths.ts` — path normalization used by the session layer
++
++Boundary fakes supplied by the script: the `../config.ts` exports, the `@earendil-works/pi-ai`
++exports (`uuidv7`, `getCurrentSystemMessage`), `./child-process.ts` (`spawnProcessSync`),
++`crypto.randomUUID` (a scripted id generator, so collisions are deterministic) and the `Date` global
++inside the module graph (a fixed clock, so no real time is read). Temporary inputs are created under
++`.prale-eval/tmp` and removed by the script.
++
++Asserted observable behaviour:
++
++1. Reading a session whose last record has no newline keeps that record exactly once and appends one
++   newline; re-reading is idempotent (same entries, same bytes).
++2. Malformed lines are skipped while ordered Unicode payloads survive in file order.
++3. Resuming such a file (producer → consumer boundary) repairs the tail before any append, so the
++   next appended record is not merged into the unterminated line and stays a separate, parseable
++   record.
++4. In a batch transfer, the colliding transfer fails instead of overwriting: the colliding source
++   bytes **and** the existing destination bytes are unchanged, and the later transfers still run.
++   The last transfer keeps the source's unterminated final record exactly once in the resulting file.
++5. Legacy migration assigns unique ids and re-chains parents even when the id generator collides,
++   and the migrated file keeps every record exactly once with a terminating newline.
++
++Regression detection was checked by temporarily restoring each defect on its own: with the dropped
++`finalEntry` push the script fails at "the unterminated final record must not be dropped"
++(`2 !== 3`); with the missing `ids.add()` it fails at "colliding ids must be retried" (`1 !== 2`).
++Both are plain assertion failures, not import errors or crashes.
++
++## Limitations
++
++`vitest` and the repository's Node dependencies are not installed in this workspace, so the
++repository's own TypeScript test files (for example
++`packages/coding-agent/test/session-manager/file-operations.test.ts`, whose
++"adds a newline after an unterminated valid record" case covers the same incident) could not be
++executed here. They are the same expectations asserted behaviourally by
++`.prale-eval/regression.mjs`, which runs with Node 24 alone.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..f6d11ad
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,16 @@
++{
++  "task_id": "advanced/session-integrity/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired packages/coding-agent/src/core/session-manager.ts in two places. (1) loadEntriesFromFile(): the parsed final newline-less record (finalEntry) was computed and discarded, so resuming a session dropped its tail while the file was still repaired with appendFileSync('\\n'); the record is now pushed before the header validation so it is retained exactly once, malformed fragments are still ignored, non-session files are still left untouched, and the single newline repair plus a later append no longer merge records. (2) migrateV1ToV2(): the collision-check Set passed to generateId() was never populated, so a duplicate generator result produced duplicate entry ids and a broken parent chain; minted ids are now recorded so generateId() retries. .prale-eval/regression.mjs links the real modules session-manager.ts, core/messages.ts and utils/paths.ts via subject.mjs createGraph and supplies its own boundary fakes (config exports, pi-ai uuidv7/getCurrentSystemMessage, child-process spawnProcessSync, a scripted crypto.randomUUID, and a fixed Date clock inside the module graph), so no real time or randomness is correctness evidence; temp files live in .prale-eval/tmp and are removed by the script. It asserts: tail record retained exactly once plus one appended newline; idempotent re-read with unchanged bytes; malformed-line skipping; ordered Unicode payloads; resume repairs the tail before appending so the next record stays parseable; a colliding batch transfer fails without touching the colliding source or the existing destination bytes while later transfers still run and retain the unterminated tail exactly once; legacy migration keeps unique ids and valid parents under a colliding id generator. Verified detection by restoring each defect alone: dropped finalEntry push fails at 'the unterminated final record must not be dropped' (2 !== 3) and missing ids.add() fails at 'colliding ids must be retried' (1 !== 2), both as plain node:assert/strict failures rather than crashes or import errors. Limitation: vitest and the repository's other Node dependencies are not installed in this workspace, so the repository's own TypeScript tests (e.g. packages/coding-agent/test/session-manager/file-operations.test.ts) could not be executed; they cover the same expectations behaviourally."
++  },
++  "deliverables": [
++    ".prale-eval/regression.mjs",
++    ".prale-eval/repair.md",
++    ".prale-eval/result.json",
++    "packages/coding-agent/src/core/session-manager.ts"
++  ]
++}
+snapshot .prale-eval/regression.mjs - 174d613516f27c7f6f739b6f4830bd3d0b5983efb83fc207bb589f0e9e06733b
+snapshot .prale-eval/repair.md - 2da02feed15d598574fa5d3a2bcbf91afadf2db242226f87fb1f56e54c6587b9
+snapshot .prale-eval/result.json - 9444803a4f2eee9a34492485fb4bee6e1c93e31c39fe88b1d46474bf851bb095
+snapshot packages/coding-agent/src/core/session-manager.ts 499417b1c261a898492a235145b5bec38541b94e9da4609014a67d12a15f06b9 a8d8a45977d957712285ff31f8ae3f569008252774f6523014ced3f9de1fcb51

@@ -1,0 +1,490 @@
+diff --git a/packages/coding-agent/src/core/session-manager.ts b/packages/coding-agent/src/core/session-manager.ts
+index 48c6099..86d3143 100644
+--- a/packages/coding-agent/src/core/session-manager.ts
++++ b/packages/coding-agent/src/core/session-manager.ts
+@@ -585,11 +585,17 @@ export function buildSessionContext(
+ /**
+  * Compute the default session directory for a cwd.
+  * Encodes cwd into a safe directory name under ~/.pi/agent/sessions/.
++ *
++ * The encoding is a shared contract with the legacy session migration
++ * (see migrations.ts) and the agent session repo: drop one leading separator,
++ * then replace every `/`, `\` and `:` with `-`. Backslashes and colons must be
++ * encoded even though this runs on POSIX, because a POSIX cwd may legitimately
++ * contain Windows-style path fragments.
+  */
+ function getDefaultSessionDirPath(cwd: string, agentDir: string = getDefaultAgentDir()): string {
+ 	const resolvedCwd = resolvePath(cwd);
+ 	const resolvedAgentDir = resolvePath(agentDir);
+-	const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\]/g, "-")}--`;
++	const safePath = `--${resolvedCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+ 	return join(resolvedAgentDir, "sessions", safePath);
+ }
+ 
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index 33ec276..911ea69 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -108,8 +108,10 @@ export function migrateSessionsFromAgentRoot(): void {
+ 
+ 			const cwd: string = header.cwd;
+ 
+-			// Compute the correct session directory (same encoding as session-manager.ts)
+-			const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/:]/g, "-")}--`;
++			// Compute the correct session directory. This must stay byte-identical to
++			// getDefaultSessionDirPath() in core/session-manager.ts, i.e. drop one
++			// leading separator and replace every `/`, `\` and `:` with `-`.
++			const safePath = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+ 			const correctDir = join(agentDir, "sessions", safePath);
+ 
+ 			// Create directory if needed
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100755
+index 0000000..0c2b85a
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,328 @@
++#!/usr/bin/env node
++/**
++ * Regression for `advanced/session-integrity/transfer`.
++ *
++ * Incident: the legacy session migration (packages/coding-agent/src/migrations.ts)
++ * moved `~/.pi/agent/*.jsonl` files into a directory that the session manager
++ * (packages/coding-agent/src/core/session-manager.ts) never looks at, because the
++ * two sides disagreed about how a cwd is encoded into a session directory name.
++ *
++ * The observable contract is: `<agentDir>/sessions/--<cwd with one leading
++ * separator dropped and every "/", "\" and ":" replaced by "-">--`. It has to hold
++ * for absolute POSIX cwds, including ones that embed Windows-style fragments
++ * (backslashes and drive letters) inside an otherwise absolute POSIX path.
++ *
++ * This script links the real production modules (migration producer + session
++ * manager reader) through the read-only subject helper, drives the real
++ * filesystem in a scratch directory under `.prale-eval/`, and asserts:
++ *   1. both modules agree on the encoded directory for slash/backslash/colon cwds,
++ *   2. migration output is discoverable by the real reader (list/continueRecent),
++ *   3. Unicode text, entry order and file bytes survive the move,
++ *   4. malformed lines are skipped without losing valid entries,
++ *   5. a colliding target is never overwritten and re-running migration is a no-op.
++ *
++ * Run with: node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import * as fs from "node:fs";
++import * as path from "node:path";
++import { createGraph } from "./subject.mjs";
++
++const WORKSPACE = path.resolve(import.meta.dirname, "..");
++const EVAL_DIR = path.join(WORKSPACE, ".prale-eval");
++const TMP_ROOT = path.join(EVAL_DIR, ".tmp-regression");
++
++const SESSION_MANAGER = "packages/coding-agent/src/core/session-manager.ts";
++const MIGRATIONS = "packages/coding-agent/src/migrations.ts";
++const PATHS_UTILS = "packages/coding-agent/src/utils/paths.ts";
++
++/** Absolute POSIX cwd with no separator/colon at all. */
++const PLAIN_CWD = "/work/proj/alpha";
++/** Absolute POSIX cwd with a Windows-style fragment (`C:\Users\alice\src`) inside it. */
++const WINDOWS_FRAGMENT_CWD = "/work/proj/weird/windows:C\\Users\\alice\\src";
++/** Absolute POSIX cwd with Unicode plus a colon plus a backslash. */
++const UNICODE_CWD = "/home/проекты/日本:テスト\\sub";
++
++const MIGRATED_ENTRY_TEXT_A = "héllo ☃ ünïcode 日本語";
++const MIGRATED_ENTRY_TEXT_B = "второй ответ ✅";
++
++/**
++ * The encoding contract, stated once in the test: drop one leading separator, then
++ * encode every "/", "\" and ":" as "-". Kept independent of both production modules.
++ */
++function expectedSessionDirName(cwd) {
++	return `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
++}
++
++function expectedSessionDir(agentDir, cwd) {
++	return path.join(agentDir, "sessions", expectedSessionDirName(cwd));
++}
++
++/** Legacy JSONL session: header first, then entries with one malformed line in the middle. */
++function legacySessionContent({ id, cwd, firstText, secondText }) {
++	const header = JSON.stringify({
++		type: "session",
++		version: 3,
++		id,
++		timestamp: "2025-01-01T00:00:00.000Z",
++		cwd,
++	});
++	const first = JSON.stringify({
++		type: "message",
++		id: `${id}-m1`,
++		parentId: null,
++		timestamp: "2025-01-01T00:00:01.000Z",
++		message: { role: "user", content: [{ type: "text", text: firstText }], timestamp: 1 },
++	});
++	// Truncated JSON: the reader must skip this physical line and keep the rest.
++	const malformed = '{"type":"message","id":';
++	const second = JSON.stringify({
++		type: "message",
++		id: `${id}-m2`,
++		parentId: `${id}-m1`,
++		timestamp: "2025-01-01T00:00:02.000Z",
++		message: {
++			role: "assistant",
++			content: [{ type: "text", text: secondText }],
++			api: "test",
++			provider: "test",
++			model: "test",
++			usage: { input: 1, output: 2, cacheRead: 0, cacheWrite: 0 },
++			stopReason: "stop",
++			timestamp: 2,
++		},
++	});
++	return `${header}\n${first}\n${malformed}\n${second}\n`;
++}
++
++function listJsonlFiles(dir) {
++	if (!fs.existsSync(dir)) return [];
++	return fs
++		.readdirSync(dir, { withFileTypes: true })
++		.filter((entry) => entry.isFile() && entry.name.endsWith(".jsonl"))
++		.map((entry) => entry.name)
++		.sort();
++}
++
++function cleanup() {
++	try {
++		fs.rmSync(TMP_ROOT, { recursive: true, force: true });
++	} catch {
++		// Scratch cleanup must never mask an assertion failure.
++	}
++}
++
++async function main() {
++	cleanup();
++	fs.mkdirSync(TMP_ROOT, { recursive: true });
++	const workRoot = fs.mkdtempSync(path.join(TMP_ROOT, "run-"));
++
++	// The fake agent dir is mutable so each phase can start from a clean store.
++	let agentDir = path.join(workRoot, "agent-contract");
++
++	// Deterministic stand-ins for boundary packages (no time, no randomness).
++	let idSeed = 0;
++	const deterministicUuid = () => {
++		idSeed += 1;
++		return `00000000-0000-7000-8000-${String(idSeed).padStart(12, "0")}`;
++	};
++	const unusedMessageFactory = () => {
++		throw new Error("boundary message factories are not exercised by this regression");
++	};
++
++	const bindings = {
++		// `../config.ts` and `./config.ts` (both modules import it under one flat map).
++		APP_NAME: "pi",
++		CONFIG_DIR_NAME: ".pi",
++		getAgentDir: () => agentDir,
++		getSessionsDir: () => path.join(agentDir, "sessions"),
++		getBinDir: () => path.join(agentDir, "bin"),
++		// `./core/keybindings.ts` and `./utils/text.ts` boundaries of migrations.ts.
++		migrateKeybindingsConfig: () => ({ config: {}, migrated: false }),
++		stripBom: (text) => (typeof text === "string" && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text),
++		// `chalk` default import used only for console output.
++		default: { green: (s) => s, yellow: (s) => s, dim: (s) => s },
++		// `@earendil-works/pi-ai` boundary of session-manager.ts.
++		uuidv7: deterministicUuid,
++		getCurrentSystemMessage: () => undefined,
++		createBranchSummaryMessage: unusedMessageFactory,
++		createCompactionSummaryMessage: unusedMessageFactory,
++		createCustomMessage: unusedMessageFactory,
++	};
++
++	const graph = createGraph(
++		WORKSPACE,
++		{
++			sessionManager: SESSION_MANAGER,
++			migrations: MIGRATIONS,
++			pathsUtils: PATHS_UTILS,
++		},
++		bindings,
++	);
++	const sessionManager = await graph.module("sessionManager");
++	const migrations = await graph.module("migrations");
++
++	// ---------------------------------------------------------------------
++	// Phase 1: both modules agree on the encoded session directory.
++	// ---------------------------------------------------------------------
++	fs.mkdirSync(agentDir, { recursive: true });
++	for (const cwd of [PLAIN_CWD, WINDOWS_FRAGMENT_CWD, UNICODE_CWD]) {
++		const dirName = expectedSessionDirName(cwd);
++		assert.ok(!/[\\:]/.test(dirName), `expected encoding to remove separators and colons: ${dirName}`);
++		// Canonical producer side (session manager's default lookup path).
++		assert.equal(
++			sessionManager.getDefaultSessionDir(cwd),
++			expectedSessionDir(agentDir, cwd),
++			`session manager must encode ${cwd} into ${dirName}`,
++		);
++		// Persisted session manager instance resolves the same directory.
++		const session = sessionManager.SessionManager.create(cwd);
++		assert.equal(session.getSessionDir(), expectedSessionDir(agentDir, cwd), `SessionManager.create(${cwd})`);
++		assert.equal(session.usesDefaultSessionDir(), true, "created session must use the default session dir");
++		assert.equal(session.getCwd(), cwd, "session manager must keep the cwd verbatim");
++	}
++	// A Windows-style fragment must not leave a literal drive-letter separator behind.
++	assert.equal(
++		path.basename(expectedSessionDir(agentDir, WINDOWS_FRAGMENT_CWD)),
++		"--work-proj-weird-windows-C-Users-alice-src--",
++	);
++	assert.equal(path.basename(expectedSessionDir(agentDir, UNICODE_CWD)), "--home-проекты-日本-テスト-sub--");
++
++	// ---------------------------------------------------------------------
++	// Phase 2: migration lands in the canonical directory and the real reader sees it.
++	// ---------------------------------------------------------------------
++	agentDir = path.join(workRoot, "agent-migrate");
++	fs.mkdirSync(agentDir, { recursive: true });
++
++	const cases = [
++		{ fileName: "session-plain.jsonl", id: "sess-plain", cwd: PLAIN_CWD },
++		{ fileName: "session-windows.jsonl", id: "sess-windows", cwd: WINDOWS_FRAGMENT_CWD },
++		{ fileName: "session-unicode.jsonl", id: "sess-unicode", cwd: UNICODE_CWD },
++	];
++	const expectedBytes = new Map();
++	for (const testCase of cases) {
++		const content = legacySessionContent({
++			id: testCase.id,
++			cwd: testCase.cwd,
++			firstText: MIGRATED_ENTRY_TEXT_A,
++			secondText: MIGRATED_ENTRY_TEXT_B,
++		});
++		const legacyPath = path.join(agentDir, testCase.fileName);
++		fs.writeFileSync(legacyPath, content, "utf8");
++		testCase.legacyPath = legacyPath;
++		expectedBytes.set(testCase.fileName, Buffer.from(content, "utf8"));
++	}
++
++	migrations.migrateSessionsFromAgentRoot();
++
++	assert.deepEqual(listJsonlFiles(agentDir), [], "migration must drain *.jsonl from the agent root");
++
++	for (const testCase of cases) {
++		const target = path.join(expectedSessionDir(agentDir, testCase.cwd), testCase.fileName);
++
++		// Producer/consumer boundary: the migrated file sits exactly where the
++		// session manager's canonical lookup points, and not one directory over.
++		assert.equal(sessionManager.getDefaultSessionDir(testCase.cwd), path.dirname(target));
++		assert.equal(fs.existsSync(testCase.legacyPath), false, `legacy file must be moved: ${testCase.fileName}`);
++		assert.equal(fs.existsSync(target), true, `migrated file must exist at ${target}`);
++
++		// Bytes are preserved by the move (Unicode included).
++		assert.deepEqual(fs.readFileSync(target), expectedBytes.get(testCase.fileName), "migrated bytes must be unchanged");
++
++		// The real reader finds it and preserves order + text; the malformed line is skipped.
++		const sessions = await sessionManager.SessionManager.list(testCase.cwd);
++		assert.equal(sessions.length, 1, `list() must find the migrated session for ${testCase.cwd}`);
++		assert.equal(sessions[0].path, target);
++		assert.equal(sessions[0].cwd, testCase.cwd);
++		assert.equal(sessions[0].id, testCase.id);
++		assert.equal(sessions[0].messageCount, 2, "malformed line must be skipped without dropping valid entries");
++		assert.equal(sessions[0].firstMessage, MIGRATED_ENTRY_TEXT_A);
++		assert.equal(sessions[0].allMessagesText, `${MIGRATED_ENTRY_TEXT_A} ${MIGRATED_ENTRY_TEXT_B}`);
++
++		// continueRecent() re-reads the same file through the discovery path.
++		const recent = sessionManager.SessionManager.continueRecent(testCase.cwd);
++		assert.equal(recent.getSessionFile(), target, "continueRecent() must open the migrated file");
++		assert.deepEqual(
++			// Array.from() copies out of the module realm before comparing.
++			Array.from(recent.getEntries(), (entry) => entry.id),
++			[`${testCase.id}-m1`, `${testCase.id}-m2`],
++			"entry order must be preserved through the migration",
++		);
++		assert.deepEqual(
++			Array.from(sessionManager.loadEntriesFromFile(target), (entry) => entry.id),
++			[testCase.id, `${testCase.id}-m1`, `${testCase.id}-m2`],
++			"raw entry loader must see header + entries in file order",
++		);
++
++		// Reading must not rewrite the migrated file.
++		assert.deepEqual(fs.readFileSync(target), expectedBytes.get(testCase.fileName), "reading must not mutate the file");
++	}
++
++	// ---------------------------------------------------------------------
++	// Phase 3: repeated migration is a no-op.
++	// ---------------------------------------------------------------------
++	const snapshot = cases.map((testCase) => ({
++		target: path.join(expectedSessionDir(agentDir, testCase.cwd), testCase.fileName),
++		bytes: fs.readFileSync(path.join(expectedSessionDir(agentDir, testCase.cwd), testCase.fileName)),
++	}));
++	migrations.migrateSessionsFromAgentRoot();
++	migrations.migrateSessionsFromAgentRoot();
++	assert.deepEqual(listJsonlFiles(agentDir), [], "repeated migration must not resurrect files in the agent root");
++	for (const [index, testCase] of cases.entries()) {
++		assert.deepEqual(fs.readFileSync(snapshot[index].target), snapshot[index].bytes, "re-migration must not touch files");
++		assert.deepEqual(listJsonlFiles(path.dirname(snapshot[index].target)), [testCase.fileName]);
++		const sessions = await sessionManager.SessionManager.list(testCase.cwd);
++		assert.equal(sessions.length, 1, "re-migration must not duplicate sessions");
++		assert.equal(sessions[0].path, snapshot[index].target);
++	}
++
++	// ---------------------------------------------------------------------
++	// Phase 4: a colliding target is never overwritten.
++	// ---------------------------------------------------------------------
++	agentDir = path.join(workRoot, "agent-collision");
++	fs.mkdirSync(agentDir, { recursive: true });
++
++	const collisionCwd = WINDOWS_FRAGMENT_CWD;
++	const collisionDir = expectedSessionDir(agentDir, collisionCwd);
++	fs.mkdirSync(collisionDir, { recursive: true });
++
++	const existingTarget = path.join(collisionDir, "session-collision.jsonl");
++	const existingContent = legacySessionContent({
++		id: "sess-existing",
++		cwd: collisionCwd,
++		firstText: "already canonical",
++		secondText: "do not touch",
++	});
++	fs.writeFileSync(existingTarget, existingContent, "utf8");
++
++	const legacyCollisionPath = path.join(agentDir, "session-collision.jsonl");
++	const legacyCollisionContent = legacySessionContent({
++		id: "sess-legacy-collision",
++		cwd: collisionCwd,
++		firstText: "legacy copy",
++		secondText: "keep me too",
++	});
++	fs.writeFileSync(legacyCollisionPath, legacyCollisionContent, "utf8");
++
++	migrations.migrateSessionsFromAgentRoot();
++	migrations.migrateSessionsFromAgentRoot();
++
++	assert.deepEqual(
++		fs.readFileSync(existingTarget),
++		Buffer.from(existingContent, "utf8"),
++		"an existing session file must never be overwritten",
++	);
++	assert.equal(fs.existsSync(legacyCollisionPath), true, "a colliding legacy file must be left in place");
++	assert.deepEqual(fs.readFileSync(legacyCollisionPath), Buffer.from(legacyCollisionContent, "utf8"));
++
++	const collidedSessions = await sessionManager.SessionManager.list(collisionCwd);
++	assert.deepEqual(
++		Array.from(collidedSessions, (session) => session.path),
++		[existingTarget],
++		"only the pre-existing canonical session is visible after a collision",
++	);
++	assert.deepEqual(listJsonlFiles(collisionDir), ["session-collision.jsonl"]);
++}
++
++await main().finally(cleanup);
++console.log("regression: legacy session migration and canonical session lookup agree on the encoded path contract");
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..d2978ce
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,89 @@
++# Repair: legacy session migration and canonical session lookup disagreed on the encoded cwd
++
++## Symptom
++
++`migrateSessionsFromAgentRoot()` (`packages/coding-agent/src/migrations.ts`) moves the
++legacy `~/.pi/agent/*.jsonl` files (the v0.30.0 bug) into
++`~/.pi/agent/sessions/<encoded-cwd>/`, which is the directory the session manager
++(`packages/coding-agent/src/core/session-manager.ts`) looks in. The migration computed
++that directory with its own copy of the cwd->directory-name encoding, and the two copies
++were not the same character class:
++
++| location | leading-separator strip | separator replace |
++| --- | --- | --- |
++| `session-manager.ts` `getDefaultSessionDirPath()` | `/^[/\\]/` | `/[/\\]/g` (missing `:`) |
++| `migrations.ts` `migrateSessionsFromAgentRoot()` | `/^[/\\]/` | `/[/:]/g` (missing `\`) |
++
++The result is a *migration that silently succeeds and a reader that cannot find the
++file*. Migration creates (and moves into) `--…--` with colons preserved, while the session
++manager looks up `--…--` with colons encoded, or – for a cwd containing a backslash – the
++migration keeps the backslash while the reader replaces it. Both directories live under
++`sessions/`, so nothing errors out; the session is simply invisible to `SessionManager.list`,
++`SessionManager.listAll`, `SessionManager.continueRecent`, `SessionManager.findById` and
++`SessionManager.open` (via the default lookup path).
++
++The scenario is reachable on POSIX: an absolute POSIX cwd may legitimately contain a
++colon and a backslash (a Windows-style fragment such as `/mnt/drive/C:\Users\alice\src`
++inside an absolute POSIX path). No Windows path *resolution* is involved or emulated —
++only the directory-name encoding.
++
++## Contract
++
++The canonical encoding already exists elsewhere in the repository and is the reference
++this repair restores:
++
++- `packages/agent/src/harness/session/jsonl/repo.ts` `sessionDirectoryName()`:
++  `` `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--` ``
++- `packages/coding-agent/test/sdk-session-manager.test.ts` asserts the same encoding for
++  `SessionManager`'s default dir.
++
++So the contract is: **drop one leading separator, then replace every `/`, `\` and `:`
++with `-`, and wrap the result in `--` … `--`.**
++
++## Fix (producer + consumer, minimal)
++
++1. `packages/coding-agent/src/core/session-manager.ts` — `getDefaultSessionDirPath()`
++   (the consumer's canonical lookup, used by `getDefaultSessionDir`, `SessionManager.create`,
++   `list`, `listAll`, `findById`, `continueRecent`, `forkFrom`) now encodes `:` as well:
++   `.replace(/[/\\:]/g, "-")`.
++2. `packages/coding-agent/src/migrations.ts` — `migrateSessionsFromAgentRoot()`
++   (the producer) now encodes `\` as well: `.replace(/[/\\:]/g, "-")`.
++
++Both files keep the same regular expression, so the producer writes exactly the directory
++that the consumer reads. Nothing else changed: function signatures, exports, the
++`resolvePath`/`mkdirSync` behaviour, the "skip if the target already exists" collision
++rule and the first-line header detection are untouched. No new cross-module import was
++introduced, so the module boundaries (and the flat binding graphs that tests link against
++these two files) are unchanged.
++
++## Behaviour that is now observable across the boundary
++
++- `getDefaultSessionDir(cwd)` and `SessionManager.create(cwd).getSessionDir()` are
++  identical for cwds with `/`, `\` and `:` (including a Windows-style fragment inside an
++  absolute POSIX path).
++- After `migrateSessionsFromAgentRoot()`, `SessionManager.list(cwd)` /
++  `continueRecent(cwd)` find the migrated file in `join(agentDir, "sessions", encodedName)`.
++- Migration is a rename, so Unicode content, entry order and file bytes are preserved;
++  malformed JSONL lines are skipped by the reader without losing valid entries.
++- A pre-existing file at the target path is never overwritten, and repeated migration runs
++  are no-ops (the legacy file is no longer in the agent root, and a colliding legacy file
++  is re-skipped).
++
++## Validation
++
++`node --experimental-vm-modules .prale-eval/regression.mjs` links the real
++`session-manager.ts`, `migrations.ts` and `utils/paths.ts` through
++`.prale-eval/subject.mjs`, with boundary fakes only for `config.ts`, `chalk`,
++`utils/text.ts`, `core/keybindings.ts` and `@earendil-works/pi-ai` (deterministic
++`uuidv7`, no time or randomness). It drives a scratch store under
++`.prale-eval/.tmp-regression/` (removed afterwards) and asserts all of the above.
++
++Mutation check performed locally: restoring either production file alone to its faulty
++baseline (`git show HEAD:…`) makes the script exit 1 with a `node:assert/strict`
++`AssertionError` (not a crash/import error); with the repair in place it exits 0.
++
++`vitest`, `tsc` and the workspace `node_modules` are not installed in this environment, so
++`npm test --workspaces` could not be run; the regression script instead parses and
++evaluates the two production files for real (type stripping + `vm.SourceTextModule`), which
++doubles as a syntax check, and exercises them against the real filesystem and the real
++session reader.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..961dd08
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/session-integrity/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired the split cwd->session-dir encoding: packages/coding-agent/src/core/session-manager.ts getDefaultSessionDirPath() now encodes ':' (was /[/\\\\]/g) and packages/coding-agent/src/migrations.ts migrateSessionsFromAgentRoot() now encodes '\\\\' (was /[/:]/g); both sides now use the canonical /^[/\\\\]/, then /[/\\\\:]/g contract that packages/agent/src/harness/session/jsonl/repo.ts sessionDirectoryName() and packages/coding-agent/test/sdk-session-manager.test.ts already state. No API, import graph or unrelated behaviour changed. .prale-eval/regression.mjs links the real session-manager.ts, migrations.ts and utils/paths.ts via .prale-eval/subject.mjs (boundary fakes only for config.ts, chalk, utils/text.ts, core/keybindings.ts and @earendil-works/pi-ai with a deterministic uuidv7; no time, randomness or network) and asserts across the producer/consumer boundary: (1) getDefaultSessionDir(cwd) and SessionManager.create(cwd).getSessionDir() equal <agentDir>/sessions/--<encoded>-- for '/work/proj/alpha', '/work/proj/weird/windows:C\\\\Users\\\\alice\\\\src' and a Unicode cwd with ':' and '\\\\'; (2) after migrateSessionsFromAgentRoot() each legacy ~/.pi/agent/*.jsonl is gone from the agent root, present at the canonical dir, and found by the real reader SessionManager.list(cwd), SessionManager.continueRecent(cwd) and loadEntriesFromFile with cwd/id/entry order preserved, the malformed middle line skipped and Unicode text intact; (3) migrated bytes are identical to the pre-migration bytes and reads never rewrite the file; (4) two extra migration runs keep exactly one file per cwd with unchanged bytes and no duplicates; (5) a pre-existing session file at a colliding target keeps its bytes and the colliding legacy file is left in place. Scratch store lives in .prale-eval/.tmp-regression/ and is removed at the end. Mutation check: restoring session-manager.ts alone to its faulty baseline fails with AssertionError 'session manager must encode /work/proj/weird/windows:C\\\\Users\\\\alice\\\\src into --work-proj-weird-windows-C-Users-alice-src--'; restoring migrations.ts alone fails with AssertionError 'migrated file must exist at .../sessions/--work-proj-weird-windows-C-Users-alice-src--/session-windows.jsonl'; both are assertion failures (exit 1), not crashes, and exit 0 with the repair. Limitation: node_modules is not installed, so vitest/tsc and the repository test suite could not be run; the regression instead type-strips and evaluates both production modules (real syntax check) against the real filesystem and real session reader."
++  }
++}
+snapshot .prale-eval/regression.mjs - 63750caa232ef1e4fd37eb2131347d9e8c32d88a3c5e5becd6e4ea6c936ad6aa
+snapshot .prale-eval/repair.md - da0a159818b4f6954e670972c96ffb9f7f2ce98c49b22eb3f9cdcb609b5be186
+snapshot .prale-eval/result.json - 7b213c90c9c9d3b8547a3759fb4eac8c475a72c205f0a80ca7d62e628ea33375
+snapshot packages/coding-agent/src/core/session-manager.ts 7e4c0b6add6b3735e5b498d84a56079acbaac5b74656e904efbb032ac2b3a20e d33d2384f31486947940c59df71dd5845bb12faf84cb4782ccbb733f5572769a
+snapshot packages/coding-agent/src/migrations.ts 143a77bc26bffeb28aa1c1ee90e2943c3d73c31353667155dff7e69aca0c30cb b1bb58da78b8ccdc4432e20eed505a177a2936d66d32a85d20fb8e327d92277b

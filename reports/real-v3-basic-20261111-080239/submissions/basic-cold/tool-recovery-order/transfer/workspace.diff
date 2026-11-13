@@ -1,0 +1,496 @@
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 98760fb..74c4207 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,9 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (!cancelled && call.replay === "safe") {
++	// Replay needs the persisted policy and the current declaration to agree: a tool whose current
++	// declaration is unsafe or gone cannot prove the effect is safe to repeat, so it settles interrupted.
++	if (!cancelled && tool !== undefined && call.replay === "safe" && tool.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..584a192
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,406 @@
++/**
++ * Regression: durable tool recovery must re-check the *current* tool declaration.
++ *
++ * Fault (original stage): `recoverToolInvocation` in
++ * `packages/agent/src/harness/runtime/drive/tools.ts` replayed every persisted
++ * `replay: "safe"` effect without consulting the declaration it now resolves.
++ * - a tool that is gone from the current configuration was looked up as
++ *   `undefined` and handed to the effect boundary, which turned the resulting
++ *   `TypeError` into a bogus error result (and emitted a recovery `tool_start`);
++ * - a tool whose declaration became `replay: "never"` was re-executed anyway,
++ *   repeating an effect that is no longer safe to repeat.
++ *
++ * Fixed behavior: an effect replays only when the persisted policy and the
++ * current declaration are both `safe` and the batch is not cancelled. Otherwise
++ * the call settles as interrupted: the durable progress checkpoint is kept and
++ * the interruption marker is appended; no tool effect runs.
++ */
++import assert from "node:assert/strict";
++import { createGraph } from "./subject.mjs";
++
++const root = process.cwd();
++
++// Real production modules: the durable tool batch procedure and everything it
++// links against inside the package.
++const modules = [
++	"packages/agent/src/harness/runtime/drive/tools.ts",
++	"packages/agent/src/harness/runtime/drive/tool-placement.ts",
++	"packages/agent/src/harness/runtime/progress.ts",
++	"packages/agent/src/harness/runtime/lane.ts",
++	"packages/agent/src/harness/runtime/restore.ts",
++	"packages/agent/src/harness/runtime/types.ts",
++	"packages/agent/src/harness/execution/tools.ts",
++	"packages/agent/src/harness/execution/effect-gate.ts",
++	"packages/agent/src/harness/session/session.ts",
++	"packages/agent/src/harness/session/types.ts",
++	"packages/agent/src/harness/session/values.ts",
++	"packages/agent/src/harness/session/commit.ts",
++	"packages/agent/src/harness/session/memory.ts",
++	"packages/agent/src/harness/session/in-memory-storage-state.ts",
++	"packages/agent/src/harness/session/mutation-line.ts",
++	"packages/agent/src/harness/session/fork-policy.ts",
++	"packages/agent/src/harness/utils/usage.ts",
++];
++
++// Boundary fakes: external packages plus the context/telemetry/lane helpers the
++// tool batch never calls on the recovery path.
++let idCounter = 0;
++const context = { abortSignal: undefined, value: () => undefined };
++const unexpected = (name) => () => {
++	throw new Error(`unexpected boundary call: ${name}`);
++};
++const bindings = {
++	uuidv7: () => `generated-${++idCounter}`,
++	validateToolArguments: (_tool, call) => call.arguments,
++	reduceAssistantMessageFrames: () => [],
++	withAbortSignal: (signal, parent) => ({ ...parent, abortSignal: signal }),
++	withoutAbortSignal: (parent) => ({ ...parent, abortSignal: undefined }),
++	awaitWithContext: (value) => value,
++	withCancel: (parent) => parent,
++	withContextValue: (_key, _value, parent) => parent,
++	BACKGROUND_CONTEXT: context,
++	// Lane/compaction helpers outside the tool-batch recovery path.
++	prepareBranchEntries: unexpected("prepareBranchEntries"),
++	prepareCompaction: unexpected("prepareCompaction"),
++	formatPromptTemplateInvocation: unexpected("formatPromptTemplateInvocation"),
++	formatSkillInvocation: unexpected("formatSkillInvocation"),
++	durableBranchPreparation: unexpected("durableBranchPreparation"),
++	durableCompactionPreparation: unexpected("durableCompactionPreparation"),
++	driveOperation: unexpected("driveOperation"),
++	chainEntries: unexpected("chainEntries"),
++	committedEntryEvents: unexpected("committedEntryEvents"),
++	readLaneQueues: unexpected("readLaneQueues"),
++};
++
++const graph = createGraph(root, modules, bindings);
++const { runTools } = await graph.module("packages/agent/src/harness/runtime/drive/tools.ts");
++const { Lane } = await graph.module("packages/agent/src/harness/runtime/lane.ts");
++const { Drive } = await graph.module("packages/agent/src/harness/runtime/types.ts");
++const { restoreLane } = await graph.module("packages/agent/src/harness/runtime/restore.ts");
++const { MemoryStorage } = await graph.module("packages/agent/src/harness/session/memory.ts");
++const { StorageBackedSession } = await graph.module("packages/agent/src/harness/session/session.ts");
++const values = await graph.module("packages/agent/src/harness/session/values.ts");
++const { insertEntry } = await graph.module("packages/agent/src/harness/session/commit.ts");
++
++const schema = { type: "object", properties: { value: { type: "string" } } };
++/** Cross-realm snapshot: production objects live in the module's VM context. */
++const plain = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
++const INTERRUPTED = /interrupt/i;
++/** A durable progress snapshot as the kernel persists it (`pendingToolOutput`). */
++const progressSnapshot = (text, details) => ({ content: [{ type: "text", text }], details });
++
++/** A harness tool whose `execute` records every call. */
++function makeTool(name, replay, calls) {
++	return {
++		name,
++		label: name,
++		description: name,
++		parameters: schema,
++		replay,
++		execute: async (_toolCallId, args) => {
++			calls.push({ name, args: structuredClone(args) });
++			return {
++				content: [{ type: "text", text: `${name} replayed ${args.value}` }],
++				details: { value: args.value },
++			};
++		},
++	};
++}
++
++/**
++ * Build one reopened durable tool batch: the assistant message and the durable
++ * tool-batch operation are already committed, the tool effects are
++ * `effect_pending` (an intent without a known outcome), exactly like a process
++ * that died mid-batch.
++ */
++async function reopen(options) {
++	const storage = new MemoryStorage({ now: () => 100 });
++	const session = new StorageBackedSession({ id: `s-${++idCounter}`, createdAt: 1, storageVersion: 1 }, storage);
++	const operationId = session.idGenerator.next(10);
++	const assistantEntryId = session.idGenerator.next(20);
++	const resultEntryIds = options.calls.map(() => session.idGenerator.next(20));
++	const configuration = {
++		model: { provider: "faux", modelId: "faux-model" },
++		thinkingLevel: "off",
++		activeToolNames: options.calls.map((call) => call.name),
++	};
++	const assistant = {
++		role: "assistant",
++		content: options.calls.map((call, index) => ({
++			type: "toolCall",
++			id: `call-${index}`,
++			name: call.name,
++			arguments: { value: call.value },
++		})),
++		stopReason: "toolUse",
++		timestamp: 20,
++		api: "faux",
++		provider: "faux",
++		model: "faux-model",
++		usage: {
++			input: 0,
++			output: 0,
++			cacheRead: 0,
++			cacheWrite: 0,
++			totalTokens: 0,
++			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++		},
++	};
++	const run = {
++		at: "tools",
++		control: { status: "running" },
++		settings: { compaction: {}, steeringMode: "all", followUpMode: "all", toolExecution: "parallel" },
++		batch: {
++			assistantEntryId,
++			configuration,
++			turnId: "turn-1",
++			calls: options.calls.map((call, index) => ({
++				status: "effect_pending",
++				sourceIndex: index,
++				resultEntryId: resultEntryIds[index],
++				replay: call.persistedReplay,
++			})),
++		},
++		latestAssistantEntryId: assistantEntryId,
++	};
++	const writes = [
++		insertEntry({ id: assistantEntryId, parentId: null, type: "message", message: assistant }),
++		values.setValue(values.branchTip("main"), assistantEntryId),
++		values.setValue(values.laneConfig("main"), configuration),
++		values.setValue(values.laneState("main"), {
++			currentOperationId: operationId,
++			lastOperationId: null,
++			inbox: [],
++		}),
++		values.setValue(values.operationMeta(operationId), {
++			operationId,
++			lane: "main",
++			sourceTipId: null,
++			startedAt: 10,
++			intent: { kind: "run", promptEntryIds: [] },
++		}),
++		values.setValue(values.operationState(operationId), run),
++	];
++	// Persisted arguments are written for every intent, exactly like the live path.
++	options.calls.forEach((call, index) => {
++		writes.push(values.setValue(values.operationToolArgs(operationId, "turn-1", index), { value: call.value }));
++		if (call.checkpoint !== undefined) {
++			writes.push(values.setValue(values.pendingToolOutput(operationId, resultEntryIds[index]), call.checkpoint));
++		}
++	});
++	await session.mutate((mutator) => mutator.commit(writes, context), context);
++
++	const events = [];
++	const config = {
++		tools: options.tools,
++		resources: {},
++		streamOptions: {},
++		retryPolicy: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
++		compaction: {},
++		steeringMode: "all",
++		followUpMode: "all",
++		toolExecution: "parallel",
++		toolContext: undefined,
++		systemPrompt: undefined,
++		toProviderMessages: (messages) => messages,
++		entryProjectors: {},
++	};
++	const hooks = { runToolWithGate: async () => undefined };
++	const lane = new Lane(
++		"main",
++		session,
++		{},
++		hooks,
++		await restoreLane(session, "main", context),
++		(cause) => (cause instanceof Error ? cause : new Error(String(cause))),
++		async (batch) => {
++			events.push(...structuredClone(batch));
++		},
++		() => {
++			throw new Error("watch is not used by the tool batch");
++		},
++		() => config,
++	);
++	const drive = new Drive({ operationId }, context);
++	lane.activeDrive = drive;
++	const operation = lane.state.operation.state;
++	let failure;
++	try {
++		await runTools(lane, drive, operation);
++	} catch (error) {
++		failure = error;
++	}
++	return {
++		failure,
++		events,
++		lane,
++		session,
++		async toolResult(index) {
++			const entry = await session.getEntry(resultEntryIds[index], context);
++			assert.equal(entry?.type, "message", `tool result ${index} was not placed in the transcript`);
++			return entry.message;
++		},
++		async checkpoint(index) {
++			return (await session.getValue(values.pendingToolOutput(operationId, resultEntryIds[index]), context))?.value;
++		},
++		startedRecovery: () => events.filter((event) => event.type === "tool_start"),
++	};
++}
++
++function assertInterrupted(result, calls, label) {
++	assert.equal(result.failure, undefined, `${label}: recovery threw instead of settling: ${result.failure}`);
++	assert.deepEqual(calls, [], `${label}: the tool effect ran even though the call must not replay`);
++	assert.deepEqual(
++		result.startedRecovery(),
++		[],
++		`${label}: recovery announced a tool effect start for a call that must not replay`,
++	);
++}
++
++// 1. The tool the persisted intent names is no longer declared. The effect can
++//    never run; the durable checkpoint must survive as an interrupted result.
++{
++	const calls = [];
++	const result = await reopen({
++		calls: [
++			{
++				name: "shell",
++				value: "persisted",
++				persistedReplay: "safe",
++				checkpoint: progressSnapshot("durable partial", { progress: "kept" }),
++			},
++		],
++		tools: [],
++	});
++	const message = await result.toolResult(0);
++	assert.equal(message.role, "toolResult", "missing declaration: result must be a tool result message");
++	assert.equal(message.isError, true, "missing declaration: an interrupted call is an error result");
++	const blocks = [...message.content].map((block) => block.text);
++	assert.match(blocks.at(-1) ?? "", INTERRUPTED,
++		`missing declaration: the result must report an interrupted tool execution, got: ${blocks.at(-1)}`);
++	assert.equal(blocks.length, 2, "missing declaration: checkpoint content plus the interruption marker");
++	assert.equal(blocks[0], "durable partial", "missing declaration: the durable progress snapshot must be preserved");
++	assert.deepEqual(plain(message.details), { progress: "kept" }, "missing declaration: checkpoint details must be kept");
++	assert.equal(await result.checkpoint(0), undefined, "missing declaration: the replay checkpoint must be cleared");
++	assertInterrupted(result, calls, "missing declaration");
++}
++
++// 2. The declaration still exists but is no longer replay-safe. The persisted
++//    intent said safe; the current declaration says never, so repeating the
++//    effect would contradict the live policy.
++{
++	const calls = [];
++	const result = await reopen({
++		calls: [
++			{
++				name: "shell",
++				value: "persisted",
++				persistedReplay: "safe",
++				checkpoint: progressSnapshot("durable partial", { progress: "kept" }),
++			},
++		],
++		tools: [makeTool("shell", "never", calls)],
++	});
++	assertInterrupted(result, calls, "declaration downgraded to never");
++	const message = await result.toolResult(0);
++	assert.equal(message.isError, true, "declaration downgraded to never: interrupted call is an error result");
++	assert.match(
++		[...message.content].map((block) => block.text).join("\n"),
++		INTERRUPTED,
++		"declaration downgraded to never: the result must report an interrupted tool execution",
++	);
++	assert.equal(
++		message.content[0]?.text,
++		"durable partial",
++		"declaration downgraded to never: the durable progress snapshot must be preserved",
++	);
++}
++
++// 3. The declaration omits `replay` entirely: the default is not safe, so the
++//    call settles interrupted like an explicit `never`.
++{
++	const calls = [];
++	const result = await reopen({
++		calls: [{ name: "shell", value: "persisted", persistedReplay: "safe" }],
++		tools: [makeTool("shell", undefined, calls)],
++	});
++	assertInterrupted(result, calls, "declaration without replay policy");
++	const message = await result.toolResult(0);
++	assert.equal(message.isError, true, "declaration without replay policy: interrupted call is an error result");
++	assert.equal(
++		message.content.length,
++		1,
++		"declaration without replay policy: only the interruption marker is expected without a checkpoint",
++	);
++	assert.match(message.content[0]?.text ?? "", INTERRUPTED,
++		"declaration without replay policy: the result must report an interrupted tool execution");
++	assert.equal(
++		Object.hasOwn(message, "details"),
++		false,
++		"declaration without replay policy: no details are invented without a checkpoint",
++	);
++}
++
++// 4. Control: both policies are safe, so the effect replays from the persisted
++//    arguments. This is the behavior the fault must not break.
++{
++	const calls = [];
++	const result = await reopen({
++		calls: [
++			{
++				name: "shell",
++				value: "persisted",
++				persistedReplay: "safe",
++				checkpoint: progressSnapshot("durable partial", { progress: "kept" }),
++			},
++		],
++		tools: [makeTool("shell", "safe", calls)],
++	});
++	assert.equal(result.failure, undefined, `both-safe replay threw: ${result.failure}`);
++	assert.deepEqual(plain(calls), [{ name: "shell", args: { value: "persisted" } }],
++		"both-safe replay must re-run the effect exactly once with the persisted arguments");
++	const message = await result.toolResult(0);
++	assert.equal(message.isError, false, "both-safe replay must publish the real tool result");
++	assert.equal(message.content[0]?.text, "shell replayed persisted", "both-safe replay must publish the tool output");
++	assert.equal(
++		result.startedRecovery().length,
++		1,
++		"both-safe replay must announce exactly one recovery tool start",
++	);
++	assert.equal(result.startedRecovery()[0]?.recovery, true, "both-safe replay start is marked as recovery");
++}
++
++// 5. The persisted intent was never safe, so a now-safe declaration cannot
++//    upgrade it: the replay policy is durable evidence, not a current default.
++{
++	const calls = [];
++	const result = await reopen({
++		calls: [{ name: "shell", value: "persisted", persistedReplay: "never" }],
++		tools: [makeTool("shell", "safe", calls)],
++	});
++	assertInterrupted(result, calls, "persisted policy never");
++	const message = await result.toolResult(0);
++	assert.match(message.content[0]?.text ?? "", INTERRUPTED,
++		"persisted policy never: the result must report an interrupted tool execution");
++}
++
++// The batch still completes: every recovered call is placed in source order.
++{
++	const calls = [];
++	const result = await reopen({
++		calls: [
++			{ name: "gone", value: "a", persistedReplay: "safe" },
++			{ name: "kept", value: "b", persistedReplay: "safe" },
++		],
++		tools: [makeTool("kept", "never", calls)],
++	});
++	assert.deepEqual(plain(calls), [], "mixed batch: no call may replay");
++	const first = await result.toolResult(0);
++	const second = await result.toolResult(1);
++	assert.equal(first.toolCallId, "call-0", "mixed batch: source order must be preserved for call-0");
++	assert.equal(second.toolCallId, "call-1", "mixed batch: source order must be preserved for call-1");
++	assert.equal(first.isError, true, "mixed batch: the missing tool settles interrupted");
++	assert.equal(second.isError, true, "mixed batch: the downgraded tool settles interrupted");
++}
++
++console.log("regression: tool recovery re-checks the current declaration before replaying");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..a161efd
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,60 @@
++{
++	"task_id": "tool-recovery-order/transfer",
++	"repository": "earendil-works/pi",
++	"mode": "repair",
++	"status": "passed",
++	"summary": "Durable tool recovery replayed a persisted replay:\"safe\" effect without re-checking the tool declaration it resolves at reopen. A tool that disappeared from the current configuration was passed to the effect boundary as undefined and turned into a bogus TypeError result (plus a recovery tool_start), and a tool whose declaration had become replay:\"never\" was re-executed anyway. Recovery now replays only when the persisted intent and the current declaration are both safe and the batch is not cancelled; every other case settles as interrupted with the durable progress checkpoint preserved, and a missing tool never reaches the effect boundary.",
++	"changes": [
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"description": "recoverToolInvocation guards the replay branch with the current declaration: tool !== undefined (missing declaration falls through to the interrupted settlement) and tool.replay === \"safe\" (a downgraded declaration cannot repeat the effect). Both are combined with the persisted call.replay === \"safe\" and !cancelled, so only both-safe, non-cancelled calls replay."
++		}
++	],
++	"deliverables": [
++		"packages/agent/src/harness/runtime/drive/tools.ts",
++		".prale-eval/regression.mjs",
++		".prale-eval/result.json"
++	],
++	"citations": [
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"lines": "515-548",
++			"claim": "recoverToolInvocation is the recovery entry point for an effect_pending tool call; the fixed guard is line 529 and the interrupted settlement fallback is the tail of the function (readCheckpoint + interruptedOutcome + publishToolOutcome)."
++		},
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"lines": "158-171",
++			"claim": "interruptedOutcome keeps the durable checkpoint content/details/usage and appends the INTERRUPTION_MARKER text; this is the settlement the regression asserts on."
++		},
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"lines": "295-330",
++			"claim": "clearReplayCheckpoint (replay intent publication) is only reached from the replay branch, so a guarded-out call no longer clears the durable checkpoint before deciding."
++		},
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"lines": "350-450",
++			"claim": "performToolInvocation is the effect boundary: prepare/replay hands it the resolved declaration, so an undefined declaration would reach executeToolCall and fail there under the original code."
++		},
++		{
++			"path": "packages/agent/src/harness/runtime/drive/tools.ts",
++			"lines": "658-695",
++			"claim": "runTools builds toolsByName from the current lane configuration filtered by the persisted activeToolNames, i.e. exactly the current declaration set recovery must re-check."
++		},
++		{
++			"path": "packages/agent/src/harness/execution/tools.ts",
++			"lines": "130-160",
++			"claim": "executeToolCall dereferences call.tool.execute inside its try block, which is why a missing declaration surfaced as a TypeError-derived error result instead of an interruption."
++		},
++		{
++			"path": "packages/agent/src/harness/pico3/kinds/tool.ts",
++			"lines": "128-158",
++			"claim": "The experimental pico3 kernel already encodes the intended rule on recovery (`if (cp.replay !== \"safe\" || (declaration.replay ?? \"unsafe\") !== \"safe\")` and a separate missing-declaration branch); the drive runtime is the implementation that violated it."
++		}
++	],
++	"validation": {
++		"command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++		"status": "passed",
++		"notes": "The regression loads the real production modules through .prale-eval/subject.mjs createGraph (drive/tools.ts plus the lane, restore, tool-placement, progress, execution and session modules it links against) and fakes only the boundary: the pi-ai argument validator, uuidv7, and the chord context helpers. It rebuilds a reopened durable tool batch exactly as the kernel persists it (assistant message with tool-call blocks, operation meta/state with effect_pending calls, persisted operationToolArgs and pendingToolOutput checkpoints) and runs runTools on it. Scenarios: (1) persisted replay:\"safe\" with the declaration gone -> asserts the tool never runs, no recovery tool_start is emitted, and the result carries the durable snapshot 'durable partial' plus the interruption marker and its details; (2) declaration downgraded to replay:\"never\" -> same interrupted settlement, zero executions; (3) declaration with no replay field (default not safe) -> interrupted with marker only and no invented details; (4) control: both policies safe -> the effect replays exactly once with the persisted arguments and publishes the real result with one recovery tool_start; (5) persisted replay:\"never\" with a now-safe declaration -> interrupted, because the durable policy cannot be upgraded; (6) mixed batch (missing + downgraded) -> both settle interrupted and are placed in source order. Verified both directions: with the fix the script exits 0, and with the original line `if (!cancelled && call.replay === \"safe\")` restored it exits 1 with AssertionError 'missing declaration: the result must report an interrupted tool execution, got: TypeError: Cannot read properties of undefined (reading \\'execute\\')'; a partial fix that only guards the missing declaration also fails it ('declaration downgraded to never: the tool effect ran even though the call must not replay'). Runtime is ~0.15s, no dependencies or network. Limitation: node_modules is absent in this checkout, so the repository's vitest suite and `npm run check` (tsc/biome) could not be run; the module graph is instead parsed and evaluated by Node 24 type stripping, which validates the edited file's syntax, and the affected existing vitest case (packages/agent/test/harness/runtime/drive-tools.test.ts, 'safe-replays persisted arguments and memos while interrupting unsafe effects') was reviewed by hand: its safe tool declares replay:\"safe\" and its unsafe one replay:\"never\", so both its expectations still hold."
++	}
++}
+snapshot .prale-eval/regression.mjs - 90ec05d7a51501a96cbe65fb7d8905db5a97fd574617c1bb9d557234ac173392
+snapshot .prale-eval/result.json - ddacc500ee4f8f49cd2647db7717cd0119635aad6cc02746516fe411b544f5b4
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 30142f45e7502ea74114043a027f72398b0085ea26691066f2cad6f66e9bf3ae 91b8a69e54ca5f39a2bad461ccf054ddc20f3948683e74bba19c38978fdb57b1

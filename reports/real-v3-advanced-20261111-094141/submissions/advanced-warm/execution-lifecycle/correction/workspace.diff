@@ -1,0 +1,717 @@
+diff --git a/packages/agent/src/harness/execution/effect-gate.ts b/packages/agent/src/harness/execution/effect-gate.ts
+index 917b1a6..903301f 100644
+--- a/packages/agent/src/harness/execution/effect-gate.ts
++++ b/packages/agent/src/harness/execution/effect-gate.ts
+@@ -55,7 +55,7 @@ export function createGate(): { gate: Gate; control: GateControl } {
+ 				controller.abort(new AbortRequested(state.cancellation));
+ 			},
+ 			close(error) {
+-				if (state.status !== "open") return;
++				if (state.status === "closed") return;
+ 				state = { status: "closed", error };
+ 				if (!controller.signal.aborted) controller.abort(error);
+ 			},
+diff --git a/packages/agent/src/harness/execution/tools.ts b/packages/agent/src/harness/execution/tools.ts
+index 1b04634..f768781 100644
+--- a/packages/agent/src/harness/execution/tools.ts
++++ b/packages/agent/src/harness/execution/tools.ts
+@@ -175,7 +175,7 @@ export function finalizeToolCall<TContext extends object | undefined>(
+ 	return {
+ 		toolCall: call.toolCall,
+ 		result,
+-		isError: patch?.isError || executed.isError,
++		isError: patch?.isError ?? executed.isError,
+ 		terminate: result.terminate === true,
+ 	};
+ }
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 9dc1a3c..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,7 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (false && !cancelled && call.replay === "safe" && tool?.replay === "safe") {
++	if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..ffc7d89
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,523 @@
++/**
++ * Cross-module regression for the execution-lifecycle correction.
++ *
++ * Real modules linked as production code:
++ *   - packages/agent/src/harness/execution/effect-gate.ts   (admission gate)
++ *   - packages/agent/src/harness/execution/tools.ts         (execute / after-tool finalize)
++ *   - packages/agent/src/harness/hooks.ts                   (after_tool aggregate pipeline)
++ *   - packages/agent/src/harness/runtime/drive/tools.ts     (durable recovery + safe replay)
++ *
++ * Everything else (lane command bus, session value store, progress channel, session
++ * errors, tool placement) is supplied here as an explicit boundary fake. No real
++ * time, randomness or external service is used; ordering is controlled with promises.
++ */
++import assert from "node:assert/strict";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createGraph } from "./subject.mjs";
++
++const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++
++const EFFECT_GATE = "packages/agent/src/harness/execution/effect-gate.ts";
++const EXECUTION_TOOLS = "packages/agent/src/harness/execution/tools.ts";
++const HOOKS = "packages/agent/src/harness/hooks.ts";
++const DRIVE_TOOLS = "packages/agent/src/harness/runtime/drive/tools.ts";
++
++/** Values created inside the VM realm have foreign prototypes; compare plain data. */
++const plain = (value) => (value === undefined ? undefined : JSON.parse(JSON.stringify(value)));
++
++// ---------------------------------------------------------------- boundary fakes
++
++class SessionInvariantError extends Error {}
++
++const address = (namespace, id) => ({ namespace, id });
++const addressKey = (value) => `${value.namespace}\u0000${value.id}`;
++
++const setValue = (target, value) => ({ kind: "value", op: "set", namespace: target.namespace, id: target.id, value });
++const deleteValue = (target) => ({ kind: "value", op: "delete", namespace: target.namespace, id: target.id });
++
++const operationToolArgs = (operationId, turnId, sourceIndex) =>
++	address("pi.op.tool_args", `${operationId}/${turnId}/${sourceIndex}`);
++const operationToolMemo = (operationId, resultEntryId, name) =>
++	address("pi.op.tool_memo", `${operationId}/${resultEntryId}/${name}`);
++const operationToolMemoPrefix = (operationId, resultEntryId) =>
++	address("pi.op.tool_memo", `${operationId}/${resultEntryId}/`);
++const pendingEntry = (entryId) => address("pi.pending.entry", entryId);
++const pendingToolOutput = (operationId, resultEntryId) =>
++	address("pi.pending.tool_output", `${operationId}/${resultEntryId}`);
++
++class ValueStore {
++	#entries = new Map();
++
++	get(target) {
++		return this.#entries.get(addressKey(target))?.value;
++	}
++
++	set(target, value) {
++		this.#entries.set(addressKey(target), { address: target, value });
++	}
++
++	delete(target) {
++		this.#entries.delete(addressKey(target));
++	}
++
++	scan(prefix) {
++		const start = addressKey(prefix);
++		return [...this.#entries.entries()]
++			.filter(([key]) => key.startsWith(start))
++			.map(([, entry]) => ({ address: entry.address, value: entry.value }));
++	}
++}
++
++/** Context helper fake: remember the admitted child context for the hook span fake. */
++let admittedContext;
++const withAbortSignal = (signal, context) => {
++	const next = { ...context, abortSignal: signal };
++	admittedContext = next;
++	return next;
++};
++
++const startHarnessSpan = async (_name, _attributes, run) =>
++	run({ setAttributes() {}, setStatus() {} }, admittedContext ?? {});
++
++const openToolProgress = () => ({ write() {}, seal() {}, drain: async () => {} });
++
++const bindings = {
++	withAbortSignal,
++	startHarnessSpan,
++	openToolProgress,
++	SessionInvariantError,
++	setValue,
++	deleteValue,
++	operationToolArgs,
++	operationToolMemo,
++	operationToolMemoPrefix,
++	pendingEntry,
++	pendingToolOutput,
++	toolCallFor: (sources, call) => sources.calls.get(call.sourceIndex),
++	withToolBatch: (run, batch) => ({ ...run, batch }),
++	materializeReady: async () => {},
++	readToolBatchSource: async () => {
++		throw new Error("readToolBatchSource is outside this regression's boundary");
++	},
++	validateToolArguments: () => {
++		throw new Error("validateToolArguments is outside this regression's boundary");
++	},
++};
++
++const graph = createGraph(ROOT, [EFFECT_GATE, EXECUTION_TOOLS, HOOKS, DRIVE_TOOLS], bindings, {}, {
++	[DRIVE_TOOLS]:
++		"\nexport const __boundary = { recoverToolInvocation, performToolInvocation, publishToolOutcome };\n",
++});
++
++const gateModule = await graph.module(EFFECT_GATE);
++const executionTools = await graph.module(EXECUTION_TOOLS);
++const hooksModule = await graph.module(HOOKS);
++const driveTools = await graph.module(DRIVE_TOOLS);
++
++function createHookRegistry() {
++	const errors = [];
++	const hooks = new hooksModule.HookRegistry((error) => {
++		errors.push(error);
++	});
++	return { hooks, errors };
++}
++
++/**
++ * One durable tool batch whose only call is an `effect_pending` safe-replay candidate.
++ * The lane fake implements only the command/settle/emit surface this procedure uses.
++ */
++function createDriveFixture({ hooks, toolName = "safe", callReplay = "safe", storedArgs, memo, checkpoint }) {
++	const store = new ValueStore();
++	if (storedArgs !== undefined) store.set(operationToolArgs("op-1", "turn-1", 0), storedArgs);
++	if (checkpoint !== undefined) store.set(pendingToolOutput("op-1", "res-1"), checkpoint);
++	if (memo !== undefined) store.set(operationToolMemo("op-1", "res-1", memo.name), memo.value);
++
++	const timeline = [];
++	const events = [];
++	const toolCall = { type: "toolCall", id: "call-0", name: toolName, arguments: { value: "live" } };
++	const call = { status: "effect_pending", sourceIndex: 0, resultEntryId: "res-1", replay: callReplay };
++	const batch = {
++		assistantEntryId: "assistant-1",
++		configuration: { activeToolNames: [toolName] },
++		turnId: "turn-1",
++		calls: [call],
++	};
++	const run = {
++		at: "tools",
++		control: { status: "running" },
++		settings: { compaction: {}, steeringMode: "all", followUpMode: "all", toolExecution: "sequential" },
++		batch,
++		latestAssistantEntryId: "assistant-1",
++	};
++	const laneState = { operation: { meta: { operationId: "op-1" }, state: run } };
++	const { gate } = gateModule.createGate();
++	const drive = { operationId: "op-1", context: {}, gate };
++	const sources = {
++		assistant: { role: "assistant", content: [toolCall], stopReason: "toolUse", timestamp: 1 },
++		calls: new Map([[0, toolCall]]),
++	};
++	const reader = {
++		getValue: async (target) => {
++			const value = store.get(target);
++			return value === undefined ? undefined : { value };
++		},
++		scanValues: async (prefix) => store.scan(prefix),
++		getEntries: async () => new Map(),
++	};
++	const settle = (result) => {
++		if (result === undefined) return undefined;
++		if (result.kind === "return") return result.result;
++		if (result.kind === "reject") throw result.error;
++		for (const write of result.writes ?? []) {
++			timeline.push(`${write.op}:${write.namespace}`);
++			if (write.op === "set") store.set(write, write.value);
++			else store.delete(write);
++		}
++		if (result.operationState !== undefined) laneState.operation.state = result.operationState;
++		for (const event of result.events?.() ?? []) {
++			timeline.push(`event:${event.type}`);
++			events.push(event);
++		}
++		return result.materialize?.();
++	};
++	const lane = {
++		name: "main",
++		state: laneState,
++		hooks,
++		command: async (mutate) => settle(await mutate(laneState, reader)),
++		settleOperation: async (_capability, mutate) =>
++			settle(await mutate(laneState, laneState.operation.state, {}, reader)),
++		emitBatch: async (batchEvents) => {
++			for (const event of batchEvents) {
++				timeline.push(`event:${event.type}`);
++				events.push(event);
++			}
++		},
++	};
++	return { lane, drive, run, sources, call, batch, toolCall, store, timeline, events, spec: toolName };
++}
++
++// ----------------------------------------------------------------------- checks
++
++const checks = [];
++
++function check(name, body) {
++	checks.push({ name, body });
++}
++
++check("an aborting gate closed with a terminal error keeps that error authoritative", async () => {
++	const { gate, control } = gateModule.createGate();
++	let releaseCancellation;
++	const cancellation = new Promise((resolve) => {
++		releaseCancellation = resolve;
++	});
++	control.beginAbort(cancellation);
++
++	// While the cancellation is pending, admission reports the cancellation request.
++	assert.throws(() => gate.admit(() => "never"), gateModule.AbortRequested);
++
++	const terminal = new Error("drive sealed");
++	control.close(terminal);
++
++	// The terminal closure wins over the still-pending cancellation.
++	assert.throws(
++		() => gate.admit(() => "never"),
++		(error) => error === terminal,
++	);
++	assert.equal(gate.signal.aborted, true);
++	assert.equal(gate.signal.reason, terminal);
++
++	// Late cancellation signalling must not turn the closure back into a cancellation.
++	control.signalAbort();
++	assert.throws(
++		() => gate.admit(() => "never"),
++		(error) => error === terminal,
++	);
++	assert.equal(gate.signal.reason, terminal);
++
++	// The first terminal error stays authoritative.
++	control.close(new Error("later seal"));
++	assert.throws(
++		() => gate.admit(() => "never"),
++		(error) => error === terminal,
++	);
++
++	releaseCancellation();
++	await cancellation;
++});
++
++check("closed gate refuses admitted hook work instead of reporting a pending cancellation", async () => {
++	const { gate, control } = gateModule.createGate();
++	const { hooks, errors } = createHookRegistry();
++	let handlerCalls = 0;
++	hooks.on("before_tool", () => {
++		handlerCalls += 1;
++		return undefined;
++	});
++
++	const cancellation = new Promise(() => {});
++	control.beginAbort(cancellation);
++	const terminal = new Error("harness closed");
++	control.close(terminal);
++
++	assert.throws(
++		() =>
++			hooks.runToolWithGate(
++				"before_tool",
++				{ lane: "main", runId: "op-1", toolCallId: "call-0", toolName: "safe", args: {} },
++				gate,
++				{},
++			),
++		(error) => error === terminal,
++	);
++	assert.equal(handlerCalls, 0);
++	assert.deepEqual(plain(errors), []);
++});
++
++check("non-cancelled safe/safe replay re-executes the persisted call and clears its checkpoint", async () => {
++	const { hooks, errors } = createHookRegistry();
++	const fixture = createDriveFixture({
++		hooks,
++		storedArgs: { value: "persisted" },
++		memo: { name: "step/a", value: { complete: true } },
++		checkpoint: { content: [{ type: "text", text: "old progress" }], details: {} },
++	});
++	const calls = [];
++	const tool = {
++		name: "safe",
++		replay: "safe",
++		execute: async (toolCallId, args, onUpdate, _toolContext, invocation) => {
++			onUpdate({ content: [{ type: "text", text: "half way" }], details: { progress: "half" } }, { checkpoint: true });
++			calls.push({ toolCallId, args: plain(args), memo: plain(await invocation.getMemo("step/a")) });
++			return { content: [{ type: "text", text: "safe replay" }], details: { value: args.value } };
++		},
++	};
++
++	const task = await driveTools.__boundary.recoverToolInvocation(
++		fixture.lane,
++		fixture.drive,
++		fixture.run,
++		fixture.sources,
++		fixture.call,
++		new Map([["safe", tool]]),
++		undefined,
++		false,
++	);
++	await task.completion;
++
++	assert.equal(calls.length, 1, "safe/safe replay must re-invoke the tool exactly once");
++	assert.deepEqual(calls[0], { toolCallId: "call-0", args: { value: "persisted" }, memo: { complete: true } });
++
++	const staged = fixture.store.get(pendingEntry("res-1"));
++	assert.equal(staged.type, "message");
++	assert.equal(staged.payload.isError, false);
++	assert.deepEqual(plain(staged.payload.content), [{ type: "text", text: "safe replay" }]);
++	assert.deepEqual(plain(staged.payload.details), { value: "persisted" });
++
++	const start = fixture.events.find((event) => event.type === "tool_start");
++	assert.equal(start.recovery, true);
++	assert.deepEqual(plain(start.args), { value: "persisted" });
++	const update = fixture.events.find((event) => event.type === "tool_update");
++	assert.equal(update.recovery, true);
++	assert.equal(fixture.timeline.indexOf("event:tool_update") < fixture.timeline.indexOf("event:tool_end"), true);
++	const end = fixture.events.find((event) => event.type === "tool_end");
++	assert.equal(end.recovery, true);
++	assert.equal(end.isError, false);
++	assert.deepEqual(plain(end.result.content), [{ type: "text", text: "safe replay" }]);
++
++	// The durable replay checkpoint is cleared before the replayed effect and the memo is released after it.
++	assert.equal(fixture.timeline.indexOf("delete:pi.pending.tool_output") < fixture.timeline.indexOf("event:tool_start"), true);
++	assert.equal(fixture.store.get(pendingToolOutput("op-1", "res-1")), undefined);
++	assert.equal(fixture.store.get(operationToolMemo("op-1", "res-1", "step/a")), undefined);
++	assert.deepEqual(plain(errors), []);
++});
++
++check("unsafe, mismatched or cancelled recoveries never replay the external effect", async () => {
++	const scenarios = [
++		{ label: "cancelled safe/safe", callReplay: "safe", toolReplay: "safe", cancelled: true },
++		{ label: "unsafe call", callReplay: "never", toolReplay: "safe", cancelled: false },
++		{ label: "unsafe tool", callReplay: "safe", toolReplay: "never", cancelled: false },
++		{ label: "unsafe tool default", callReplay: "safe", toolReplay: undefined, cancelled: false },
++	];
++
++	for (const scenario of scenarios) {
++		const { hooks, errors } = createHookRegistry();
++		const fixture = createDriveFixture({
++			hooks,
++			callReplay: scenario.callReplay,
++			storedArgs: { value: "persisted" },
++			checkpoint: { content: [{ type: "text", text: "durable partial" }], details: { progress: "kept" } },
++		});
++		let executed = 0;
++		const tool = {
++			...(scenario.toolReplay === undefined ? {} : { replay: scenario.toolReplay }),
++			name: "safe",
++			execute: async () => {
++				executed += 1;
++				return { content: [{ type: "text", text: "must not run" }], details: {} };
++			},
++		};
++
++		const task = await driveTools.__boundary.recoverToolInvocation(
++			fixture.lane,
++			fixture.drive,
++			fixture.run,
++			fixture.sources,
++			fixture.call,
++			new Map([["safe", tool]]),
++			undefined,
++			scenario.cancelled,
++		);
++		await task.completion;
++
++		assert.equal(executed, 0, `${scenario.label} must not replay the effect`);
++		assert.equal(
++			fixture.events.some((event) => event.type === "tool_start"),
++			false,
++			`${scenario.label} must not announce a replayed start`,
++		);
++		const staged = fixture.store.get(pendingEntry("res-1"));
++		assert.equal(staged.payload.isError, true, `${scenario.label} stages an interrupted result`);
++		assert.deepEqual(plain(staged.payload.details), { progress: "kept" });
++		const texts = plain(staged.payload.content.map((block) => block.text));
++		assert.deepEqual(texts.slice(0, 1), ["durable partial"]);
++		assert.match(texts.at(-1), /external outcome is unknown/);
++		const end = fixture.events.find((event) => event.type === "tool_end");
++		assert.equal(end.isError, true);
++		assert.equal(fixture.store.get(pendingToolOutput("op-1", "res-1")), undefined);
++		assert.deepEqual(plain(errors), []);
++	}
++});
++
++async function runAfterTool({ hooks, tool, clearedArgs = {} }) {
++	const fixture = createDriveFixture({ hooks, storedArgs: clearedArgs });
++	const call = { status: "effect_pending", sourceIndex: 0, resultEntryId: "res-1", replay: "safe" };
++	const outcome = await driveTools.__boundary.performToolInvocation(
++		fixture.lane,
++		fixture.drive,
++		fixture.batch,
++		call,
++		{ toolCall: fixture.toolCall, tool, args: clearedArgs },
++		undefined,
++		false,
++	);
++	return outcome;
++}
++
++check("an after-tool hook may explicitly clear isError on a failed tool result", async () => {
++	const { hooks, errors } = createHookRegistry();
++	hooks.on("after_tool", () => ({
++		content: [{ type: "text", text: "recovered by hook" }],
++		details: { patched: true },
++	}));
++	hooks.on("after_tool", () => ({ isError: false }));
++
++	const outcome = await runAfterTool({
++		hooks,
++		tool: {
++			name: "safe",
++			replay: "safe",
++			execute: async () => {
++				throw new Error("boom");
++			},
++		},
++	});
++
++	assert.equal(outcome.message.isError, false, "the hook's explicit false must survive finalization");
++	assert.deepEqual(plain(outcome.message.content), [{ type: "text", text: "recovered by hook" }]);
++	assert.deepEqual(plain(outcome.message.details), { patched: true });
++	assert.deepEqual(plain(errors), []);
++});
++
++check("finalization applies explicit empty/false patches and preserves unpatched fields and usage", async () => {
++	const details = { raw: true };
++	const usage = {
++		input: 3,
++		output: 4,
++		cacheRead: 0,
++		cacheWrite: 0,
++		totalTokens: 7,
++		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
++	};
++
++	const { hooks, errors } = createHookRegistry();
++	hooks.on("after_tool", () => ({ content: [] }));
++
++	const outcome = await runAfterTool({
++		hooks,
++		tool: {
++			name: "safe",
++			replay: "safe",
++			execute: async () => ({ content: [{ type: "text", text: "raw" }], details, usage, terminate: true }),
++		},
++	});
++
++	assert.deepEqual(plain(outcome.message.content), [], "an explicit empty content patch must be applied");
++	assert.equal(outcome.message.details, details, "unpatched details must be preserved by identity");
++	assert.equal(outcome.message.usage, usage, "unpatched usage must be preserved by identity");
++	assert.equal(outcome.message.isError, false);
++	assert.equal(outcome.terminate, true, "unpatched terminate must be preserved");
++
++	const second = createHookRegistry();
++	second.hooks.on("after_tool", () => ({ terminate: false, isError: true }));
++	const raised = await runAfterTool({
++		hooks: second.hooks,
++		tool: {
++			name: "safe",
++			replay: "safe",
++			execute: async () => ({ content: [{ type: "text", text: "raw" }], details, usage, terminate: true }),
++		},
++	});
++	assert.equal(raised.message.isError, true, "an explicit true patch must win over a successful execution");
++	assert.equal(raised.terminate, false, "an explicit false terminate patch must be applied");
++	assert.deepEqual(plain(raised.message.content), [{ type: "text", text: "raw" }]);
++	assert.equal(raised.message.usage, usage);
++
++	const third = createHookRegistry();
++	third.hooks.on("after_tool", () => ({}));
++	const untouched = await runAfterTool({
++		hooks: third.hooks,
++		tool: {
++			name: "safe",
++			replay: "safe",
++			execute: async () => ({ content: [{ type: "text", text: "raw" }], details, usage }),
++		},
++	});
++	assert.deepEqual(plain(untouched.message.content), [{ type: "text", text: "raw" }]);
++	assert.equal(untouched.message.details, details);
++	assert.equal(untouched.message.usage, usage);
++	assert.equal(untouched.message.isError, false);
++	assert.deepEqual(plain([...errors, ...second.errors, ...third.errors]), []);
++});
++
++check("a failing tool without hooks keeps isError true and reports the tool failure text", async () => {
++	const { hooks, errors } = createHookRegistry();
++	const outcome = await runAfterTool({
++		hooks,
++		tool: {
++			name: "safe",
++			replay: "safe",
++			execute: async () => {
++				throw new Error("tool exploded");
++			},
++		},
++	});
++	assert.equal(outcome.message.isError, true);
++	assert.deepEqual(plain(outcome.message.content), [{ type: "text", text: "tool exploded" }]);
++	assert.deepEqual(plain(errors), []);
++});
++
++let failures = 0;
++for (const { name, body } of checks) {
++	try {
++		await body();
++		console.log(`ok - ${name}`);
++	} catch (error) {
++		failures += 1;
++		console.error(`not ok - ${name}`);
++		console.error(error);
++	}
++}
++if (failures !== 0) throw new Error(`${failures} regression check(s) failed`);
++console.log(`regression: ${checks.length} checks passed`);
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..8b2fefa
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,121 @@
++# Repair: safe recovery without corrupting patched outcomes
++
++Task: `advanced/execution-lifecycle/correction` (repository `earendil-works/pi`, mode `repair`).
++
++The incident is split across three production modules of the durable agent harness
++(`packages/agent/src/harness`). Each repair is a one-line semantic correction; no API,
++type surface, event shape or unrelated behaviour changed.
++
++## 1. `execution/effect-gate.ts` — a terminal closure must beat a pending cancellation
++
++`createGate()` keeps one of three states: `open`, `aborting`, `closed`.
++`close(error)` used to bail out unless the gate was still `open`, so a gate that had
++already entered `aborting` (cancellation requested, `signalAbort()` not yet applied)
++silently ignored the terminal error. Every later `admit()` then re-threw
++`AbortRequested` carrying the *pending cancellation*, so the owner's terminal error never
++became authoritative and a cancellation that resolved later could look like the reason for
++refusal.
++
++```diff
++- if (state.status !== "open") return;
+++ if (state.status === "closed") return;
++```
++
++Consequences, all observable through the gate's public surface:
++
++* `aborting` + `close(error)` now moves the gate to `closed`; `admit()` throws `error`
++  (the terminal error), never `AbortRequested`.
++* The signal is aborted with that terminal error when it was not aborted yet, so
++  `gate.signal.reason` is the terminal error rather than a cancellation.
++* `signalAbort()` after the closure is a no-op (it only acts on `aborting`), so a late
++  cancellation commit can no longer override the closure.
++* Re-closing keeps the first terminal error, preserving idempotent owner semantics.
++
++This is a producer/consumer boundary: `HookRegistry.runWithGate`/`runToolWithGate`
++(hooks.ts) and `executeToolCall` (execution/tools.ts) are the consumers of `admit()` and
++inherit the corrected behaviour without their own changes.
++
++## 2. `execution/tools.ts` — explicit `isError: false` from an after-tool hook survives
++
++`finalizeToolCall` merges the `after_tool` aggregate patch field by field. `content`,
++`details`, `usage` and `terminate` already used "apply unless `undefined`" (so explicit
++`false`/empty values are applied, and unset fields — including `usage` — are preserved
++from the executed result). `isError` alone used `||`:
++
++```diff
++- isError: patch?.isError || executed.isError,
+++ isError: patch?.isError ?? executed.isError,
++```
++
++With `||`, an explicit `patch.isError === false` (the documented way for an after-tool
++hook to recover a failed tool) was swallowed whenever the execution had failed, so a
++hook-cleared result was still staged and reported as an error. `??` keeps the requested
++"explicit value wins, otherwise inherit the execution outcome" semantics, and an explicit
++`true` still overrides a successful execution. Field-by-field merging of `content`,
++`details`, `usage`, `terminate` and the `...executed.result` spread (unmodelled fields)
++is untouched.
++
++## 3. `runtime/drive/tools.ts` — non-cancelled safe/safe replay is allowed
++
++Recovery of an `effect_pending` tool call decided between "replay it" and "synthesize an
++interrupted result". The replay branch was hard-disabled by a leftover `false &&`, so
++every safe/safe call was treated as interrupted even though the durable intent recorded
++`replay: "safe"` and the registered tool declares `replay: "safe"`:
++
++```diff
++- if (false && !cancelled && call.replay === "safe" && tool?.replay === "safe") {
+++ if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
++```
++
++The guard now expresses exactly the policy: replay requires a non-cancelled recovery, a
++`safe` durable checkpoint and a `safe` tool declaration. Reuse therefore goes through the
++existing path — `clearReplayCheckpoint` publishes the persisted arguments commit (deleting
++the progress checkpoint) *before* the effect, the tool is re-invoked with the persisted
++arguments and its durable replay memos, and the outcome is published with
++`recovery: true`. Cancelled recoveries, `replay: "never"` checkpoints and tools without a
++`safe` declaration still produce the interruption result, keep the durable checkpoint
++content in the transcript and never cross the external effect boundary.
++
++## Cross-module verification (`.prale-eval/regression.mjs`)
++
++The script links the four real production modules in one `createGraph` graph
++
++```
++execution/effect-gate.ts  execution/tools.ts  hooks.ts  runtime/drive/tools.ts
++```
++
++and supplies its own boundary fakes for the rest of the harness (lane command bus and
++settled-operation bus, session value store, progress channel, session invariant error,
++tool placement, telemetry span, abort-signal context). Private procedures that live
++outside the public API (`recoverToolInvocation`, `performToolInvocation`) are exposed to
++the test through the documented `trailers` hook of `subject.mjs`. There is no real clock,
++randomness, network or filesystem input; ordering is driven by promises and by recording
++the commit/event timeline of the fake lane.
++
++Seven checks are asserted with uncaught `node:assert/strict` assertions:
++
++1. aborting gate closed with a terminal error → terminal error authoritative, signal
++   reason is the terminal error, late `signalAbort()` cannot override it, re-close keeps
++   the first error;
++2. `HookRegistry.runToolWithGate` on such a gate refuses admission with the terminal
++   error and never runs the handler (hooks ↔ gate boundary);
++3. non-cancelled safe/safe replay re-invokes the tool exactly once with the persisted
++   arguments and persisted memo, clears the checkpoint before `tool_start`, streams the
++   replayed `tool_update`, stages a non-error result and deletes the memos (drive ↔
++   execution ↔ hooks boundary);
++4. cancelled, unsafe-call, unsafe-tool and default-tool recoveries never execute the
++   effect and stage the interrupted result with the preserved checkpoint details;
++5. an after-tool hook explicitly clearing `isError: false` on a failed tool is honoured
++   end-to-end in the staged result;
++6. explicit empty `content: []`, explicit `terminate: false` and explicit `isError: true`
++   patches are applied while unpatched `details`/`usage` are preserved by identity;
++7. with no hook, a failing tool still stages `isError: true` with the tool failure text.
++
++Mutation check (performed manually in the workspace, then reverted): restoring each of
++the three files alone to its faulty baseline makes the script fail with a real assertion
++(gate checks 1–2, finalize check 5, replay check 3) — no import error, crash or timeout.
++
++Limitation: the repository's own vitest suites and type checks were not run because
++`node_modules` is not installed in this workspace and dependency installation is out of
++scope. The vm-module regression above is the focused validation and uses only Node 24
++built-ins.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..dc57781
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/execution-lifecycle/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Regression links the four real production modules (harness/execution/effect-gate.ts, harness/execution/tools.ts, harness/hooks.ts, harness/runtime/drive/tools.ts) in one createGraph graph with self-supplied boundary fakes for the lane command/settle bus, session value store, progress channel, session invariant error, tool placement, telemetry span and abort-signal context; private procedures are exposed only through the subject.mjs trailers hook. All 7 node:assert/strict checks pass (exit 0): (1) an aborting gate closed with a terminal error makes that error authoritative for future admissions, aborts the signal with it, ignores a late signalAbort and keeps the first terminal error on re-close; (2) HookRegistry.runToolWithGate refuses admission on such a gate with the terminal error and runs no handler; (3) non-cancelled safe/safe replay re-invokes the tool once with the persisted arguments and durable memo, clears the replay checkpoint before tool_start, streams the replayed tool_update, stages a non-error result and releases the memos; (4) cancelled and unsafe/mismatched recoveries never execute the effect and stage the interrupted result with the preserved checkpoint details; (5) an after-tool hook returning isError:false on a failed tool is honoured in the staged tool result; (6) explicit content:[] , terminate:false and isError:true patches are applied while unpatched details/usage are preserved by identity; (7) without hooks a failing tool still stages isError:true with the tool failure text. Mutation sensitivity was verified by restoring each of the three changed files alone to its faulty baseline (git HEAD): effect-gate.ts fails checks 1-2, execution/tools.ts fails check 5, runtime/drive/tools.ts fails check 3 - every case a real assertion failure, not a crash, import error or timeout; repairs were then restored byte-identically. No real time, randomness, network or external services are used; async ordering is controlled with promises and a recorded commit/event timeline. Only in-memory fakes are used, so no test inputs had to be left on disk (the scratch backup directory used during mutation checking was removed). Limitation: the repository's vitest suites and TypeScript type checks could not be executed because node_modules is not installed in the workspace and dependency installation is out of scope; the vm-module regression above is the focused validation and needs only Node 24 built-ins."
++  }
++}
+snapshot .prale-eval/regression.mjs - f8321a5db05978496c5b7c7a0be3fe7343e04e2045fd1608db833a367ff43f6a
+snapshot .prale-eval/repair.md - 9f593a099a9aa2c48041016ab10a5f1980f58cdca86cf75cb50f9e79ea2581ad
+snapshot .prale-eval/result.json - 84576abdbf249c38f6c8a392e3710d93e5f7bd32feee47598b2e7460df4d26e4
+snapshot packages/agent/src/harness/execution/effect-gate.ts c124c30db0e8227683b77b580c3a2fa66f93922638d898087001b97d396633c1 eb2e140917ec55d7297f13208bb696bcd38666cf806b842c319946555ec7d37c
+snapshot packages/agent/src/harness/execution/tools.ts 71631ad502f569fe1d1d60f025da44266f8eca58e69756ea17538e65ab9e66af 446b8624b365162a8878efeadcdc97ac053dc953f25155743d6a0646cf8868d5
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 3dd561b18237e638e156bac54d3c51127e16f5f70dff71455f7da59317d10490 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

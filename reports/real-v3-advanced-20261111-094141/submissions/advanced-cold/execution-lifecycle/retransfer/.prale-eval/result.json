@@ -1,0 +1,40 @@
+{
+  "task_id": "advanced/execution-lifecycle/retransfer",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Runs from the workspace root with Node 24. The script links the three real production modules in one createGraph VM graph - packages/agent/src/harness/execution/effect-gate.ts (gate), packages/agent/src/harness/execution/tools.ts (executor) and packages/agent/src/harness/runtime/drive/tools.ts (recovery scheduler) - and fakes only the outer boundaries (durable value store/reader, progress channel, placement helpers, validateToolArguments, withAbortSignal), so every assertion observes behavior across the scheduler -> executor -> gate chain. It asserts: (1) gate - after close(terminal) a late beginAbort/signalAbort keeps refusing admission with the same terminal error object, never invokes, keeps signal.reason === terminal, a repeat close cannot replace it, while a genuinely aborting gate still refuses with AbortRequested carrying its cancellation and signals only after cancellation settles; (2) executor - in-flight updates and { checkpoint: true } intents are delivered, but a tool that fires onUpdate after it resolved publishes nothing new, and a sealed gate refuses the effect before the tool body runs; (3) scheduler - a cancelled recovery opens no progress channel, writes no checkpoint, reads the checkpoint before settling it, invokes no tool, publishes no tool_start/tool_update and exactly one interrupted tool_end with the marker text plus the checkpoint's details/usage, while a non-cancelled safe/safe recovery replays the persisted arguments once, clears the checkpoint, and publishes exactly one tool_start and one tool_end with preserved content/details/usage. Asynchronous ordering is controlled with promises only (no timers, randomness or external services). Mutation check performed during development: restoring exactly one of the three production files to its faulty baseline (effect-gate beginAbort guard, executor acceptingUpdates=true, scheduler ignoring cancelled) makes the script exit non-zero with a node:assert/strict assertion failure in all three cases - no crash, import error or timeout. Repository-wide vitest was not run because the workspace has no installed node_modules and dependencies must not be installed; this script is the focused executable validation."
+  },
+  "claims": [
+    {
+      "claim": "A cancelled recovery still executes; cancelled recoveries never clear/invoke.",
+      "citation": "packages/agent/src/harness/runtime/drive/tools.ts recoverToolInvocation now requires !cancelled for the safe/safe replay branch; asserted by .prale-eval/regression.mjs 'cancelled recovery never invokes the tool effect' / 'cancelled recovery reads the checkpoint before settling it'."
+    },
+    {
+      "claim": "A completed tool can emit new updates; completion seals live and checkpoint callbacks.",
+      "citation": "packages/agent/src/harness/execution/tools.ts executeToolCall finally block sets acceptingUpdates = false; asserted by .prale-eval/regression.mjs 'completed tool cannot publish new live updates'."
+    },
+    {
+      "claim": "beginAbort cannot reopen a closed gate or replace its terminal error.",
+      "citation": "packages/agent/src/harness/execution/effect-gate.ts beginAbort returns unless the gate is open; asserted by .prale-eval/regression.mjs 'closed gate keeps refusing with its terminal error' and 'repeat close cannot replace the terminal error'."
+    },
+    {
+      "claim": "Non-cancelled safe/safe recovery must still complete, preserve usage/details and publish once.",
+      "citation": "Same rewritten branch in packages/agent/src/harness/runtime/drive/tools.ts; asserted by .prale-eval/regression.mjs 'safe/safe recovery replays persisted arguments once', 'safe/safe recovery publishes exactly one tool_start' / 'exactly one tool_end' and the staged message details/usage assertions."
+    },
+    {
+      "claim": "Existing APIs and unrelated behavior are preserved.",
+      "citation": "Only the three internal transitions changed (9 insertions, 3 deletions across execution/effect-gate.ts, execution/tools.ts and runtime/drive/tools.ts); no exported signature, event shape or durable format was altered."
+    }
+  ],
+  "deliverables": [
+    "packages/agent/src/harness/execution/effect-gate.ts",
+    "packages/agent/src/harness/execution/tools.ts",
+    "packages/agent/src/harness/runtime/drive/tools.ts",
+    ".prale-eval/regression.mjs",
+    ".prale-eval/repair.md",
+    ".prale-eval/result.json"
+  ]
+}

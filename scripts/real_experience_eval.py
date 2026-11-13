@@ -119,13 +119,20 @@ def load_capsule(path: Path) -> Capsule:
     except KeyError as error:
         raise RealExperienceError(f"{path}: missing {error.args[0]}") from error
     if (
-        capsule.benchmark_id not in {"prale-experience-real-v2", "prale-experience-crossrepo-v1"}
+        capsule.benchmark_id
+        not in {"prale-experience-real-v2", "prale-experience-real-v3", "prale-experience-crossrepo-v1"}
         or len(capsule.base_commit) != 40
     ):
         raise RealExperienceError(f"{path}: unsupported capsule")
     if not archive.is_file() or sha256(archive) != capsule.source_digest:
         raise RealExperienceError(f"{path}: source archive is missing or has the wrong digest")
     return capsule
+
+
+def _reject_private_validation_path(path: Path) -> None:
+    """Reserve controller-only filenames at every depth in real-v2 workspaces."""
+    if any(part in {"oracle.py", "fixture.json", "mutation.patch"} for part in path.parts):
+        raise RealExperienceError(f"private validation artifact cannot enter agent workspace: {path}")
 
 
 def materialize_stage(*, capsule: Capsule, fixture: Path, destination: Path, task_text: str | None = None) -> Path:
@@ -139,6 +146,9 @@ def materialize_stage(*, capsule: Capsule, fixture: Path, destination: Path, tas
     if destination.exists():
         raise RealExperienceError(f"destination already exists: {destination}")
     with tarfile.open(capsule.source_archive) as archive:
+        if capsule.benchmark_id in {"prale-experience-real-v2", "prale-experience-real-v3"}:
+            for member in archive.getmembers():
+                _reject_private_validation_path(Path(member.name))
         _safe_extract(archive, destination)
     patch = (fixture / "mutation.patch").resolve()
     if patch.is_file() and patch.read_text(encoding="utf-8").strip():
@@ -156,11 +166,29 @@ def materialize_stage(*, capsule: Capsule, fixture: Path, destination: Path, tas
                 raise RealExperienceError("fixture support must not contain symlinks")
             if source.is_file():
                 relative = source.relative_to(support)
+                if capsule.benchmark_id in {"prale-experience-real-v2", "prale-experience-real-v3"}:
+                    _reject_private_validation_path(relative)
                 if relative.parts[0] != ".prale-eval":
                     raise RealExperienceError("fixture support must be under .prale-eval")
                 target = destination / relative
                 target.parent.mkdir(parents=True, exist_ok=True)
                 shutil.copy2(source, target)
+    if capsule.benchmark_id in {"prale-experience-real-v2", "prale-experience-real-v3"}:
+        # Also check mutation-created paths before committing any agent-visible history.
+        for path in destination.rglob("*"):
+            _reject_private_validation_path(path.relative_to(destination))
+    metadata_path = fixture / "fixture.json"
+    discovery = metadata_path.is_file() and json.loads(metadata_path.read_text()).get("public_support_version") == 1
+    if discovery:
+        # Copy the complete mutated tree so its inode creation times follow an
+        # ordinary tree traversal rather than exposing the later fault injection.
+        with tempfile.TemporaryDirectory(prefix="prale-source-copy-", dir=destination.parent) as copied:
+            fresh = Path(copied) / "workspace"
+            shutil.copytree(destination, fresh, symlinks=True)
+            shutil.rmtree(destination)
+            fresh.rename(destination)
+        # Normalize before git add too: its index stores per-file mtime/ctime.
+        _normalize_source_timestamps(destination)
     _git(destination, "init")
     _git(destination, "config", "user.email", "fixture@example.invalid")
     _git(destination, "config", "user.name", "PRALE real-eval fixture")
@@ -168,7 +196,20 @@ def materialize_stage(*, capsule: Capsule, fixture: Path, destination: Path, tas
     committed = _git(destination, "commit", "-m", "fixture baseline")
     if committed.returncode:
         raise RealExperienceError(f"could not commit fixture baseline: {committed.stderr.strip()}")
+    if discovery:
+        _normalize_source_timestamps(destination)
     return destination
+
+
+def _normalize_source_timestamps(workspace: Path) -> None:
+    """Normalize source metadata without following symlinks or touching Git."""
+    timestamp_ns = 1_700_000_000_000_000_000
+    for directory, directories, filenames in os.walk(workspace, followlinks=False):
+        if Path(directory) == workspace:
+            directories[:] = [name for name in directories if name != ".git"]
+        for name in (*directories, *filenames):
+            os.utime(Path(directory) / name, ns=(timestamp_ns, timestamp_ns), follow_symlinks=False)
+    os.utime(workspace, ns=(timestamp_ns, timestamp_ns))
 
 
 def run_stage(
@@ -211,8 +252,13 @@ def run_stage(
         before = _workspace_snapshot(workspace)
         fixture_metadata = _object(fixture / "fixture.json") if (fixture / "fixture.json").is_file() else {}
         oracle_version = fixture_metadata.get("oracle_version")
-        behavioral = capsule.benchmark_id == "prale-experience-real-v2" and oracle_version in {3, 4}
+        behavioral = capsule.benchmark_id in {
+            "prale-experience-real-v2",
+            "prale-experience-real-v3",
+        } and oracle_version in {3, 4}
         fault_source = root / "original-fault.ts"
+        fault_bytes: dict[Path, bytes] = {}
+        manifest_bytes = b""
         if behavioral:
             if fixture_metadata.get("source_commit") != capsule.base_commit:
                 raise RealExperienceError("behavioral fixture does not match capsule commit")
@@ -227,16 +273,10 @@ def run_stage(
                 ):
                     raise RealExperienceError("invalid behavioral fixture target")
                 captured = fault_source / target if oracle_version == 4 else fault_source
-                captured.parent.mkdir(parents=True, exist_ok=True)
-                captured.write_bytes((workspace / target).read_bytes())
-            if oracle_version == 4:
-                from real_experience_advanced_oracle import capture_baseline
+                fault_bytes[captured] = (workspace / target).read_bytes()
+            from real_experience_manifest import baseline_manifest
 
-                capture_baseline(workspace, fault_source, baseline)
-            else:
-                from real_experience_manifest import capture_manifest
-
-                capture_manifest(workspace, fault_source.with_suffix(".baseline.json"), baseline)
+            manifest_bytes = json.dumps(baseline_manifest(workspace, baseline), sort_keys=True).encode() + b"\n"
         home = root / "home"
         home.mkdir()
         (root / "tmp").mkdir()
@@ -273,6 +313,15 @@ def run_stage(
                 error.stderr.decode("utf-8", errors="replace") if isinstance(error.stderr, bytes) else error.stderr
             )
             agent_output = ((timeout_stdout or "") + (timeout_stderr or ""))[-20_000:]
+        # Only expose validation artifacts after agent process-group cleanup.
+        if behavioral:
+            for captured, content in fault_bytes.items():
+                captured.parent.mkdir(parents=True, exist_ok=True)
+                captured.write_bytes(content)
+            manifest_path = (
+                fault_source / "baseline.json" if oracle_version == 4 else fault_source.with_suffix(".baseline.json")
+            )
+            manifest_path.write_bytes(manifest_bytes)
         oracle_command = ["python", str(fixture / "oracle.py"), str(workspace)]
         if behavioral:
             oracle_command.extend([str(fault_source), baseline])

@@ -12,6 +12,22 @@ REPO = Path(__file__).resolve().parents[2]
 CAPSULE = REPO / "evals/experience-real-v2/capsules/pi-b455975/source.tar"
 
 
+def submission_boundaries() -> str:
+    # Tests supply their own scenario adapters; generated support has no map.
+    legacy = (REPO / "scripts/real_experience_advanced/subject.mjs").read_text()
+    start = legacy.index("export function createGraph(")
+    end = legacy.index("/** Coupled real resolver", start)
+    trailer_start = legacy.index("source += `", start) + len("source += `")
+    trailer_end = legacy.index("`;", trailer_start)
+    trailer = json.dumps(legacy[trailer_start:trailer_end])
+    wrapper = (
+        "import {createGraph as loadGraph} from './subject.mjs';\n"
+        "export function createGraph(root, bindings = {}, builtinOverrides = {}) {\n"
+        "  return loadGraph(root, modules, bindings, builtinOverrides, " + "{[modules.drive]: " + trailer + "});\n}\n"
+    )
+    return legacy[:start] + wrapper + legacy[end:]
+
+
 def test_advanced_corpus_has_twelve_multifile_tasks():
     from build_real_experience_advanced import FIXTURES, ROOT, render
 
@@ -89,7 +105,7 @@ def test_healthy_passes_and_every_partial_repair_fails(tmp_path, healthy_sources
 REGRESSIONS = {
     "resource-consistency": """
 import assert from 'node:assert/strict';
-import {createResourcePipeline} from './subject.mjs';
+import {createResourcePipeline} from './local-boundaries.mjs';
 const p = await createResourcePipeline(process.cwd());
 assert.equal(await p.resolve(), false);
 const pre = await p.loader.loadProjectTrustExtensions();
@@ -118,7 +134,7 @@ assert.equal(p.consentWrites.length, 1);
 import assert from 'node:assert/strict';
 import {mkdtempSync,writeFileSync,readFileSync,existsSync,rmSync} from 'node:fs';
 import {join,basename} from 'node:path';
-import {createSessionPipeline} from './subject.mjs';
+import {createSessionPipeline} from './local-boundaries.mjs';
 const dir = mkdtempSync(join(process.cwd(),'.prale-eval','advanced-authored-'));
 try {
   const p = await createSessionPipeline(process.cwd(),dir);
@@ -149,7 +165,7 @@ try {
 """,
     "execution-lifecycle": """
 import assert from 'node:assert/strict';
-import {createExecutionPipeline} from './subject.mjs';
+import {createExecutionPipeline} from './local-boundaries.mjs';
 const p = await createExecutionPipeline(process.cwd());
 for (const persisted of ['safe','never']) for (const declared of ['safe','never',undefined]) {
   for (const cancelled of [false,true]) {
@@ -194,7 +210,7 @@ def submitted(tmp_path, healthy_sources, fixture):
     shutil.copytree(healthy_sources, root)
     public = root / ".prale-eval"
     public.mkdir()
-    shutil.copy2(REPO / "scripts/real_experience_advanced/subject.mjs", public / "subject.mjs")
+    shutil.copy2(REPO / "scripts/real_experience_public_subject.mjs", public / "subject.mjs")
     originals = {}
     faults = tmp_path / "faults"
     for fault in fixture.faults:
@@ -218,6 +234,7 @@ def submitted(tmp_path, healthy_sources, fixture):
     capture_baseline(root, faults, baseline)
     for target, original in originals.items():
         (root / target).write_text(original)
+    (public / "local-boundaries.mjs").write_text(submission_boundaries())
     (public / "regression.mjs").write_text(REGRESSIONS[fixture.episode])
     (public / "repair.md").write_text(
         "Repair the producer and consumer together, preserving all trust, data safety and lifecycle boundaries. "
@@ -263,7 +280,7 @@ def test_regression_covering_only_one_file_is_rejected(tmp_path, healthy_sources
     args = submitted(tmp_path, healthy_sources, fixture)
     (args[1] / ".prale-eval/regression.mjs").write_text("""
 import assert from 'node:assert/strict';
-import {createSessionPipeline} from './subject.mjs';
+import {createSessionPipeline} from './local-boundaries.mjs';
 const p=await createSessionPipeline(process.cwd(),process.cwd());
 assert.equal(p.text.stripBom('\\uFEFFx'),'x');
 """)
@@ -317,10 +334,14 @@ def test_advanced_stage_captures_all_fault_sources_and_runs_external_oracle(heal
     changes = [(fault.target, (healthy_sources / fault.target).read_text()) for fault in fixture.faults]
     script = (
         "from pathlib import Path\n"
+        "assert not list(Path.cwd().parent.glob('original-fault*'))\n"
+        "assert not any(p.name in {'oracle.py', 'fixture.json', 'mutation.patch'} "
+        "for p in Path.cwd().parent.rglob('*'))\n"
         f"targets = {[f.target for f in fixture.faults]!r}\n"
         f"assert {visibility!r} != 'hidden' or all(t not in Path('TASK.md').read_text() for t in targets)\n"
         f"changes = {changes!r}\n"
         "for target, content in changes: Path(target).write_text(content)\n"
+        f"Path('.prale-eval/local-boundaries.mjs').write_text({submission_boundaries()!r})\n"
         f"Path('.prale-eval/regression.mjs').write_text({REGRESSIONS[fixture.episode]!r})\n"
         f"Path('.prale-eval/result.json').write_text({json.dumps(delivery)!r})\n"
         "Path('.prale-eval/repair.md').write_text('Repair all interacting producer and consumer modules, "

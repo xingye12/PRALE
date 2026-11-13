@@ -1,0 +1,28 @@
+{
+  "task_id": "tool-recovery-order/correction",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Repaired the blanket never-replay guard in packages/agent/src/harness/runtime/drive/tools.ts:527 (recoverToolInvocation): 'if (false && !cancelled && call.replay === \"safe\" && tool?.replay === \"safe\")' -> 'if (!cancelled && call.replay === \"safe\" && tool?.replay === \"safe\")'. One-line production change; the verified replay body (clearReplayCheckpoint before invocation, performToolInvocation, then publishToolOutcome) and the interrupted fallback for unsafe/missing/cancelled declarations were already correct and are untouched. The regression loads the real production modules (runtime/drive/tools.ts, runtime/drive/tool-placement.ts, runtime/progress.ts, execution/tools.ts, execution/effect-gate.ts, session/commit.ts, session/values.ts, session/types.ts) through .prale-eval/subject.mjs createGraph, faking only the Lane/Drive/Session protocol boundary with an in-memory durable store, a serialized command line, and a real effect gate. Scenario 1 drives runTools over a restored 'tools' operation with an effect_pending safe/safe call plus an unsafe call and asserts: the safe call is invoked exactly once with the persisted arguments (not live ones), its previous progress checkpoint is deleted in a commit that precedes the invocation, the resulting outcome is staged only after the invocation completes, pre-crash memos are readable, the stale checkpoint text does not leak into the result, the tool_start/tool_end events carry recovery:true, and the batch reaches the next checkpoint while the unsafe call is never executed and keeps its durable checkpoint plus the unknown-outcome marker. Scenario 2 asserts the conditional restrictions still hold for an unsafe call record, an unsafe (never) tool declaration and a missing tool declaration (no execution, no tool_start, checkpoint preserved). Scenario 3 drives runTools in parallel mode and flips durable control to cancel_requested while the first replay starts, asserting the remaining safe/safe call is not replayed and reports the interrupted result. Verified: with the fix the script exits 0 (3 consecutive runs, deterministic); with the original 'if (false && ...)' guard restored it exits 1 with AssertionError 'a verified safe/safe effect_pending call must be replayed exactly once (unsafe declarations must never run)' (actual [] vs ['safe']). Limitation: the repository's vitest suite and type check could not be executed because no node_modules are installed in this workspace and dependencies must not be installed; the standalone Node 24 --experimental-vm-modules regression above is the focused validation. No production file other than tools.ts was modified, and .prale-eval/regression.mjs is the only added file. Additional verification of the assertions' discriminating power: with the blanket 'false &&' guard restored the script exits 1; with an over-permissive fix that drops '!cancelled' it exits 1 on 'a cancellation must stop the remaining verified safe replays instead of invoking them'; with an over-permissive fix that drops 'tool?.replay === \"safe\"' or 'call.replay === \"safe\"' it exits 1 on 'unsafe, missing and cancelled declarations must never be replayed'. The final state of packages/agent/src/harness/runtime/drive/tools.ts is the single-line repair shown above, and the regression exits 0 on it."
+  },
+  "claims": [
+    {
+      "claim": "The fault was a blanket never-replay rule that made verified safe/safe effect_pending calls unreplayable because the whole safe-replay branch was guarded by 'false &&'.",
+      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:527 (recoverToolInvocation), before/after diff is a single condition line"
+    },
+    {
+      "claim": "Verified safe/safe calls now replay exactly once when not cancelled: the old checkpoint is cleared in a committed write before the invocation and the resulting outcome is published after the invocation completes.",
+      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:528 clearReplayCheckpoint (deleteValue(pendingToolOutput(...)) + tool_start recovery event) then :531 performToolInvocation(...).then(publishToolOutcome); asserted in .prale-eval/regression.mjs scenario 1"
+    },
+    {
+      "claim": "Conditional restrictions remain for unsafe, missing and cancelled declarations: those paths still fall through to readCheckpoint + interruptedOutcome.",
+      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:536-539; asserted in .prale-eval/regression.mjs scenarios 2 and 3"
+    },
+    {
+      "claim": "The regression exercises the repaired production code and fails on this stage's original fault.",
+      "evidence": ".prale-eval/regression.mjs exits 0 on the fixed source and exits 1 with AssertionError both when the 'false &&' guard was temporarily restored and per scenario 1's first assertion"
+    }
+  ]
+}

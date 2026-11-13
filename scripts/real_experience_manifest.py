@@ -26,14 +26,19 @@ def _files(workspace: Path) -> dict[str, dict[str, str]]:
     return result
 
 
-def capture_manifest(workspace: Path, manifest_path: Path, baseline: str) -> None:
-    """Called by the controller before any agent code runs, outside the workspace."""
-    if manifest_path.resolve().is_relative_to(workspace.resolve()):
-        raise ValueError("controller baseline must be outside the agent workspace")
-    manifest = {
+def baseline_manifest(workspace: Path, baseline: str) -> dict[str, object]:
+    """Capture trusted fingerprints in controller memory before agent execution."""
+    return {
         "baseline_commit": baseline,
         "files": _files(workspace),
         "git_config_sha256": hashlib.sha256((workspace / ".git/config").read_bytes()).hexdigest(),
     }
+
+
+def capture_manifest(workspace: Path, manifest_path: Path, baseline: str) -> None:
+    """Called by the controller before any agent code runs, outside the workspace."""
+    if manifest_path.resolve().is_relative_to(workspace.resolve()):
+        raise ValueError("controller baseline must be outside the agent workspace")
+    manifest = baseline_manifest(workspace, baseline)
     manifest_path.parent.mkdir(parents=True, exist_ok=True)
     manifest_path.write_text(json.dumps(manifest, sort_keys=True) + "\n", encoding="utf-8")

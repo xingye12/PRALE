@@ -155,7 +155,7 @@ FIXTURES = (
 
 def render() -> dict[Path, str]:
     files: dict[Path, str] = {}
-    public_loader = (REPO / "scripts/real_experience_contracts/subject.mjs").read_text(encoding="utf-8")
+    public_loader = (REPO / "scripts/real_experience_public_subject.mjs").read_text(encoding="utf-8")
     with tarfile.open(CAPSULE) as archive:
         sources = {}
         for target in {fixture.target for fixture in FIXTURES}:
@@ -180,11 +180,14 @@ def render() -> dict[Path, str]:
         task_id = f"{fixture.episode}/{fixture.stage}"
         files[base / "TASK.md"] = (
             f"# {task_id}\n\n{fixture.task}\n\n"
-            f"Repair `{fixture.target}` with minimal changes. Add `.prale-eval/regression.mjs`, a standalone Node "
+            "Locate the faulty production code by exploring the repository and repair it with minimal changes. "
+            "Add `.prale-eval/regression.mjs`, a standalone Node "
             "assertion script that exercises the repaired production code. It must exit zero when fixed and fail with "
             "an assertion on this stage's original fault. No dependencies or network are needed: Node 24 provides "
             "TypeScript stripping and VM modules. The read-only `.prale-eval/subject.mjs` helper loads the real source "
-            "with explicit boundary fakes; inspect its exported functions for usage. Run "
+            "using `loadModule(root, relativePath, bindings, trailer)` or "
+            "`createGraph(root, modules, bindings, builtinOverrides, trailers)`. Discover paths and symbols "
+            "in the repository and write your own boundary fakes; no task-specific adapters are supplied. Run "
             "`node --experimental-vm-modules .prale-eval/regression.mjs` from the workspace root. "
             "Do not replace assertions with printed success.\n\n"
             "Write `.prale-eval/result.json` with "
@@ -195,14 +198,16 @@ def render() -> dict[Path, str]:
             "Hidden acceptance executes production behavior and replays your regression on isolated fixed and "
             "original-fault copies. A timeout, syntax/import error, or missing runtime is a failure, not proof that "
             "the regression detected the fault.\n\n"
-            "Only modify the target source and add regression files under `.prale-eval/`. Do not modify TASK.md, "
+            "Modify only production code needed for this incident and add tests under `.prale-eval/`. "
+            "Do not modify TASK.md, "
             "subject.mjs, package locks, Git configuration, or harness files. The acceptance oracle is hidden.\n"
         )
         files[base / "fixture.json"] = (
             json.dumps(
                 {
                     "oracle_version": 3,
-                    "fixture_revision": 4,
+                    "fixture_revision": 6,
+                    "public_support_version": 1,
                     "episode": fixture.episode,
                     "stage": fixture.stage,
                     "task_id": task_id,

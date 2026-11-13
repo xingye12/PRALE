@@ -1,0 +1,796 @@
+diff --git a/packages/agent/src/harness/execution/effect-gate.ts b/packages/agent/src/harness/execution/effect-gate.ts
+index 0e33834..903301f 100644
+--- a/packages/agent/src/harness/execution/effect-gate.ts
++++ b/packages/agent/src/harness/execution/effect-gate.ts
+@@ -52,6 +52,7 @@ export function createGate(): { gate: Gate; control: GateControl } {
+ 			},
+ 			signalAbort() {
+ 				if (state.status !== "aborting" || controller.signal.aborted) return;
++				controller.abort(new AbortRequested(state.cancellation));
+ 			},
+ 			close(error) {
+ 				if (state.status === "closed") return;
+diff --git a/packages/agent/src/harness/execution/tools.ts b/packages/agent/src/harness/execution/tools.ts
+index e5b968a..f768781 100644
+--- a/packages/agent/src/harness/execution/tools.ts
++++ b/packages/agent/src/harness/execution/tools.ts
+@@ -149,7 +149,7 @@ export function executeToolCall<TContext extends object | undefined>(
+ 		} catch (error) {
+ 			return {
+ 				result: createErrorToolResult(error instanceof Error ? error.message : String(error)),
+-				isError: false,
++				isError: true,
+ 			};
+ 		} finally {
+ 			acceptingUpdates = false;
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 91fce39..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -385,7 +385,7 @@ async function performToolInvocation<TContext extends object | undefined>(
+ 			drive.gate,
+ 			(partial, options) => {
+ 				publishUpdate(partial);
+-				if (options?.checkpoint !== false) progress.write(partial);
++				if (options?.checkpoint === true) progress.write(partial);
+ 			},
+ 			toolContext,
+ 			capability.invocation,
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..0967643
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,624 @@
++/**
++ * Cross-module regression for the durable tool-invocation lifecycle.
++ *
++ * Real modules linked in one VM graph (no task-specific adapters, no doubles of the
++ * code under test):
++ *
++ *   - packages/agent/src/harness/execution/effect-gate.ts   admission gate + AbortRequested
++ *   - packages/agent/src/harness/execution/tools.ts         executeToolCall: throw -> error output
++ *   - packages/agent/src/harness/runtime/progress.ts        durable progress channel
++ *   - packages/agent/src/harness/runtime/drive/tools.ts     performToolInvocation: checkpoint
++ *                                                           filtering, drain, hooks, outcome
++ *
++ * Everything else (Session scalar store, lane mutation line, hook bus, bound-value address
++ * constructors, chord context, pi-ai validation, tool placement) is a boundary fake supplied
++ * here. Ordering is controlled with promises only: no timers, no randomness, no services.
++ */
++import assert from "node:assert/strict";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createGraph } from "./subject.mjs";
++
++const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const EFFECT_GATE = "packages/agent/src/harness/execution/effect-gate.ts";
++const EXECUTION_TOOLS = "packages/agent/src/harness/execution/tools.ts";
++const PROGRESS = "packages/agent/src/harness/runtime/progress.ts";
++const DRIVE_TOOLS = "packages/agent/src/harness/runtime/drive/tools.ts";
++
++const OPERATION_ID = "operation-1";
++const TURN_ID = "turn-1";
++const INVOCATION_ID = "result-1";
++
++// ---------------------------------------------------------------------------
++// Boundary fakes
++// ---------------------------------------------------------------------------
++
++function deferred() {
++	let resolve;
++	let reject;
++	const promise = new Promise((res, rej) => {
++		resolve = res;
++		reject = rej;
++	});
++	promise.catch(() => {});
++	return { promise, resolve, reject };
++}
++
++/** Deterministic identity for a bound-value address produced by the fake values boundary. */
++function addressKey(address) {
++	const { family, ...rest } = address;
++	return `${family}:${JSON.stringify(rest)}`;
++}
++
++/** Bound-value address constructors plus the write descriptors they travel in. */
++const values = {
++	setValue: (address, value) => ({ kind: "set", address, value }),
++	deleteValue: (address) => ({ kind: "delete", address }),
++	appendList: (address, value) => ({ kind: "append", address, value }),
++	pendingToolOutput: (operationId, invocationId) => ({ family: "pendingToolOutput", operationId, invocationId }),
++	pendingAssistantFrames: (operationId, responseEntryId) => ({
++		family: "pendingAssistantFrames",
++		operationId,
++		responseEntryId,
++	}),
++	pendingEntry: (resultEntryId) => ({ family: "pendingEntry", resultEntryId }),
++	operationToolArgs: (operationId, turnId, sourceIndex) => ({
++		family: "operationToolArgs",
++		operationId,
++		turnId,
++		sourceIndex,
++	}),
++	operationToolMemo: (operationId, invocationId, name) => ({
++		family: "operationToolMemo",
++		operationId,
++		invocationId,
++		name,
++	}),
++	operationToolMemoPrefix: (operationId, invocationId) => ({
++		family: "operationToolMemo",
++		operationId,
++		invocationId,
++	}),
++};
++
++const configuration = {
++	model: { provider: "test", modelId: "model" },
++	thinkingLevel: "off",
++	activeToolNames: ["probe"],
++};
++
++/** Lane projection: one recovered call whose durable effect is still pending. */
++function operationState() {
++	return {
++		tipId: "assistant-entry",
++		configuration,
++		inbox: [],
++		lastOperationId: null,
++		operation: {
++			meta: {
++				operationId: OPERATION_ID,
++				lane: "main",
++				sourceTipId: null,
++				startedAt: 1,
++				intent: { kind: "run", promptEntryIds: [] },
++			},
++			state: {
++				at: "tools",
++				control: { status: "running" },
++				settings: {
++					compaction: {},
++					steeringMode: "all",
++					followUpMode: "all",
++					toolExecution: "parallel",
++				},
++				inbox: [],
++				writes: [],
++				latestAssistantEntryId: "assistant-entry",
++				batch: {
++					assistantEntryId: "assistant-entry",
++					configuration,
++					turnId: TURN_ID,
++					calls: [{ status: "effect_pending", sourceIndex: 0, resultEntryId: INVOCATION_ID, replay: "never" }],
++				},
++			},
++		},
++	};
++}
++
++/**
++ * Fake lane: one serialized mutation line over a scalar store, one event bus, one hook bus.
++ * `command` mirrors the real contract - plan against the authoritative projection, then
++ * (optionally behind a held barrier) apply every write and publish the new projection.
++ */
++function createLane() {
++	const store = new Map();
++	const events = [];
++	const log = [];
++	const hookEvents = [];
++	const pendingDeliveries = [];
++	let manualDelivery = false;
++	let barrier;
++	let queue = Promise.resolve();
++
++	const applyWrite = (write) => {
++		const key = addressKey(write.address);
++		if (write.kind === "delete") {
++			store.delete(key);
++			return;
++		}
++		if (write.kind === "append") {
++			const list = store.get(key) ?? [];
++			list.push(write.value);
++			store.set(key, list);
++			return;
++		}
++		store.set(key, write.value);
++	};
++
++	const reader = {
++		getValue: async (address) => {
++			const key = addressKey(address);
++			return store.has(key) ? { seq: 1, address, value: store.get(key) } : undefined;
++		},
++		readList: async (address) =>
++			(store.get(addressKey(address)) ?? []).map((value, index) => ({ seq: index + 1, address, value })),
++		scanValues: async () => [],
++	};
++
++	const lane = {
++		name: "main",
++		store,
++		events,
++		log,
++		hookEvents,
++		state: operationState(),
++		readConfig: () => ({ tools: [], toolContext: undefined, retryPolicy: { enabled: false } }),
++		hooks: {
++			// The real HookRegistry admits the whole pipeline through the gate synchronously.
++			runToolWithGate(name, event, gate) {
++				return gate.admit(async () => {
++					hookEvents.push({ name, event });
++					log.push(name);
++					return undefined;
++				});
++			},
++		},
++		emitBatch(batch) {
++			events.push(...batch);
++			log.push(`event:${batch.map((event) => event.type).join("+")}`);
++			if (!manualDelivery) return Promise.resolve();
++			const pending = deferred();
++			pendingDeliveries.push(pending);
++			return pending.promise;
++		},
++		command(plan) {
++			const run = queue.then(async () => {
++				const decision = await plan(lane.state, reader);
++				if (decision.kind === "return") return decision.result;
++				if (decision.kind === "reject") throw decision.error;
++				if (barrier !== undefined) await barrier.promise;
++				for (const write of decision.writes) applyWrite(write);
++				lane.state = decision.next;
++				log.push(`commit:${decision.writes.map((write) => write.kind).join("+")}`);
++				return decision.materialize === undefined ? undefined : decision.materialize();
++			});
++			queue = run.then(
++				() => undefined,
++				() => undefined,
++			);
++			return run;
++		},
++		/** Resolve once every mutation already enqueued on the line has settled. */
++		async flush() {
++			await queue;
++		},
++		holdCommits(promise) {
++			barrier = promise;
++		},
++		useManualDelivery() {
++			manualDelivery = true;
++		},
++		/** Resolve the oldest outstanding live-event delivery. */
++		releaseDelivery() {
++			const pending = pendingDeliveries.shift();
++			if (pending !== undefined) pending.resolve();
++		},
++		deliveryCount() {
++			return pendingDeliveries.length;
++		},
++		read(address) {
++			return store.get(addressKey(address));
++		},
++	};
++	return lane;
++}
++
++/** Fake Drive: real gate views plus the process-local context handed to admitted work. */
++function createDrive(gate, control) {
++	return {
++		operationId: OPERATION_ID,
++		gate,
++		control,
++		context: { abortSignal: undefined, toString: () => "[test context]" },
++	};
++}
++
++function toolCall(name = "probe") {
++	return { type: "toolCall", id: "tool-call-1", name, arguments: {} };
++}
++
++function partial(text) {
++	return { content: [{ type: "text", text }], details: { step: text } };
++}
++
++function textOf(result) {
++	return (result.content ?? []).flatMap((part) => (part.type === "text" ? [part.text] : [])).join("\n");
++}
++
++function toolUpdateEvents(lane) {
++	return lane.events.filter((event) => event.type === "tool_update");
++}
++
++const invocation = {
++	invocationId: INVOCATION_ID,
++	operationId: OPERATION_ID,
++	turnId: TURN_ID,
++	getMemo: async () => undefined,
++	setMemo: async () => {},
++};
++
++// ---------------------------------------------------------------------------
++// Graph
++// ---------------------------------------------------------------------------
++
++const graph = createGraph(
++	ROOT,
++	[EFFECT_GATE, EXECUTION_TOOLS, PROGRESS, DRIVE_TOOLS],
++	{
++		// pi-ai boundary: argument validation is not part of this incident.
++		validateToolArguments: (_tool, call) => call.arguments,
++		// chord context boundary: the admitted context carries the gate signal.
++		withAbortSignal: (signal, context) => ({
++			...(context ?? {}),
++			abortSignal: context?.abortSignal === undefined ? signal : AbortSignal.any([context.abortSignal, signal]),
++		}),
++		// session boundary used only by defensive invariant paths.
++		SessionInvariantError: class SessionInvariantError extends Error {},
++		...values,
++		// tool-placement boundary: placement/materialization is out of scope here.
++		materializeReady: async () => undefined,
++		readToolBatchSource: async () => ({ assistant: { stopReason: "toolUse", toolCalls: [] }, toolCalls: [] }),
++		toolCallFor: (_sources, call) => call.toolCall,
++		withToolBatch: (run, batch) => ({ ...run, batch }),
++	},
++	{},
++	{
++		// Expose the module-private invocation procedure so the test can drive the real
++		// producer (tool update callback) through the real consumer (progress + drive).
++		[DRIVE_TOOLS]: "\nexport { performToolInvocation as __performToolInvocation };\n",
++	},
++);
++
++const gateModule = await graph.module(EFFECT_GATE);
++const executionTools = await graph.module(EXECUTION_TOOLS);
++const progressModule = await graph.module(PROGRESS);
++const driveTools = await graph.module(DRIVE_TOOLS);
++
++assert.equal(typeof gateModule.createGate, "function");
++assert.equal(typeof gateModule.AbortRequested, "function");
++assert.equal(typeof executionTools.executeToolCall, "function");
++assert.equal(typeof progressModule.openToolProgress, "function");
++assert.equal(typeof driveTools.runTools, "function");
++assert.equal(typeof driveTools.__performToolInvocation, "function");
++
++const performToolInvocation = driveTools.__performToolInvocation;
++
++function pendingInvocation(lane, tool) {
++	const state = lane.state.operation.state;
++	return {
++		batch: state.batch,
++		call: state.batch.calls[0],
++		cleared: { toolCall: toolCall(tool.name), tool, args: {} },
++	};
++}
++
++// ---------------------------------------------------------------------------
++// 1. Effect gate: abort-first admission, and signaling the admitted effect
++// ---------------------------------------------------------------------------
++
++{
++	const { gate, control } = gateModule.createGate();
++	const cancellation = deferred();
++	const aborts = [];
++	gate.signal.addEventListener("abort", () => aborts.push("abort"));
++
++	assert.equal(gate.signal.aborted, false, "a fresh gate must not be aborted");
++	assert.equal(gate.admit(() => "admitted"), "admitted", "an open gate admits synchronously");
++
++	control.beginAbort(cancellation.promise);
++	assert.equal(
++		gate.signal.aborted,
++		false,
++		"beginAbort alone must not signal: the cancellation marker has not committed yet",
++	);
++
++	// No new effect may be admitted once durable cancellation has begun.
++	const startedAfterBeginAbort = [];
++	let refusal;
++	try {
++		gate.admit(() => startedAfterBeginAbort.push("started"));
++	} catch (error) {
++		refusal = error;
++	}
++	assert.ok(
++		refusal instanceof gateModule.AbortRequested,
++		"admission after beginAbort must be refused with the shared AbortRequested",
++	);
++	assert.equal(refusal.cancellation, cancellation.promise);
++	assert.deepEqual(startedAfterBeginAbort, [], "a refused admission must never invoke its effect");
++
++	// Signaling must reach the already-admitted effect's signal.
++	control.signalAbort();
++	assert.equal(gate.signal.aborted, true, "signalAbort must abort the admitted work's signal");
++	assert.deepEqual(aborts, ["abort"], "abort listeners must fire exactly once");
++	assert.ok(
++		gate.signal.reason instanceof gateModule.AbortRequested,
++		"the gate must abort with its own AbortRequested so waiters treat it as expected cancellation",
++	);
++
++	cancellation.resolve();
++}
++
++// ---------------------------------------------------------------------------
++// 2. Tool execution boundary: a throw stays an error, and an abort-first gate
++//    never starts the tool
++// ---------------------------------------------------------------------------
++
++for (const [label, execute] of [
++	[
++		"synchronous",
++		() => {
++			throw new Error("tool failed synchronously");
++		},
++	],
++	[
++		"asynchronous",
++		async () => {
++			throw new Error("tool failed asynchronously");
++		},
++	],
++]) {
++	const { gate } = gateModule.createGate();
++	const executed = await executionTools.executeToolCall(
++		{ toolCall: toolCall(), tool: { name: "probe", label: "Probe", description: "probe", execute }, args: {} },
++		gate,
++		() => {},
++		undefined,
++		invocation,
++		{ abortSignal: undefined },
++	);
++	assert.equal(executed.isError, true, `a ${label} tool throw must stay an error result`);
++	assert.match(textOf(executed.result), /tool failed/, `the ${label} throw message must be preserved`);
++}
++
++{
++	const { gate, control } = gateModule.createGate();
++	const cancellation = deferred();
++	control.beginAbort(cancellation.promise);
++	let started = 0;
++	let refusal;
++	try {
++		executionTools.executeToolCall(
++			{
++				toolCall: toolCall(),
++				tool: {
++					name: "probe",
++					label: "Probe",
++					description: "probe",
++					execute: async () => {
++						started += 1;
++						return partial("never");
++					},
++				},
++				args: {},
++			},
++			gate,
++			() => {},
++			undefined,
++			invocation,
++			{ abortSignal: undefined },
++		);
++	} catch (error) {
++		refusal = error;
++	}
++	assert.ok(refusal instanceof gateModule.AbortRequested);
++	assert.equal(started, 0, "no tool effect may start after beginAbort");
++	cancellation.resolve();
++}
++
++// ---------------------------------------------------------------------------
++// 3. Recovered invocation: live progress vs. durable checkpoints, then a throw
++// ---------------------------------------------------------------------------
++
++{
++	const lane = createLane();
++	const { gate, control } = gateModule.createGate();
++	const drive = createDrive(gate, control);
++	const seen = {};
++
++	const tool = {
++		name: "probe",
++		label: "Probe",
++		description: "probe",
++		async execute(_id, _args, onUpdate) {
++			const liveOnly = partial("live-only");
++			onUpdate(liveOnly);
++			await lane.flush();
++			seen.afterLiveOnly = lane.read(values.pendingToolOutput(drive.operationId, INVOCATION_ID));
++
++			const checkpoint = partial("checkpoint");
++			onUpdate(checkpoint, { checkpoint: true });
++			await lane.flush();
++			seen.afterCheckpoint = lane.read(values.pendingToolOutput(drive.operationId, INVOCATION_ID));
++
++			const trailingLive = partial("trailing-live");
++			onUpdate(trailingLive);
++			await lane.flush();
++			seen.afterTrailingLive = lane.read(values.pendingToolOutput(drive.operationId, INVOCATION_ID));
++
++			throw new Error("recovered tool exploded");
++		},
++	};
++
++	const built = pendingInvocation(lane, tool);
++	const outcome = await performToolInvocation(lane, drive, built.batch, built.call, built.cleared, undefined, true);
++
++	// Every admitted live update reached observers, in order, tagged as recovery work.
++	const updates = toolUpdateEvents(lane);
++	assert.deepEqual(
++		updates.map((event) => event.partialResult.details.step),
++		["live-only", "checkpoint", "trailing-live"],
++		"every admitted live update must reach observers in order",
++	);
++	assert.deepEqual(
++		updates.map((event) => event.recovery),
++		[true, true, true],
++		"recovered invocations must tag live updates as recovery work",
++	);
++	assert.deepEqual(
++		updates.map((event) => event.toolCallId),
++		["tool-call-1", "tool-call-1", "tool-call-1"],
++	);
++
++	// Only checkpoint:true updates were persisted.
++	assert.equal(seen.afterLiveOnly, undefined, "a live-only update must never be persisted");
++	assert.equal(seen.afterCheckpoint?.details.step, "checkpoint", "checkpoint:true must persist its snapshot");
++	assert.equal(
++		seen.afterTrailingLive?.details.step,
++		"checkpoint",
++		"a live update after the checkpoint must not replace the durable snapshot",
++	);
++
++	// The tool exception stays an error in the final message.
++	assert.equal(outcome.message.role, "toolResult");
++	assert.equal(outcome.message.isError, true, "a tool exception must remain an error in the final message");
++	assert.match(textOf(outcome.message), /recovered tool exploded/);
++	assert.equal(outcome.terminate, false);
++
++	const afterTool = lane.hookEvents.filter((hook) => hook.name === "after_tool");
++	assert.equal(afterTool.length, 1, "after_tool must run once for a real recovered execution");
++	assert.equal(afterTool[0].event.isError, true, "after_tool must observe the error result");
++	assert.equal(
++		lane.log.indexOf("commit:set") < lane.log.indexOf("after_tool"),
++		true,
++		"the durable checkpoint commit must precede after_tool",
++	);
++}
++
++// ---------------------------------------------------------------------------
++// 4. Ordering: live delivery and progress drain complete before after_tool
++// ---------------------------------------------------------------------------
++
++{
++	const lane = createLane();
++	lane.useManualDelivery();
++	const commitBarrier = deferred();
++	lane.holdCommits(commitBarrier.promise);
++	const { gate, control } = gateModule.createGate();
++	const drive = createDrive(gate, control);
++	const toolReturned = deferred();
++
++	const tool = {
++		name: "probe",
++		label: "Probe",
++		description: "probe",
++		async execute(_id, _args, onUpdate) {
++			onUpdate(partial("checkpoint"), { checkpoint: true });
++			toolReturned.resolve();
++			return partial("final");
++		},
++	};
++
++	const built = pendingInvocation(lane, tool);
++	const running = performToolInvocation(lane, drive, built.batch, built.call, built.cleared, undefined, false);
++
++	await toolReturned.promise;
++	// The checkpoint commit is still held: neither after_tool nor publication may happen yet.
++	assert.deepEqual(lane.hookEvents, [], "after_tool must wait for the drained checkpoint");
++	assert.equal(lane.read(values.pendingToolOutput(OPERATION_ID, INVOCATION_ID)), undefined);
++	assert.equal(lane.deliveryCount(), 1, "the live update delivery must still be outstanding");
++
++	commitBarrier.resolve();
++	lane.releaseDelivery();
++	const outcome = await running;
++	lane.log.push("publish-outcome");
++
++	assert.equal(lane.read(values.pendingToolOutput(OPERATION_ID, INVOCATION_ID))?.details.step, "checkpoint");
++	const commitIndex = lane.log.indexOf("commit:set");
++	const afterToolIndex = lane.log.indexOf("after_tool");
++	const publishIndex = lane.log.indexOf("publish-outcome");
++	assert.notEqual(commitIndex, -1, "the checkpoint must be committed");
++	assert.notEqual(afterToolIndex, -1, "after_tool must run");
++	assert.equal(commitIndex < afterToolIndex, true, "final hooks must follow progress drain");
++	assert.equal(afterToolIndex < publishIndex, true, "final publication must follow progress drain");
++	assert.equal(outcome.message.isError, false, "a successful effect is not an error");
++	assert.equal(textOf(outcome.message), "final");
++	assert.deepEqual(
++		lane.hookEvents.map((hook) => hook.event.isError),
++		[false],
++	);
++}
++
++// ---------------------------------------------------------------------------
++// 5. Signaling the abort reaches the already-admitted tool's AbortSignal
++// ---------------------------------------------------------------------------
++
++{
++	const lane = createLane();
++	const { gate, control } = gateModule.createGate();
++	const drive = createDrive(gate, control);
++	const toolStarted = deferred();
++	const releaseTool = deferred();
++	const signalEvents = [];
++	const observed = {};
++
++	const tool = {
++		name: "probe",
++		label: "Probe",
++		description: "probe",
++		async execute(_id, _args, _onUpdate, _toolContext, _invocation, context) {
++			assert.equal(context.abortSignal, gate.signal, "the admitted tool must own the gate signal");
++			context.abortSignal.addEventListener("abort", () => signalEvents.push("abort"), { once: true });
++			observed.abortedBefore = context.abortSignal.aborted;
++			toolStarted.resolve();
++			await releaseTool.promise;
++			observed.abortedAtSettlement = context.abortSignal.aborted;
++			return partial("finished after abort");
++		},
++	};
++
++	const built = pendingInvocation(lane, tool);
++	const running = performToolInvocation(lane, drive, built.batch, built.call, built.cleared, undefined, false);
++
++	await toolStarted.promise;
++	assert.equal(gate.signal.aborted, false, "an open gate must not signal before the marker commits");
++
++	const cancellation = deferred();
++	control.beginAbort(cancellation.promise);
++	assert.deepEqual(signalEvents, [], "beginAbort alone must not signal the admitted tool");
++	cancellation.resolve();
++	control.signalAbort();
++
++	assert.equal(gate.signal.aborted, true, "signalAbort must reach the already-admitted tool's signal");
++	assert.deepEqual(signalEvents, ["abort"], "the tool's abort listener must fire");
++
++	releaseTool.resolve();
++	const outcome = await running;
++	assert.equal(observed.abortedBefore, false);
++	assert.equal(observed.abortedAtSettlement, true, "the admitted tool must observe the abort signal");
++	assert.equal(outcome.message.isError, false, "a tool that settles after abort keeps its real result");
++	assert.equal(textOf(outcome.message), "finished after abort");
++	assert.equal(lane.log.includes("after_tool"), false, "after_tool must not start once the gate is aborting");
++}
++
++console.log("regression: durable tool lifecycle invariants hold across effect-gate, execution, progress, drive");
+diff --git a/.prale-eval/repair.md b/.prale-eval/repair.md
+new file mode 100644
+index 0000000..f02bcb9
+--- /dev/null
++++ b/.prale-eval/repair.md
+@@ -0,0 +1,100 @@
++# Repair: live progress, durable progress and errors diverge
++
++Task: `advanced/execution-lifecycle/transfer` — repository `earendil-works/pi`.
++
++## Incident
++
++A recovered tool invocation (`effect_pending`, `recovery: true`) emits live progress, an
++explicit checkpoint (`{ checkpoint: true }`), then throws. The observed behaviour was wrong
++in three independent places along the producer/consumer chain:
++
++| Boundary | Required | Observed before the repair |
++|---|---|---|
++| `runtime/drive/tools.ts` → `runtime/progress.ts` | only `checkpoint: true` updates are persisted; every admitted update still reaches observers | every update was persisted (`options?.checkpoint !== false` is always true because the option type is `checkpoint?: true`) |
++| `execution/tools.ts` → `runtime/drive/tools.ts` | a tool exception stays an error in the final message | the `catch` in `executeToolCall` returned `isError: false`, so the staged `ToolResultMessage`, the `after_tool` event payload and the `tool_end` event all reported success |
++| `execution/effect-gate.ts` → admitted tool/provider | `signalAbort()` must pull the signal of work that was already admitted | `signalAbort()` only checked its guard and never aborted the controller, so `requestAbort` committed the durable marker without ever reaching the running tool's `AbortSignal` (retry timers and in-flight provider streams also hung until they finished on their own) |
++
++All three sit on the same call path, so the divergence showed up as one symptom: live output
++streamed, the durable checkpoint was wrong (or missing), and the terminal result claimed
++success.
++
++## Changes (3 lines of production code)
++
++1. `packages/agent/src/harness/execution/effect-gate.ts` — `GateControl.signalAbort()` now
++   performs the abort it was already guarding:
++
++   ```ts
++   signalAbort() {
++       if (state.status !== "aborting" || controller.signal.aborted) return;
++       controller.abort(new AbortRequested(state.cancellation));
++   }
++   ```
++
++   The reason is the gate's own `AbortRequested(cancellation)`, which is what every consumer of
++   `gate.signal` expects: `waitUntil()` rejects with `signal.reason` and `driveOperation()`
++   only tolerates `AbortRequested` as *expected* cancellation; provider requests and tool
++   contexts only need `signal.aborted`. `close()` keeps aborting with the closing error, so the
++   two lifecycle paths stay distinguishable.
++
++2. `packages/agent/src/harness/execution/tools.ts` — the `executeToolCall` catch now returns
++   `isError: true`. `finalizeToolCall` propagates `executed.isError` unless an `after_tool`
++   patch overrides it, so the error flag reaches the staged `pendingEntry` message, the
++   `after_tool` event and `tool_end`.
++
++3. `packages/agent/src/harness/runtime/drive/tools.ts` — the update consumer in
++   `performToolInvocation` now gates durable persistence on the explicit request:
++
++   ```ts
++   (partial, options) => {
++       publishUpdate(partial);                                  // always live
++       if (options?.checkpoint === true) progress.write(partial); // durable only on request
++   }
++   ```
++
++   `publishUpdate` (the `tool_update` event path) is unchanged, so every admitted live update
++   still reaches observers; only the scalar `pendingToolOutput` replacement is now restricted to
++   `checkpoint: true`.
++
++Behaviour that was already correct and is preserved (and now asserted): `gate.admit` refuses
++new effects synchronously after `beginAbort` with `AbortRequested`; `executeToolCall` still
++fences late updates with `acceptingUpdates`; `performToolInvocation` still seals and drains the
++progress channel (and awaits the latest live delivery) before `after_tool` and before the
++outcome it publishes; the interruption/abort synthetic outcomes keep `terminate: false` and
++`isError: true`.
++
++## Cross-module regression
++
++`.prale-eval/regression.mjs` links four real modules in one VM graph
++(`effect-gate.ts`, `execution/tools.ts`, `runtime/progress.ts`, `runtime/drive/tools.ts`) with
++`createGraph` and supplies its own boundary fakes: a scalar Session store with real bound-value
++address descriptors, a serialized lane mutation line, an `emitBatch` event bus with a
++promise-controlled delivery, and a `HookRegistry`-shaped hook bus that admits through the real
++gate. Only the module-private `performToolInvocation` is exposed through the `trailers`
++mechanism; no production code is patched or stubbed.
++
++Scenarios (all ordering controlled with promises, no timers):
++
++1. gate: fresh gate admits; `beginAbort` alone neither signals nor admits; `signalAbort`
++   aborts, fires the listener once, and carries `AbortRequested`.
++2. `executeToolCall`: synchronous and asynchronous throws are error results with the original
++   message; an abort-first gate never starts the tool and surfaces the gate's own
++   `AbortRequested` (cross-module class identity).
++3. recovered invocation: three updates (live, checkpoint, live) — observer sees all three in
++   order tagged `recovery`, the store shows `undefined` → `checkpoint` → still `checkpoint`,
++   and the thrown tool yields `isError: true` plus an `after_tool` that observes the error.
++4. ordering: with the checkpoint commit and the live delivery both held open, `after_tool`
++   cannot run; after release the mutation log is `commit → after_tool → publish-outcome`.
++5. abort after admission: the tool observes the gate signal, the listener fires after
++   `signalAbort`, the tool's real result is kept (`isError: false`), and `after_tool` does not
++   start because the gate refuses admission.
++
++Verified detection: restoring any one of the three files to its faulty baseline makes the
++script fail with an assertion (gate → "signalAbort must abort the admitted work's signal";
++tools → "a synchronous tool throw must stay an error result"; drive/tools → "a live-only update
++must never be persisted"), and restoring all three fails as well. No crash, import error or
++timeout is involved.
++
++Validation: `node --experimental-vm-modules .prale-eval/regression.mjs` → passes.
++The repository's own vitest suites could not be run because no dependencies are installed in
++this workspace and installing them is out of scope; the behaviours they cover are reproduced by
++the regression above against the same modules.
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..2c30404
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "advanced/execution-lifecycle/transfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root; the script prints 'regression: durable tool lifecycle invariants hold across effect-gate, execution, progress, drive' and exits 0. It links four real production modules in one VM graph via .prale-eval/subject.mjs createGraph - packages/agent/src/harness/execution/effect-gate.ts, packages/agent/src/harness/execution/tools.ts, packages/agent/src/harness/runtime/progress.ts and packages/agent/src/harness/runtime/drive/tools.ts - and supplies its own boundary fakes for the Session scalar store, the lane mutation line, the emitBatch event bus, the HookRegistry hook bus, the chord context, pi-ai argument validation and tool placement. Only the module-private performToolInvocation is exposed through the subject trailers hook; no production module is stubbed. Coverage: (1) gate semantics - a fresh gate admits, beginAbort alone neither signals nor admits and refuses new effects with the shared AbortRequested, signalAbort aborts the already-admitted signal (listener fires once, reason is AbortRequested); (2) executeToolCall turns synchronous and asynchronous tool throws into isError:true results with the original message, and an abort-first gate never starts the tool; (3) a recovered invocation that emits live-only progress, an explicit checkpoint and another live update observes all three live updates in order tagged recovery:true while the durable pendingToolOutput snapshot goes undefined -> checkpoint -> still checkpoint, and the subsequent throw yields a final message with isError:true and an after_tool hook that sees the error; (4) with the checkpoint commit and the live delivery both held open, after_tool cannot run early, and after release the mutation log order is commit -> after_tool -> publish-outcome, so final publication follows progress drain; (5) an abort signaled after admission reaches the running tool's AbortSignal, the tool's real result is kept (isError:false) and after_tool does not start. Fault detection was checked by restoring each repaired file to its faulty baseline one at a time and all three together: each run fails with an uncaught node:assert/strict assertion ('signalAbort must abort the admitted work's signal', 'a synchronous tool throw must stay an error result', 'a live-only update must never be persisted') rather than crashing, failing to import or timing out. No timers, randomness or external services are used; ordering is controlled with promises. Limitation: the repository's vitest suites could not be executed because no node_modules are installed in the workspace and dependency installation is out of scope, so the same behaviours were asserted directly against the production modules through the VM graph."
++  }
++}
+snapshot .prale-eval/regression.mjs - 1291261d030d2790b1b7b52b40b634b42875f599b95a5e545e3d3642e4ad101a
+snapshot .prale-eval/repair.md - c5ef4254435b8c8aba0e6ab66d8ad976cfa541af79a87ed78260cbc40c9140d4
+snapshot .prale-eval/result.json - e49aa092c97422f13625a3db70618c2cc63ebd3c64a18f56b58317034dd9a23f
+snapshot packages/agent/src/harness/execution/effect-gate.ts b83cf3f0823780e694ac9b5726913683c074a6c78a9213f09bc9fe2ce75935e1 eb2e140917ec55d7297f13208bb696bcd38666cf806b842c319946555ec7d37c
+snapshot packages/agent/src/harness/execution/tools.ts 9872562d00722599bcce5d2820a280bbdb71f9f5779afae12a67a810a2e59ae0 446b8624b365162a8878efeadcdc97ac053dc953f25155743d6a0646cf8868d5
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 1259e79fadea8c2c61499aea735a88cb3960f372b22de921320c644b2962dcc3 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

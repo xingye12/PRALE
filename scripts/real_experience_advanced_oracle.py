@@ -13,6 +13,7 @@ from typing import Any
 
 from real_experience_manifest import _files, capture_manifest
 from real_experience_oracle import COMMAND, REGRESSION, _regular, run_node
+from real_experience_support import subject_path
 
 CONTRACTS = Path(__file__).with_name("real_experience_advanced")
 WRAPPER = Path(__file__).with_name("real_experience_contracts") / "regression.mjs"
@@ -69,7 +70,7 @@ def evaluate(fixture: Path, workspace: Path, fault_sources: Path, baseline: str)
             _regular(fault_sources, target)
         _regular(workspace, REGRESSION)
         helper = _regular(workspace, ".prale-eval/subject.mjs")
-        if helper.read_bytes() != (CONTRACTS / "subject.mjs").read_bytes():
+        if helper.read_bytes() != subject_path(metadata, CONTRACTS).read_bytes():
             raise ValueError("read-only public graph loader changed")
         if len(_regular(workspace, ".prale-eval/repair.md").read_text(encoding="utf-8").strip()) < 80:
             raise ValueError("repair.md must explain the cross-module repair")

@@ -1,0 +1,675 @@
+diff --git a/packages/agent/src/harness/runtime/drive/tools.ts b/packages/agent/src/harness/runtime/drive/tools.ts
+index 9dc1a3c..1bff010 100644
+--- a/packages/agent/src/harness/runtime/drive/tools.ts
++++ b/packages/agent/src/harness/runtime/drive/tools.ts
+@@ -524,7 +524,7 @@ async function recoverToolInvocation<TContext extends object | undefined>(
+ ): Promise<ToolCallTask> {
+ 	const toolCall = toolCallFor(sources, call);
+ 	const tool = toolsByName.get(toolCall.name);
+-	if (false && !cancelled && call.replay === "safe" && tool?.replay === "safe") {
++	if (!cancelled && call.replay === "safe" && tool?.replay === "safe") {
+ 		const args = await clearReplayCheckpoint(lane, drive, run.batch, call, toolCall);
+ 		const cleared: ClearedToolCall<TContext> = { toolCall, tool, args };
+ 		return {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..7b09276
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,619 @@
++/**
++ * Regression: recovery of a durable tool batch must replay verified safe/safe calls.
++ *
++ * Incident: `recoverToolInvocation` in packages/agent/src/harness/runtime/drive/tools.ts
++ * carried a blanket `if (false && ...)` guard, so every `effect_pending` call was converted
++ * into a synthetic "external outcome is unknown" result - even when both the durable call
++ * record and the tool declaration promised `safe` replay and the batch was not cancelled.
++ *
++ * Required behaviour (and what is asserted below):
++ *  - `call.replay === "safe"` + `tool.replay === "safe"` + not cancelled: replay exactly once,
++ *    using the persisted arguments, with the previous progress checkpoint cleared in a commit
++ *    *before* the tool is invoked and the resulting outcome published *after* invocation.
++ *  - unsafe call record, unsafe/missing tool declaration, or a cancelled batch: never invoke,
++ *    keep the conditional restriction (synthetic interrupted result carrying the checkpoint).
++ *
++ * The real production modules are loaded through .prale-eval/subject.mjs; only the Lane /
++ * Drive / Session protocol boundary is faked here. No dependencies, no network.
++ *
++ * Run: node --experimental-vm-modules .prale-eval/regression.mjs
++ */
++import assert from "node:assert/strict";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createGraph } from "./subject.mjs";
++
++const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++
++const SOURCES = {
++	tools: "packages/agent/src/harness/runtime/drive/tools.ts",
++	placement: "packages/agent/src/harness/runtime/drive/tool-placement.ts",
++	progress: "packages/agent/src/harness/runtime/progress.ts",
++	executionTools: "packages/agent/src/harness/execution/tools.ts",
++	effectGate: "packages/agent/src/harness/execution/effect-gate.ts",
++	commit: "packages/agent/src/harness/session/commit.ts",
++	values: "packages/agent/src/harness/session/values.ts",
++	sessionTypes: "packages/agent/src/harness/session/types.ts",
++};
++
++/** Boundary fake for ../../session/session.ts (only the invariant error is consumed here). */
++class SessionInvariantError extends Error {
++	constructor(message) {
++		super(message);
++		this.name = "SessionInvariantError";
++	}
++}
++
++const graph = await createGraph(ROOT, SOURCES, {
++	SessionInvariantError,
++	// Boundary fake for the provider argument validator.
++	validateToolArguments: (_tool, call) => call.arguments,
++	// Boundary fake for @earendil-works/chord/context re-exported by ../../context.ts.
++	withAbortSignal: (signal, context) => ({ ...context, abortSignal: signal }),
++});
++
++const { runTools } = await graph.module("tools");
++const values = await graph.module("values");
++const effectGate = await graph.module("effectGate");
++
++const INTERRUPTION_MARKER = "external outcome is unknown";
++
++/** In-memory stand-in for the durable Session value/entry store behind a Lane. */
++class RecordedStore {
++	constructor() {
++		this.values = new Map();
++		this.entries = new Map();
++		this.log = [];
++		this.seq = 0;
++	}
++
++	static keyOf(namespace, key) {
++		return `${namespace}\u0000${key}`;
++	}
++
++	seed(address, value) {
++		this.seq += 1;
++		this.values.set(RecordedStore.keyOf(address.namespace, address.key), { address, value, seq: this.seq });
++	}
++
++	read(address) {
++		return this.values.get(RecordedStore.keyOf(address.namespace, address.key))?.value;
++	}
++
++	reader() {
++		return {
++			getValue: async (address) => this.values.get(RecordedStore.keyOf(address.namespace, address.key)),
++			scanValues: async (prefix) =>
++				[...this.values.values()].filter(
++					({ address }) => address.namespace === prefix.namespace && address.key.startsWith(prefix.key),
++				),
++			getEntries: async (ids) => {
++				const found = new Map();
++				for (const id of ids) {
++					const entry = this.entries.get(id);
++					if (entry !== undefined) found.set(id, entry);
++				}
++				return found;
++			},
++			readList: async () => [],
++		};
++	}
++
++	/** Apply a durable commit exactly as the session would and record it for ordering assertions. */
++	commit(writes) {
++		const seqs = [];
++		for (const write of writes) {
++			this.seq += 1;
++			seqs.push(this.seq);
++			if (write.kind === "value") {
++				const key = RecordedStore.keyOf(write.namespace, write.key);
++				this.log.push(`commit:${write.op}:${write.namespace}:${write.key}`);
++				if (write.op === "set") {
++					this.values.set(key, {
++						address: { namespace: write.namespace, key: write.key, kind: "value" },
++						value: write.value,
++						seq: this.seq,
++					});
++				} else {
++					this.values.delete(key);
++				}
++			} else if (write.kind === "entry") {
++				this.log.push(`commit:entry:${write.entry.id}`);
++				this.entries.set(write.entry.id, { ...write.entry, seq: this.seq, timestamp: 1 });
++			} else if (write.kind === "usage") {
++				this.log.push(`commit:usage:${write.row.id}`);
++			} else {
++				this.log.push(`commit:list:${write.op}:${write.namespace}:${write.key}`);
++			}
++		}
++		return { firstSeq: 1, seqs, timestamp: 100, stats: {} };
++	}
++}
++
++/** Boundary fake for the Lane mutation protocol consumed by the drive procedures. */
++class FakeLane {
++	constructor({ store, state, config, hooks }) {
++		this.store = store;
++		this._state = state;
++		this.cancelRequested = false;
++		this.config = config;
++		this.hooks = hooks;
++		this.name = "main";
++		this.events = [];
++		this.onToolStart = undefined;
++		this.queue = Promise.resolve();
++		this.session = { idGenerator: { next: () => `generated-${(store.seq += 1)}` } };
++	}
++
++	/** Durable lane state; a cancel request that has already landed stays in effect. */
++	get state() {
++		return this._state;
++	}
++
++	set state(next) {
++		const run = next?.operation?.state;
++		this._state =
++			this.cancelRequested && run?.at === "tools"
++				? {
++						...next,
++						operation: { ...next.operation, state: { ...run, control: { status: "cancel_requested", requestedAt: 30 } } },
++					}
++				: next;
++	}
++
++	readConfig() {
++		return this.config;
++	}
++
++	async emitBatch(batch) {
++		for (const event of batch) {
++			this.events.push(event);
++			this.store.log.push(`event:${event.type}:${event.toolCallId ?? ""}`);
++			if (event.type === "tool_start" && this.onToolStart !== undefined) this.onToolStart(event);
++		}
++	}
++
++	async applyDecision(decision) {
++		if (decision.kind === "return") return decision.result;
++		if (decision.kind === "reject") throw decision.error;
++		const commit = this.store.commit(decision.writes);
++		this.state = decision.next;
++		const result = decision.materialize(commit);
++		const events = decision.events?.(commit) ?? [];
++		if (events.length > 0) await this.emitBatch(events);
++		return result;
++	}
++
++	/** Serialize mutations on one session line, exactly like Lane.command(). */
++	command(plan) {
++		const result = this.queue.then(async () => this.applyDecision(await plan(this.state, this.store.reader())));
++		this.queue = result.then(
++			() => undefined,
++			() => undefined,
++		);
++		return result;
++	}
++
++	async settleOperation(_capability, plan) {
++		return this.command(async (state, reader) => {
++			const operation = state.operation;
++			if (operation === null) throw new SessionInvariantError("Operation command requires an operation");
++			const decision = await plan(state, operation.state, operation.meta, reader);
++			if (decision.kind !== "commit") return decision;
++			return {
++				kind: "commit",
++				writes: decision.writes,
++				next: {
++					...state,
++					...decision.lane,
++					operation: { meta: operation.meta, state: decision.operationState },
++				},
++				materialize: decision.materialize,
++				...(decision.events === undefined ? {} : { events: decision.events }),
++			};
++		});
++	}
++
++	async continueOperation(capability, plan) {
++		return this.settleOperation(capability, async (state, current, meta, reader) => {
++			if (current.control.status === "cancel_requested") {
++				return { kind: "return", result: { kind: "cancel_requested" } };
++			}
++			const decision = await plan(state, current, meta, reader);
++			if (decision.kind === "return") {
++				return { kind: "return", result: { kind: "result", value: decision.result } };
++			}
++			return { ...decision, materialize: (commit) => ({ kind: "result", value: decision.materialize(commit) }) };
++		});
++	}
++}
++
++/**
++ * Build one restored "tools" operation:
++ *  - `calls`: [{ name, call, args?, checkpoint?, memos? }] durable ToolCall records,
++ *  - `tools`: [{ name, replay, execute? }] tool declarations advertised by the lane config.
++ */
++function createHarness({ calls, tools, mode = "sequential" }) {
++	const store = new RecordedStore();
++	const operationId = "op-1";
++	const assistantEntryId = "assistant-1";
++	const executions = [];
++	const observations = [];
++
++	const assistant = {
++		role: "assistant",
++		content: calls.map(({ name }, index) => ({
++			type: "toolCall",
++			id: `call-${index}`,
++			name,
++			arguments: { value: "live-arguments" },
++		})),
++		stopReason: "toolUse",
++		timestamp: 20,
++	};
++	store.entries.set(assistantEntryId, {
++		id: assistantEntryId,
++		parentId: null,
++		type: "message",
++		message: assistant,
++		seq: 0,
++		timestamp: 0,
++	});
++
++	const configuration = {
++		model: { provider: "faux", modelId: "faux-model" },
++		thinkingLevel: "off",
++		activeToolNames: calls.map(({ name }) => name),
++	};
++	const run = {
++		at: "tools",
++		control: { status: "running" },
++		settings: {
++			compaction: { enabled: false },
++			steeringMode: "all",
++			followUpMode: "all",
++			toolExecution: mode,
++		},
++		batch: {
++			assistantEntryId,
++			configuration,
++			turnId: "turn-1",
++			calls: calls.map(({ call }) => call),
++		},
++		latestAssistantEntryId: assistantEntryId,
++	};
++	const state = {
++		tipId: assistantEntryId,
++		inbox: [],
++		lastOperationId: null,
++		configuration,
++		operation: {
++			meta: {
++				operationId,
++				lane: "main",
++				sourceTipId: null,
++				startedAt: 1,
++				intent: { kind: "run", promptEntryIds: [] },
++			},
++			state: run,
++		},
++	};
++	const config = {
++		tools: [],
++		resources: {},
++		streamOptions: {},
++		retryPolicy: { enabled: false, maxRetries: 0, baseDelayMs: 0 },
++		compaction: { enabled: false },
++		steeringMode: "all",
++		followUpMode: "all",
++		toolExecution: mode,
++		toolContext: undefined,
++		systemPrompt: undefined,
++		toProviderMessages: (messages) => messages,
++		entryProjectors: {},
++	};
++
++	const lane = new FakeLane({
++		store,
++		state,
++		config,
++		hooks: { runToolWithGate: async () => undefined },
++	});
++
++	const harnessTools = tools.map((spec) => ({
++		name: spec.name,
++		label: spec.name,
++		description: spec.name,
++		parameters: { type: "object", properties: {}, additionalProperties: true },
++		replay: spec.replay,
++		execute: async (_toolCallId, args, _onUpdate, _toolContext, invocation) => {
++			const durable = calls.find((candidate) => candidate.name === spec.name && candidate.call.replay !== undefined);
++			const resultEntryId = durable?.call.resultEntryId;
++			executions.push(spec.name);
++			store.log.push(`execute:${spec.name}`);
++			const record = {
++				tool: spec.name,
++				args,
++				checkpointCleared:
++					resultEntryId === undefined
++						? undefined
++						: store.read(values.pendingToolOutput(operationId, resultEntryId)) === undefined,
++				outcomeStaged:
++					resultEntryId === undefined ? undefined : store.read(values.pendingEntry(resultEntryId)) !== undefined,
++				memo: undefined,
++			};
++			observations.push(record);
++			await spec.execute?.({ args, invocation, record, store, operationId, resultEntryId });
++			return {
++				content: [{ type: "text", text: `${spec.name} replayed` }],
++				details: { replayed: true },
++			};
++		},
++	}));
++	config.tools = harnessTools;
++
++	const drive = { operationId, gate: effectGate.createGate().gate, context: {} };
++
++	for (const { call, args, checkpoint, memos } of calls) {
++		if (args !== undefined) {
++			store.seed(values.operationToolArgs(operationId, "turn-1", call.sourceIndex), args);
++		}
++		if (checkpoint !== undefined) {
++			store.seed(values.pendingToolOutput(operationId, call.resultEntryId), checkpoint);
++		}
++		for (const [name, value] of Object.entries(memos ?? {})) {
++			store.seed(values.operationToolMemo(operationId, call.resultEntryId, name), value);
++		}
++	}
++
++	const sources = {
++		assistant,
++		calls: new Map(assistant.content.map((block, index) => [index, block])),
++	};
++
++	return {
++		store,
++		lane,
++		drive,
++		run,
++		state,
++		sources,
++		config,
++		executions,
++		observations,
++		tools: harnessTools,
++		toolsByName: new Map(harnessTools.map((tool) => [tool.name, tool])),
++		operationId,
++		resultIds: calls.map(({ call }) => call.resultEntryId),
++		log: store.log,
++	};
++}
++
++function resultMessage(store, resultEntryId) {
++	const entry = store.entries.get(resultEntryId);
++	assert.ok(entry, `expected a durable tool result entry for ${resultEntryId}`);
++	assert.equal(entry.type, "message");
++	assert.equal(entry.message.role, "toolResult");
++	return entry.message;
++}
++
++function lastText(message) {
++	const text = message.content.at(-1);
++	assert.equal(text?.type, "text");
++	return text.text;
++}
++
++function indexOfLog(log, marker, label) {
++	const index = log.indexOf(marker);
++	assert.notEqual(index, -1, `expected the log to contain ${label} (${JSON.stringify(marker)}); log: ${log.join(" | ")}`);
++	return index;
++}
++
++// ---------------------------------------------------------------------------
++// 1. Verified safe/safe calls replay exactly once when the batch is not cancelled.
++// ---------------------------------------------------------------------------
++{
++	const harness = createHarness({
++		calls: [
++			{
++				name: "safe",
++				call: { status: "effect_pending", sourceIndex: 0, resultEntryId: "result-0", replay: "safe" },
++				args: { value: "persisted" },
++				checkpoint: { content: [{ type: "text", text: "old progress" }], details: { stale: true } },
++				memos: { "step/a": { complete: true } },
++			},
++			{
++				name: "unsafe",
++				call: { status: "effect_pending", sourceIndex: 1, resultEntryId: "result-1", replay: "never" },
++				args: { value: "unsafe" },
++				checkpoint: { content: [{ type: "text", text: "durable partial" }], details: { progress: "kept" } },
++			},
++		],
++		tools: [
++			{
++				name: "safe",
++				replay: "safe",
++				execute: async ({ invocation, record }) => {
++					record.memo = await invocation.getMemo("step/a");
++				},
++			},
++			{ name: "unsafe", replay: "never" },
++		],
++	});
++
++	const outcome = await runTools(harness.lane, harness.drive, harness.run);
++	assert.equal(outcome.kind, "continue");
++
++	// The fault: the safe branch was unreachable, so the verified call was never replayed.
++	assert.deepEqual(
++		harness.executions,
++		["safe"],
++		"a verified safe/safe effect_pending call must be replayed exactly once (unsafe declarations must never run)",
++	);
++
++	const replay = harness.observations[0];
++	assert.deepEqual(replay.args, { value: "persisted" }, "replay must use the persisted arguments, not live arguments");
++	assert.equal(replay.checkpointCleared, true, "the old progress checkpoint must be cleared before the invocation starts");
++	assert.equal(replay.outcomeStaged, false, "the resulting outcome must only be published after the invocation completes");
++	assert.deepEqual(replay.memo, { complete: true }, "replay must be able to read the memos saved before the crash");
++
++	const checkpointDelete = indexOfLog(
++		harness.log,
++		`commit:delete:pi.pending.tool_output:${harness.operationId}:result-0`,
++		"the replay checkpoint clear",
++	);
++	const invocation = indexOfLog(harness.log, "execute:safe", "the replayed invocation");
++	const outcomePublish = indexOfLog(harness.log, "commit:set:pi.pending.entry:result-0", "the published replay outcome");
++	assert.ok(checkpointDelete < invocation, "the old checkpoint must be cleared before the replayed invocation");
++	assert.ok(invocation < outcomePublish, "the replay outcome must be published only after the invocation completes");
++
++	const replayed = resultMessage(harness.store, "result-0");
++	assert.equal(replayed.isError, false, "the replayed call must publish a successful tool result");
++	assert.ok(
++		replayed.content.some((block) => block.type === "text" && block.text.includes("safe replayed")),
++		"the replayed call must publish the fresh tool output",
++	);
++	assert.ok(
++		!JSON.stringify(replayed.content).includes("old progress"),
++		"the replayed call must replace the stale checkpoint instead of reporting an interruption",
++	);
++
++	const interrupted = resultMessage(harness.store, "result-1");
++	assert.equal(interrupted.isError, true, "an unsafe declaration keeps the interrupted result");
++	assert.equal(interrupted.content[0].text, "durable partial", "an unsafe declaration keeps the durable checkpoint content");
++	assert.ok(lastText(interrupted).includes(INTERRUPTION_MARKER), "an unsafe declaration keeps the unknown-outcome marker");
++	assert.deepEqual(interrupted.details, { progress: "kept" });
++
++	const safeStart = harness.lane.events.find((event) => event.type === "tool_start" && event.toolCallId === "call-0");
++	assert.deepEqual(JSON.parse(JSON.stringify(safeStart)), {
++		type: "tool_start",
++		lane: "main",
++		runId: harness.operationId,
++		turnId: "turn-1",
++		toolCallId: "call-0",
++		toolName: "safe",
++		args: { value: "persisted" },
++		recovery: true,
++	});
++	const safeEnd = harness.lane.events.find((event) => event.type === "tool_end" && event.toolCallId === "call-0");
++	assert.equal(safeEnd?.isError, false);
++	assert.equal(safeEnd?.recovery, true);
++	assert.equal(
++		harness.lane.events.some((event) => event.type === "tool_start" && event.toolCallId === "call-1"),
++		false,
++		"an unsafe declaration must not publish a tool_start",
++	);
++	assert.equal(
++		harness.lane.events.find((event) => event.type === "tool_end" && event.toolCallId === "call-1")?.isError,
++		true,
++	);
++	assert.equal(harness.lane.state.operation.state.at, "checkpoint", "a fully recovered batch must reach the next checkpoint");
++	assert.equal(harness.lane.state.operation.state.continuation.kind, "need_assistant");
++}
++
++// ---------------------------------------------------------------------------
++// 2. Unsafe, missing and unsafe-declared tools keep the conditional restriction.
++// ---------------------------------------------------------------------------
++{
++	const harness = createHarness({
++		calls: [
++			{
++				name: "call-declares-never",
++				call: { status: "effect_pending", sourceIndex: 0, resultEntryId: "result-0", replay: "never" },
++				args: { value: "a" },
++				checkpoint: { content: [{ type: "text", text: "checkpoint a" }], details: {} },
++			},
++			{
++				name: "tool-declares-never",
++				call: { status: "effect_pending", sourceIndex: 1, resultEntryId: "result-1", replay: "safe" },
++				args: { value: "b" },
++				checkpoint: { content: [{ type: "text", text: "checkpoint b" }], details: {} },
++			},
++			{
++				name: "tool-missing",
++				call: { status: "effect_pending", sourceIndex: 2, resultEntryId: "result-2", replay: "safe" },
++				args: { value: "c" },
++				checkpoint: { content: [{ type: "text", text: "checkpoint c" }], details: {} },
++			},
++		],
++		tools: [
++			{ name: "call-declares-never", replay: "safe" },
++			{ name: "tool-declares-never", replay: "never" },
++		],
++	});
++
++	await runTools(harness.lane, harness.drive, harness.run);
++
++	assert.deepEqual(harness.executions, [], "unsafe, missing and cancelled declarations must never be replayed");
++
++	for (const [index, marker] of [
++		[0, "checkpoint a"],
++		[1, "checkpoint b"],
++		[2, "checkpoint c"],
++	]) {
++		const message = resultMessage(harness.store, `result-${index}`);
++		assert.equal(message.isError, true, `call ${index} must report an interrupted effect`);
++		assert.equal(message.content[0].text, marker, `call ${index} must keep its durable checkpoint content`);
++		assert.ok(lastText(message).includes(INTERRUPTION_MARKER), `call ${index} must keep the unknown-outcome marker`);
++	}
++	assert.equal(
++		harness.lane.events.some((event) => event.type === "tool_start"),
++		false,
++		"a restricted recovery must not publish a tool_start",
++	);
++}
++
++// ---------------------------------------------------------------------------
++// 3. A cancelled batch keeps the restriction even for a verified safe/safe call.
++// ---------------------------------------------------------------------------
++{
++	const harness = createHarness({
++		mode: "parallel",
++		calls: [
++			{
++				name: "safe-first",
++				call: { status: "effect_pending", sourceIndex: 0, resultEntryId: "result-0", replay: "safe" },
++				args: { value: "first" },
++				checkpoint: { content: [{ type: "text", text: "first checkpoint" }], details: {} },
++			},
++			{
++				name: "safe-second",
++				call: { status: "effect_pending", sourceIndex: 1, resultEntryId: "result-1", replay: "safe" },
++				args: { value: "second" },
++				checkpoint: { content: [{ type: "text", text: "second checkpoint" }], details: {} },
++			},
++		],
++		tools: [
++			{ name: "safe-first", replay: "safe" },
++			{ name: "safe-second", replay: "safe" },
++		],
++	});
++
++	// A cancellation lands while the first replay is starting: the durable control status flips to
++	// cancel_requested exactly as a concurrent cancel request would (this is the flag runParallel
++	// forwards to recovery for the remaining calls in the batch).
++	harness.lane.onToolStart = (event) => {
++		if (event.toolCallId !== "call-0") return;
++		harness.lane.cancelRequested = true;
++		harness.lane.state = harness.lane.state;
++	};
++
++	await runTools(harness.lane, harness.drive, harness.run);
++
++	assert.deepEqual(
++		harness.executions,
++		["safe-first"],
++		"a cancellation must stop the remaining verified safe replays instead of invoking them",
++	);
++	const cancelled = resultMessage(harness.store, "result-1");
++	assert.equal(cancelled.isError, true, "a cancelled safe call must report an interrupted effect");
++	assert.equal(cancelled.content[0].text, "second checkpoint", "a cancelled safe call must keep its durable checkpoint");
++	assert.ok(lastText(cancelled).includes(INTERRUPTION_MARKER));
++	assert.equal(
++		harness.lane.events.some((event) => event.type === "tool_start" && event.toolCallId === "call-1"),
++		false,
++		"a cancelled safe call must not publish a tool_start",
++	);
++}
++
++console.log("ok: safe/safe recovery replays once and unsafe, missing and cancelled declarations stay interrupted");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..3c7dc74
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,28 @@
++{
++  "task_id": "tool-recovery-order/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired the blanket never-replay guard in packages/agent/src/harness/runtime/drive/tools.ts:527 (recoverToolInvocation): 'if (false && !cancelled && call.replay === \"safe\" && tool?.replay === \"safe\")' -> 'if (!cancelled && call.replay === \"safe\" && tool?.replay === \"safe\")'. One-line production change; the verified replay body (clearReplayCheckpoint before invocation, performToolInvocation, then publishToolOutcome) and the interrupted fallback for unsafe/missing/cancelled declarations were already correct and are untouched. The regression loads the real production modules (runtime/drive/tools.ts, runtime/drive/tool-placement.ts, runtime/progress.ts, execution/tools.ts, execution/effect-gate.ts, session/commit.ts, session/values.ts, session/types.ts) through .prale-eval/subject.mjs createGraph, faking only the Lane/Drive/Session protocol boundary with an in-memory durable store, a serialized command line, and a real effect gate. Scenario 1 drives runTools over a restored 'tools' operation with an effect_pending safe/safe call plus an unsafe call and asserts: the safe call is invoked exactly once with the persisted arguments (not live ones), its previous progress checkpoint is deleted in a commit that precedes the invocation, the resulting outcome is staged only after the invocation completes, pre-crash memos are readable, the stale checkpoint text does not leak into the result, the tool_start/tool_end events carry recovery:true, and the batch reaches the next checkpoint while the unsafe call is never executed and keeps its durable checkpoint plus the unknown-outcome marker. Scenario 2 asserts the conditional restrictions still hold for an unsafe call record, an unsafe (never) tool declaration and a missing tool declaration (no execution, no tool_start, checkpoint preserved). Scenario 3 drives runTools in parallel mode and flips durable control to cancel_requested while the first replay starts, asserting the remaining safe/safe call is not replayed and reports the interrupted result. Verified: with the fix the script exits 0 (3 consecutive runs, deterministic); with the original 'if (false && ...)' guard restored it exits 1 with AssertionError 'a verified safe/safe effect_pending call must be replayed exactly once (unsafe declarations must never run)' (actual [] vs ['safe']). Limitation: the repository's vitest suite and type check could not be executed because no node_modules are installed in this workspace and dependencies must not be installed; the standalone Node 24 --experimental-vm-modules regression above is the focused validation. No production file other than tools.ts was modified, and .prale-eval/regression.mjs is the only added file. Additional verification of the assertions' discriminating power: with the blanket 'false &&' guard restored the script exits 1; with an over-permissive fix that drops '!cancelled' it exits 1 on 'a cancellation must stop the remaining verified safe replays instead of invoking them'; with an over-permissive fix that drops 'tool?.replay === \"safe\"' or 'call.replay === \"safe\"' it exits 1 on 'unsafe, missing and cancelled declarations must never be replayed'. The final state of packages/agent/src/harness/runtime/drive/tools.ts is the single-line repair shown above, and the regression exits 0 on it."
++  },
++  "claims": [
++    {
++      "claim": "The fault was a blanket never-replay rule that made verified safe/safe effect_pending calls unreplayable because the whole safe-replay branch was guarded by 'false &&'.",
++      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:527 (recoverToolInvocation), before/after diff is a single condition line"
++    },
++    {
++      "claim": "Verified safe/safe calls now replay exactly once when not cancelled: the old checkpoint is cleared in a committed write before the invocation and the resulting outcome is published after the invocation completes.",
++      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:528 clearReplayCheckpoint (deleteValue(pendingToolOutput(...)) + tool_start recovery event) then :531 performToolInvocation(...).then(publishToolOutcome); asserted in .prale-eval/regression.mjs scenario 1"
++    },
++    {
++      "claim": "Conditional restrictions remain for unsafe, missing and cancelled declarations: those paths still fall through to readCheckpoint + interruptedOutcome.",
++      "evidence": "packages/agent/src/harness/runtime/drive/tools.ts:536-539; asserted in .prale-eval/regression.mjs scenarios 2 and 3"
++    },
++    {
++      "claim": "The regression exercises the repaired production code and fails on this stage's original fault.",
++      "evidence": ".prale-eval/regression.mjs exits 0 on the fixed source and exits 1 with AssertionError both when the 'false &&' guard was temporarily restored and per scenario 1's first assertion"
++    }
++  ]
++}
+snapshot .prale-eval/regression.mjs - 4e1a9573c7b9f2a7e3afdb78ae295172c06fcaaea476d1295153a78827fbed06
+snapshot .prale-eval/result.json - 18c87bcaa97faf3a3969db666daa74cdc5a01b996dfcf911a4220890672ed3dd
+snapshot packages/agent/src/harness/runtime/drive/tools.ts 3dd561b18237e638e156bac54d3c51127e16f5f70dff71455f7da59317d10490 0dbfd29f893bd01a296cf243523db1e0fedf5b2ff7f1ce828588f33a7b16d7a3

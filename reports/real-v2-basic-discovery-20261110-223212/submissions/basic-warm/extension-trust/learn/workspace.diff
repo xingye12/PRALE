@@ -1,0 +1,222 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 611ec15..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -435,7 +435,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 	async loadProjectTrustExtensions(): Promise<LoadExtensionsResult> {
+ 		// Force untrusted project settings for the bootstrap pass. This keeps project-local
+ 		// extensions/packages out while still loading user/global and temporary CLI extensions.
+-		this.settingsManager.setProjectTrusted(true);
++		this.settingsManager.setProjectTrusted(false);
+ 		await this.settingsManager.reload();
+ 		return this.loadCurrentExtensionSet({ includeInlineFactories: true });
+ 	}
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..0d261e7
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,156 @@
++/**
++ * Regression: project extensions must not leak into the project-trust bootstrap.
++ *
++ * `DefaultResourceLoader.reload({ resolveProjectTrust })` first performs a bootstrap pass
++ * with forced *untrusted* project settings, then resolves trust, then reloads. The previous
++ * on-disk state may already be "trusted", so the bootstrap pass must actively force
++ * untrusted settings instead of assuming the current state is untrusted.
++ *
++ * Exercises the real `packages/coding-agent/src/core/resource-loader.ts` through the
++ * read-only `.prale-eval/subject.mjs` boundary fakes.
++ */
++import assert from "node:assert/strict";
++import { basename, dirname, resolve } from "node:path";
++import { fileURLToPath } from "node:url";
++
++const root = resolve(dirname(fileURLToPath(import.meta.url)), "..");
++const { createTrustSubject } = await import(new URL("./subject.mjs", import.meta.url).href);
++
++// Extensions come from the reloaded module's realm, so normalize into plain host arrays
++// before comparing (realm-specific Array.prototype would fail deep equality checks).
++const extensionNames = (extensions) =>
++	Array.from(extensions, (extension) => basename(String(extension.path))).sort();
++
++// ---------------------------------------------------------------------------
++// Scenario 1: previous state was trusted, trust resolution approves the project.
++// The bootstrap pass must still be untrusted: only user/global (and CLI) extensions
++// may be visible to the trust resolver, and project extensions load only afterwards.
++// ---------------------------------------------------------------------------
++{
++	const { loader, events, state, paths } = await createTrustSubject(root, { initialTrusted: true });
++	let bootstrapNames;
++	let resolveCalls = 0;
++	let trustedAtResolution;
++
++	await loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			resolveCalls += 1;
++			bootstrapNames = extensionNames(extensionsResult.extensions);
++			trustedAtResolution = state.loadedTrust;
++			return true;
++		},
++	});
++
++	assert.equal(resolveCalls, 1, "trust resolver must run exactly once per reload");
++
++	// Core invariant: a previously-trusted state must not leak project extensions into the
++	// trust bootstrap pass.
++	assert.equal(
++		bootstrapNames.includes("project.ts"),
++		false,
++		`bootstrap pass leaked project extensions into trust resolution: ${JSON.stringify(bootstrapNames)}`,
++	);
++	assert.deepEqual(
++		bootstrapNames,
++		["cli.ts", "user.ts"],
++		`bootstrap must load user/global and CLI extensions only, saw ${JSON.stringify(bootstrapNames)}`,
++	);
++	assert.equal(
++		trustedAtResolution,
++		false,
++		"settings loaded for the bootstrap pass must be untrusted even when the previous state was trusted",
++	);
++
++	// The forced-untrusted state must be applied explicitly (set + settings reload) before
++	// the bootstrap extension resolution, whatever the prior state was.
++	const firstSetIndex = events.findIndex((event) => event[0] === "set");
++	assert.ok(firstSetIndex >= 0, `expected an explicit project trust write, events: ${JSON.stringify(events)}`);
++	assert.deepEqual(
++		[...events[firstSetIndex]],
++		["set", false],
++		"bootstrap must force project trust to false before reloading settings",
++	);
++	assert.equal(
++		events[firstSetIndex][1],
++		false,
++		"bootstrap must force project trust to false even when the previous state was trusted",
++	);
++
++	const firstResolveIndex = events.findIndex((event) => event[0] === "resolve");
++	assert.ok(firstResolveIndex > firstSetIndex, "trust must be forced before extensions are resolved");
++	assert.equal(
++		events[firstResolveIndex][1],
++		false,
++		`bootstrap extension resolution must observe untrusted settings, events: ${JSON.stringify(events)}`,
++	);
++
++	// The bootstrap extension load must not include the project extension.
++	const trustedSetIndex = events.findIndex((event) => event[0] === "set" && event[1] === true);
++	const bootstrapLoadIndex = events.findIndex(
++		(event, index) => event[0] === "extensions" && (trustedSetIndex === -1 || index < trustedSetIndex),
++	);
++	assert.ok(bootstrapLoadIndex >= 0, `expected a bootstrap extension load, events: ${JSON.stringify(events)}`);
++	assert.deepEqual(
++		[...events[bootstrapLoadIndex][1]].sort(),
++		["cli.ts", "user.ts"],
++		`bootstrap extension load must exclude project extensions, saw ${JSON.stringify(events[bootstrapLoadIndex][1])}`,
++	);
++
++	// After trust is approved the project extension loads in the final pass, and user/CLI
++	// extensions stay available.
++	const finalNames = extensionNames(loader.getExtensions().extensions);
++	assert.deepEqual(
++		finalNames,
++		["cli.ts", "project.ts", "user.ts"],
++		`trusted final reload must load user, project and CLI extensions, saw ${JSON.stringify(finalNames)}`,
++	);
++	assert.equal(
++		finalNames.includes(basename(paths.user)),
++		true,
++		"user/global extensions must remain available after trust resolution",
++	);
++	assert.equal(
++		finalNames.includes(basename(paths.cli)),
++		true,
++		"CLI extensions must remain available after trust resolution",
++	);
++	assert.equal(loader.getExtensions().errors.length, 0, "no extension load errors expected");
++}
++
++// ---------------------------------------------------------------------------
++// Scenario 2: previous state was untrusted and trust resolution rejects the project.
++// The bootstrap pass must be untrusted too, and the project extension must stay out of
++// the final set while user/global and CLI extensions remain available.
++// ---------------------------------------------------------------------------
++{
++	const { loader, events, state } = await createTrustSubject(root, { initialTrusted: false });
++	let bootstrapNames;
++
++	await loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			bootstrapNames = extensionNames(extensionsResult.extensions);
++			assert.equal(state.loadedTrust, false, "bootstrap settings must be untrusted while trust is unresolved");
++			return false;
++		},
++	});
++
++	assert.deepEqual(
++		bootstrapNames,
++		["cli.ts", "user.ts"],
++		`untrusted bootstrap must load user/CLI extensions only, saw ${JSON.stringify(bootstrapNames)}`,
++	);
++
++	const finalNames = extensionNames(loader.getExtensions().extensions);
++	assert.deepEqual(
++		finalNames,
++		["cli.ts", "user.ts"],
++		`a rejected project must not load project extensions, saw ${JSON.stringify(finalNames)}`,
++	);
++	assert.equal(
++		events.some((event) => event[0] === "set" && event[1] === false),
++		true,
++		`expected an explicit untrusted write, events: ${JSON.stringify(events)}`,
++	);
++}
++
++console.log("regression: project extensions no longer leak into the trust bootstrap");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..52a6a31
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,38 @@
++{
++  "task_id": "extension-trust/learn",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "DefaultResourceLoader.loadProjectTrustExtensions must force untrusted project settings before reloading settings and resolving the bootstrap extension set.",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:435-441"
++    },
++    {
++      "claim": "The bootstrap pass now writes projectTrusted=false instead of true, so a previously-trusted state can no longer leak project extensions into trust resolution.",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:438"
++    },
++    {
++      "claim": "User/global and temporary CLI extensions still load during the bootstrap pass and are reused by the final extension set.",
++      "citation": "packages/coding-agent/src/core/resource-loader.ts:452-457, 641-690"
++    },
++    {
++      "claim": "Regression coverage exercises the real loader through the read-only subject helper with settings/package/extension boundary fakes.",
++      "citation": ".prale-eval/regression.mjs"
++    }
++  ],
++  "deliverables": [
++    {
++      "path": "packages/coding-agent/src/core/resource-loader.ts",
++      "change": "Forced untrusted project settings in the trust bootstrap pass (setProjectTrusted(false) + reload before resolving extensions)."
++    },
++    {
++      "path": ".prale-eval/regression.mjs",
++      "change": "Standalone Node assertion regression for trust bootstrap isolation, final trusted/untrusted extension sets, and user/CLI extension availability."
++    }
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Ran from the workspace root with Node 24: exit 0 and 'regression: project extensions no longer leak into the trust bootstrap'. The script loads the real resource-loader.ts via .prale-eval/subject.mjs (createTrustSubject) with explicit settings/package/extension boundary fakes and asserts: (1) with initialTrusted=true the first trust write is [set, false] and the bootstrap resolve event observes loadedTrust=false; (2) the extensions handed to resolveProjectTrust are exactly cli.ts+user.ts, i.e. project.ts never appears in the bootstrap pass even though the prior state was trusted; (3) the bootstrap extension load event excludes project.ts; (4) after approval the final set is cli.ts+project.ts+user.ts with zero errors; (5) with initialTrusted=false and a rejected project, bootstrap and final sets are cli.ts+user.ts. Verified differential behavior by temporarily restoring the original fault (setProjectTrusted(true)): the script failed with AssertionError 'bootstrap pass leaked project extensions into trust resolution: [\"cli.ts\",\"project.ts\",\"user.ts\"]' at the core invariant assertion, then passed again after restoring the fix. Extension arrays are normalized with Array.from because the loaded module lives in a separate VM realm; without that, prototype-sensitive deep equality misfires. Limitation: the repository has no installed node_modules, so vitest (packages/coding-agent/test/resource-loader.test.ts) could not be executed and no dependencies were installed; the standalone VM-based regression was the focused validation instead."
++  }
++}
+snapshot .prale-eval/regression.mjs - 0493464b97032bdb314f27b225a02f130c9350d6e8587806805bbad7e033254f
+snapshot .prale-eval/result.json - 7041edbbec9f119b729ee30354550e9b46de5b7b616c1b6ebc4416a5e1b7b721
+snapshot packages/coding-agent/src/core/resource-loader.ts 4b33246df80dbf73189b1de1f4eac1939ff8315cf00ab9fb0c06d362d8ce2594 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

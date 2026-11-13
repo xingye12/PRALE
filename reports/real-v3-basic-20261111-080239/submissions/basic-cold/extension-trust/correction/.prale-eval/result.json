@@ -1,0 +1,54 @@
+{
+  "task_id": "extension-trust/correction",
+  "repository": "earendil-works/pi",
+  "mode": "repair",
+  "fault": {
+    "file": "packages/coding-agent/src/core/resource-loader.ts",
+    "symbol": "DefaultResourceLoader.reload()",
+    "original": "const projectTrusted = false;",
+    "explanation": "reload({ resolveProjectTrust }) performed the untrusted bootstrap extension load (loadProjectTrustExtensions(), which already forces settingsManager.setProjectTrusted(false)) and then hard-coded projectTrusted = false instead of consulting the supplied resolver. The trust resolver was never called, so an approved project never received its project-scoped settings/extensions/packages and no extension project_trust handler could ever run."
+  },
+  "repair": {
+    "file": "packages/coding-agent/src/core/resource-loader.ts",
+    "change": "const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });",
+    "notes": "One-line minimal change: the resolver is invoked exactly once, is awaited before SettingsManager.setProjectTrusted() and the subsequent trusted resource pass, and receives the untrusted bootstrap LoadExtensionsResult produced by loadProjectTrustExtensions(). No other production code touched."
+  },
+  "claims": [
+    {
+      "claim": "Policy explicitly allows project resources after a true decision.",
+      "citation": "packages/coding-agent/src/core/resource-loader.ts:450-455 (DefaultResourceLoader.reload) passing the resolver result to SettingsManager.setProjectTrusted, consumed by packages/coding-agent/src/core/package-manager.ts:1746 and resource-loader.ts:1095,1109",
+      "evidence": "regression.mjs scenario 1: resolver returns true -> project extension is loaded and settingsManager.isProjectTrusted() === true."
+    },
+    {
+      "claim": "Policy denies project resources after a false decision.",
+      "citation": "packages/coding-agent/src/core/resource-loader.ts:450-455 + packages/coding-agent/src/core/package-manager.ts:1746 (project scope withheld when !isProjectTrusted)",
+      "evidence": "regression.mjs scenario 2: resolver returns false -> only the user extension is loaded, project extension never loaded, trust state stays false."
+    },
+    {
+      "claim": "The resolver must observe an untrusted bootstrap result.",
+      "citation": "packages/coding-agent/src/core/resource-loader.ts:435-441 (loadProjectTrustExtensions forces setProjectTrusted(false) and reloads) followed by the resolver call at line 453",
+      "evidence": "regression.mjs asserts the resolver input carries the user-only bootstrap extensionsResult while settingsManager.isProjectTrusted() === false."
+    },
+    {
+      "claim": "Call the resolver once and preserve its asynchronous ordering.",
+      "citation": "packages/coding-agent/src/core/resource-loader.ts:453 (single awaited call)",
+      "evidence": "regression.mjs asserts resolverCalls === 1 and event ordering: packageManager.resolve(trusted=false) -> trustResolver.start -> trustResolver.end (after a 25ms async gap) -> packageManager.resolve(trusted=true)."
+    }
+  ],
+  "deliverables": {
+    "production": [
+      "packages/coding-agent/src/core/resource-loader.ts (repaired DefaultResourceLoader.reload)"
+    ],
+    "tests": [
+      ".prale-eval/regression.mjs"
+    ],
+    "result": [
+      ".prale-eval/result.json"
+    ]
+  },
+  "validation": {
+    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
+    "status": "passed",
+    "notes": "Ran from the workspace root with Node v24.14.0 (TypeScript stripping + --experimental-vm-modules); exit code 0, output 'resource-loader project trust regression: all scenarios passed'. The script loads the real packages/coding-agent/src/core/resource-loader.ts through .prale-eval/subject.mjs loadModule() with hand-written boundary fakes for chalk, ../config.ts, ../utils/paths.ts, ../utils/text.ts, ./event-bus.ts, ./extensions/loader.ts, ./footer-data-provider.ts, ./package-manager.ts, ./prompt-templates.ts, ./settings-manager.ts, ./skills.ts, ./source-info.ts and ./timings.ts; the fake package manager mirrors DefaultPackageManager by withholding project-scoped resources unless settingsManager.isProjectTrusted(), and every scenario uses non-existent fixture paths so no filesystem writes or network access occur. Three scenarios are asserted with node:assert/strict (no printed-success shortcuts): (1) resolver resolves true after a 25ms async gap -> resolver called exactly once, its input is the untrusted, user-only bootstrap LoadExtensionsResult, and after reload the project and user extensions are both present with the user extension loaded exactly once; (2) resolver resolves false -> project extension never loaded and trust state remains false; (3) reload() without a resolveProjectTrust option -> resolver not invoked and a previously saved trusted/untrusted decision still gates project resources. Fault re-check performed locally: reverting the repaired line back to 'const projectTrusted = false;' makes the script exit 1 with 'AssertionError: trusted decision: project trust resolver must be consulted exactly once (0 !== 1)'; restoring the fix returns exit 0. Limitation: the repository has no installed node_modules, so the upstream vitest suite (test/resource-loader.test.ts, which asserts the same contract) and any tsc typecheck could not be executed in this sandbox; validation therefore relies on the standalone Node regression described above."
+  }
+}

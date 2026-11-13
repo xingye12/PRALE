@@ -1,0 +1,148 @@
+diff --git a/packages/coding-agent/src/migrations.ts b/packages/coding-agent/src/migrations.ts
+index f03fd60..bcd2106 100644
+--- a/packages/coding-agent/src/migrations.ts
++++ b/packages/coding-agent/src/migrations.ts
+@@ -121,6 +121,9 @@ export function migrateSessionsFromAgentRoot(): void {
+ 			const fileName = file.split("/").pop() || file.split("\\").pop();
+ 			const newPath = join(correctDir, fileName!);
+ 
++			// On collision the existing destination wins: keep both copies untouched
++			// and continue migrating the remaining files.
++			if (existsSync(newPath)) continue;
+ 
+ 			renameSync(file, newPath);
+ 		} catch {
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..46c460e
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,109 @@
++/**
++ * Regression for session migration collision policy.
++ *
++ * Contract: `migrateSessionsFromAgentRoot()` moves legacy `*.jsonl` session
++ * files from the agent root into `sessions/<encoded-cwd>/`. When the
++ * destination file already exists, the destination always wins: its bytes and
++ * the colliding legacy source are both left untouched, and unrelated legacy
++ * files keep migrating. Nothing is ever overwritten or deleted on collision.
++ *
++ * The real production module is executed through the read-only
++ * `.prale-eval/subject.mjs` loader; only external boundaries (config path
++ * resolution, chalk, keybinding migration) are faked.
++ */
++import assert from "node:assert/strict";
++import * as fs from "node:fs";
++import * as path from "node:path";
++import { fileURLToPath } from "node:url";
++import { createGraph } from "./subject.mjs";
++
++const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
++const MIGRATIONS = "packages/coding-agent/src/migrations.ts";
++const TEXT_UTILS = "packages/coding-agent/src/utils/text.ts";
++
++// Sandbox directory kept inside the workspace so nothing outside it is touched.
++const agentDir = path.join(root, ".prale-eval", ".tmp-session-migration");
++const projectCwd = "/work/demo-project";
++const safePath = `--${projectCwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
++const correctDir = path.join(agentDir, "sessions", safePath);
++
++const collideName = "collide.jsonl";
++const freshName = "fresh.jsonl";
++
++const header = (id) => `${JSON.stringify({ type: "session", id, timestamp: "2025-01-01T00:00:00Z", cwd: projectCwd })}\n`;
++const legacyCollideBytes = `${header("legacy-collide")}legacy-body-collide\n`;
++const destCollideBytes = `${header("dest-wins")}destination-body-kept\n`;
++const legacyFreshBytes = `${header("legacy-fresh")}fresh-body\n`;
++
++const chalk = { green: (s) => s, yellow: (s) => s, dim: (s) => s, red: (s) => s };
++
++const bindings = {
++	CONFIG_DIR_NAME: ".pi",
++	getAgentDir: () => agentDir,
++	getBinDir: () => path.join(agentDir, "bin"),
++	migrateKeybindingsConfig: () => ({ config: {}, migrated: false }),
++	default: chalk,
++};
++
++function setup() {
++	fs.rmSync(agentDir, { recursive: true, force: true });
++	fs.mkdirSync(correctDir, { recursive: true });
++	// Collision: legacy source in the agent root and a pre-existing destination.
++	fs.writeFileSync(path.join(agentDir, collideName), legacyCollideBytes);
++	fs.writeFileSync(path.join(correctDir, collideName), destCollideBytes);
++	// Unrelated legacy file that must still be migrated.
++	fs.writeFileSync(path.join(agentDir, freshName), legacyFreshBytes);
++}
++
++function cleanup() {
++	fs.rmSync(agentDir, { recursive: true, force: true });
++}
++
++try {
++	setup();
++
++	const graph = createGraph(root, [MIGRATIONS, TEXT_UTILS], bindings);
++	const migrations = await graph.module(MIGRATIONS);
++	assert.equal(
++		typeof migrations.migrateSessionsFromAgentRoot,
++		"function",
++		"migrateSessionsFromAgentRoot should be exported by the production module",
++	);
++
++	migrations.migrateSessionsFromAgentRoot();
++
++	// 1) The existing destination keeps its exact bytes.
++	const destPath = path.join(correctDir, collideName);
++	assert.ok(fs.existsSync(destPath), "the pre-existing destination session must still exist");
++	assert.equal(
++		fs.readFileSync(destPath, "utf8"),
++		destCollideBytes,
++		"collision policy: the existing destination must not be overwritten by the legacy source",
++	);
++
++	// 2) The colliding legacy source is neither deleted nor rewritten.
++	const legacyPath = path.join(agentDir, collideName);
++	assert.ok(fs.existsSync(legacyPath), "the colliding legacy source must not be deleted on collision");
++	assert.equal(
++		fs.readFileSync(legacyPath, "utf8"),
++		legacyCollideBytes,
++		"the colliding legacy source bytes must remain untouched",
++	);
++
++	// 3) Migration continues for unrelated files.
++	assert.equal(fs.existsSync(path.join(agentDir, freshName)), false, "an unrelated legacy session must still be moved");
++	const freshDest = path.join(correctDir, freshName);
++	assert.ok(fs.existsSync(freshDest), "an unrelated legacy session must still land in the correct session directory");
++	assert.equal(fs.readFileSync(freshDest, "utf8"), legacyFreshBytes, "the migrated session keeps its bytes");
++
++	// 4) Nothing else appeared in the session directory.
++	assert.deepEqual(
++		Array.from(fs.readdirSync(correctDir), (entry) => String(entry)).sort(),
++		[collideName, freshName].sort(),
++		"migration must not create or duplicate session files on collision",
++	);
++
++	console.log("session migration collision policy: destination wins, legacy source preserved, unrelated files migrated");
++} finally {
++	cleanup();
++}
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..c108625
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,10 @@
++{
++  "task_id": "session-migration/correction",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Repaired packages/coding-agent/src/migrations.ts: migrateSessionsFromAgentRoot() now skips a legacy agent-root *.jsonl session when the computed destination file already exists (existsSync(newPath) -> continue) instead of calling renameSync unconditionally, which overwrote the destination bytes and removed the legacy source. The regression loads the real production module through .prale-eval/subject.mjs createGraph (migrations.ts plus the real utils/text.ts; only config getAgentDir/getBinDir, chalk, and migrateKeybindingsConfig are faked) and runs migrateSessionsFromAgentRoot() against a temp agent dir inside the workspace (.prale-eval/.tmp-session-migration, removed afterwards). It asserts the pre-existing destination keeps its exact bytes, the colliding legacy source still exists with its original bytes, an unrelated legacy session is still migrated into sessions/--work-demo-project--/ with unchanged content, and the session directory contains no extra files. Bidirectional check performed locally: with the guard temporarily removed (original fault), the script exits 1 on AssertionError 'collision policy: the existing destination must not be overwritten by the legacy source' (destination bytes replaced by legacy bytes); with the fix in place it exits 0. Node v24.14.0; runs without installing dependencies; vitest suite was not run because node_modules is not installed in this workspace."
++  }
++}
+snapshot .prale-eval/regression.mjs - cafd1731729925fdd39b812b07b4766269354419c2342a7ee90b62ef9b59bd15
+snapshot .prale-eval/result.json - 9a4382b40fdbfa5cdc7e894f57febcc8daba480befd06c832c06075cd6f1a845
+snapshot packages/coding-agent/src/migrations.ts fa74f12db342d61654c95ff5e8ebb62046871e5668c2729706e529d3fb0e8771 779ae8b207366c8fbc6ff43c9f1fbd611ad185fa13bcfae40aead7586d26c748

@@ -1,0 +1,559 @@
+diff --git a/packages/coding-agent/src/core/resource-loader.ts b/packages/coding-agent/src/core/resource-loader.ts
+index 72decd8..204c9c3 100644
+--- a/packages/coding-agent/src/core/resource-loader.ts
++++ b/packages/coding-agent/src/core/resource-loader.ts
+@@ -451,7 +451,7 @@ export class DefaultResourceLoader implements ResourceLoader {
+ 		if (options?.resolveProjectTrust) {
+ 			preTrustExtensions = await this.loadProjectTrustExtensions();
+ 			const projectTrusted = await options.resolveProjectTrust({ extensionsResult: preTrustExtensions });
+-			this.settingsManager.setProjectTrusted(true);
++			this.settingsManager.setProjectTrusted(projectTrusted);
+ 		}
+ 
+ 		// reload() preserves SettingsManager.projectTrusted and reloads settings for that trust state.
+diff --git a/.prale-eval/regression.mjs b/.prale-eval/regression.mjs
+new file mode 100644
+index 0000000..a869d0c
+--- /dev/null
++++ b/.prale-eval/regression.mjs
+@@ -0,0 +1,478 @@
++/**
++ * Regression for extension-trust/retransfer.
++ *
++ * Fault: `DefaultResourceLoader.reload()` transferred the project-trust phase
++ * result by unconditionally marking project settings trusted
++ * (`settingsManager.setProjectTrusted(true)`) instead of applying the decision
++ * that `resolveProjectTrust` returned. A denied decision therefore behaved like
++ * approval, so a reload exposed project resources.
++ *
++ * The script loads the real
++ * `packages/coding-agent/src/core/resource-loader.ts` and the real
++ * `packages/coding-agent/src/core/settings-manager.ts` inside a VM graph and
++ * fakes only the boundaries (package manager, extension loader, skills /
++ * prompts / themes loaders, path + config helpers). The fake package manager
++ * gates project-scoped resources on `settingsManager.isProjectTrusted()`,
++ * exactly like `DefaultPackageManager.addAutoDiscoveredResources()` does, and
++ * exposes project settings entries, which the real `SettingsManager` only loads
++ * while the project is trusted.
++ *
++ * Phases asserted:
++ *   1. bootstrap (during resolveProjectTrust): project resources absent,
++ *      user/global + CLI resources present, settings still untrusted
++ *   2. denied decision (false): project resources stay absent afterwards,
++ *      user/global + CLI stay available
++ *   3. approved decision (true) on a fresh loader: project resources appear
++ *   4. re-transfer on a reloaded loader: true -> project resources appear,
++ *      false again -> project resources disappear
++ */
++import assert from "node:assert/strict";
++import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from "node:fs";
++import { stripVTControlCharacters } from "node:util";
++import * as nodePath from "node:path";
++import { createGraph } from "./subject.mjs";
++
++const ROOT = nodePath.resolve(import.meta.dirname, "..");
++const RESOURCE_LOADER = "packages/coding-agent/src/core/resource-loader.ts";
++const SETTINGS_MANAGER = "packages/coding-agent/src/core/settings-manager.ts";
++const CONFIG_DIR = ".pi";
++
++const join = nodePath.join;
++const basename = nodePath.basename;
++
++// ---------------------------------------------------------------------------
++// Boundary fakes
++// ---------------------------------------------------------------------------
++
++/** Mirrors utils/paths.ts resolvePath for the absolute/relative inputs used here. */
++function fakeResolvePath(input, baseDir) {
++	const value = String(input ?? "").trim();
++	if (value.startsWith("~/")) return nodePath.join("/home/tester", value.slice(2));
++	if (nodePath.isAbsolute(value)) return nodePath.normalize(value);
++	return nodePath.resolve(baseDir ?? ROOT, value);
++}
++
++function fakeCanonicalizePath(input) {
++	try {
++		return nodePath.normalize(fakeResolvePath(input));
++	} catch {
++		return input;
++	}
++}
++
++function fakeStripBom(text) {
++	return typeof text === "string" && text.charCodeAt(0) === 0xfeff ? text.slice(1) : text;
++}
++
++function extensionEntry(pathValue) {
++	return {
++		path: pathValue,
++		resolvedPath: fakeResolvePath(pathValue),
++		commands: new Map(),
++		tools: new Map(),
++		flags: new Map(),
++		sourceInfo: undefined,
++	};
++}
++
++function autoEntries(dir, accept = () => true) {
++	if (!existsSync(dir)) return [];
++	return readdirSync(dir, { withFileTypes: true })
++		.filter((entry) => entry.isFile() || entry.isDirectory())
++		.filter((entry) => accept(entry.name))
++		.sort((a, b) => a.name.localeCompare(b.name))
++		.map((entry) => join(dir, entry.name));
++}
++
++/**
++ * Stands in for DefaultPackageManager. Mirrors the production trust gating:
++ * project settings entries exist only while the project is trusted (the real
++ * SettingsManager drops project settings when untrusted), and auto-discovered
++ * `.pi/{extensions,skills,prompts,themes}` entries are gated on
++ * `settingsManager.isProjectTrusted()` just like addAutoDiscoveredResources().
++ * User/global and CLI (temporary) resources are never gated.
++ */
++class FakePackageManager {
++	constructor(options) {
++		this.cwd = options.cwd;
++		this.agentDir = options.agentDir;
++		this.settingsManager = options.settingsManager;
++	}
++
++	async resolve() {
++		const settingsManager = this.settingsManager;
++		const globalSettings = settingsManager.getGlobalSettings();
++		const projectSettings = settingsManager.getProjectSettings();
++		const projectTrusted = settingsManager.isProjectTrusted();
++		const projectBaseDir = join(this.cwd, CONFIG_DIR);
++		const resolved = { extensions: [], skills: [], prompts: [], themes: [] };
++
++		const add = (type, paths, baseDir, metadata) => {
++			for (const pathValue of paths) {
++				resolved[type].push({
++					path: fakeResolvePath(pathValue, baseDir),
++					enabled: true,
++					metadata: { ...metadata, baseDir },
++				});
++			}
++		};
++
++		const resourceTypes = ["extensions", "skills", "prompts", "themes"];
++		for (const type of resourceTypes) {
++			// Configured entries: the real SettingsManager empties project settings
++			// while the project is untrusted, so these disappear on their own.
++			add(type, projectSettings[type] ?? [], projectBaseDir, {
++				source: "local",
++				scope: "project",
++				origin: "top-level",
++			});
++			add(type, globalSettings[type] ?? [], this.agentDir, {
++				source: "local",
++				scope: "user",
++				origin: "top-level",
++			});
++		}
++
++		if (projectTrusted) {
++			add("extensions", autoEntries(join(projectBaseDir, "extensions"), (name) => name.endsWith(".ts")), projectBaseDir, {
++				source: "auto",
++				scope: "project",
++				origin: "top-level",
++			});
++			for (const type of ["skills", "prompts", "themes"]) {
++				add(type, autoEntries(join(projectBaseDir, type)), projectBaseDir, {
++					source: "auto",
++					scope: "project",
++					origin: "top-level",
++				});
++			}
++		}
++
++		add("extensions", autoEntries(join(this.agentDir, "extensions"), (name) => name.endsWith(".ts")), this.agentDir, {
++			source: "auto",
++			scope: "user",
++			origin: "top-level",
++		});
++		for (const type of ["skills", "prompts", "themes"]) {
++			add(type, autoEntries(join(this.agentDir, type)), this.agentDir, {
++				source: "auto",
++				scope: "user",
++				origin: "top-level",
++			});
++		}
++
++		return resolved;
++	}
++
++	async resolveExtensionSources(sources) {
++		return {
++			extensions: Array.from(sources, (source) => ({
++				path: fakeResolvePath(source, this.cwd),
++				enabled: true,
++				metadata: { source: "cli", scope: "temporary", origin: "top-level" },
++			})),
++			skills: [],
++			prompts: [],
++			themes: [],
++		};
++	}
++}
++
++/** Names shared by every stubbed module (the VM helper uses one flat binding map). */
++function boundaryBindings() {
++	const colorize = (value) => stripVTControlCharacters(String(value));
++	const runtime = { kind: "extension-runtime" };
++
++	const bindings = {
++		// chalk (default import of resource-loader) and proper-lockfile (default
++		// import of settings-manager) share the single `default` binding slot.
++		default: {
++			yellow: colorize,
++			red: colorize,
++			cyan: colorize,
++			green: colorize,
++			gray: colorize,
++			dim: colorize,
++			bold: colorize,
++			lockSync: () => () => {},
++			check: async () => true,
++			unlock: async () => {},
++		},
++		// config
++		CONFIG_DIR_NAME: CONFIG_DIR,
++		getAgentDir: () => join(ROOT, ".prale-eval", ".tmp", "unused-agent-dir"),
++		// utils/paths + utils/text
++		canonicalizePath: fakeCanonicalizePath,
++		isLocalPath: (value) => value.startsWith(".") || value.startsWith("~") || nodePath.isAbsolute(value),
++		resolvePath: fakeResolvePath,
++		normalizePath: (value) => nodePath.normalize(fakeResolvePath(value)),
++		stripBom: fakeStripBom,
++		// event bus / extension runtime plumbing
++		createEventBus: () => ({ emit() {}, on: () => () => {} }),
++		clearExtensionCache: () => {},
++		createExtensionRuntime: () => runtime,
++		loadExtensionFromFactory: () => {
++			throw new Error("unexpected inline extension factory load");
++		},
++		loadExtensionsCached: async (paths, cwd, _eventBus, existingRuntime) => {
++			const list = Array.from(paths);
++			return {
++				extensions: list.map((entry) => extensionForPath(entry, cwd)),
++				errors: [],
++				warnings: [],
++				runtime: existingRuntime ?? runtime,
++			};
++		},
++		// git/footer helper: no worktree rewriting in the fixture
++		findGitPaths: () => undefined,
++		// DefaultPackageManager
++		DefaultPackageManager: FakePackageManager,
++		// resource loaders
++		loadPromptTemplates: ({ promptPaths }) => ({
++			templates: Array.from(promptPaths ?? [], (entry) => ({
++				name: basename(entry, nodePath.extname(entry)),
++				filePath: entry,
++				content: "",
++			})),
++			diagnostics: [],
++		}),
++		loadSkills: ({ skillPaths }) => ({
++			skills: Array.from(skillPaths ?? [], (entry) => ({
++				// resource-loader maps a skill directory to its SKILL.md
++				name: basename(entry) === "SKILL.md" ? basename(nodePath.dirname(entry)) : basename(entry, nodePath.extname(entry)),
++				filePath: entry,
++				description: "",
++				sourceInfo: undefined,
++			})),
++			diagnostics: [],
++		}),
++		loadThemeFromPath: (filePath) => ({ name: basename(filePath, ".json"), sourcePath: filePath }),
++		createSourceInfo: (pathValue, metadata) => ({ path: pathValue, ...(metadata ?? {}) }),
++		resetTimings: () => {},
++		// @earendil-works/pi-ai constant consumed by settings-manager
++		DEFAULT_MAX_AGENT_RETRY_DELAY_MS: 30_000,
++		// http-dispatcher helpers consumed by settings-manager
++		DEFAULT_HTTP_IDLE_TIMEOUT_MS: 60_000,
++		parseHttpIdleTimeoutMs: () => undefined,
++	};
++
++	return bindings;
++}
++
++function extensionForPath(pathValue, cwd) {
++	const resolved = cwd ? fakeResolvePath(pathValue, cwd) : fakeResolvePath(pathValue);
++	return { ...extensionEntry(resolved), path: resolved };
++}
++
++// ---------------------------------------------------------------------------
++// Fixture
++// ---------------------------------------------------------------------------
++
++function writeFixtureFile(filePath, content) {
++	mkdirSync(nodePath.dirname(filePath), { recursive: true });
++	writeFileSync(filePath, content, "utf-8");
++}
++
++function createFixture() {
++	const tmpParent = join(ROOT, ".prale-eval", ".tmp");
++	mkdirSync(tmpParent, { recursive: true });
++	const base = mkdtempSync(join(tmpParent, "run-"));
++	const agentDir = join(base, "agent");
++	const cwd = join(base, "project");
++	const cliDir = join(base, "cli");
++	const projectConfigDir = join(cwd, CONFIG_DIR);
++
++	writeFixtureFile(join(agentDir, "settings.json"), `${JSON.stringify({}, null, 2)}\n`);
++	writeFixtureFile(join(agentDir, "extensions", "user.ts"), "export default function () {}\n");
++	writeFixtureFile(join(agentDir, "skills", "user-skill", "SKILL.md"), "user skill\n");
++	writeFixtureFile(join(agentDir, "prompts", "user-prompt.md"), "user prompt\n");
++	writeFixtureFile(join(agentDir, "themes", "user-theme.json"), "{}\n");
++	writeFixtureFile(join(agentDir, "SYSTEM.md"), "USER GLOBAL SYSTEM PROMPT\n");
++	writeFixtureFile(join(agentDir, "APPEND_SYSTEM.md"), "USER GLOBAL APPEND\n");
++
++	writeFixtureFile(
++		join(projectConfigDir, "settings.json"),
++		`${JSON.stringify({ extensions: ["settings-extension.ts"], skills: ["settings-skill"] }, null, 2)}\n`,
++	);
++	writeFixtureFile(join(projectConfigDir, "extensions", "project.ts"), "export default function () {}\n");
++	writeFixtureFile(join(projectConfigDir, "settings-extension.ts"), "export default function () {}\n");
++	writeFixtureFile(join(projectConfigDir, "skills", "project-skill", "SKILL.md"), "project skill\n");
++	writeFixtureFile(join(projectConfigDir, "skills", "settings-skill", "SKILL.md"), "settings skill\n");
++	writeFixtureFile(join(projectConfigDir, "prompts", "deploy.md"), "project prompt\n");
++	writeFixtureFile(join(projectConfigDir, "themes", "project-theme.json"), "{}\n");
++	writeFixtureFile(join(projectConfigDir, "SYSTEM.md"), "PROJECT SYSTEM PROMPT\n");
++	writeFixtureFile(join(projectConfigDir, "APPEND_SYSTEM.md"), "PROJECT APPEND\n");
++
++	writeFixtureFile(join(cliDir, "cli.ts"), "export default function () {}\n");
++
++	return { base, agentDir, cwd, cliExtensionPath: join(cliDir, "cli.ts") };
++}
++
++// ---------------------------------------------------------------------------
++// Assertion helpers (VM results are copied into host arrays before comparing)
++// ---------------------------------------------------------------------------
++
++const PROJECT_ONLY = ["project.ts", "settings-extension.ts"];
++
++function extensionNames(loader) {
++	return Array.from(loader.getExtensions().extensions, (extension) => basename(extension.path)).sort();
++}
++
++function skillNames(loader) {
++	return Array.from(loader.getSkills().skills, (skill) => skill.name).sort();
++}
++
++function promptNames(loader) {
++	return Array.from(loader.getPrompts().prompts, (prompt) => prompt.name).sort();
++}
++
++function themeNames(loader) {
++	return Array.from(loader.getThemes().themes, (theme) => theme.name).sort();
++}
++
++function assertAbsent(actual, expectedAbsent, message) {
++	for (const name of expectedAbsent) {
++		assert.ok(!actual.includes(name), `${message}: unexpected ${name} in [${actual.join(", ")}]`);
++	}
++}
++
++function assertPresent(actual, expectedPresent, message) {
++	for (const name of expectedPresent) {
++		assert.ok(actual.includes(name), `${message}: missing ${name} in [${actual.join(", ")}]`);
++	}
++}
++
++function assertProjectResourcesAbsent(loader, phase) {
++	const extensions = extensionNames(loader);
++	assertAbsent(extensions, PROJECT_ONLY, `${phase}: project extensions must stay unloaded`);
++	const skills = skillNames(loader);
++	assertAbsent(skills, ["project-skill", "settings-skill"], `${phase}: project skills must stay unloaded`);
++	const prompts = promptNames(loader);
++	assertAbsent(prompts, ["deploy"], `${phase}: project prompts must stay unloaded`);
++	assertAbsent(themeNames(loader), ["project-theme"], `${phase}: project themes must stay unloaded`);
++	assert.notEqual(loader.getSystemPrompt(), "PROJECT SYSTEM PROMPT\n", `${phase}: project SYSTEM.md must stay unloaded`);
++	assert.ok(
++		!Array.from(loader.getAppendSystemPrompt()).includes("PROJECT APPEND\n"),
++		`${phase}: project APPEND_SYSTEM.md must stay unloaded`,
++	);
++}
++
++function assertUserAndCliResourcesPresent(loader, phase) {
++	const extensions = extensionNames(loader);
++	assertPresent(extensions, ["user.ts", "cli.ts"], `${phase}: user/global and CLI extensions must stay available`);
++	assertPresent(skillNames(loader), ["user-skill"], `${phase}: user/global skills must stay available`);
++	assertPresent(promptNames(loader), ["user-prompt"], `${phase}: user/global prompts must stay available`);
++	assert.equal(loader.getSystemPrompt(), "USER GLOBAL SYSTEM PROMPT\n", `${phase}: global SYSTEM.md must stay available`);
++	assert.deepEqual(
++		Array.from(loader.getAppendSystemPrompt()),
++		["USER GLOBAL APPEND\n"],
++		`${phase}: global APPEND_SYSTEM.md must stay available`,
++	);
++}
++
++function assertProjectResourcesPresent(loader, phase) {
++	const extensions = extensionNames(loader);
++	assertPresent(extensions, PROJECT_ONLY, `${phase}: approved project extensions must load`);
++	assertPresent(extensions, ["user.ts", "cli.ts"], `${phase}: user/global and CLI extensions must stay available`);
++	assertPresent(skillNames(loader), ["project-skill", "settings-skill"], `${phase}: approved project skills must load`);
++	assertPresent(skillNames(loader), ["user-skill"], `${phase}: user/global skills must stay available`);
++	assertPresent(promptNames(loader), ["deploy"], `${phase}: approved project prompts must load`);
++	assertPresent(promptNames(loader), ["user-prompt"], `${phase}: user/global prompts must stay available`);
++	assert.equal(loader.getSystemPrompt(), "PROJECT SYSTEM PROMPT\n", `${phase}: approved project SYSTEM.md must load`);
++	assert.deepEqual(
++		Array.from(loader.getAppendSystemPrompt()),
++		["PROJECT APPEND\n"],
++		`${phase}: approved project APPEND_SYSTEM.md must load`,
++	);
++}
++
++// ---------------------------------------------------------------------------
++// Scenario
++// ---------------------------------------------------------------------------
++
++const fixture = createFixture();
++const bindings = boundaryBindings();
++const graph = createGraph(
++	ROOT,
++	{ resourceLoader: RESOURCE_LOADER, settingsManager: SETTINGS_MANAGER },
++	bindings,
++);
++const { DefaultResourceLoader } = await graph.module("resourceLoader");
++const { SettingsManager } = await graph.module("settingsManager");
++
++function createLoader(resolveTrusted) {
++	const settingsManager = SettingsManager.create(fixture.cwd, fixture.agentDir, { projectTrusted: false });
++	const loader = new DefaultResourceLoader({
++		cwd: fixture.cwd,
++		agentDir: fixture.agentDir,
++		settingsManager,
++		// AGENTS.md discovery walks to the filesystem root; it is unrelated to
++		// project trust, so keep this scenario self-contained.
++		noContextFiles: true,
++		additionalExtensionPaths: [fixture.cliExtensionPath],
++	});
++	return { loader, settingsManager, resolveTrusted };
++}
++
++let deniedSettingsManager;
++
++try {
++	// --- Phase 1 + 2: bootstrap isolation, then a denied decision ------------
++	const denied = createLoader(async () => false);
++	deniedSettingsManager = denied.settingsManager;
++	let bootstrapChecked = false;
++	await denied.loader.reload({
++		resolveProjectTrust: async ({ extensionsResult }) => {
++			const bootstrapExtensions = Array.from(extensionsResult.extensions, (extension) => basename(extension.path)).sort();
++			assert.deepEqual(
++				bootstrapExtensions,
++				["cli.ts", "user.ts"],
++				`bootstrap: only user/global and CLI extensions may load, got [${bootstrapExtensions.join(", ")}]`,
++			);
++			assert.equal(
++				denied.settingsManager.isProjectTrusted(),
++				false,
++				"bootstrap: project settings must be untrusted while the decision is pending",
++			);
++			bootstrapChecked = true;
++			return false;
++		},
++	});
++	assert.ok(bootstrapChecked, "bootstrap: resolveProjectTrust must run exactly once");
++	assertProjectResourcesAbsent(denied.loader, "denied reload");
++	assertUserAndCliResourcesPresent(denied.loader, "denied reload");
++	assert.equal(
++		denied.settingsManager.isProjectTrusted(),
++		false,
++		"denied reload: the false decision must be transferred to the settings manager",
++	);
++
++	// --- Phase 3: an approved decision on a fresh loader ---------------------
++	const approved = createLoader(async () => true);
++	await approved.loader.reload({
++		resolveProjectTrust: async () => true,
++	});
++	assert.equal(
++		approved.settingsManager.isProjectTrusted(),
++		true,
++		"approved reload: the true decision must be transferred to the settings manager",
++	);
++	assertProjectResourcesPresent(approved.loader, "approved reload");
++
++	// --- Phase 4: re-transfer across reloads of the same loader --------------
++	await denied.loader.reload({ resolveProjectTrust: async () => true });
++	assertProjectResourcesPresent(denied.loader, "re-transfer to trusted");
++	await denied.loader.reload({ resolveProjectTrust: async () => false });
++	assertProjectResourcesAbsent(denied.loader, "re-transfer to untrusted");
++	assertUserAndCliResourcesPresent(denied.loader, "re-transfer to untrusted");
++
++	assert.equal(
++		deniedSettingsManager.isProjectTrusted(),
++		false,
++		"re-transfer to untrusted: settings manager must end up untrusted",
++	);
++} finally {
++	rmSync(fixture.base, { recursive: true, force: true });
++}
++
++console.log("extension-trust/retransfer regression: project trust phases preserved");
+diff --git a/.prale-eval/result.json b/.prale-eval/result.json
+new file mode 100644
+index 0000000..f5c1872
+--- /dev/null
++++ b/.prale-eval/result.json
+@@ -0,0 +1,53 @@
++{
++  "task_id": "extension-trust/retransfer",
++  "repository": "earendil-works/pi",
++  "mode": "repair",
++  "claims": [
++    {
++      "claim": "DefaultResourceLoader.reload() now transfers the decision returned by resolveProjectTrust to the settings manager instead of unconditionally marking the project trusted, so a denied decision no longer behaves like approval.",
++      "citations": [
++        "packages/coding-agent/src/core/resource-loader.ts:449-455"
++      ]
++    },
++    {
++      "claim": "Bootstrap phase separation is unchanged: loadProjectTrustExtensions() still forces project settings untrusted and loads only user/global plus temporary CLI extensions before the decision exists.",
++      "citations": [
++        "packages/coding-agent/src/core/resource-loader.ts:435-441",
++        "packages/coding-agent/src/core/resource-loader.ts:606-633"
++      ]
++    },
++    {
++      "claim": "Project settings/resources are exposed only while the project is trusted: SettingsManager drops project settings when untrusted and the package manager gates auto-discovered .pi resources on isProjectTrusted().",
++      "citations": [
++        "packages/coding-agent/src/core/settings-manager.ts:410-414",
++        "packages/coding-agent/src/core/settings-manager.ts:510-537",
++        "packages/coding-agent/src/core/package-manager.ts:2428-2460"
++      ]
++    },
++    {
++      "claim": "Project SYSTEM.md / APPEND_SYSTEM.md discovery stays gated on isProjectTrusted(), so the wrong trust value also leaked project prompts.",
++      "citations": [
++        "packages/coding-agent/src/core/resource-loader.ts:1093-1119"
++      ]
++    }
++  ],
++  "deliverables": [
++    {
++      "path": "packages/coding-agent/src/core/resource-loader.ts",
++      "change": "One-line repair in DefaultResourceLoader.reload(): this.settingsManager.setProjectTrusted(projectTrusted) instead of setProjectTrusted(true)."
++    },
++    {
++      "path": ".prale-eval/regression.mjs",
++      "change": "Standalone Node assertion script that loads the real resource-loader.ts and settings-manager.ts through .prale-eval/subject.mjs with boundary fakes and asserts the four trust phases."
++    },
++    {
++      "path": ".prale-eval/result.json",
++      "change": "This validation record."
++    }
++  ],
++  "validation": {
++    "command": "node --experimental-vm-modules .prale-eval/regression.mjs",
++    "status": "passed",
++    "notes": "Regression loads packages/coding-agent/src/core/resource-loader.ts plus packages/coding-agent/src/core/settings-manager.ts as real modules via createGraph() and fakes only the boundaries (FakePackageManager, loadExtensionsCached, loadSkills, loadPromptTemplates, loadThemeFromPath, config/paths/text helpers, chalk+proper-lockfile default binding, findGitPaths, timings/event-bus stubs). The fake package manager mirrors production gating: project settings entries come from SettingsManager.getProjectSettings() (real, emptied while untrusted) and auto-discovered .pi/{extensions,skills,prompts,themes} entries are gated on settingsManager.isProjectTrusted(), matching DefaultPackageManager.addAutoDiscoveredResources(). Fixtures are created under .prale-eval/.tmp and removed in a finally block. Asserted phases: (1) during the resolveProjectTrust bootstrap callback only cli.ts + user.ts extensions are loaded and settings are still untrusted; (2) after a denied (false) decision project.ts, settings-extension.ts, project-skill, settings-skill, deploy prompt, project-theme and .pi/SYSTEM.md + .pi/APPEND_SYSTEM.md stay unloaded while user/global and CLI resources remain available; (3) a fresh loader approving (true) loads the project extensions, skills, prompts and project system prompt; (4) re-transfer on the same loader: true then false flips project resources on and off again. Verified locally in both directions: with the repair the command exits 0; with the original fault restored (setProjectTrusted(true)) it exits 1 with 'AssertionError: denied reload: project extensions must stay unloaded: unexpected project.ts in [cli.ts, project.ts, settings-extension.ts, user.ts]'. Limitation: this checkout has no node_modules and installing dependencies was out of scope, so the repository's vitest suite (packages/coding-agent/test/resource-loader.test.ts) and tsgo/tsc type checking could not be executed; the production module was instead parsed and executed through Node 24 TypeScript stripping in the VM graph, which is the same code path the regression exercises."
++  }
++}
+snapshot .prale-eval/regression.mjs - 2c3c03236c671811642da66fa5cef4e6884cc0dc263e654fda7732399bb3013e
+snapshot .prale-eval/result.json - 48c19e33ef45d34d1ec9c768909c2e9b7da55648c99ab53ae053e3b806df4a8b
+snapshot packages/coding-agent/src/core/resource-loader.ts 076fed822b4c7a151bb59becc911d376eab3ae0eecbc7ecbdf90b2adc827b22b 81016cfd1941bf4ecf2c70e40d59f31bb2949649596e833384d1b4d105d4dd4d

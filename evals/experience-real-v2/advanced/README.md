@@ -2,7 +2,7 @@
 
 本题库独立于旧的 `../fixtures/`，不替换原有 12 题。复用同一个冻结 pi capsule：
 `b45597504eeaba1f11a9920a1d1048c361ed4b8e`。标识为 `real-v2-advanced-v1`，
-fixture revision 3、oracle version 4。题目、数据、行为断言均在本地运行；不使用 LLM judge。
+fixture revision 5、oracle version 4。题目、数据、行为断言均在本地运行；不使用 LLM judge。
 
 完整的逐题构造、验收过程与审计修复见
 [CONSTRUCTION_AND_TESTING.md](CONSTRUCTION_AND_TESTING.md)。该文档包含故障细节，面向维护者，不作为 Agent 输入。
@@ -60,7 +60,7 @@ cold 使用 `--memory-mode cold` 以及独立的 state/output 路径。Claude Co
 ## 验收
 
 每题交付修复源码、`.prale-eval/regression.mjs`、结果 JSON 与 `repair.md`。
-公共 `subject.mjs` 是只读的模块加载及边界测试辅助代码。目标生产模块会调用其他
+公共 `subject.mjs` 仅提供通用模块加载，不包含源码入口映射、业务符号或场景专用 fake。Agent 自行选择模块和提供边界绑定，目标生产模块应调用其他
 目标模块的真实实现：resolver → loader → SettingsManager、migration → text/path → reader、
 recovery → executor/finalizer → gate。不会把待修复模块替换成正确的 fake。
 
@@ -99,6 +99,13 @@ Migration 的目录枚举被明确排序，避免依赖宿主文件系统顺序�
 另增加了字段继承、完整恢复链 gate 准入、失败后的迟到回调与额外变异测试。
 
 完整复验为进阶题库 119 项，加原 real-v2 和相关 crossrepo 流程 68 项，合计 187 项通过。
-详细问题、证据边界和运行方法见上面的维护者文档。请为 revision 3 使用新的 state/output 目录。
+详细问题、证据边界和运行方法见上面的维护者文档。请为 revision 5 使用新的 state/output 目录。
 
 2026-11-09 补充验收审计见 [审计报告](../AUDIT_REPORT.md)，其中记录最新复验结果；上面的 187 项为 revision 2 历史记录。
+
+当前 fixture revision 5：题面不列故障模块和修改数量，公共加载器也不含任务到源码的映射。
+Agent 从 incident 自行探索生产代码及调用链，定位全部故障，并向通用 `createGraph` 提供模块路径、
+边界 fake 和必要的私有入口 trailer。具体场景适配仅保留在工作区外的隐藏验收侧。
+新 workspace 在注入故障后重建并统一时间戳，Git 索引不会保留故障文件的特殊修改时间。
+隐藏 oracle、逐文件故障回放和回归检出要求保持原样。批量及单题 CLI 默认隐藏目标；
+历史 revision 3/4 成绩需单独统计。
